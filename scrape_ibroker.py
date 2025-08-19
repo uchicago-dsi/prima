@@ -213,7 +213,7 @@ def parse_results_table_html(table_html: str) -> pd.DataFrame:
     dt = pd.to_datetime(pd.Series(dt_str, dtype="string"), errors="coerce")
 
     # derive exam_id from row title when it contains 'Exported ... \\EXAMID\\...'
-    titles = np.array([r.get("title") or "" for r in rows], dtype=object)
+    titles = np.array([r.get("title") or "" for r in rows], dtype=str)
     mask = np.char.find(np.char.lower(titles), "exported") >= 0
     exam = np.full(titles.shape, np.nan, dtype=object)
     if mask.any():
@@ -232,7 +232,7 @@ def parse_results_table_html(table_html: str) -> pd.DataFrame:
     )
 
     # keep MG/MR; if this empties the frame, that's still a valid 'no MG/MR for this id'
-    df = df[df["Modality"].str.contains(r"\b(MG|MR)\b", na=False)]
+    # df = df[df["Modality"].str.contains(r"\b(MG|MR)\b", na=False)]
     return df
 
 
