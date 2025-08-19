@@ -13,3 +13,5 @@ einops
 h5py
 beautifulsoup4
 selenium
+tenacity
+tqdm
