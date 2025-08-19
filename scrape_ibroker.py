@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 from bs4 import BeautifulSoup
 from selenium import webdriver
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.firefox.options import Options
@@ -24,7 +24,7 @@ from tqdm.auto import tqdm
 
 # insert real values here; study id file should be a text file with a list of study ids, one per line
 username = "annawoodard@uchicago.edu"
-password = "foo"
+password = "16352a"
 study_id_file = "/gpfs/data/huo-lab/Image/ChiMEC/study-16352a.csv"
 output_file = "data/imaging_metadata.csv"
 
@@ -79,6 +79,29 @@ def login(driver, username: str, password: str) -> None:
     )
 
 
+def activate_radiology_tab(driver) -> None:
+    """ensure the 'radiology images' tab panel is visible
+
+    clicks the tab header if the panel is still display:none; waits until it is displayed
+    """
+    panel = driver.find_element(By.ID, "TabContainer1_tabPanel1")
+    if not panel.is_displayed():
+        driver.find_element(By.ID, "__tab_TabContainer1_tabPanel1").click()
+        WebDriverWait(driver, 30).until(
+            lambda d: d.find_element(By.ID, "TabContainer1_tabPanel1").is_displayed()
+        )
+
+
+def select_all_modalities(driver) -> None:
+    """select 'All' modalities so the results grid is populated
+
+    calls the built-in __doPostBack via clicking the 'All' link
+    """
+    link = WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.ID, "lbAll")))
+    link.click()
+    wait_aspnet_idle(driver, 60)
+
+
 def wait_aspnet_idle(driver, timeout: int = 60) -> None:
     """block until document is complete and asp.net updatepanel is not mid-ajax
 
@@ -104,63 +127,127 @@ def set_study_id(study_id: str) -> None:
     wait_aspnet_idle(driver, 60)
 
 
-def find_results_table_element(driver):
-    """locate the radiology results grid without table indexing
+def find_results_table_html(driver) -> str:
+    """return outerHTML of the studies grid
 
-    prefers the grid under the radiology images tab with a header 'Study DateTime'
-    falls back to the first table after the 'available studies to export' marker
+    targets the GridView id 'TabContainer1_tabPanel1_gv1' directly, then falls back
+    to a lightweight header-based search inside the radiology tab
     """
+    activate_radiology_tab(driver)
     wait_aspnet_idle(driver, 60)
-    try:
-        return WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located(
-                (
-                    By.XPATH,
-                    "//div[@id='TabContainer1_tabPanel1']"
-                    "//table[.//th[contains(normalize-space(.),'Study DateTime')]]",
-                )
-            )
+
+    # direct by id – fastest and most reliable on this WebForms page
+    html = driver.execute_script(
+        "var t=document.getElementById('TabContainer1_tabPanel1_gv1');"
+        "return t ? t.outerHTML : null;"
+    )
+    if html:
+        return html
+
+    # lightweight fallback: pick the table whose first header row contains modality/studydt/studydescription
+    js = r"""
+    (function(){
+      function norm(s){return (s||'').toLowerCase().replace(/\s+/g,' ').trim();}
+      function score(tbl){
+        var first = tbl.querySelector('tr'); if(!first) return 0;
+        var cells = Array.from(first.children).map(td => norm(td.textContent));
+        var s = 0;
+        if (cells.some(t=>t.includes('modality'))) s += 3;
+        if (cells.some(t=>t.includes('studydt')||t.includes('study date')||t.includes('study datetime'))) s += 3;
+        if (cells.some(t=>t.includes('studydescription')||t.includes('study description'))) s += 2;
+        return s;
+      }
+      var panel = document.getElementById('TabContainer1_tabPanel1') || document.body;
+      var best=null, bestScore=0;
+      for (var t of panel.querySelectorAll('table')) {
+        var sc = score(t);
+        if (sc > bestScore) { best = t; bestScore = sc; }
+      }
+      return best ? best.outerHTML : null;
+    })();
+    """
+    html = driver.execute_script(js)
+    if not html:
+        # fail-fast with a forensics snapshot of what we actually saw
+        panel_html = driver.execute_script(
+            "var p=document.getElementById('TabContainer1_tabPanel1');"
+            "return p ? p.outerHTML : document.body.outerHTML;"
         )
-    except TimeoutException:
-        # fallback to the first table following the marker text
-        return WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located(
-                (
-                    By.XPATH,
-                    "//span[contains(@class,'highlight') and "
-                    "contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),"
-                    "'available studies to export')]/following::table[1]",
-                )
-            )
+        with open("data/debug_last_panel.html", "w") as f:
+            f.write(panel_html)
+        raise TimeoutException(
+            "studies grid not found (expected id 'TabContainer1_tabPanel1_gv1')"
         )
+    return html
 
 
 def parse_results_table_html(table_html: str) -> pd.DataFrame:
-    """parse the ibroker results table into a dataframe with exam_id
+    """parse the studies grid into a dataframe
 
-    infers exam_id from each row's title when containing 'Exported'
-    filters modalities to MG and MR
+    normalizes 'StudyDT' → 'Study DateTime', drops the leading checkbox column,
+    extracts exam_id when present (rare here), filters to MG/MR
     """
-    soup = BeautifulSoup(table_html, "lxml")
+    df = pd.read_html(table_html, header=0)[0]  # pandas guarantees a list or raises
+    df.columns = [c.strip() for c in df.columns]
 
-    # read the table header/body through pandas
-    df = pd.read_html(str(soup), parse_dates=True, header=0)[0]
-    if "Unnamed: 0" in df.columns:
-        df = df.drop(columns=["Unnamed: 0"])
+    # drop the unnamed checkbox column if present
+    for c in list(df.columns):
+        if not c or c.lower().startswith("unnamed"):
+            df = df.drop(columns=[c])
+
+    # normalize column names we care about
+    rename = {}
+    for c in list(df.columns):
+        lc = c.lower().replace(" ", "")
+        if lc in {"studydt", "studydatetime", "studydate"}:
+            rename[c] = "Study DateTime"
+        elif lc.startswith("studydescription"):
+            rename[c] = "StudyDescription"
+        elif lc.startswith("modality"):
+            rename[c] = "Modality"
+    if rename:
+        df = df.rename(columns=rename)
+
+    required = {"Modality", "Study DateTime", "StudyDescription"}
+    missing = required - set(df.columns)
+    if missing:
+        raise KeyError(f"grid missing expected columns: {missing}")
+
     df["Study DateTime"] = pd.to_datetime(df["Study DateTime"], errors="coerce")
 
-    # build an exam_id map from the row title attributes
+    # optional exam_id inference: rows in this grid typically have no title/export info
+    soup = BeautifulSoup(table_html, "lxml")
     rows = soup.find_all("tr")[1:]
-    tds = [r.find_all("td") for r in rows]
+    cells = [r.find_all("td") for r in rows]
+
+    # find the dt column index from the header we just parsed to avoid guessing
+    header_cells = [
+        h.get_text(strip=True).lower().replace(" ", "")
+        for h in soup.find("tr").find_all(["th", "td"])
+    ]
+    try:
+        dt_idx = header_cells.index("studydt")
+    except ValueError:
+        # backup: look for 'study date' / 'study datetime'
+        dt_idx = next(
+            (
+                i
+                for i, t in enumerate(header_cells)
+                if "study" in t and ("date" in t or "datetime" in t)
+            ),
+            2,
+        )
+
     dates = [
-        pd.to_datetime(c[2].get_text(strip=True), errors="coerce")
-        if len(c) >= 3
+        pd.to_datetime(c[dt_idx].get_text(strip=True), errors="coerce")
+        if len(c) > dt_idx
         else pd.NaT
-        for c in tds
+        for c in cells
     ]
     titles = [r.get("title") or "" for r in rows]
     exam_ids = [
-        t.split()[-1].split("\\")[-2] if "Exported" in t else np.nan for t in titles
+        t.split()[-1].split("\\")[-2] if "exported" in t.lower() else np.nan
+        for t in titles
     ]
 
     id_map = (
@@ -169,7 +256,9 @@ def parse_results_table_html(table_html: str) -> pd.DataFrame:
         .drop_duplicates("Study DateTime")
     )
     out = df.merge(id_map, on="Study DateTime", how="left")
-    out = out[out["Modality"].str.contains("MG|MR", na=False)]
+
+    # keep modalities you actually want
+    out = out[out["Modality"].str.contains(r"\b(MG|MR)\b", na=False)]
     return out
 
 
@@ -182,29 +271,16 @@ os.makedirs(os.path.dirname(output_file), exist_ok=True)
 if os.path.isfile(output_file):
     result = pd.read_csv(output_file)
     study_ids = set(study_ids) - set(
-        result[~pd.isnull(result["exam_id"])].study_id.tolist()
+        result[~pd.isnull(result["study_id"])].study_id.tolist()
     )
 for study_id in tqdm(study_ids):
-    try:
-        set_study_id(study_id)
-        table_el = find_results_table_element(driver)
-        df = parse_results_table_html(table_el.get_attribute("outerHTML"))
-    except (TimeoutException, ValueError, KeyError, IndexError, NoSuchElementException):
-        # no grid or no rows for this id
-        df = pd.DataFrame(
-            {
-                "Study DateTime": [np.nan],
-                "StudyDescription": [np.nan],
-                "Modality": [np.nan],
-            }
-        )
+    set_study_id(study_id)
+    activate_radiology_tab(driver)
+    wait_aspnet_idle(driver, 60)
 
+    table_html = find_results_table_html(driver)  # raises if missing
+    df = parse_results_table_html(table_html)  # raises if schema changed
     df["study_id"] = study_id
 
-    if result is None:
-        result = df
-    else:
-        # keep order stable and avoid index collisions
-        result = pd.concat([result, df], ignore_index=True)
-
+    result = df if result is None else pd.concat([result, df], ignore_index=True)
     result.to_csv(output_file, index=False)
