@@ -9,6 +9,7 @@
 # Selenium additionally requires the installation of a driver for your browser (Chrome in this example). See here for details: https://selenium-python.readthedocs.io/installation.html
 
 import os
+from io import StringIO
 
 import numpy as np
 import pandas as pd
@@ -182,23 +183,27 @@ def find_results_table_html(driver) -> str:
 
 
 def parse_results_table_html(table_html: str) -> pd.DataFrame:
-    """parse the studies grid into a dataframe
+    """parse the gv1 studies grid into a dataframe with an exam_id column
 
-    normalizes 'StudyDT' → 'Study DateTime', drops the leading checkbox column,
-    extracts exam_id when present (rare here), filters to MG/MR
+    - avoids pandas' deprecation by wrapping html in StringIO
+    - normalizes headers to ['Modality', 'Study DateTime', 'StudyDescription']
+    - assigns exam_id row-wise from <tr title="..."> (no merge needed)
+    - filters to MG/MR modalities only
     """
-    df = pd.read_html(table_html, header=0)[0]  # pandas guarantees a list or raises
-    df.columns = [c.strip() for c in df.columns]
+    # read the grid; pandas 2.1+ requires StringIO for literal html
+    df = pd.read_html(StringIO(table_html), header=0)[0]  # returns a list or raises
+    # drop the leading checkbox column if present
+    keep = [
+        c
+        for c in df.columns
+        if str(c).strip() and not str(c).lower().startswith("unnamed")
+    ]
+    df = df.loc[:, keep]
 
-    # drop the unnamed checkbox column if present
-    for c in list(df.columns):
-        if not c or c.lower().startswith("unnamed"):
-            df = df.drop(columns=[c])
-
-    # normalize column names we care about
+    # normalize headers
     rename = {}
     for c in list(df.columns):
-        lc = c.lower().replace(" ", "")
+        lc = str(c).lower().replace(" ", "")
         if lc in {"studydt", "studydatetime", "studydate"}:
             rename[c] = "Study DateTime"
         elif lc.startswith("studydescription"):
@@ -213,53 +218,42 @@ def parse_results_table_html(table_html: str) -> pd.DataFrame:
     if missing:
         raise KeyError(f"grid missing expected columns: {missing}")
 
-    df["Study DateTime"] = pd.to_datetime(df["Study DateTime"], errors="coerce")
+    # parse datetime aggressively; non-parsable -> NaT, which is fine
+    df["Study DateTime"] = pd.to_datetime(
+        df["Study DateTime"], errors="coerce"
+    )  # tz-naive by design
+    # ref: errors='coerce' → NaT for non-dates/out-of-bounds dates :contentReference[oaicite:2]{index=2}
 
-    # optional exam_id inference: rows in this grid typically have no title/export info
+    # extract exam_id row-wise from the live grid's <tr title="..."> (if present)
     soup = BeautifulSoup(table_html, "lxml")
-    rows = soup.find_all("tr")[1:]
-    cells = [r.find_all("td") for r in rows]
+    # prefer explicit grid id; fall back to first table's rows
+    rows = soup.select("#TabContainer1_tabPanel1_gv1 tr")
+    if not rows:
+        rows = soup.find_all("tr")
+    data_rows = rows[1:]  # skip header
 
-    # find the dt column index from the header we just parsed to avoid guessing
-    header_cells = [
-        h.get_text(strip=True).lower().replace(" ", "")
-        for h in soup.find("tr").find_all(["th", "td"])
-    ]
-    try:
-        dt_idx = header_cells.index("studydt")
-    except ValueError:
-        # backup: look for 'study date' / 'study datetime'
-        dt_idx = next(
-            (
-                i
-                for i, t in enumerate(header_cells)
-                if "study" in t and ("date" in t or "datetime" in t)
-            ),
-            2,
+    titles = [r.get("title") or "" for r in data_rows]
+    # vectorized-ish extraction: compute mask then list-comprehension for the positives
+    has_export = (
+        np.char.find(np.char.lower(np.array(titles, dtype=object)), "exported") >= 0
+    )
+    exam_id = np.full(len(titles), np.nan, dtype=object)
+    if has_export.any():
+        exported_titles = [t for t, m in zip(titles, has_export) if m]
+        extracted = [t.split()[-1].split("\\")[-2] for t in exported_titles]
+        exam_id[np.where(has_export)[0]] = extracted
+
+    if len(exam_id) != len(df):
+        # fail loudly so you notice a DOM/schema drift
+        raise ValueError(
+            f"row count mismatch between parsed df ({len(df)}) and grid rows ({len(exam_id)})"
         )
 
-    dates = [
-        pd.to_datetime(c[dt_idx].get_text(strip=True), errors="coerce")
-        if len(c) > dt_idx
-        else pd.NaT
-        for c in cells
-    ]
-    titles = [r.get("title") or "" for r in rows]
-    exam_ids = [
-        t.split()[-1].split("\\")[-2] if "exported" in t.lower() else np.nan
-        for t in titles
-    ]
+    df["exam_id"] = exam_id
 
-    id_map = (
-        pd.DataFrame({"Study DateTime": dates, "exam_id": exam_ids})
-        .dropna(subset=["Study DateTime"])
-        .drop_duplicates("Study DateTime")
-    )
-    out = df.merge(id_map, on="Study DateTime", how="left")
-
-    # keep modalities you actually want
-    out = out[out["Modality"].str.contains(r"\b(MG|MR)\b", na=False)]
-    return out
+    # keep breast imaging modalities only
+    df = df[df["Modality"].str.contains(r"\b(MG|MR)\b", na=False)]
+    return df
 
 
 driver = make_driver()
