@@ -231,9 +231,58 @@ def create_screening_mammograms_plot(
             va="bottom",
         )
 
-    # sixth panel - empty
-    ax6.set_xticks([])
-    ax6.set_yticks([])
+    # sixth panel - mammogram year distribution comparison
+    if len(case_screening_mammograms) > 0 and len(control_screening_mammograms) > 0:
+        # extract years from mammogram dates
+        case_years = case_screening_mammograms["Study DateTime"].dt.year
+        control_years = control_screening_mammograms["Study DateTime"].dt.year
+
+        # create year bins
+        min_year = min(case_years.min(), control_years.min())
+        max_year = max(case_years.max(), control_years.max())
+        year_bins = range(min_year, max_year + 2)
+
+        # create overlapping histograms
+        ax6.hist(
+            case_years,
+            bins=year_bins,
+            alpha=0.6,
+            label=f"cases (n={len(case_screening_per_patient)})",
+            color="red",
+            edgecolor="black",
+            linewidth=0.5,
+        )
+        ax6.hist(
+            control_years,
+            bins=year_bins,
+            alpha=0.6,
+            label=f"controls (n={len(control_screening_per_patient)})",
+            color="blue",
+            edgecolor="black",
+            linewidth=0.5,
+        )
+
+        ax6.set_title("screening mammogram years\n(cases vs controls)")
+        ax6.set_xlabel("year of mammogram")
+        ax6.set_ylabel("number of mammograms")
+        ax6.legend()
+        ax6.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+
+        # rotate x-axis labels if needed
+        if max_year - min_year > 10:
+            ax6.tick_params(axis="x", rotation=45)
+    else:
+        ax6.text(
+            0.5,
+            0.5,
+            "insufficient data",
+            ha="center",
+            va="center",
+            transform=ax6.transAxes,
+        )
+        ax6.set_title("screening mammogram years\n(cases vs controls)")
+        ax6.set_xticks([])
+        ax6.set_yticks([])
 
     plt.tight_layout()
     plt.savefig(
@@ -741,7 +790,7 @@ print(mg_per_patient.head(10))
 print("\n=== SCREENING MAMMOGRAM ANALYSIS ===")
 # first merge MG scans with patient data to get DatedxIndex
 mg_with_patient_data = mg_scans.merge(
-    chimec_with_study_id[["AnonymousID", "DatedxIndex", "case_or_control"]],
+    chimec_with_study_id[["AnonymousID", "DatedxIndex", "case_or_control", "chip"]],
     left_on="study_id",
     right_on="AnonymousID",
     how="inner",
