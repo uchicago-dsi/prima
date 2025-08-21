@@ -65,6 +65,344 @@ def get_base_modality(modality):
 # add base modality column to metadata
 metadata["base_modality"] = metadata["Modality"].apply(get_base_modality)
 
+# modality labels for plotting
+BASE_MODALITY_LABELS = {
+    "CR": "computed radiography",
+    "DX": "digital radiography",
+    "MG": "mammography",
+    "US": "ultrasound",
+    "CT": "ct",
+    "MR": "mri",
+    "NM": "nuclear medicine",
+    "PT": "pet",
+    "XA": "x-ray angiography",
+    "RF": "fluoroscopy",
+    "ES": "endoscopy",
+    "XC": "external camera",
+    "PX": "panoramic x-ray",
+    "RG": "radiographic imaging",
+}
+
+
+# helper functions for analysis
+def filter_patients_by_chip_status(data, chip_status="all"):
+    """
+    filter patients by chip status
+
+    Parameters
+    ----------
+    data : pd.DataFrame
+        dataframe with chip column
+    chip_status : str
+        "all" for all patients, "genotyped" for only patients with non-null chip status
+
+    Returns
+    -------
+    pd.DataFrame
+        filtered dataframe
+    """
+    if chip_status == "all":
+        return data
+    elif chip_status == "genotyped":
+        return data[data["chip"].notna()]
+    else:
+        raise ValueError("chip_status must be 'all' or 'genotyped'")
+
+
+def create_screening_mammograms_plot(
+    case_screening_per_patient,
+    case_before_dx_month_per_patient,
+    control_screening_per_patient,
+    case_screening_mammograms,
+    case_before_dx_month_mammograms,
+    control_screening_mammograms,
+    chip_status,
+    plots_dir,
+):
+    """create screening mammograms plot"""
+    fig, ((ax1, ax2, ax3), (ax4, ax5, ax6)) = plt.subplots(2, 3, figsize=(24, 12))
+
+    # cases - mammograms >3 months before diagnosis
+    if len(case_screening_per_patient) > 0:
+        ax1.hist(
+            case_screening_per_patient.values,
+            bins=range(1, case_screening_per_patient.max() + 2),
+            alpha=0.7,
+            edgecolor="black",
+        )
+        ax1.set_xticks(range(1, min(21, case_screening_per_patient.max() + 1)))
+    else:
+        ax1.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax1.transAxes)
+
+    ax1.set_title("cases\n(mammograms >3 months before diagnosis)")
+    ax1.set_xlabel("number of screening mammograms per patient")
+    ax1.set_ylabel("number of patients")
+    ax1.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+
+    # cases - mammograms before/including diagnosis month
+    if len(case_before_dx_month_per_patient) > 0:
+        ax2.hist(
+            case_before_dx_month_per_patient.values,
+            bins=range(1, case_before_dx_month_per_patient.max() + 2),
+            alpha=0.7,
+            edgecolor="black",
+        )
+        ax2.set_xticks(range(1, min(21, case_before_dx_month_per_patient.max() + 1)))
+    else:
+        ax2.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax2.transAxes)
+
+    ax2.set_title("cases\n(mammograms before/including dx month)")
+    ax2.set_xlabel("number of mammograms per patient")
+    ax2.set_ylabel("number of patients")
+    ax2.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+
+    # controls
+    if len(control_screening_per_patient) > 0:
+        ax3.hist(
+            control_screening_per_patient.values,
+            bins=range(1, control_screening_per_patient.max() + 2),
+            alpha=0.7,
+            edgecolor="black",
+        )
+        ax3.set_xticks(range(1, min(21, control_screening_per_patient.max() + 1)))
+    else:
+        ax3.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax3.transAxes)
+
+    ax3.set_title("controls\n(all mammograms)")
+    ax3.set_xlabel("number of mammograms per patient")
+    ax3.set_ylabel("number of patients")
+    ax3.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+
+    # fourth panel - collapsed summary
+    categories = [
+        "cases\n(>3 months before dx)",
+        "cases\n(before/including dx month)",
+        "controls\n(all mammograms)",
+    ]
+    counts = [
+        len(case_screening_per_patient),
+        len(case_before_dx_month_per_patient),
+        len(control_screening_per_patient),
+    ]
+
+    bars4 = ax4.bar(categories, counts, alpha=0.7, edgecolor="black")
+    ax4.set_title("total patients with mammograms")
+    ax4.set_ylabel("number of patients")
+    ax4.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+
+    # add value labels on bars
+    for bar, count in zip(bars4, counts):
+        height = bar.get_height()
+        ax4.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            height + 0.01 * max(counts),
+            f"{count}",
+            ha="center",
+            va="bottom",
+        )
+
+    # fifth panel - total mammograms by category
+    categories_mammograms = [
+        "cases\n(>3 months before dx)",
+        "cases\n(before/including dx month)",
+        "controls\n(all mammograms)",
+    ]
+    total_mammograms = [
+        len(case_screening_mammograms),
+        len(case_before_dx_month_mammograms),
+        len(control_screening_mammograms),
+    ]
+
+    bars5 = ax5.bar(
+        categories_mammograms, total_mammograms, alpha=0.7, edgecolor="black"
+    )
+    ax5.set_title("total mammograms by category")
+    ax5.set_ylabel("number of mammograms")
+    ax5.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+
+    # add value labels on bars
+    for bar, count in zip(bars5, total_mammograms):
+        height = bar.get_height()
+        ax5.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            height + 0.01 * max(total_mammograms),
+            f"{count}",
+            ha="center",
+            va="bottom",
+        )
+
+    # sixth panel - empty
+    ax6.set_xticks([])
+    ax6.set_yticks([])
+
+    plt.tight_layout()
+    plt.savefig(
+        plots_dir / f"screening_mammograms_per_patient_{chip_status}.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close()
+
+
+def create_mg_mammograms_per_patient_plot(
+    mg_per_patient, chimec_with_study_id, mg_scans, chip_status, plots_dir
+):
+    """create MG mammograms per patient plot"""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+
+    # get case and control patients
+    mg_with_case_control = mg_scans.merge(
+        chimec_with_study_id[["AnonymousID", "case_or_control"]],
+        left_on="study_id",
+        right_on="AnonymousID",
+        how="inner",
+    )
+
+    # cases
+    case_mg_scans = mg_with_case_control[
+        mg_with_case_control["case_or_control"] == "Case"
+    ]
+    case_mg_per_patient = case_mg_scans["study_id"].value_counts()
+
+    ax1.hist(
+        case_mg_per_patient.values,
+        bins=range(1, max(case_mg_per_patient.max(), 2) + 2),
+        alpha=0.7,
+        edgecolor="black",
+    )
+    ax1.set_title("cases")
+    ax1.set_xlabel("number of mammograms per patient")
+    ax1.set_ylabel("number of patients")
+    ax1.set_xticks(range(1, min(21, case_mg_per_patient.max() + 1)))
+    ax1.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+
+    # controls
+    control_mg_scans = mg_with_case_control[
+        mg_with_case_control["case_or_control"] == "Control"
+    ]
+    control_mg_per_patient = control_mg_scans["study_id"].value_counts()
+
+    ax2.hist(
+        control_mg_per_patient.values,
+        bins=range(1, max(control_mg_per_patient.max(), 2) + 2),
+        alpha=0.7,
+        edgecolor="black",
+    )
+    ax2.set_title("controls")
+    ax2.set_xlabel("number of mammograms per patient")
+    ax2.set_ylabel("number of patients")
+    ax2.set_xticks(range(1, min(21, control_mg_per_patient.max() + 1)))
+    ax2.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+
+    plt.tight_layout()
+    plt.savefig(
+        plots_dir / f"mg_mammograms_per_patient_{chip_status}.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close()
+
+
+def create_modality_distribution_plot(metadata, chip_status, plots_dir):
+    """create modality distribution plot"""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+    # number of exams by modality
+    exam_counts = metadata["base_modality"].value_counts().sort_values(ascending=False)
+    # map modality codes to readable labels
+    exam_labels = [BASE_MODALITY_LABELS.get(mod, mod) for mod in exam_counts.index]
+    ax1.bar(exam_labels, exam_counts.values)
+    ax1.set_title("number of exams by modality")
+    ax1.set_xlabel("modality")
+    ax1.set_ylabel("number of exams")
+    ax1.set_xticks(range(len(exam_labels)))
+    ax1.set_xticklabels(exam_labels, rotation=45, ha="right")
+
+    # patients with at least one exam in each modality
+    patient_counts = (
+        metadata.groupby("base_modality")["study_id"]
+        .nunique()
+        .sort_values(ascending=False)
+    )
+    total_patients = metadata["study_id"].nunique()
+    # map modality codes to readable labels
+    patient_labels = [
+        BASE_MODALITY_LABELS.get(mod, mod) for mod in patient_counts.index
+    ]
+    ax2.bar(patient_labels, patient_counts.values)
+    ax2.set_title(
+        "patients with ≥1 exam in each modality\n(sum > total patients due to multi-modality)"
+    )
+    ax2.set_xlabel("modality")
+    ax2.set_ylabel("number of patients")
+    ax2.set_xticks(range(len(patient_labels)))
+    ax2.set_xticklabels(patient_labels, rotation=45, ha="right")
+    ax2.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+
+    plt.tight_layout()
+    plt.savefig(
+        plots_dir / f"modality_distribution_{chip_status}.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close()
+
+
+def create_time_analysis_plot(cases_mg, controls_mg, chip_status, plots_dir):
+    """create time analysis plot"""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 6))
+
+    # cases
+    if len(cases_mg) > 0:
+        case_time_to_dx = cases_mg["days_to_dx"].dropna()
+        # convert days to years
+        case_time_to_dx_years = case_time_to_dx / 365.25
+        ax1.hist(case_time_to_dx_years, bins=50, alpha=0.7, edgecolor="black")
+        ax1.set_title("cases\n(positive = mammogram before diagnosis)")
+        ax1.set_xlabel("years from mammogram to diagnosis")
+        ax1.set_ylabel("number of mammograms")
+        ax1.axvline(x=0, color="red", linestyle="--", alpha=0.7, label="diagnosis date")
+        ax1.axvline(
+            x=90 / 365.25,
+            color="orange",
+            linestyle="--",
+            alpha=0.7,
+            label="3 months before dx (screening threshold)",
+        )
+        ax1.legend()
+    else:
+        ax1.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax1.transAxes)
+        ax1.set_title("cases\n(positive = mammogram before diagnosis)")
+        ax1.set_xlabel("years from mammogram to diagnosis")
+        ax1.set_ylabel("number of mammograms")
+
+    # controls
+    if len(controls_mg) > 0:
+        control_time_from_first = controls_mg["days_from_first_mammogram"].dropna()
+        # convert days to years
+        control_time_from_first_years = control_time_from_first / 365.25
+        ax2.hist(control_time_from_first_years, bins=50, alpha=0.7, edgecolor="black")
+        ax2.axvline(
+            x=0, color="red", linestyle="--", alpha=0.7, label="first mammogram"
+        )
+    else:
+        ax2.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax2.transAxes)
+
+    ax2.set_title("controls\n(time from first mammogram)")
+    ax2.set_xlabel("years from first mammogram")
+    ax2.set_ylabel("number of mammograms")
+    if len(controls_mg) > 0:
+        ax2.legend()
+
+    plt.tight_layout()
+    plt.savefig(
+        plots_dir / f"time_analysis_cases_vs_controls_{chip_status}.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close()
+
+
 print("\n=== BASE MODALITY ANALYSIS ===")
 print("unique base modalities:")
 print(metadata["base_modality"].value_counts())
@@ -139,16 +477,17 @@ controls_count = chip_patients_with_status[
 ].shape[0]
 
 print("\n=== ENHANCED SUMMARY ===")
-print(f"Total patients in chimec_patients: {len(chimec_patients):,}")
+print(f"Total ChiMEC patients: {len(chimec_patients):,}")
 print(
-    f"Patients with chip data: {len(chimec_with_study_id[chimec_with_study_id['chip'].notna()]):,}"
+    f"ChiMEC patients with chip data (genotyped): {len(chimec_with_study_id[chimec_with_study_id['chip'].notna()]):,} ({len(chimec_with_study_id[chimec_with_study_id['chip'].notna()]) / len(chimec_patients) * 100:.1f}%)"
 )
 print(f"  - Cases: {cases_count:,}")
 print(f"  - Controls: {controls_count:,}")
-print(f"Chip patients with study_id (can be linked): {len(chip_patients_study_ids):,}")
 print(
-    f"Chip patients with at least one MG modality record: {len(chip_patients_with_mg):,}"
+    f"ChiMEC patients with imaging data available: {metadata['study_id'].nunique():,} ({metadata['study_id'].nunique() / len(chimec_patients) * 100:.1f}%)"
 )
+print(f"Genotyped ChiMEC patients with imaging data: {len(chip_patients_study_ids):,}")
+print(f"Genotyped ChiMEC patients with MG imaging: {len(chip_patients_with_mg):,}")
 
 # time-to-diagnosis analysis for cases
 print("\n=== TIME-TO-DIAGNOSIS ANALYSIS ===")
@@ -354,42 +693,15 @@ BASE_MODALITY_LABELS = {
     "RG": "radiographic imaging",
 }
 
-# create modality distribution plots
+# create modality distribution plot for all patients
 print("\n=== CREATING MODALITY DISTRIBUTION PLOTS ===")
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+create_modality_distribution_plot(metadata, "all", plots_dir)
 
-# number of exams by modality
-exam_counts = metadata["base_modality"].value_counts().sort_values(ascending=False)
-# map modality codes to readable labels
-exam_labels = [BASE_MODALITY_LABELS.get(mod, mod) for mod in exam_counts.index]
-ax1.bar(exam_labels, exam_counts.values)
-ax1.set_title("number of exams by modality")
-ax1.set_xlabel("modality")
-ax1.set_ylabel("number of exams")
-ax1.set_xticks(range(len(exam_labels)))
-ax1.set_xticklabels(exam_labels, rotation=45, ha="right")
-
-# patients with at least one exam in each modality
+# print interpretation
+total_patients = metadata["study_id"].nunique()
 patient_counts = (
     metadata.groupby("base_modality")["study_id"].nunique().sort_values(ascending=False)
 )
-total_patients = metadata["study_id"].nunique()
-# map modality codes to readable labels
-patient_labels = [BASE_MODALITY_LABELS.get(mod, mod) for mod in patient_counts.index]
-ax2.bar(patient_labels, patient_counts.values)
-ax2.set_title(
-    "patients with ≥1 exam in each modality\n(sum > total patients due to multi-modality)"
-)
-ax2.set_xlabel("modality")
-ax2.set_ylabel("number of patients")
-ax2.set_xticks(range(len(patient_labels)))
-ax2.set_xticklabels(patient_labels, rotation=45, ha="right")
-ax2.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
-
-plt.tight_layout()
-plt.savefig(plots_dir / "modality_distribution.png", dpi=300, bbox_inches="tight")
-plt.close()
-
 print("\nINTERPRETATION:")
 print("- Each bar shows how many patients have at least one exam of that modality type")
 print("- Patients with multiple modalities appear in multiple bars")
@@ -417,54 +729,10 @@ print(f"max mammograms per patient: {mg_per_patient.max()}")
 print(f"mean mammograms per patient: {mg_per_patient.mean():.2f}")
 print(f"median mammograms per patient: {mg_per_patient.median():.1f}")
 
-# create histograms for cases and controls separately
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
-
-# get case and control patients
-mg_with_case_control = mg_scans.merge(
-    chimec_with_study_id[["AnonymousID", "case_or_control"]],
-    left_on="study_id",
-    right_on="AnonymousID",
-    how="inner",
+# create MG mammograms per patient plot for all patients
+create_mg_mammograms_per_patient_plot(
+    mg_per_patient, chimec_with_study_id, mg_scans, "all", plots_dir
 )
-
-# cases
-case_mg_scans = mg_with_case_control[mg_with_case_control["case_or_control"] == "Case"]
-case_mg_per_patient = case_mg_scans["study_id"].value_counts()
-
-ax1.hist(
-    case_mg_per_patient.values,
-    bins=range(1, max(case_mg_per_patient.max(), 2) + 2),
-    alpha=0.7,
-    edgecolor="black",
-)
-ax1.set_title("cases")
-ax1.set_xlabel("number of mammograms per patient")
-ax1.set_ylabel("number of patients")
-ax1.set_xticks(range(1, min(21, case_mg_per_patient.max() + 1)))
-ax1.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
-
-# controls
-control_mg_scans = mg_with_case_control[
-    mg_with_case_control["case_or_control"] == "Control"
-]
-control_mg_per_patient = control_mg_scans["study_id"].value_counts()
-
-ax2.hist(
-    control_mg_per_patient.values,
-    bins=range(1, max(control_mg_per_patient.max(), 2) + 2),
-    alpha=0.7,
-    edgecolor="black",
-)
-ax2.set_title("controls")
-ax2.set_xlabel("number of mammograms per patient")
-ax2.set_ylabel("number of patients")
-ax2.set_xticks(range(1, min(21, control_mg_per_patient.max() + 1)))
-ax2.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
-
-plt.tight_layout()
-plt.savefig(plots_dir / "mg_mammograms_per_patient.png", dpi=300, bbox_inches="tight")
-plt.close()
 
 print("\ntop 10 patients with most mammograms:")
 print(mg_per_patient.head(10))
@@ -480,6 +748,20 @@ mg_with_patient_data = mg_scans.merge(
 )
 
 print(f"MG scans with patient data: {len(mg_with_patient_data)}")
+
+# key insight about imaging population
+imaging_patients_with_chip = mg_with_patient_data["chip"].notna().sum()
+total_imaging_patients = mg_with_patient_data["study_id"].nunique()
+print(f"ChiMEC patients with MG imaging: {total_imaging_patients:,}")
+print(
+    f"Of these, genotyped: {mg_with_patient_data[mg_with_patient_data['chip'].notna()]['study_id'].nunique():,} ({mg_with_patient_data[mg_with_patient_data['chip'].notna()]['study_id'].nunique() / total_imaging_patients * 100:.1f}%)"
+)
+print(
+    f"Of these, NOT genotyped: {mg_with_patient_data[mg_with_patient_data['chip'].isna()]['study_id'].nunique():,} ({mg_with_patient_data[mg_with_patient_data['chip'].isna()]['study_id'].nunique() / total_imaging_patients * 100:.1f}%)"
+)
+print(
+    "NOTE: This explains why 'all' and 'genotyped' plots show identical counts - all ChiMEC patients with imaging happen to be genotyped!"
+)
 
 # convert dates to datetime
 mg_with_patient_data["Study DateTime"] = pd.to_datetime(
@@ -589,65 +871,17 @@ if len(control_screening_per_patient) > 0:
 else:
     print("no control mammograms found")
 
-# create histograms for screening mammograms - cases and controls separately
-fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(24, 6))
-
-# cases
-if len(case_screening_per_patient) > 0:
-    ax1.hist(
-        case_screening_per_patient.values,
-        bins=range(1, case_screening_per_patient.max() + 2),
-        alpha=0.7,
-        edgecolor="black",
-    )
-    ax1.set_xticks(range(1, min(21, case_screening_per_patient.max() + 1)))
-else:
-    ax1.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax1.transAxes)
-
-ax1.set_title("cases\n(mammograms >3 months before diagnosis)")
-ax1.set_xlabel("number of screening mammograms per patient")
-ax1.set_ylabel("number of patients")
-ax1.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
-
-# controls
-if len(control_screening_per_patient) > 0:
-    ax2.hist(
-        control_screening_per_patient.values,
-        bins=range(1, control_screening_per_patient.max() + 2),
-        alpha=0.7,
-        edgecolor="black",
-    )
-    ax2.set_xticks(range(1, min(21, control_screening_per_patient.max() + 1)))
-else:
-    ax2.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax2.transAxes)
-
-ax2.set_title("controls\n(all mammograms)")
-ax2.set_xlabel("number of mammograms per patient")
-ax2.set_ylabel("number of patients")
-ax2.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
-
-# cases - mammograms before/including diagnosis month
-if len(case_before_dx_month_per_patient) > 0:
-    ax3.hist(
-        case_before_dx_month_per_patient.values,
-        bins=range(1, case_before_dx_month_per_patient.max() + 2),
-        alpha=0.7,
-        edgecolor="black",
-    )
-    ax3.set_xticks(range(1, min(21, case_before_dx_month_per_patient.max() + 1)))
-else:
-    ax3.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax3.transAxes)
-
-ax3.set_title("cases\n(mammograms before/including dx month)")
-ax3.set_xlabel("number of mammograms per patient")
-ax3.set_ylabel("number of patients")
-ax3.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
-
-plt.tight_layout()
-plt.savefig(
-    plots_dir / "screening_mammograms_per_patient.png", dpi=300, bbox_inches="tight"
+# create screening mammograms plot for all patients
+create_screening_mammograms_plot(
+    case_screening_per_patient,
+    case_before_dx_month_per_patient,
+    control_screening_per_patient,
+    case_screening_mammograms,
+    case_before_dx_month_mammograms,
+    control_screening_mammograms,
+    "all",
+    plots_dir,
 )
-plt.close()
 
 print("\ntop 10 case patients with most screening mammograms:")
 if len(case_screening_per_patient) > 0:
@@ -720,50 +954,8 @@ if len(controls_mg) > 0:
     print(f"mean: {control_time_from_first.mean():.1f} days")
     print(f"median: {control_time_from_first.median():.1f} days")
 
-# create histograms for cases and controls separately
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 6))
-
-# cases
-if len(cases_mg) > 0:
-    case_time_to_dx = cases_mg["days_to_dx"].dropna()
-    ax1.hist(case_time_to_dx, bins=50, alpha=0.7, edgecolor="black")
-    ax1.set_title("cases\n(positive = mammogram before diagnosis)")
-    ax1.set_xlabel("days from mammogram to diagnosis")
-    ax1.set_ylabel("number of mammograms")
-    ax1.axvline(x=0, color="red", linestyle="--", alpha=0.7, label="diagnosis date")
-    ax1.axvline(
-        x=90,
-        color="orange",
-        linestyle="--",
-        alpha=0.7,
-        label="3 months before dx (screening threshold)",
-    )
-    ax1.legend()
-else:
-    ax1.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax1.transAxes)
-    ax1.set_title("cases\n(positive = mammogram before diagnosis)")
-    ax1.set_xlabel("days from mammogram to diagnosis")
-    ax1.set_ylabel("number of mammograms")
-
-# controls
-if len(controls_mg) > 0:
-    control_time_from_first = controls_mg["days_from_first_mammogram"].dropna()
-    ax2.hist(control_time_from_first, bins=50, alpha=0.7, edgecolor="black")
-    ax2.axvline(x=0, color="red", linestyle="--", alpha=0.7, label="first mammogram")
-else:
-    ax2.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax2.transAxes)
-
-ax2.set_title("controls\n(time from first mammogram)")
-ax2.set_xlabel("days from first mammogram")
-ax2.set_ylabel("number of mammograms")
-if len(controls_mg) > 0:
-    ax2.legend()
-
-plt.tight_layout()
-plt.savefig(
-    plots_dir / "time_analysis_cases_vs_controls.png", dpi=300, bbox_inches="tight"
-)
-plt.close()
+# create time analysis plot for all patients
+create_time_analysis_plot(cases_mg, controls_mg, "all", plots_dir)
 
 # additional breakdown for cases
 if len(cases_mg) > 0:
@@ -786,5 +978,147 @@ if len(controls_mg) > 0:
     )
     print(f"mammograms >1 year after first: {(control_time_from_first > 365).sum()}")
 
+# create genotyped-only versions of all plots
+print("\n=== CREATING GENOTYPED-ONLY VERSIONS ===")
+
+# filter for only genotyped patients
+genotyped_patients = filter_patients_by_chip_status(chimec_with_study_id, "genotyped")
+genotyped_metadata = metadata[
+    metadata["study_id"].isin(genotyped_patients["AnonymousID"])
+]
+
+print(f"genotyped patients: {len(genotyped_patients)}")
+print(f"genotyped metadata records: {len(genotyped_metadata)}")
+
+# create genotyped-only modality distribution plot
+create_modality_distribution_plot(genotyped_metadata, "genotyped", plots_dir)
+
+# create genotyped-only MG mammograms per patient plot
+genotyped_mg_scans = genotyped_metadata[
+    genotyped_metadata["base_modality"] == "MG"
+].copy()
+genotyped_mg_per_patient = genotyped_mg_scans["study_id"].value_counts()
+create_mg_mammograms_per_patient_plot(
+    genotyped_mg_per_patient,
+    genotyped_patients,
+    genotyped_mg_scans,
+    "genotyped",
+    plots_dir,
+)
+
+# create genotyped-only screening mammograms analysis
+genotyped_mg_with_patient_data = genotyped_mg_scans.merge(
+    genotyped_patients[["AnonymousID", "DatedxIndex", "case_or_control"]],
+    left_on="study_id",
+    right_on="AnonymousID",
+    how="inner",
+)
+
+print(f"genotyped MG scans with patient data: {len(genotyped_mg_with_patient_data)}")
+
+# convert dates to datetime
+genotyped_mg_with_patient_data["Study DateTime"] = pd.to_datetime(
+    genotyped_mg_with_patient_data["Study DateTime"]
+)
+genotyped_mg_with_patient_data["DatedxIndex"] = pd.to_datetime(
+    genotyped_mg_with_patient_data["DatedxIndex"], format="%d/%m/%Y"
+)
+
+# calculate time difference in days (positive = mammogram before diagnosis)
+genotyped_mg_with_patient_data["days_to_dx"] = (
+    genotyped_mg_with_patient_data["DatedxIndex"]
+    - genotyped_mg_with_patient_data["Study DateTime"]
+).dt.days
+
+# separate cases and controls for screening analysis
+genotyped_cases_mg = genotyped_mg_with_patient_data[
+    genotyped_mg_with_patient_data["case_or_control"] == "Case"
+].copy()
+genotyped_controls_mg = genotyped_mg_with_patient_data[
+    genotyped_mg_with_patient_data["case_or_control"] == "Control"
+].copy()
+
+# for cases: filter for screening mammograms (> 3 months = 90 days before diagnosis)
+genotyped_case_screening_mammograms = genotyped_cases_mg[
+    genotyped_cases_mg["days_to_dx"] > 90
+].copy()
+
+# for cases: filter for mammograms anytime before and including diagnosis month
+genotyped_cases_mg["mammogram_ym"] = genotyped_cases_mg["Study DateTime"].dt.to_period(
+    "M"
+)
+genotyped_cases_mg["diagnosis_ym"] = genotyped_cases_mg["DatedxIndex"].dt.to_period("M")
+genotyped_case_before_dx_month_mammograms = genotyped_cases_mg[
+    genotyped_cases_mg["mammogram_ym"] <= genotyped_cases_mg["diagnosis_ym"]
+].copy()
+
+# for controls: all mammograms are considered (no diagnosis date filter)
+genotyped_control_screening_mammograms = genotyped_controls_mg.copy()
+
+# count screening mammograms per patient for cases
+genotyped_case_screening_per_patient = (
+    genotyped_case_screening_mammograms["study_id"].value_counts()
+    if len(genotyped_case_screening_mammograms) > 0
+    else pd.Series(dtype=int)
+)
+
+# count mammograms before/including diagnosis month per patient for cases
+genotyped_case_before_dx_month_per_patient = (
+    genotyped_case_before_dx_month_mammograms["study_id"].value_counts()
+    if len(genotyped_case_before_dx_month_mammograms) > 0
+    else pd.Series(dtype=int)
+)
+
+# count all mammograms per patient for controls
+genotyped_control_screening_per_patient = (
+    genotyped_control_screening_mammograms["study_id"].value_counts()
+    if len(genotyped_control_screening_mammograms) > 0
+    else pd.Series(dtype=int)
+)
+
+# create genotyped-only screening mammograms plot
+create_screening_mammograms_plot(
+    genotyped_case_screening_per_patient,
+    genotyped_case_before_dx_month_per_patient,
+    genotyped_control_screening_per_patient,
+    genotyped_case_screening_mammograms,
+    genotyped_case_before_dx_month_mammograms,
+    genotyped_control_screening_mammograms,
+    "genotyped",
+    plots_dir,
+)
+
+# create genotyped-only time analysis
+genotyped_cases_mg_for_time = genotyped_mg_with_patient_data[
+    genotyped_mg_with_patient_data["case_or_control"] == "Case"
+].copy()
+genotyped_controls_mg_for_time = genotyped_mg_with_patient_data[
+    genotyped_mg_with_patient_data["case_or_control"] == "Control"
+].copy()
+
+# for controls, calculate time from first mammogram
+if len(genotyped_controls_mg_for_time) > 0:
+    genotyped_controls_mg_for_time = genotyped_controls_mg_for_time.sort_values(
+        "Study DateTime"
+    )
+    genotyped_first_mammogram_dates = genotyped_controls_mg_for_time.groupby(
+        "study_id"
+    )["Study DateTime"].first()
+    genotyped_controls_mg_for_time = genotyped_controls_mg_for_time.merge(
+        genotyped_first_mammogram_dates.rename("first_mammogram_date"),
+        left_on="study_id",
+        right_index=True,
+    )
+    genotyped_controls_mg_for_time["days_from_first_mammogram"] = (
+        genotyped_controls_mg_for_time["Study DateTime"]
+        - genotyped_controls_mg_for_time["first_mammogram_date"]
+    ).dt.days
+
+# create genotyped-only time analysis plot
+create_time_analysis_plot(
+    genotyped_cases_mg_for_time, genotyped_controls_mg_for_time, "genotyped", plots_dir
+)
+
 print("\n=== SCRIPT COMPLETED ===")
 print(f"All plots saved to: {plots_dir.absolute()}")
+print("Created both 'all' and 'genotyped' versions of all plots")
