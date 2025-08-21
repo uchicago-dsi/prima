@@ -19,7 +19,7 @@ micromamba create -y --name prima python=3.11
 micromamba activate prima
 git clone git@github.com:uchicago-dsi/prima.git
 cd prima
-micromamba install -y pytorch torchvision pytorch-cuda=12.1 selenium firefox geckodriver -c pytorch -c nvidia
+micromamba install -y pytorch torchvision pytorch-cuda=12.1 selenium firefox geckodriver ipykernel -c pytorch -c nvidia
 pip install -e . # if developing
 # pip install . # if not developing
 pip install -r requirements.txt

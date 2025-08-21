@@ -1,19 +1,14 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-import glob
 import logging
 import os
-import random
-import subprocess
-import time
 
 import numpy as np
 import pandas as pd
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.common.keys import Keys
-from tqdm.auto import tqdm
 
 format_string = "%(asctime)s %(name)s:%(lineno)d [%(levelname)s]  %(message)s"
 logging.basicConfig(filename="download.log", format=format_string, level=logging.DEBUG)
