@@ -242,24 +242,22 @@ def create_screening_mammograms_plot(
         max_year = max(case_years.max(), control_years.max())
         year_bins = range(min_year, max_year + 2)
 
-        # create overlapping histograms
+        # create overlapping histograms with outline style
         ax6.hist(
             case_years,
             bins=year_bins,
-            alpha=0.6,
+            histtype="step",
             label=f"cases (n={len(case_screening_per_patient)})",
             color="red",
-            edgecolor="black",
-            linewidth=0.5,
+            linewidth=2,
         )
         ax6.hist(
             control_years,
             bins=year_bins,
-            alpha=0.6,
+            histtype="step",
             label=f"controls (n={len(control_screening_per_patient)})",
             color="blue",
-            edgecolor="black",
-            linewidth=0.5,
+            linewidth=2,
         )
 
         ax6.set_title("screening mammogram years\n(cases vs controls)")
