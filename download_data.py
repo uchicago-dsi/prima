@@ -26,7 +26,6 @@ PASSWORD = os.getenv("IBROKER_PASSWORD")
 
 
 def get_base_modality(modality):
-    """Extracts a simplified base modality from the full modality string."""
     if pd.isna(modality):
         return None
     modality_str = str(modality).upper()
@@ -50,20 +49,16 @@ def get_base_modality(modality):
 
 
 def load_and_merge_data():
-    """Loads all source CSVs and derives case/control status."""
     print("--- Phase 1: Loading and Merging Data ---")
     try:
         patients = pd.read_csv(CHIMEC_PATIENTS_FILE)
         print(f"Loaded {len(patients):,} rows from patient info file.")
-
         key = pd.read_csv(KEY_FILE)
         print(f"Loaded {len(key):,} rows from study_id-MRN key file.")
-
         metadata = pd.read_csv(METADATA_FILE)
         print(f"Loaded {len(metadata):,} exam records from raw metadata file.")
         metadata["base_modality"] = metadata["Modality"].apply(get_base_modality)
         print("  - Added 'base_modality' column.")
-
     except FileNotFoundError as e:
         print(f"ERROR: Input file not found - {e}", file=sys.stderr)
         sys.exit(1)
@@ -73,16 +68,9 @@ def load_and_merge_data():
     db["MRN"] = pd.to_numeric(db["MRN"], errors="coerce")
 
     print("\nStep 1.2: Merging result with patient info file...")
-    # Add a sentinel column to track if a match was found in the patients file
     patients["_in_patient_file"] = True
     db = pd.merge(
         db, patients.drop(columns=["status"], errors="ignore"), on="MRN", how="left"
-    )
-    print(
-        f"  - Exams for patients found in patient file: {db['_in_patient_file'].notna().sum():,}"
-    )
-    print(
-        f"  - Exams for patients NOT in patient file: {db['_in_patient_file'].isna().sum():,}"
     )
 
     print("\nStep 1.3: Cleaning dates and deriving Case/Control status...")
@@ -91,14 +79,12 @@ def load_and_merge_data():
         db["DatedxIndex"], errors="coerce", dayfirst=True
     )
 
-    # **CRITICAL FIX**: Derive case_control_status from DatedxIndex
     conditions = [
-        db["DatedxIndex"].notna(),  # If DatedxIndex exists, they are a Case
-        db["_in_patient_file"] == True,  # If no DxDate but in file, they are a Control
+        db["DatedxIndex"].notna(),
+        db["_in_patient_file"] == True,
     ]
     choices = ["Case", "Control"]
     db["case_control_status"] = np.select(conditions, choices, default="Unknown")
-
     print("  - Derived Case/Control status based on DatedxIndex:")
     print(db["case_control_status"].value_counts().to_string())
 
@@ -110,13 +96,12 @@ def load_and_merge_data():
 
 
 def check_disk_for_downloads(df: pd.DataFrame, basedir: str):
-    # This function remains the same as Version 5
     print(f"\n--- Phase 2: Auditing Filesystem for Downloads in {basedir} ---")
     df["is_downloaded"] = False
     exams_with_accession = df[df["Accession"].notna()]
     if exams_with_accession.empty:
         print(
-            "No exams with known Accession Numbers in the database. Cannot check download status."
+            "No exams with known Accession Numbers in metadata. Cannot pre-emptively check download status."
         )
         return df
     found_accessions = set()
@@ -143,32 +128,26 @@ def check_disk_for_downloads(df: pd.DataFrame, basedir: str):
 def identify_download_targets(
     df: pd.DataFrame, filter_by_genotyping: bool, modality: str
 ):
-    """Applies filtering logic to find the specific exams to download."""
     print("\n--- Phase 3: Identifying Target Exams for Download ---")
     df["rejection_reason"] = ""
-
     print(f"Initial pool: {len(df):,} exams")
 
-    # Filter Step 1: Modality
     modality_mask = df["base_modality"] == modality
     df.loc[~modality_mask, "rejection_reason"] = f"Wrong modality (not {modality})"
     targets = df[modality_mask].copy()
     print(f"  - Kept {len(targets):,} exams after filtering for modality '{modality}'.")
 
-    # Filter Step 2: Already Downloaded
     mask_downloaded = targets["is_downloaded"] == True
     targets.loc[mask_downloaded, "rejection_reason"] = "Already on disk"
     targets = targets[~mask_downloaded]
     print(f"  - Rejected {mask_downloaded.sum():,} because they are on disk.")
 
-    # Filter Step 3: Genotyping
     if filter_by_genotyping:
         mask_no_chip = targets["chip"].isna()
         targets.loc[mask_no_chip, "rejection_reason"] = "No genotyping data"
         targets = targets[~mask_no_chip]
         print(f"  - Rejected {mask_no_chip.sum():,} due to missing genotyping data.")
 
-    # Filter Step 4: Case/Control Logic
     case_mask = targets["case_control_status"] == "Case"
     bad_case_date_mask = case_mask & (
         targets["Study DateTime"] > targets["DatedxIndex"]
@@ -179,7 +158,6 @@ def identify_download_targets(
         f"  - Rejected {bad_case_date_mask.sum():,} 'Case' exams that occurred after diagnosis."
     )
 
-    # Filter Step 5: Must be "Available"
     has_accession_mask = targets["Accession"].notna()
     targets.loc[has_accession_mask, "rejection_reason"] = (
         "Already has Accession (in exported list)"
@@ -189,22 +167,24 @@ def identify_download_targets(
         f"  - Rejected {has_accession_mask.sum():,} exams already in iBroker's 'Exported' list."
     )
 
-    print(f"  = {len(targets):,} final target exams identified.")
+    print(f"  = {len(targets):,} final potential target exams identified.")
     return targets.sort_values(by=["study_id", "Study DateTime"])
 
 
 def execute_downloads(targets_df: pd.DataFrame, batch_size: int):
-    # This function remains the same
+    """Verifies exam availability live and requests exports."""
     if targets_df.empty:
-        print("\nNo exams to download in this batch.")
-        return []
+        return {}, 0
 
     batch_targets = targets_df.head(batch_size).copy()
     print(
         f"\n--- Phase 4: Executing Downloads for a Batch of {len(batch_targets)} Exams ---"
     )
     driver = None
-    successfully_requested_indices = []
+    # This will map the DataFrame index to the outcome
+    outcomes = {}
+    already_exported_counter = 0
+
     try:
         driver = make_driver()
         login(driver, USERNAME, PASSWORD)
@@ -224,49 +204,59 @@ def execute_downloads(targets_df: pd.DataFrame, batch_size: int):
                 print(f"ERROR navigating for study_id {study_id}. Skipping. Error: {e}")
                 continue
 
-            requested_this_patient = []
+            # Build a map of what's ACTUALLY available on the live page
+            available_on_page = {}
             page_rows = driver.find_elements(
                 by="xpath",
                 value="//table[@id='TabContainer1_tabPanel1_gv1']//tr[position()>1]",
             )
-
             for row in page_rows:
                 try:
                     cells = row.find_elements(by="tag name", value="td")
-                    row_date = pd.to_datetime(cells[2].text)
+                    row_date = pd.to_datetime(cells[2].text).date()
                     row_desc = cells[3].text.strip()
-
-                    match = patient_exams[
-                        (patient_exams["Study DateTime"].dt.date == row_date.date())
-                        & (patient_exams["StudyDescription"] == row_desc)
-                    ]
-                    if not match.empty:
-                        exam_index = match.index[0]
-                        print(
-                            f"  - Found match: {row_date.date()} '{row_desc}'. Selecting checkbox."
-                        )
-                        checkbox = row.find_element(
-                            by="xpath", value=".//input[@type='checkbox']"
-                        )
-                        checkbox.click()
-                        requested_this_patient.append(exam_index)
+                    checkbox = row.find_element(
+                        by="xpath", value=".//input[@type='checkbox']"
+                    )
+                    available_on_page[(row_date, row_desc)] = checkbox
                 except Exception:
                     pass
 
-            if requested_this_patient:
-                print(
-                    f"  Requesting export for {len(requested_this_patient)} selected exams..."
+            requested_this_patient = False
+            # Now, check our targets against the live reality
+            for index, target_exam in patient_exams.iterrows():
+                target_key = (
+                    target_exam["Study DateTime"].date(),
+                    target_exam["StudyDescription"],
                 )
+
+                if target_key in available_on_page:
+                    # It's available! Click it.
+                    print(
+                        f"  - Found available exam from {target_key[0]}. Selecting checkbox."
+                    )
+                    available_on_page[target_key].click()
+                    outcomes[index] = "Request Submitted"
+                    requested_this_patient = True
+                else:
+                    # It's NOT available - must have been exported already.
+                    print(
+                        f"  - INFO: Exam from {target_key[0]} is no longer available (already exported)."
+                    )
+                    outcomes[index] = "Already Exported"
+                    already_exported_counter += 1
+
+            if requested_this_patient:
+                print("  Submitting export request for selected exams...")
                 driver.find_element(by="name", value="btnExport").click()
                 wait_aspnet_idle(driver)
                 print("  Export request submitted.")
-                successfully_requested_indices.extend(requested_this_patient)
     finally:
         if driver:
             print("Closing webdriver session.")
             driver.quit()
 
-    return successfully_requested_indices
+    return outcomes, already_exported_counter
 
 
 def main():
@@ -281,7 +271,7 @@ def main():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=50,
+        default=20,
         help="Max number of exams to request in one run.",
     )
     parser.add_argument(
@@ -309,31 +299,44 @@ def main():
 
     db["is_target"] = False
     db.loc[targets.index, "is_target"] = True
-    db["is_export_requested_this_run"] = False
+    db["download_attempt_outcome"] = pd.NA
     db["export_requested_on"] = pd.NaT
 
     if targets.empty:
         print("\nNo new exams to download based on the current criteria.")
     else:
         print("\n--- Summary of Exams to Download ---")
-        print(f"Total target exams: {len(targets)}")
+        print(f"Total potential targets: {len(targets)}")
         print(f"Unique patients to process: {targets['study_id'].nunique()}")
+        print(f"First 5 patients: {targets['study_id'].unique().tolist()[:5]}")
 
         proceed = (
             input(
-                f"\nProceed with requesting the first batch of up to {args.batch_size} exams? (y/n): "
+                f"\nProceed with attempting to request the first batch of up to {args.batch_size} exams? (y/n): "
             )
             .lower()
             .strip()
         )
         if proceed == "y":
-            requested_indices = execute_downloads(targets, args.batch_size)
-            if requested_indices:
-                print(
-                    f"\nSuccessfully requested export for {len(requested_indices)} exams this run."
-                )
-                db.loc[requested_indices, "is_export_requested_this_run"] = True
-                db.loc[requested_indices, "export_requested_on"] = datetime.now()
+            outcomes, already_exported_count = execute_downloads(
+                targets, args.batch_size
+            )
+
+            submitted_count = 0
+            if outcomes:
+                for index, outcome in outcomes.items():
+                    db.loc[index, "download_attempt_outcome"] = outcome
+                    if outcome == "Request Submitted":
+                        db.loc[index, "export_requested_on"] = datetime.now()
+                        submitted_count += 1
+
+            print("\n--- Run Summary ---")
+            print(
+                f"Successfully submitted export requests for: {submitted_count} exams."
+            )
+            print(
+                f"Discovered to be already exported:        {already_exported_count} exams."
+            )
         else:
             print("Download cancelled by user.")
 
@@ -349,7 +352,7 @@ def main():
         "Accession",
         "is_downloaded",
         "is_target",
-        "is_export_requested_this_run",
+        "download_attempt_outcome",
         "export_requested_on",
         "rejection_reason",
         "Modality",

@@ -209,80 +209,181 @@ def parse_results_table_html(table_html: str) -> pd.DataFrame:
     return df
 
 
+def parse_all_tables_from_page(page_html: str) -> pd.DataFrame:
+    """
+    Parses the full HTML page to find and extract data from both the "Exported"
+    and "Available" studies tables, returning them as a single combined DataFrame.
+    """
+    doc = lxml_html.fromstring(page_html)
+    dfs_to_combine = []
+
+    # --- Part 1: Parse the "Exported" table (gvExported) if it exists ---
+    exported_table_nodes = doc.xpath(
+        "//table[@id='TabContainer1_tabPanel1_gvExported']"
+    )
+    if exported_table_nodes:
+        root = exported_table_nodes[0]
+        trs = root.xpath(".//tr")
+        if len(trs) > 1:  # Check if there are data rows
+            rows = trs[1:]
+            # Columns: StudyDT, StudyDescription, Status, Accession, Exported On
+            dt_str = [r.xpath("normalize-space(td[1])") for r in rows]
+            desc = [r.xpath("normalize-space(td[2])") for r in rows]
+            status = [r.xpath("normalize-space(td[3])") for r in rows]
+            accession = [r.xpath("normalize-space(td[4])") for r in rows]
+            exported_on_str = [r.xpath("normalize-space(td[5])") for r in rows]
+
+            df_exported = pd.DataFrame(
+                {
+                    "Study DateTime": pd.to_datetime(
+                        pd.Series(dt_str), errors="coerce"
+                    ),
+                    "StudyDescription": desc,
+                    "Status": status,
+                    "Accession": accession,
+                    "Exported On": pd.to_datetime(
+                        pd.Series(exported_on_str), errors="coerce"
+                    ),
+                }
+            )
+            dfs_to_combine.append(df_exported)
+
+    # --- Part 2: Parse the "Available" table (gv1) if it exists ---
+    available_table_nodes = doc.xpath("//table[@id='TabContainer1_tabPanel1_gv1']")
+    if available_table_nodes:
+        root = available_table_nodes[0]
+        trs = root.xpath(".//tr")
+        if len(trs) > 1:  # Check if there are data rows
+            rows = trs[1:]
+
+            # This is your original, excellent parsing logic for this table
+            modality = [r.xpath("normalize-space(td[2])") for r in rows]
+            dt_str = [r.xpath("normalize-space(td[3])") for r in rows]
+            desc = [r.xpath("normalize-space(td[4])") for r in rows]
+
+            titles = np.array([r.get("title") or "" for r in rows], dtype=str)
+            mask = np.char.find(np.char.lower(titles), "exported") >= 0
+            exam = np.full(titles.shape, np.nan, dtype=object)
+            if mask.any():
+                extracted = np.array(
+                    [t.split()[-1].split("\\")[-2] for t in titles[mask]], dtype=object
+                )
+                exam[np.where(mask)[0]] = extracted
+
+            df_available = pd.DataFrame(
+                {
+                    "Modality": modality,
+                    "Study DateTime": pd.to_datetime(
+                        pd.Series(dt_str), errors="coerce"
+                    ),
+                    "StudyDescription": desc,
+                    "exam_id": exam,
+                }
+            )
+            dfs_to_combine.append(df_available)
+
+    # --- Part 3: Combine and return ---
+    if not dfs_to_combine:
+        return pd.DataFrame()  # Return empty if no tables were found
+
+    # concat will intelligently merge, creating NaNs for columns not present in one of the frames
+    return pd.concat(dfs_to_combine, ignore_index=True)
+
+
 # --- run ---
-driver = None
-try:
-    print("Starting headless Firefox driver...")
-    driver = make_driver()
-    print("Driver started. Logging in...")
-    login(driver, username, password)
-    print("Login successful. Bootstrapping HTTP session...")
-    session = bootstrap_http_session_from_driver(driver)
-    print("HTTP session created. Browser is no longer needed.")
-finally:
-    if driver:
-        print("Closing webdriver session...")
-        driver.quit()
-        print("Webdriver closed.")
+def main():
+    driver = None
+    try:
+        print("Starting headless Firefox driver...")
+        driver = make_driver()
+        print("Driver started. Logging in...")
+        login(driver, username, password)
+        print("Login successful. Bootstrapping HTTP session...")
+        session = bootstrap_http_session_from_driver(driver)
+        print("HTTP session created. Browser is no longer needed.")
+    finally:
+        if driver:
+            print("Closing webdriver session...")
+            driver.quit()
+            print("Webdriver closed.")
 
-# --- Main scraping logic using the HTTP session ---
-try:
-    page_html, state = http_get_root(session)
-    page_html, state = post_link_event(session, state, "lbAll")
+    # --- Main scraping logic using the HTTP session ---
+    try:
+        page_html, state = http_get_root(session)
+        page_html, state = post_link_event(session, state, "lbAll")
 
-    os.makedirs(os.path.dirname(output_file), exist_ok=True)
-    output_exists = os.path.isfile(output_file)
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        output_exists = os.path.isfile(output_file)
 
-    if output_exists and os.path.getsize(output_file) > 0:
-        print(f"Output file '{output_file}' found. Reading seen IDs to resume...")
-        try:
-            seen_df = pd.read_csv(output_file, usecols=["study_id"])
-            seen = set(seen_df["study_id"].astype(str))
-            study_ids_to_process = [sid for sid in study_ids if str(sid) not in seen]
-            print(
-                f"{len(seen)} IDs already processed. {len(study_ids_to_process)} remaining."
-            )
-        except (pd.errors.EmptyDataError, KeyError, ValueError):
-            print("Output file is empty or invalid. Processing all IDs.")
-            study_ids_to_process = study_ids
-    else:
-        print(f"Output file '{output_file}' not found or is empty. Starting a new run.")
-        study_ids_to_process = study_ids
-
-    with open(output_file, "a", newline="") as f:
-        if not output_exists or os.path.getsize(output_file) == 0:
-            header_df = pd.DataFrame(
-                columns=[
-                    "Modality",
-                    "Study DateTime",
-                    "StudyDescription",
-                    "exam_id",
-                    "study_id",
-                ]
-            )
-            header_df.to_csv(f, index=False, header=True)
-
-        for study_id in tqdm(study_ids_to_process, desc="Scraping Study IDs"):
+        if output_exists and os.path.getsize(output_file) > 0:
+            print(f"Output file '{output_file}' found. Reading seen IDs to resume...")
             try:
-                page_html, state = post_fetch_grid(session, state, str(study_id))
-                table_html = extract_gv1_table_html(page_html)
-                df = parse_results_table_html(table_html)
+                seen_df = pd.read_csv(output_file, usecols=["study_id"])
+                seen = set(seen_df["study_id"].astype(str))
+                study_ids_to_process = [
+                    sid for sid in study_ids if str(sid) not in seen
+                ]
+                print(
+                    f"{len(seen)} IDs already processed. {len(study_ids_to_process)} remaining."
+                )
+            except (pd.errors.EmptyDataError, KeyError, ValueError):
+                print("Output file is empty or invalid. Processing all IDs.")
+                study_ids_to_process = study_ids
+        else:
+            print(
+                f"Output file '{output_file}' not found or is empty. Starting a new run."
+            )
+            study_ids_to_process = study_ids
 
-                if df.empty:
+        all_columns = [
+            "Modality",
+            "Study DateTime",
+            "StudyDescription",
+            "exam_id",
+            "Status",
+            "Accession",
+            "Exported On",
+            "study_id",
+        ]
+
+        with open(output_file, "a", newline="") as f:
+            if not output_exists or os.path.getsize(output_file) == 0:
+                # Write the new, comprehensive header
+                pd.DataFrame(columns=all_columns).to_csv(f, index=False, header=True)
+
+            for study_id in tqdm(study_ids_to_process, desc="Scraping Study IDs"):
+                try:
+                    page_html, state = post_fetch_grid(session, state, str(study_id))
+
+                    # UPDATED: Single call to the new, powerful parsing function
+                    df = parse_all_tables_from_page(page_html)
+
+                    if df.empty:
+                        continue
+
+                    df["study_id"] = study_id
+
+                    # Reorder columns to match the header for consistency
+                    # This will add any missing columns as NaN automatically
+                    df = df.reindex(columns=all_columns)
+
+                    df.to_csv(f, index=False, header=False)
+                    f.flush()
+
+                except (requests.exceptions.RequestException, ValueError) as e:
+                    print(
+                        f"\nWARNING: Failed to process study_id {study_id}. Error: {e}"
+                    )
+                    print("Re-initializing session state and continuing to next ID...")
+                    page_html, state = http_get_root(session)
                     continue
 
-                df["study_id"] = study_id
-                df.to_csv(f, index=False, header=False)
-                f.flush()  # <-- KEY CHANGE: Force write to disk after each ID
+        print("Scraping complete.")
 
-            except (requests.exceptions.RequestException, ValueError) as e:
-                print(f"\nWARNING: Failed to process study_id {study_id}. Error: {e}")
-                print("Re-initializing session state and continuing to next ID...")
-                page_html, state = http_get_root(session)
-                continue
+    except Exception as e:
+        print(f"\nAn unexpected fatal error occurred: {e}")
+        traceback.print_exc()
 
-    print("Scraping complete.")
 
-except Exception as e:
-    print(f"\nAn unexpected fatal error occurred: {e}")
-    traceback.print_exc()
+if __name__ == "__main__":
+    main()
