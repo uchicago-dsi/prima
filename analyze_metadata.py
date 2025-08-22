@@ -13,21 +13,18 @@ import pandas as pd
 plots_dir = Path("plots")
 plots_dir.mkdir(exist_ok=True)
 
-print("Loading data...")
-
+print("=== LOADING DATA ===")
 # load data
 chimec_patients = pd.read_csv(
     "/gpfs/data/phs/groups/Projects/Huo_projects/SPORE/annawoodard/List_ChiMEC_priority_2025July30.csv"
 )
-print(f"Loaded {len(chimec_patients):,} ChiMEC patients")
-
 key = pd.read_csv("/gpfs/data/huo-lab/Image/ChiMEC/study-16352a.csv")
 metadata = pd.read_csv(
     "/gpfs/data/huo-lab/Image/annawoodard/prima/data/imaging_metadata.csv"
 )
-
-print(f"Loaded key table with {len(key):,} records")
-print(f"Loaded metadata with {len(metadata):,} records")
+print(f"ChiMEC patients: {len(chimec_patients):,}")
+print(f"Key table records: {len(key):,}")
+print(f"Metadata records: {len(metadata):,}")
 
 
 # helper function to extract base modality
@@ -450,24 +447,12 @@ def create_time_analysis_plot(cases_mg, controls_mg, chip_status, plots_dir):
     plt.close()
 
 
-print("\n=== BASE MODALITY ANALYSIS ===")
-print("unique base modalities:")
-print(metadata["base_modality"].value_counts())
-
-print("\nexamples of modality -> base_modality mapping:")
-sample_mapping = metadata[["Modality", "base_modality"]].drop_duplicates().head(20)
-print(sample_mapping)
-
-# find MRNs in chimec_patients but not in key
+# find and save missing MRNs
 missing_mrns = chimec_patients[~chimec_patients["MRN"].isin(key["MRN"])]["MRN"].tolist()
-print(f"\nNumber of MRNs in chimec_patients but not in key: {len(missing_mrns)}")
-
-# save missing MRNs to text file
 with open("missing_mrns.txt", "w") as f:
     for mrn in missing_mrns:
         f.write(f"{mrn}\n")
-
-print(f"Saved {len(missing_mrns)} missing MRNs to missing_mrns.txt")
+print(f"missing MRNs (not in key): {len(missing_mrns):,} (saved to missing_mrns.txt)")
 
 # connect study_id in metadata to chip column in chimec_patients through key table
 # step 1: merge chimec_patients with key table to get AnonymousID for each MRN
@@ -481,60 +466,52 @@ chimec_with_study_id = chimec_with_study_id.rename(
 )
 
 print("\n=== DATA LINKING SUMMARY ===")
-print(f"Original chimec_patients shape: {chimec_patients.shape}")
-print(f"After merging with key table: {chimec_with_study_id.shape}")
-print(f"Patients with chip data: {chimec_with_study_id['chip'].notna().sum()}")
+print(f"ChiMEC patients after key merge: {chimec_with_study_id.shape[0]:,}")
+print(f"patients with chip data: {chimec_with_study_id['chip'].notna().sum():,}")
 print(
-    f"Patients with chip data AND study_id: {(chimec_with_study_id['chip'].notna() & chimec_with_study_id['AnonymousID'].notna()).sum()}"
+    f"patients with chip + study_id: {(chimec_with_study_id['chip'].notna() & chimec_with_study_id['AnonymousID'].notna()).sum():,}"
 )
 
-# step 2: identify patients with chip data who have at least one MG modality record
-# get study_ids for patients with chip data
+# identify chip patients with MG records
 chip_patients_study_ids = chimec_with_study_id[chimec_with_study_id["chip"].notna()][
     "AnonymousID"
 ].dropna()
-
-print(
-    f"\nNumber of patients with chip data: {len(chimec_with_study_id[chimec_with_study_id['chip'].notna()])}"
-)
-print(
-    f"Number of patients with chip data who have study_id: {len(chip_patients_study_ids)}"
-)
-
-# find which of these study_ids have MG modality records
 mg_records = metadata[metadata["Modality"].str.contains("MG", na=False)]
 chip_patients_with_mg = chip_patients_study_ids[
     chip_patients_study_ids.isin(mg_records["study_id"])
 ]
 
 print(
-    f"Number of chip patients with at least one MG record: {len(chip_patients_with_mg)}"
-)
-print(
-    f"Percentage of chip patients with MG records: {len(chip_patients_with_mg) / len(chip_patients_study_ids) * 100:.1f}%"
+    f"chip patients with MG records: {len(chip_patients_with_mg):,} / {len(chip_patients_study_ids):,} ({len(chip_patients_with_mg) / len(chip_patients_study_ids) * 100:.1f}%)"
 )
 
-# enhanced summary with cases vs controls
+# total cases vs controls breakdown (all ChiMEC patients)
+total_cases_count = chimec_with_study_id[
+    chimec_with_study_id["case_or_control"] == "Case"
+].shape[0]
+total_controls_count = chimec_with_study_id[
+    chimec_with_study_id["case_or_control"] == "Control"
+].shape[0]
+
+# genotyped cases vs controls breakdown
 chip_patients_with_status = chimec_with_study_id[chimec_with_study_id["chip"].notna()]
-cases_count = chip_patients_with_status[
+genotyped_cases_count = chip_patients_with_status[
     chip_patients_with_status["case_or_control"] == "Case"
 ].shape[0]
-controls_count = chip_patients_with_status[
+genotyped_controls_count = chip_patients_with_status[
     chip_patients_with_status["case_or_control"] == "Control"
 ].shape[0]
 
-print("\n=== ENHANCED SUMMARY ===")
-print(f"Total ChiMEC patients: {len(chimec_patients):,}")
+print("\n=== PATIENT SUMMARY ===")
 print(
-    f"ChiMEC patients with chip data (genotyped): {len(chimec_with_study_id[chimec_with_study_id['chip'].notna()]):,} ({len(chimec_with_study_id[chimec_with_study_id['chip'].notna()]) / len(chimec_patients) * 100:.1f}%)"
+    f"total ChiMEC patients: {len(chimec_patients):,} (cases: {total_cases_count:,}, controls: {total_controls_count:,})"
 )
-print(f"  - Cases: {cases_count:,}")
-print(f"  - Controls: {controls_count:,}")
 print(
-    f"ChiMEC patients with imaging data available: {metadata['study_id'].nunique():,} ({metadata['study_id'].nunique() / len(chimec_patients) * 100:.1f}%)"
+    f"genotyped patients: {len(chimec_with_study_id[chimec_with_study_id['chip'].notna()]):,} (cases: {genotyped_cases_count:,}, controls: {genotyped_controls_count:,})"
 )
-print(f"Genotyped ChiMEC patients with imaging data: {len(chip_patients_study_ids):,}")
-print(f"Genotyped ChiMEC patients with MG imaging: {len(chip_patients_with_mg):,}")
+print(f"patients with imaging: {metadata['study_id'].nunique():,}")
+print(f"genotyped with imaging: {len(chip_patients_study_ids):,}")
+print(f"genotyped with MG imaging: {len(chip_patients_with_mg):,}")
 
 # time-to-diagnosis analysis for cases
 print("\n=== TIME-TO-DIAGNOSIS ANALYSIS ===")
@@ -564,12 +541,12 @@ cases_imaging["time_to_diagnosis"] = (
 # convert days to years (approximate, 365.25 days per year)
 cases_imaging["time_to_diagnosis_years"] = cases_imaging["time_to_diagnosis"] / 365.25
 
-print(f"Total case imaging records: {len(cases_imaging)}")
+print(f"total case imaging records: {len(cases_imaging):,}")
 print(
-    f"Records with valid time-to-diagnosis: {cases_imaging['time_to_diagnosis'].notna().sum()}"
+    f"records with valid time-to-diagnosis: {cases_imaging['time_to_diagnosis'].notna().sum():,}"
 )
 print(
-    f"Range of time-to-diagnosis: {cases_imaging['time_to_diagnosis'].min()} to {cases_imaging['time_to_diagnosis'].max()} days"
+    f"range of time-to-diagnosis: {cases_imaging['time_to_diagnosis'].min():,} to {cases_imaging['time_to_diagnosis'].max():,} days"
 )
 
 # create histogram including positive times (mammos after dx), x axis in years
@@ -588,88 +565,33 @@ plt.close()
 
 # summary stats (in years)
 print("\ntime-to-diagnosis statistics (years):")
-print(f"Mean: {time_to_dx_years.mean():.2f} years")
-print(f"Median: {time_to_dx_years.median():.2f} years")
-print(f"Exams after diagnosis (negative values): {(time_to_dx_years < 0).sum()}")
-print(f"Exams before diagnosis (positive values): {(time_to_dx_years > 0).sum()}")
+print(f"mean: {time_to_dx_years.mean():.2f} years")
+print(f"median: {time_to_dx_years.median():.2f} years")
+print(f"exams after diagnosis (negative values): {(time_to_dx_years < 0).sum():,}")
+print(f"exams before diagnosis (positive values): {(time_to_dx_years > 0).sum():,}")
 
-# debugging extreme time-to-diagnosis values
-print("\n=== DEBUGGING EXTREME TIME-TO-DIAGNOSIS VALUES ===")
-print("=" * 50)
-
-# find records with extreme negative values (more than 10 years before diagnosis)
-extreme_negative = cases_imaging[cases_imaging["time_to_diagnosis"] < -3650]  # 10 years
-print(f"Records with >10 years before diagnosis: {len(extreme_negative)}")
+# check for extreme time-to-diagnosis values
+print("\n=== TIME-TO-DIAGNOSIS VALIDATION ===")
+extreme_negative = cases_imaging[
+    cases_imaging["time_to_diagnosis"] < -3650
+]  # >10 years before
+extreme_positive = cases_imaging[
+    cases_imaging["time_to_diagnosis"] > 3650
+]  # >10 years after
+print(f"records >10 years after diagnosis: {len(extreme_negative):,}")
+print(f"records >10 years before diagnosis: {len(extreme_positive):,}")
+print(
+    f"time range: {cases_imaging['time_to_diagnosis'].min():.0f} to {cases_imaging['time_to_diagnosis'].max():.0f} days"
+)
+print(
+    f"mean: {cases_imaging['time_to_diagnosis'].mean():.1f} days, median: {cases_imaging['time_to_diagnosis'].median():.1f} days"
+)
 
 if len(extreme_negative) > 0:
-    print("\nEXAMPLES OF EXTREME VALUES:")
-    extreme_examples = extreme_negative[
-        [
-            "AnonymousID",
-            "DatedxIndex",
-            "Study DateTime",
-            "time_to_diagnosis",
-            "Modality",
-        ]
-    ].head(10)
-    print(extreme_examples)
-
-    print(
-        f"\nMINIMUM TIME-TO-DIAGNOSIS: {extreme_negative['time_to_diagnosis'].min()} days"
-    )
-    print(
-        f"This is approximately {extreme_negative['time_to_diagnosis'].min() / 365.25:.1f} years before diagnosis"
-    )
-
-    # check if there are any obvious date format issues
-    print("\nCHECKING FOR DATE FORMAT ISSUES:")
     min_record = extreme_negative.loc[extreme_negative["time_to_diagnosis"].idxmin()]
-    print("Record with minimum value:")
-    print(f"  AnonymousID: {min_record['AnonymousID']}")
     print(
-        f"  DatedxIndex: {min_record['DatedxIndex']} (type: {type(min_record['DatedxIndex'])})"
+        f"most extreme case: {min_record['time_to_diagnosis']:.0f} days ({min_record['time_to_diagnosis'] / 365.25:.1f} years) after diagnosis"
     )
-    print(
-        f"  Study DateTime: {min_record['Study DateTime']} (type: {type(min_record['Study DateTime'])})"
-    )
-    print(f"  Time to diagnosis: {min_record['time_to_diagnosis']} days")
-    print(f"  Modality: {min_record['Modality']}")
-
-    # check if this is a specific patient with multiple extreme values
-    print("\nCHECKING IF THIS IS A PATTERN FOR SPECIFIC PATIENTS:")
-    patient_extreme_counts = extreme_negative["AnonymousID"].value_counts()
-    print(f"Patients with extreme values: {len(patient_extreme_counts)}")
-    print("Top 5 patients with most extreme values:")
-    print(patient_extreme_counts.head())
-
-# also check for extreme positive values
-extreme_positive = cases_imaging[cases_imaging["time_to_diagnosis"] > 3650]  # 10 years
-print(f"\nRecords with >10 years after diagnosis: {len(extreme_positive)}")
-
-if len(extreme_positive) > 0:
-    print("\nEXAMPLES OF EXTREME POSITIVE VALUES:")
-    extreme_pos_examples = extreme_positive[
-        [
-            "AnonymousID",
-            "DatedxIndex",
-            "Study DateTime",
-            "time_to_diagnosis",
-            "Modality",
-        ]
-    ].head(5)
-    print(extreme_pos_examples)
-
-# check the overall distribution
-print("\nOVERALL DISTRIBUTION:")
-print(f"Total records: {len(cases_imaging)}")
-print(
-    f"Records with valid time-to-diagnosis: {cases_imaging['time_to_diagnosis'].notna().sum()}"
-)
-print(
-    f"Range: {cases_imaging['time_to_diagnosis'].min()} to {cases_imaging['time_to_diagnosis'].max()} days"
-)
-print(f"Mean: {cases_imaging['time_to_diagnosis'].mean():.1f} days")
-print(f"Median: {cases_imaging['time_to_diagnosis'].median():.1f} days")
 
 
 def extract_base_modality(modality: str) -> str:
@@ -715,10 +637,9 @@ def extract_base_modality(modality: str) -> str:
 # add base modality column to metadata
 metadata["base_modality"] = metadata["Modality"].apply(extract_base_modality)
 
-print("\n=== MODALITY ANALYSIS ===")
+print("\n=== BASE MODALITY ANALYSIS ===")
 print("unique base modalities:")
 print(metadata["base_modality"].value_counts())
-
 print("\nexamples of modality -> base_modality mapping:")
 sample_mapping = metadata[["Modality", "base_modality"]].drop_duplicates().head(20)
 print(sample_mapping)
@@ -740,49 +661,35 @@ BASE_MODALITY_LABELS = {
     "RG": "radiographic imaging",
 }
 
-# create modality distribution plot for all patients
-print("\n=== CREATING MODALITY DISTRIBUTION PLOTS ===")
-create_modality_distribution_plot(metadata, "all", plots_dir)
-
-# print interpretation
+print("\n=== MODALITY DISTRIBUTION ===")
 total_patients = metadata["study_id"].nunique()
 patient_counts = (
     metadata.groupby("base_modality")["study_id"].nunique().sort_values(ascending=False)
 )
-print("\nINTERPRETATION:")
-print("- Each bar shows how many patients have at least one exam of that modality type")
-print("- Patients with multiple modalities appear in multiple bars")
 print(
-    f"- Sum ({patient_counts.sum():,}) > Total patients ({total_patients:,}) is EXPECTED"
+    f"patients with multi-modality imaging: sum ({patient_counts.sum():,}) > total ({total_patients:,})"
 )
-print(
-    "- This visualization answers: 'How many patients have imaging data for each modality?'"
-)
+create_modality_distribution_plot(metadata, "all", plots_dir)
 
 # MG mammogram analysis
-print("\n=== MG MAMMOGRAM ANALYSIS ===")
+print("\n=== MAMMOGRAM ANALYSIS ===")
 # filter for only MG mammograms
 mg_scans = metadata[metadata["base_modality"] == "MG"].copy()
 
-print(f"total MG scans: {len(mg_scans)}")
-print(f"unique patients with MG scans: {mg_scans['study_id'].nunique()}")
-
-# count number of MG mammograms per patient
 mg_per_patient = mg_scans["study_id"].value_counts()
-
-print("\nsummary statistics:")
-print(f"min mammograms per patient: {mg_per_patient.min()}")
-print(f"max mammograms per patient: {mg_per_patient.max()}")
-print(f"mean mammograms per patient: {mg_per_patient.mean():.2f}")
-print(f"median mammograms per patient: {mg_per_patient.median():.1f}")
+print(
+    f"total MG scans: {len(mg_scans):,} (patients: {mg_scans['study_id'].nunique():,})"
+)
+print(
+    f"mammograms per patient - range: {mg_per_patient.min()}-{mg_per_patient.max()}, mean: {mg_per_patient.mean():.1f}, median: {mg_per_patient.median():.1f}"
+)
 
 # create MG mammograms per patient plot for all patients
 create_mg_mammograms_per_patient_plot(
     mg_per_patient, chimec_with_study_id, mg_scans, "all", plots_dir
 )
 
-print("\ntop 10 patients with most mammograms:")
-print(mg_per_patient.head(10))
+print(f"patients with most mammograms: {mg_per_patient.head(3).to_dict()}")
 
 # screening mammogram analysis
 print("\n=== SCREENING MAMMOGRAM ANALYSIS ===")
@@ -796,19 +703,18 @@ mg_with_patient_data = mg_scans.merge(
 
 print(f"MG scans with patient data: {len(mg_with_patient_data)}")
 
-# key insight about imaging population
-imaging_patients_with_chip = mg_with_patient_data["chip"].notna().sum()
+# genotyping coverage in imaging population
 total_imaging_patients = mg_with_patient_data["study_id"].nunique()
-print(f"ChiMEC patients with MG imaging: {total_imaging_patients:,}")
+genotyped_imaging = mg_with_patient_data[mg_with_patient_data["chip"].notna()][
+    "study_id"
+].nunique()
 print(
-    f"Of these, genotyped: {mg_with_patient_data[mg_with_patient_data['chip'].notna()]['study_id'].nunique():,} ({mg_with_patient_data[mg_with_patient_data['chip'].notna()]['study_id'].nunique() / total_imaging_patients * 100:.1f}%)"
+    f"ChiMEC patients with MG imaging: {total_imaging_patients:,} (genotyped: {genotyped_imaging:,}, {genotyped_imaging / total_imaging_patients * 100:.1f}%)"
 )
-print(
-    f"Of these, NOT genotyped: {mg_with_patient_data[mg_with_patient_data['chip'].isna()]['study_id'].nunique():,} ({mg_with_patient_data[mg_with_patient_data['chip'].isna()]['study_id'].nunique() / total_imaging_patients * 100:.1f}%)"
-)
-print(
-    "NOTE: This explains why 'all' and 'genotyped' plots show identical counts - all ChiMEC patients with imaging happen to be genotyped!"
-)
+if genotyped_imaging == total_imaging_patients:
+    print(
+        "all ChiMEC patients with imaging are genotyped (explains identical 'all' vs 'genotyped' plots)"
+    )
 
 # convert dates to datetime
 mg_with_patient_data["Study DateTime"] = pd.to_datetime(
@@ -846,20 +752,13 @@ case_before_dx_month_mammograms = cases_mg[
 control_screening_mammograms = controls_mg.copy()
 
 print(
-    f"case screening mammograms (>90 days before dx): {len(case_screening_mammograms)}"
+    f"case screening mammograms (>90 days before dx): {len(case_screening_mammograms):,} ({case_screening_mammograms['study_id'].nunique() if len(case_screening_mammograms) > 0 else 0:,} patients)"
 )
 print(
-    f"case mammograms (before/including dx month): {len(case_before_dx_month_mammograms)}"
-)
-print(f"control mammograms (all): {len(control_screening_mammograms)}")
-print(
-    f"unique case patients with screening mammograms: {case_screening_mammograms['study_id'].nunique() if len(case_screening_mammograms) > 0 else 0}"
+    f"case mammograms (before/including dx month): {len(case_before_dx_month_mammograms):,} ({case_before_dx_month_mammograms['study_id'].nunique() if len(case_before_dx_month_mammograms) > 0 else 0:,} patients)"
 )
 print(
-    f"unique case patients with mammograms before/including dx month: {case_before_dx_month_mammograms['study_id'].nunique() if len(case_before_dx_month_mammograms) > 0 else 0}"
-)
-print(
-    f"unique control patients with mammograms: {control_screening_mammograms['study_id'].nunique() if len(control_screening_mammograms) > 0 else 0}"
+    f"control mammograms (all): {len(control_screening_mammograms):,} ({control_screening_mammograms['study_id'].nunique() if len(control_screening_mammograms) > 0 else 0:,} patients)"
 )
 
 # count screening mammograms per patient for cases
@@ -883,40 +782,19 @@ control_screening_per_patient = (
     else pd.Series(dtype=int)
 )
 
-print("\ncase screening mammogram summary statistics:")
+# mammograms per patient summary
 if len(case_screening_per_patient) > 0:
-    print(f"min screening mammograms per patient: {case_screening_per_patient.min()}")
-    print(f"max screening mammograms per patient: {case_screening_per_patient.max()}")
     print(
-        f"mean screening mammograms per patient: {case_screening_per_patient.mean():.2f}"
+        f"case screening per patient - range: {case_screening_per_patient.min()}-{case_screening_per_patient.max()}, mean: {case_screening_per_patient.mean():.1f}"
     )
-    print(
-        f"median screening mammograms per patient: {case_screening_per_patient.median():.1f}"
-    )
-else:
-    print("no case screening mammograms found")
-
-print("\ncase mammograms before/including dx month summary statistics:")
 if len(case_before_dx_month_per_patient) > 0:
-    print(f"min mammograms per patient: {case_before_dx_month_per_patient.min()}")
-    print(f"max mammograms per patient: {case_before_dx_month_per_patient.max()}")
-    print(f"mean mammograms per patient: {case_before_dx_month_per_patient.mean():.2f}")
     print(
-        f"median mammograms per patient: {case_before_dx_month_per_patient.median():.1f}"
+        f"case before/including dx month per patient - range: {case_before_dx_month_per_patient.min()}-{case_before_dx_month_per_patient.max()}, mean: {case_before_dx_month_per_patient.mean():.1f}"
     )
-else:
-    print("no case mammograms before/including dx month found")
-
-print("\ncontrol mammogram summary statistics:")
 if len(control_screening_per_patient) > 0:
-    print(f"min mammograms per patient: {control_screening_per_patient.min()}")
-    print(f"max mammograms per patient: {control_screening_per_patient.max()}")
-    print(f"mean mammograms per patient: {control_screening_per_patient.mean():.2f}")
     print(
-        f"median mammograms per patient: {control_screening_per_patient.median():.1f}"
+        f"control per patient - range: {control_screening_per_patient.min()}-{control_screening_per_patient.max()}, mean: {control_screening_per_patient.mean():.1f}"
     )
-else:
-    print("no control mammograms found")
 
 # create screening mammograms plot for all patients
 create_screening_mammograms_plot(
@@ -930,23 +808,6 @@ create_screening_mammograms_plot(
     plots_dir,
 )
 
-print("\ntop 10 case patients with most screening mammograms:")
-if len(case_screening_per_patient) > 0:
-    print(case_screening_per_patient.head(10))
-else:
-    print("no case screening mammograms found")
-
-print("\ntop 10 case patients with most mammograms before/including dx month:")
-if len(case_before_dx_month_per_patient) > 0:
-    print(case_before_dx_month_per_patient.head(10))
-else:
-    print("no case mammograms before/including dx month found")
-
-print("\ntop 10 control patients with most mammograms:")
-if len(control_screening_per_patient) > 0:
-    print(control_screening_per_patient.head(10))
-else:
-    print("no control mammograms found")
 
 # histogram of time to DatedxIndex for cases and time from first mammogram for controls
 print("\n=== TIME ANALYSIS ===")
@@ -972,58 +833,48 @@ if len(controls_mg) > 0:
         controls_mg["Study DateTime"] - controls_mg["first_mammogram_date"]
     ).dt.days
 
-# cases time to diagnosis analysis
+# time analysis summary
 if len(cases_mg) > 0:
     case_time_to_dx = cases_mg["days_to_dx"].dropna()
-    print(f"total case MG scans with valid time to diagnosis: {len(case_time_to_dx)}")
-    print("\ncase time to diagnosis summary statistics:")
-    print(f"min: {case_time_to_dx.min()} days")
-    print(f"max: {case_time_to_dx.max()} days")
-    print(f"mean: {case_time_to_dx.mean():.1f} days")
-    print(f"median: {case_time_to_dx.median():.1f} days")
     print(
-        f"mammograms before diagnosis (positive values): {(case_time_to_dx > 0).sum()}"
+        f"case MG scans: {len(case_time_to_dx):,} (before dx: {(case_time_to_dx > 0).sum():,}, after: {(case_time_to_dx < 0).sum():,}, on dx day: {(case_time_to_dx == 0).sum():,})"
     )
     print(
-        f"mammograms after diagnosis (negative values): {(case_time_to_dx < 0).sum()}"
+        f"case time to dx - range: {case_time_to_dx.min():.0f} to {case_time_to_dx.max():.0f} days, mean: {case_time_to_dx.mean():.0f}, median: {case_time_to_dx.median():.0f}"
     )
-    print(f"mammograms on diagnosis day: {(case_time_to_dx == 0).sum()}")
 
-# controls time from first mammogram analysis
 if len(controls_mg) > 0:
     control_time_from_first = controls_mg["days_from_first_mammogram"].dropna()
     print(
-        f"\ntotal control MG scans with valid time from first mammogram: {len(control_time_from_first)}"
+        f"control MG scans: {len(control_time_from_first):,} with time from first mammogram"
     )
-    print("\ncontrol time from first mammogram summary statistics:")
-    print(f"min: {control_time_from_first.min()} days")
-    print(f"max: {control_time_from_first.max()} days")
-    print(f"mean: {control_time_from_first.mean():.1f} days")
-    print(f"median: {control_time_from_first.median():.1f} days")
+    print(
+        f"control time from first - range: {control_time_from_first.min():.0f} to {control_time_from_first.max():.0f} days, mean: {control_time_from_first.mean():.0f}, median: {control_time_from_first.median():.0f}"
+    )
 
 # create time analysis plot for all patients
 create_time_analysis_plot(cases_mg, controls_mg, "all", plots_dir)
 
-# additional breakdown for cases
+# time period breakdown
 if len(cases_mg) > 0:
     case_time_to_dx = cases_mg["days_to_dx"].dropna()
-    print("\ncase breakdown by time periods:")
-    print(f"screening mammograms (>90 days before dx): {(case_time_to_dx > 90).sum()}")
+    screening = (case_time_to_dx > 90).sum()
+    diagnostic = ((case_time_to_dx >= 0) & (case_time_to_dx <= 90)).sum()
+    after = (case_time_to_dx < 0).sum()
     print(
-        f"diagnostic mammograms (0-90 days before dx): {((case_time_to_dx >= 0) & (case_time_to_dx <= 90)).sum()}"
+        f"case time periods - screening (>90d): {screening:,}, diagnostic (0-90d): {diagnostic:,}, after dx: {after:,}"
     )
-    print(f"mammograms after diagnosis: {(case_time_to_dx < 0).sum()}")
 
-# additional breakdown for controls
 if len(controls_mg) > 0:
     control_time_from_first = controls_mg["days_from_first_mammogram"].dropna()
-    print("\ncontrol breakdown by time periods:")
-    print(f"first mammograms: {(control_time_from_first == 0).sum()}")
-    print(f"follow-up mammograms (>0 days): {(control_time_from_first > 0).sum()}")
+    first = (control_time_from_first == 0).sum()
+    followup = (control_time_from_first > 0).sum()
+    within_year = (
+        (control_time_from_first >= 0) & (control_time_from_first <= 365)
+    ).sum()
     print(
-        f"mammograms within 1 year of first: {((control_time_from_first >= 0) & (control_time_from_first <= 365)).sum()}"
+        f"control time periods - first: {first:,}, follow-up: {followup:,}, within 1yr: {within_year:,}"
     )
-    print(f"mammograms >1 year after first: {(control_time_from_first > 365).sum()}")
 
 # create genotyped-only versions of all plots
 print("\n=== CREATING GENOTYPED-ONLY VERSIONS ===")
@@ -1034,8 +885,9 @@ genotyped_metadata = metadata[
     metadata["study_id"].isin(genotyped_patients["AnonymousID"])
 ]
 
-print(f"genotyped patients: {len(genotyped_patients)}")
-print(f"genotyped metadata records: {len(genotyped_metadata)}")
+print(
+    f"genotyped patients: {len(genotyped_patients):,} (metadata records: {len(genotyped_metadata):,})"
+)
 
 # create genotyped-only modality distribution plot
 create_modality_distribution_plot(genotyped_metadata, "genotyped", plots_dir)
@@ -1061,7 +913,7 @@ genotyped_mg_with_patient_data = genotyped_mg_scans.merge(
     how="inner",
 )
 
-print(f"genotyped MG scans with patient data: {len(genotyped_mg_with_patient_data)}")
+print(f"genotyped MG scans with patient data: {len(genotyped_mg_with_patient_data):,}")
 
 # convert dates to datetime
 genotyped_mg_with_patient_data["Study DateTime"] = pd.to_datetime(
@@ -1166,6 +1018,6 @@ create_time_analysis_plot(
     genotyped_cases_mg_for_time, genotyped_controls_mg_for_time, "genotyped", plots_dir
 )
 
-print("\n=== SCRIPT COMPLETED ===")
-print(f"All plots saved to: {plots_dir.absolute()}")
-print("Created both 'all' and 'genotyped' versions of all plots")
+print("\n=== ANALYSIS COMPLETE ===")
+print(f"plots saved to: {plots_dir.absolute()}")
+print("created 'all' and 'genotyped' versions of all plots")
