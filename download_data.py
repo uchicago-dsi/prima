@@ -176,87 +176,128 @@ def execute_downloads(targets_df: pd.DataFrame, batch_size: int):
     if targets_df.empty:
         return {}, 0
 
-    batch_targets = targets_df.head(batch_size).copy()
     print(
-        f"\n--- Phase 4: Executing Downloads for a Batch of {len(batch_targets)} Exams ---"
+        f"\n--- Phase 4: Executing Downloads (target: {batch_size} successful exports) ---"
     )
     driver = None
     # This will map the DataFrame index to the outcome
     outcomes = {}
     already_exported_counter = 0
+    successfully_exported_counter = 0
+    processed_index = 0
 
     try:
         driver = make_driver()
         login(driver, USERNAME, PASSWORD)
 
-        for study_id, patient_exams in tqdm(
-            batch_targets.groupby("study_id"), desc="Processing Patients"
+        # Continue processing until we reach the target batch size of successful exports
+        while successfully_exported_counter < batch_size and processed_index < len(
+            targets_df
         ):
-            print(f"\nProcessing patient {study_id} ({len(patient_exams)} exams)...")
-            try:
-                driver.find_element(by="name", value="tbxAssignedID").clear()
-                driver.find_element(by="name", value="tbxAssignedID").send_keys(
-                    str(int(study_id))
-                )
-                driver.find_element(by="name", value="btnFetch").click()
-                wait_aspnet_idle(driver)
-            except Exception as e:
-                print(f"ERROR navigating for study_id {study_id}. Skipping. Error: {e}")
-                continue
+            # Get the next batch of exams to process
+            remaining_needed = batch_size - successfully_exported_counter
+            # Process a reasonable chunk at a time, but at least what we need
+            chunk_size = max(remaining_needed, 10)
+            current_batch = targets_df.iloc[
+                processed_index : processed_index + chunk_size
+            ].copy()
 
-            # Build a map of what's ACTUALLY available on the live page
-            available_on_page = {}
-            page_rows = driver.find_elements(
-                by="xpath",
-                value="//table[@id='TabContainer1_tabPanel1_gv1']//tr[position()>1]",
+            if current_batch.empty:
+                break
+
+            print(
+                f"\nProcessing batch {processed_index // 10 + 1}: {len(current_batch)} exams (need {remaining_needed} more successful exports)"
             )
-            for row in page_rows:
-                try:
-                    cells = row.find_elements(by="tag name", value="td")
-                    row_date = pd.to_datetime(cells[2].text).date()
-                    row_desc = cells[3].text.strip()
-                    checkbox = row.find_element(
-                        by="xpath", value=".//input[@type='checkbox']"
-                    )
-                    available_on_page[(row_date, row_desc)] = checkbox
-                except Exception:
-                    pass
 
-            requested_this_patient = False
-            # Now, check our targets against the live reality
-            for index, target_exam in patient_exams.iterrows():
-                target_key = (
-                    target_exam["Study DateTime"].date(),
-                    target_exam["StudyDescription"],
+            for study_id, patient_exams in tqdm(
+                current_batch.groupby("study_id"),
+                desc="Processing Patients",
+                leave=False,
+            ):
+                print(
+                    f"\nProcessing patient {study_id} ({len(patient_exams)} exams)..."
                 )
-
-                if target_key in available_on_page:
-                    # It's available! Click it.
-                    print(
-                        f"  - Found available exam from {target_key[0]}. Selecting checkbox."
+                try:
+                    driver.find_element(by="name", value="tbxAssignedID").clear()
+                    driver.find_element(by="name", value="tbxAssignedID").send_keys(
+                        str(int(study_id))
                     )
-                    available_on_page[target_key].click()
-                    outcomes[index] = "Request Submitted"
-                    requested_this_patient = True
-                else:
-                    # It's NOT available - must have been exported already.
+                    driver.find_element(by="name", value="btnFetch").click()
+                    wait_aspnet_idle(driver)
+                except Exception as e:
                     print(
-                        f"  - INFO: Exam from {target_key[0]} is no longer available (already exported)."
+                        f"ERROR navigating for study_id {study_id}. Skipping. Error: {e}"
                     )
-                    outcomes[index] = "Already Exported"
-                    already_exported_counter += 1
+                    continue
 
-            if requested_this_patient:
-                print("  Submitting export request for selected exams...")
-                driver.find_element(by="name", value="btnExport").click()
-                wait_aspnet_idle(driver)
-                print("  Export request submitted.")
+                # Build a map of what's ACTUALLY available on the live page
+                available_on_page = {}
+                page_rows = driver.find_elements(
+                    by="xpath",
+                    value="//table[@id='TabContainer1_tabPanel1_gv1']//tr[position()>1]",
+                )
+                for row in page_rows:
+                    try:
+                        cells = row.find_elements(by="tag name", value="td")
+                        row_date = pd.to_datetime(cells[2].text).date()
+                        row_desc = cells[3].text.strip()
+                        checkbox = row.find_element(
+                            by="xpath", value=".//input[@type='checkbox']"
+                        )
+                        available_on_page[(row_date, row_desc)] = checkbox
+                    except Exception:
+                        pass
+
+                requested_this_patient = False
+                # Now, check our targets against the live reality
+                for index, target_exam in patient_exams.iterrows():
+                    target_key = (
+                        target_exam["Study DateTime"].date(),
+                        target_exam["StudyDescription"],
+                    )
+
+                    if target_key in available_on_page:
+                        # It's available! Click it.
+                        print(
+                            f"  - Found available exam from {target_key[0]}. Selecting checkbox."
+                        )
+                        available_on_page[target_key].click()
+                        outcomes[index] = "Request Submitted"
+                        successfully_exported_counter += 1
+                        requested_this_patient = True
+                    else:
+                        # It's NOT available - must have been exported already.
+                        print(
+                            f"  - INFO: Exam from {target_key[0]} is no longer available (already exported)."
+                        )
+                        outcomes[index] = "Already Exported"
+                        already_exported_counter += 1
+
+                if requested_this_patient:
+                    print("  Submitting export request for selected exams...")
+                    driver.find_element(by="name", value="btnExport").click()
+                    wait_aspnet_idle(driver)
+                    print("  Export request submitted.")
+
+                # Check if we've reached our target
+                if successfully_exported_counter >= batch_size:
+                    print(
+                        f"\nReached target of {batch_size} successful exports. Stopping."
+                    )
+                    break
+
+            # Update processed index for next iteration
+            processed_index += len(current_batch)
+
+            # Check if we've reached our target (in case we broke out of inner loop)
+            if successfully_exported_counter >= batch_size:
+                break
     finally:
         if driver:
             print("Closing webdriver session.")
             driver.quit()
 
-    return outcomes, already_exported_counter
+    return outcomes, already_exported_counter, successfully_exported_counter
 
 
 def main():
@@ -271,7 +312,7 @@ def main():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=20,
+        default=50,
         help="Max number of exams to request in one run.",
     )
     parser.add_argument(
@@ -312,30 +353,31 @@ def main():
 
         proceed = (
             input(
-                f"\nProceed with attempting to request the first batch of up to {args.batch_size} exams? (y/n): "
+                f"\nProceed with attempting to export {args.batch_size} exams? (y/n): "
             )
             .lower()
             .strip()
         )
         if proceed == "y":
-            outcomes, already_exported_count = execute_downloads(
-                targets, args.batch_size
+            outcomes, already_exported_count, successfully_exported_count = (
+                execute_downloads(targets, args.batch_size)
             )
 
-            submitted_count = 0
             if outcomes:
                 for index, outcome in outcomes.items():
                     db.loc[index, "download_attempt_outcome"] = outcome
                     if outcome == "Request Submitted":
                         db.loc[index, "export_requested_on"] = datetime.now()
-                        submitted_count += 1
 
             print("\n--- Run Summary ---")
             print(
-                f"Successfully submitted export requests for: {submitted_count} exams."
+                f"Successfully submitted export requests for: {successfully_exported_count} exams."
             )
             print(
                 f"Discovered to be already exported:        {already_exported_count} exams."
+            )
+            print(
+                f"Total exams processed:                    {successfully_exported_count + already_exported_count} exams."
             )
         else:
             print("Download cancelled by user.")
