@@ -4,16 +4,47 @@ Script extracted from dev.ipynb
 Performs ChiMEC patient data analysis and generates plots
 """
 
+import argparse
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import pandas as pd
 
+# argument parser
+parser = argparse.ArgumentParser(
+    description="Analyze imaging metadata for specified modality"
+)
+parser.add_argument(
+    "--modality",
+    type=str,
+    default="MG",
+    choices=[
+        "CR",
+        "DX",
+        "MG",
+        "US",
+        "CT",
+        "MR",
+        "NM",
+        "PT",
+        "XA",
+        "RF",
+        "ES",
+        "XC",
+        "PX",
+        "RG",
+    ],
+    help="Base modality to analyze (default: MG)",
+)
+args = parser.parse_args()
+
+SELECTED_MODALITY = args.modality
+
 # create plots directory if it doesn't exist
 plots_dir = Path("plots")
 plots_dir.mkdir(exist_ok=True)
 
-print("=== LOADING DATA ===")
+print(f"=== LOADING DATA FOR MODALITY: {SELECTED_MODALITY} ===")
 # load data
 chimec_patients = pd.read_csv(
     "/gpfs/data/phs/groups/Projects/Huo_projects/SPORE/annawoodard/List_ChiMEC_priority_2025July30.csv"
@@ -110,13 +141,15 @@ def create_screening_mammograms_plot(
     case_screening_per_patient,
     case_before_dx_month_per_patient,
     control_screening_per_patient,
-    case_screening_mammograms,
-    case_before_dx_month_mammograms,
-    control_screening_mammograms,
+    case_screening_scans,
+    case_before_dx_month_scans,
+    control_screening_scans,
     chip_status,
     plots_dir,
+    modality="MG",
 ):
-    """create screening mammograms plot"""
+    """create screening scans plot"""
+    modality_label = BASE_MODALITY_LABELS.get(modality, modality.lower())
     fig, ((ax1, ax2, ax3), (ax4, ax5, ax6)) = plt.subplots(2, 3, figsize=(24, 12))
 
     # cases - mammograms >3 months before diagnosis
@@ -131,8 +164,8 @@ def create_screening_mammograms_plot(
     else:
         ax1.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax1.transAxes)
 
-    ax1.set_title("cases\n(mammograms >3 months before diagnosis)")
-    ax1.set_xlabel("number of screening mammograms per patient")
+    ax1.set_title(f"cases\n({modality_label} >3 months before diagnosis)")
+    ax1.set_xlabel(f"number of screening {modality_label} scans per patient")
     ax1.set_ylabel("number of patients")
     ax1.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
 
@@ -148,8 +181,8 @@ def create_screening_mammograms_plot(
     else:
         ax2.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax2.transAxes)
 
-    ax2.set_title("cases\n(mammograms before/including dx month)")
-    ax2.set_xlabel("number of mammograms per patient")
+    ax2.set_title(f"cases\n({modality_label} before/including dx month)")
+    ax2.set_xlabel(f"number of {modality_label} scans per patient")
     ax2.set_ylabel("number of patients")
     ax2.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
 
@@ -165,8 +198,8 @@ def create_screening_mammograms_plot(
     else:
         ax3.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax3.transAxes)
 
-    ax3.set_title("controls\n(all mammograms)")
-    ax3.set_xlabel("number of mammograms per patient")
+    ax3.set_title(f"controls\n(all {modality_label})")
+    ax3.set_xlabel(f"number of {modality_label} scans per patient")
     ax3.set_ylabel("number of patients")
     ax3.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
 
@@ -174,7 +207,7 @@ def create_screening_mammograms_plot(
     categories = [
         "cases\n(>3 months before dx)",
         "cases\n(before/including dx month)",
-        "controls\n(all mammograms)",
+        f"controls\n(all {modality_label})",
     ]
     counts = [
         len(case_screening_per_patient),
@@ -183,7 +216,7 @@ def create_screening_mammograms_plot(
     ]
 
     bars4 = ax4.bar(categories, counts, alpha=0.7, edgecolor="black")
-    ax4.set_title("total patients with mammograms")
+    ax4.set_title(f"total patients with {modality_label}")
     ax4.set_ylabel("number of patients")
     ax4.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
 
@@ -198,41 +231,39 @@ def create_screening_mammograms_plot(
             va="bottom",
         )
 
-    # fifth panel - total mammograms by category
-    categories_mammograms = [
+    # fifth panel - total scans by category
+    categories_scans = [
         "cases\n(>3 months before dx)",
         "cases\n(before/including dx month)",
-        "controls\n(all mammograms)",
+        f"controls\n(all {modality_label})",
     ]
-    total_mammograms = [
-        len(case_screening_mammograms),
-        len(case_before_dx_month_mammograms),
-        len(control_screening_mammograms),
+    total_scans = [
+        len(case_screening_scans),
+        len(case_before_dx_month_scans),
+        len(control_screening_scans),
     ]
 
-    bars5 = ax5.bar(
-        categories_mammograms, total_mammograms, alpha=0.7, edgecolor="black"
-    )
-    ax5.set_title("total mammograms by category")
-    ax5.set_ylabel("number of mammograms")
+    bars5 = ax5.bar(categories_scans, total_scans, alpha=0.7, edgecolor="black")
+    ax5.set_title(f"total {modality_label} scans by category")
+    ax5.set_ylabel(f"number of {modality_label} scans")
     ax5.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
 
     # add value labels on bars
-    for bar, count in zip(bars5, total_mammograms):
+    for bar, count in zip(bars5, total_scans):
         height = bar.get_height()
         ax5.text(
             bar.get_x() + bar.get_width() / 2.0,
-            height + 0.01 * max(total_mammograms),
+            height + 0.01 * max(total_scans),
             f"{count}",
             ha="center",
             va="bottom",
         )
 
-    # sixth panel - mammogram year distribution comparison
-    if len(case_screening_mammograms) > 0 and len(control_screening_mammograms) > 0:
-        # extract years from mammogram dates
-        case_years = case_screening_mammograms["Study DateTime"].dt.year
-        control_years = control_screening_mammograms["Study DateTime"].dt.year
+    # sixth panel - scan year distribution comparison
+    if len(case_screening_scans) > 0 and len(control_screening_scans) > 0:
+        # extract years from scan dates
+        case_years = case_screening_scans["Study DateTime"].dt.year
+        control_years = control_screening_scans["Study DateTime"].dt.year
 
         # create year bins
         min_year = min(case_years.min(), control_years.min())
@@ -257,9 +288,9 @@ def create_screening_mammograms_plot(
             linewidth=2,
         )
 
-        ax6.set_title("screening mammogram years\n(cases vs controls)")
-        ax6.set_xlabel("year of mammogram")
-        ax6.set_ylabel("number of mammograms")
+        ax6.set_title(f"screening {modality_label} years\n(cases vs controls)")
+        ax6.set_xlabel(f"year of {modality_label}")
+        ax6.set_ylabel(f"number of {modality_label} scans")
         ax6.legend()
         ax6.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
 
@@ -275,13 +306,13 @@ def create_screening_mammograms_plot(
             va="center",
             transform=ax6.transAxes,
         )
-        ax6.set_title("screening mammogram years\n(cases vs controls)")
+        ax6.set_title(f"screening {modality_label} years\n(cases vs controls)")
         ax6.set_xticks([])
         ax6.set_yticks([])
 
     plt.tight_layout()
     plt.savefig(
-        plots_dir / f"screening_mammograms_per_patient_{chip_status}.png",
+        plots_dir / f"screening_{modality.lower()}_scans_per_patient_{chip_status}.png",
         dpi=300,
         bbox_inches="tight",
     )
@@ -289,13 +320,18 @@ def create_screening_mammograms_plot(
 
 
 def create_mg_mammograms_per_patient_plot(
-    mg_per_patient, chimec_with_study_id, mg_scans, chip_status, plots_dir
+    selected_modality_per_patient,
+    chimec_with_study_id,
+    selected_modality_scans,
+    chip_status,
+    plots_dir,
+    modality="MG",
 ):
-    """create MG mammograms per patient plot"""
+    """create selected modality scans per patient plot"""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
 
     # get case and control patients
-    mg_with_case_control = mg_scans.merge(
+    selected_modality_with_case_control = selected_modality_scans.merge(
         chimec_with_study_id[["AnonymousID", "case_or_control"]],
         left_on="study_id",
         right_on="AnonymousID",
@@ -303,44 +339,49 @@ def create_mg_mammograms_per_patient_plot(
     )
 
     # cases
-    case_mg_scans = mg_with_case_control[
-        mg_with_case_control["case_or_control"] == "Case"
+    case_selected_modality_scans = selected_modality_with_case_control[
+        selected_modality_with_case_control["case_or_control"] == "Case"
     ]
-    case_mg_per_patient = case_mg_scans["study_id"].value_counts()
+    case_selected_modality_per_patient = case_selected_modality_scans[
+        "study_id"
+    ].value_counts()
 
+    modality_label = BASE_MODALITY_LABELS.get(modality, modality.lower())
     ax1.hist(
-        case_mg_per_patient.values,
-        bins=range(1, max(case_mg_per_patient.max(), 2) + 2),
+        case_selected_modality_per_patient.values,
+        bins=range(1, max(case_selected_modality_per_patient.max(), 2) + 2),
         alpha=0.7,
         edgecolor="black",
     )
     ax1.set_title("cases")
-    ax1.set_xlabel("number of mammograms per patient")
+    ax1.set_xlabel(f"number of {modality_label} scans per patient")
     ax1.set_ylabel("number of patients")
-    ax1.set_xticks(range(1, min(21, case_mg_per_patient.max() + 1)))
+    ax1.set_xticks(range(1, min(21, case_selected_modality_per_patient.max() + 1)))
     ax1.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
 
     # controls
-    control_mg_scans = mg_with_case_control[
-        mg_with_case_control["case_or_control"] == "Control"
+    control_selected_modality_scans = selected_modality_with_case_control[
+        selected_modality_with_case_control["case_or_control"] == "Control"
     ]
-    control_mg_per_patient = control_mg_scans["study_id"].value_counts()
+    control_selected_modality_per_patient = control_selected_modality_scans[
+        "study_id"
+    ].value_counts()
 
     ax2.hist(
-        control_mg_per_patient.values,
-        bins=range(1, max(control_mg_per_patient.max(), 2) + 2),
+        control_selected_modality_per_patient.values,
+        bins=range(1, max(control_selected_modality_per_patient.max(), 2) + 2),
         alpha=0.7,
         edgecolor="black",
     )
     ax2.set_title("controls")
-    ax2.set_xlabel("number of mammograms per patient")
+    ax2.set_xlabel(f"number of {modality_label} scans per patient")
     ax2.set_ylabel("number of patients")
-    ax2.set_xticks(range(1, min(21, control_mg_per_patient.max() + 1)))
+    ax2.set_xticks(range(1, min(21, control_selected_modality_per_patient.max() + 1)))
     ax2.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
 
     plt.tight_layout()
     plt.savefig(
-        plots_dir / f"mg_mammograms_per_patient_{chip_status}.png",
+        plots_dir / f"{modality.lower()}_scans_per_patient_{chip_status}.png",
         dpi=300,
         bbox_inches="tight",
     )
@@ -392,19 +433,26 @@ def create_modality_distribution_plot(metadata, chip_status, plots_dir):
     plt.close()
 
 
-def create_time_analysis_plot(cases_mg, controls_mg, chip_status, plots_dir):
+def create_time_analysis_plot(
+    cases_selected_modality,
+    controls_selected_modality,
+    chip_status,
+    plots_dir,
+    modality="MG",
+):
     """create time analysis plot"""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 6))
 
+    modality_label = BASE_MODALITY_LABELS.get(modality, modality.lower())
     # cases
-    if len(cases_mg) > 0:
-        case_time_to_dx = cases_mg["days_to_dx"].dropna()
+    if len(cases_selected_modality) > 0:
+        case_time_to_dx = cases_selected_modality["days_to_dx"].dropna()
         # convert days to years
         case_time_to_dx_years = case_time_to_dx / 365.25
         ax1.hist(case_time_to_dx_years, bins=50, alpha=0.7, edgecolor="black")
-        ax1.set_title("cases\n(positive = mammogram before diagnosis)")
-        ax1.set_xlabel("years from mammogram to diagnosis")
-        ax1.set_ylabel("number of mammograms")
+        ax1.set_title(f"cases\n(positive = {modality_label} before diagnosis)")
+        ax1.set_xlabel(f"years from {modality_label} to diagnosis")
+        ax1.set_ylabel(f"number of {modality_label} scans")
         ax1.axvline(x=0, color="red", linestyle="--", alpha=0.7, label="diagnosis date")
         ax1.axvline(
             x=90 / 365.25,
@@ -416,31 +464,34 @@ def create_time_analysis_plot(cases_mg, controls_mg, chip_status, plots_dir):
         ax1.legend()
     else:
         ax1.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax1.transAxes)
-        ax1.set_title("cases\n(positive = mammogram before diagnosis)")
-        ax1.set_xlabel("years from mammogram to diagnosis")
-        ax1.set_ylabel("number of mammograms")
+        ax1.set_title(f"cases\n(positive = {modality_label} before diagnosis)")
+        ax1.set_xlabel(f"years from {modality_label} to diagnosis")
+        ax1.set_ylabel(f"number of {modality_label} scans")
 
     # controls
-    if len(controls_mg) > 0:
-        control_time_from_first = controls_mg["days_from_first_mammogram"].dropna()
+    if len(controls_selected_modality) > 0:
+        control_time_from_first = controls_selected_modality[
+            "days_from_first_scan"
+        ].dropna()
         # convert days to years
         control_time_from_first_years = control_time_from_first / 365.25
         ax2.hist(control_time_from_first_years, bins=50, alpha=0.7, edgecolor="black")
         ax2.axvline(
-            x=0, color="red", linestyle="--", alpha=0.7, label="first mammogram"
+            x=0, color="red", linestyle="--", alpha=0.7, label=f"first {modality_label}"
         )
     else:
         ax2.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax2.transAxes)
 
-    ax2.set_title("controls\n(time from first mammogram)")
-    ax2.set_xlabel("years from first mammogram")
-    ax2.set_ylabel("number of mammograms")
-    if len(controls_mg) > 0:
+    ax2.set_title(f"controls\n(time from first {modality_label})")
+    ax2.set_xlabel(f"years from first {modality_label}")
+    ax2.set_ylabel(f"number of {modality_label} scans")
+    if len(controls_selected_modality) > 0:
         ax2.legend()
 
     plt.tight_layout()
     plt.savefig(
-        plots_dir / f"time_analysis_cases_vs_controls_{chip_status}.png",
+        plots_dir
+        / f"time_analysis_{modality.lower()}_cases_vs_controls_{chip_status}.png",
         dpi=300,
         bbox_inches="tight",
     )
@@ -472,17 +523,17 @@ print(
     f"patients with chip + study_id: {(chimec_with_study_id['chip'].notna() & chimec_with_study_id['AnonymousID'].notna()).sum():,}"
 )
 
-# identify chip patients with MG records
+# identify chip patients with selected modality records
 chip_patients_study_ids = chimec_with_study_id[chimec_with_study_id["chip"].notna()][
     "AnonymousID"
 ].dropna()
-mg_records = metadata[metadata["Modality"].str.contains("MG", na=False)]
-chip_patients_with_mg = chip_patients_study_ids[
-    chip_patients_study_ids.isin(mg_records["study_id"])
+selected_modality_records = metadata[metadata["base_modality"] == SELECTED_MODALITY]
+chip_patients_with_selected_modality = chip_patients_study_ids[
+    chip_patients_study_ids.isin(selected_modality_records["study_id"])
 ]
 
 print(
-    f"chip patients with MG records: {len(chip_patients_with_mg):,} / {len(chip_patients_study_ids):,} ({len(chip_patients_with_mg) / len(chip_patients_study_ids) * 100:.1f}%)"
+    f"chip patients with {SELECTED_MODALITY} records: {len(chip_patients_with_selected_modality):,} / {len(chip_patients_study_ids):,} ({len(chip_patients_with_selected_modality) / len(chip_patients_study_ids) * 100:.1f}%)"
 )
 
 # total cases vs controls breakdown (all ChiMEC patients)
@@ -511,7 +562,9 @@ print(
 )
 print(f"patients with imaging: {metadata['study_id'].nunique():,}")
 print(f"genotyped with imaging: {len(chip_patients_study_ids):,}")
-print(f"genotyped with MG imaging: {len(chip_patients_with_mg):,}")
+print(
+    f"genotyped with {SELECTED_MODALITY} imaging: {len(chip_patients_with_selected_modality):,}"
+)
 
 # time-to-diagnosis analysis for cases
 print("\n=== TIME-TO-DIAGNOSIS ANALYSIS ===")
@@ -528,7 +581,7 @@ cases_with_study_id["DatedxIndex"] = pd.to_datetime(
 cases_imaging = cases_with_study_id.merge(
     metadata, left_on="AnonymousID", right_on="study_id", how="inner"
 )
-cases_imaging = cases_imaging[cases_imaging["base_modality"] == "MG"]
+cases_imaging = cases_imaging[cases_imaging["base_modality"] == SELECTED_MODALITY]
 
 # ensure Study DateTime is datetime type
 cases_imaging["Study DateTime"] = pd.to_datetime(cases_imaging["Study DateTime"])
@@ -671,45 +724,54 @@ print(
 )
 create_modality_distribution_plot(metadata, "all", plots_dir)
 
-# MG mammogram analysis
-print("\n=== MAMMOGRAM ANALYSIS ===")
-# filter for only MG mammograms
-mg_scans = metadata[metadata["base_modality"] == "MG"].copy()
+# selected modality analysis
+print(f"\n=== {SELECTED_MODALITY} ANALYSIS ===")
+# filter for only selected modality scans
+selected_modality_scans = metadata[
+    metadata["base_modality"] == SELECTED_MODALITY
+].copy()
 
-mg_per_patient = mg_scans["study_id"].value_counts()
+selected_modality_per_patient = selected_modality_scans["study_id"].value_counts()
 print(
-    f"total MG scans: {len(mg_scans):,} (patients: {mg_scans['study_id'].nunique():,})"
+    f"total {SELECTED_MODALITY} scans: {len(selected_modality_scans):,} (patients: {selected_modality_scans['study_id'].nunique():,})"
 )
 print(
-    f"mammograms per patient - range: {mg_per_patient.min()}-{mg_per_patient.max()}, mean: {mg_per_patient.mean():.1f}, median: {mg_per_patient.median():.1f}"
+    f"scans per patient - range: {selected_modality_per_patient.min()}-{selected_modality_per_patient.max()}, mean: {selected_modality_per_patient.mean():.1f}, median: {selected_modality_per_patient.median():.1f}"
 )
 
-# create MG mammograms per patient plot for all patients
+# create selected modality scans per patient plot for all patients
 create_mg_mammograms_per_patient_plot(
-    mg_per_patient, chimec_with_study_id, mg_scans, "all", plots_dir
+    selected_modality_per_patient,
+    chimec_with_study_id,
+    selected_modality_scans,
+    "all",
+    plots_dir,
+    SELECTED_MODALITY,
 )
 
-print(f"patients with most mammograms: {mg_per_patient.head(3).to_dict()}")
+print(f"patients with most scans: {selected_modality_per_patient.head(3).to_dict()}")
 
-# screening mammogram analysis
-print("\n=== SCREENING MAMMOGRAM ANALYSIS ===")
-# first merge MG scans with patient data to get DatedxIndex
-mg_with_patient_data = mg_scans.merge(
+# screening analysis
+print(f"\n=== SCREENING {SELECTED_MODALITY} ANALYSIS ===")
+# first merge selected modality scans with patient data to get DatedxIndex
+selected_modality_with_patient_data = selected_modality_scans.merge(
     chimec_with_study_id[["AnonymousID", "DatedxIndex", "case_or_control", "chip"]],
     left_on="study_id",
     right_on="AnonymousID",
     how="inner",
 )
 
-print(f"MG scans with patient data: {len(mg_with_patient_data)}")
+print(
+    f"{SELECTED_MODALITY} scans with patient data: {len(selected_modality_with_patient_data)}"
+)
 
 # genotyping coverage in imaging population
-total_imaging_patients = mg_with_patient_data["study_id"].nunique()
-genotyped_imaging = mg_with_patient_data[mg_with_patient_data["chip"].notna()][
-    "study_id"
-].nunique()
+total_imaging_patients = selected_modality_with_patient_data["study_id"].nunique()
+genotyped_imaging = selected_modality_with_patient_data[
+    selected_modality_with_patient_data["chip"].notna()
+]["study_id"].nunique()
 print(
-    f"ChiMEC patients with MG imaging: {total_imaging_patients:,} (genotyped: {genotyped_imaging:,}, {genotyped_imaging / total_imaging_patients * 100:.1f}%)"
+    f"ChiMEC patients with {SELECTED_MODALITY} imaging: {total_imaging_patients:,} (genotyped: {genotyped_imaging:,}, {genotyped_imaging / total_imaging_patients * 100:.1f}%)"
 )
 if genotyped_imaging == total_imaging_patients:
     print(
@@ -717,72 +779,79 @@ if genotyped_imaging == total_imaging_patients:
     )
 
 # convert dates to datetime
-mg_with_patient_data["Study DateTime"] = pd.to_datetime(
-    mg_with_patient_data["Study DateTime"]
+selected_modality_with_patient_data["Study DateTime"] = pd.to_datetime(
+    selected_modality_with_patient_data["Study DateTime"]
 )
-mg_with_patient_data["DatedxIndex"] = pd.to_datetime(
-    mg_with_patient_data["DatedxIndex"], format="%d/%m/%Y"
+selected_modality_with_patient_data["DatedxIndex"] = pd.to_datetime(
+    selected_modality_with_patient_data["DatedxIndex"], format="%d/%m/%Y"
 )
 
-# calculate time difference in days (positive = mammogram before diagnosis)
-mg_with_patient_data["days_to_dx"] = (
-    mg_with_patient_data["DatedxIndex"] - mg_with_patient_data["Study DateTime"]
+# calculate time difference in days (positive = scan before diagnosis)
+selected_modality_with_patient_data["days_to_dx"] = (
+    selected_modality_with_patient_data["DatedxIndex"]
+    - selected_modality_with_patient_data["Study DateTime"]
 ).dt.days
 
 # separate cases and controls for screening analysis
-cases_mg = mg_with_patient_data[
-    mg_with_patient_data["case_or_control"] == "Case"
+cases_selected_modality = selected_modality_with_patient_data[
+    selected_modality_with_patient_data["case_or_control"] == "Case"
 ].copy()
-controls_mg = mg_with_patient_data[
-    mg_with_patient_data["case_or_control"] == "Control"
+controls_selected_modality = selected_modality_with_patient_data[
+    selected_modality_with_patient_data["case_or_control"] == "Control"
 ].copy()
 
-# for cases: filter for screening mammograms (> 3 months = 90 days before diagnosis)
-case_screening_mammograms = cases_mg[cases_mg["days_to_dx"] > 90].copy()
+# for cases: filter for screening scans (> 3 months = 90 days before diagnosis)
+case_screening_scans = cases_selected_modality[
+    cases_selected_modality["days_to_dx"] > 90
+].copy()
 
-# for cases: filter for mammograms anytime before and including diagnosis month
+# for cases: filter for scans anytime before and including diagnosis month
 # convert to year-month for comparison
-cases_mg["mammogram_ym"] = cases_mg["Study DateTime"].dt.to_period("M")
-cases_mg["diagnosis_ym"] = cases_mg["DatedxIndex"].dt.to_period("M")
-case_before_dx_month_mammograms = cases_mg[
-    cases_mg["mammogram_ym"] <= cases_mg["diagnosis_ym"]
+cases_selected_modality["scan_ym"] = cases_selected_modality[
+    "Study DateTime"
+].dt.to_period("M")
+cases_selected_modality["diagnosis_ym"] = cases_selected_modality[
+    "DatedxIndex"
+].dt.to_period("M")
+case_before_dx_month_scans = cases_selected_modality[
+    cases_selected_modality["scan_ym"] <= cases_selected_modality["diagnosis_ym"]
 ].copy()
 
-# for controls: all mammograms are considered (no diagnosis date filter)
-control_screening_mammograms = controls_mg.copy()
+# for controls: all scans are considered (no diagnosis date filter)
+control_screening_scans = controls_selected_modality.copy()
 
 print(
-    f"case screening mammograms (>90 days before dx): {len(case_screening_mammograms):,} ({case_screening_mammograms['study_id'].nunique() if len(case_screening_mammograms) > 0 else 0:,} patients)"
+    f"case screening scans (>90 days before dx): {len(case_screening_scans):,} ({case_screening_scans['study_id'].nunique() if len(case_screening_scans) > 0 else 0:,} patients)"
 )
 print(
-    f"case mammograms (before/including dx month): {len(case_before_dx_month_mammograms):,} ({case_before_dx_month_mammograms['study_id'].nunique() if len(case_before_dx_month_mammograms) > 0 else 0:,} patients)"
+    f"case scans (before/including dx month): {len(case_before_dx_month_scans):,} ({case_before_dx_month_scans['study_id'].nunique() if len(case_before_dx_month_scans) > 0 else 0:,} patients)"
 )
 print(
-    f"control mammograms (all): {len(control_screening_mammograms):,} ({control_screening_mammograms['study_id'].nunique() if len(control_screening_mammograms) > 0 else 0:,} patients)"
+    f"control scans (all): {len(control_screening_scans):,} ({control_screening_scans['study_id'].nunique() if len(control_screening_scans) > 0 else 0:,} patients)"
 )
 
-# count screening mammograms per patient for cases
+# count screening scans per patient for cases
 case_screening_per_patient = (
-    case_screening_mammograms["study_id"].value_counts()
-    if len(case_screening_mammograms) > 0
+    case_screening_scans["study_id"].value_counts()
+    if len(case_screening_scans) > 0
     else pd.Series(dtype=int)
 )
 
-# count mammograms before/including diagnosis month per patient for cases
+# count scans before/including diagnosis month per patient for cases
 case_before_dx_month_per_patient = (
-    case_before_dx_month_mammograms["study_id"].value_counts()
-    if len(case_before_dx_month_mammograms) > 0
+    case_before_dx_month_scans["study_id"].value_counts()
+    if len(case_before_dx_month_scans) > 0
     else pd.Series(dtype=int)
 )
 
-# count all mammograms per patient for controls
+# count all scans per patient for controls
 control_screening_per_patient = (
-    control_screening_mammograms["study_id"].value_counts()
-    if len(control_screening_mammograms) > 0
+    control_screening_scans["study_id"].value_counts()
+    if len(control_screening_scans) > 0
     else pd.Series(dtype=int)
 )
 
-# mammograms per patient summary
+# scans per patient summary
 if len(case_screening_per_patient) > 0:
     print(
         f"case screening per patient - range: {case_screening_per_patient.min()}-{case_screening_per_patient.max()}, mean: {case_screening_per_patient.mean():.1f}"
@@ -796,68 +865,82 @@ if len(control_screening_per_patient) > 0:
         f"control per patient - range: {control_screening_per_patient.min()}-{control_screening_per_patient.max()}, mean: {control_screening_per_patient.mean():.1f}"
     )
 
-# create screening mammograms plot for all patients
+# create screening scans plot for all patients
 create_screening_mammograms_plot(
     case_screening_per_patient,
     case_before_dx_month_per_patient,
     control_screening_per_patient,
-    case_screening_mammograms,
-    case_before_dx_month_mammograms,
-    control_screening_mammograms,
+    case_screening_scans,
+    case_before_dx_month_scans,
+    control_screening_scans,
     "all",
     plots_dir,
+    SELECTED_MODALITY,
 )
 
 
-# histogram of time to DatedxIndex for cases and time from first mammogram for controls
+# histogram of time to DatedxIndex for cases and time from first scan for controls
 print("\n=== TIME ANALYSIS ===")
 
 # separate cases and controls
-cases_mg = mg_with_patient_data[
-    mg_with_patient_data["case_or_control"] == "Case"
+cases_selected_modality_time = selected_modality_with_patient_data[
+    selected_modality_with_patient_data["case_or_control"] == "Case"
 ].copy()
-controls_mg = mg_with_patient_data[
-    mg_with_patient_data["case_or_control"] == "Control"
+controls_selected_modality_time = selected_modality_with_patient_data[
+    selected_modality_with_patient_data["case_or_control"] == "Control"
 ].copy()
 
-# for controls, calculate time from first mammogram
-if len(controls_mg) > 0:
-    controls_mg = controls_mg.sort_values("Study DateTime")
-    first_mammogram_dates = controls_mg.groupby("study_id")["Study DateTime"].first()
-    controls_mg = controls_mg.merge(
-        first_mammogram_dates.rename("first_mammogram_date"),
+# for controls, calculate time from first scan
+if len(controls_selected_modality_time) > 0:
+    controls_selected_modality_time = controls_selected_modality_time.sort_values(
+        "Study DateTime"
+    )
+    first_scan_dates = controls_selected_modality_time.groupby("study_id")[
+        "Study DateTime"
+    ].first()
+    controls_selected_modality_time = controls_selected_modality_time.merge(
+        first_scan_dates.rename("first_scan_date"),
         left_on="study_id",
         right_index=True,
     )
-    controls_mg["days_from_first_mammogram"] = (
-        controls_mg["Study DateTime"] - controls_mg["first_mammogram_date"]
+    controls_selected_modality_time["days_from_first_scan"] = (
+        controls_selected_modality_time["Study DateTime"]
+        - controls_selected_modality_time["first_scan_date"]
     ).dt.days
 
 # time analysis summary
-if len(cases_mg) > 0:
-    case_time_to_dx = cases_mg["days_to_dx"].dropna()
+if len(cases_selected_modality_time) > 0:
+    case_time_to_dx = cases_selected_modality_time["days_to_dx"].dropna()
     print(
-        f"case MG scans: {len(case_time_to_dx):,} (before dx: {(case_time_to_dx > 0).sum():,}, after: {(case_time_to_dx < 0).sum():,}, on dx day: {(case_time_to_dx == 0).sum():,})"
+        f"case {SELECTED_MODALITY} scans: {len(case_time_to_dx):,} (before dx: {(case_time_to_dx > 0).sum():,}, after: {(case_time_to_dx < 0).sum():,}, on dx day: {(case_time_to_dx == 0).sum():,})"
     )
     print(
         f"case time to dx - range: {case_time_to_dx.min():.0f} to {case_time_to_dx.max():.0f} days, mean: {case_time_to_dx.mean():.0f}, median: {case_time_to_dx.median():.0f}"
     )
 
-if len(controls_mg) > 0:
-    control_time_from_first = controls_mg["days_from_first_mammogram"].dropna()
+if len(controls_selected_modality_time) > 0:
+    control_time_from_first = controls_selected_modality_time[
+        "days_from_first_scan"
+    ].dropna()
     print(
-        f"control MG scans: {len(control_time_from_first):,} with time from first mammogram"
+        f"control {SELECTED_MODALITY} scans: {len(control_time_from_first):,} with time from first scan"
     )
     print(
         f"control time from first - range: {control_time_from_first.min():.0f} to {control_time_from_first.max():.0f} days, mean: {control_time_from_first.mean():.0f}, median: {control_time_from_first.median():.0f}"
     )
 
 # create time analysis plot for all patients
-create_time_analysis_plot(cases_mg, controls_mg, "all", plots_dir)
+create_time_analysis_plot(
+    cases_selected_modality_time,
+    controls_selected_modality_time,
+    "all",
+    plots_dir,
+    SELECTED_MODALITY,
+)
 
 # time period breakdown
-if len(cases_mg) > 0:
-    case_time_to_dx = cases_mg["days_to_dx"].dropna()
+if len(cases_selected_modality_time) > 0:
+    case_time_to_dx = cases_selected_modality_time["days_to_dx"].dropna()
     screening = (case_time_to_dx > 90).sum()
     diagnostic = ((case_time_to_dx >= 0) & (case_time_to_dx <= 90)).sum()
     after = (case_time_to_dx < 0).sum()
@@ -865,8 +948,10 @@ if len(cases_mg) > 0:
         f"case time periods - screening (>90d): {screening:,}, diagnostic (0-90d): {diagnostic:,}, after dx: {after:,}"
     )
 
-if len(controls_mg) > 0:
-    control_time_from_first = controls_mg["days_from_first_mammogram"].dropna()
+if len(controls_selected_modality_time) > 0:
+    control_time_from_first = controls_selected_modality_time[
+        "days_from_first_scan"
+    ].dropna()
     first = (control_time_from_first == 0).sum()
     followup = (control_time_from_first > 0).sum()
     within_year = (
@@ -892,130 +977,149 @@ print(
 # create genotyped-only modality distribution plot
 create_modality_distribution_plot(genotyped_metadata, "genotyped", plots_dir)
 
-# create genotyped-only MG mammograms per patient plot
-genotyped_mg_scans = genotyped_metadata[
-    genotyped_metadata["base_modality"] == "MG"
+# create genotyped-only selected modality scans per patient plot
+genotyped_selected_modality_scans = genotyped_metadata[
+    genotyped_metadata["base_modality"] == SELECTED_MODALITY
 ].copy()
-genotyped_mg_per_patient = genotyped_mg_scans["study_id"].value_counts()
+genotyped_selected_modality_per_patient = genotyped_selected_modality_scans[
+    "study_id"
+].value_counts()
 create_mg_mammograms_per_patient_plot(
-    genotyped_mg_per_patient,
+    genotyped_selected_modality_per_patient,
     genotyped_patients,
-    genotyped_mg_scans,
+    genotyped_selected_modality_scans,
     "genotyped",
     plots_dir,
+    SELECTED_MODALITY,
 )
 
-# create genotyped-only screening mammograms analysis
-genotyped_mg_with_patient_data = genotyped_mg_scans.merge(
+# create genotyped-only screening analysis
+genotyped_selected_modality_with_patient_data = genotyped_selected_modality_scans.merge(
     genotyped_patients[["AnonymousID", "DatedxIndex", "case_or_control"]],
     left_on="study_id",
     right_on="AnonymousID",
     how="inner",
 )
 
-print(f"genotyped MG scans with patient data: {len(genotyped_mg_with_patient_data):,}")
+print(
+    f"genotyped {SELECTED_MODALITY} scans with patient data: {len(genotyped_selected_modality_with_patient_data):,}"
+)
 
 # convert dates to datetime
-genotyped_mg_with_patient_data["Study DateTime"] = pd.to_datetime(
-    genotyped_mg_with_patient_data["Study DateTime"]
+genotyped_selected_modality_with_patient_data["Study DateTime"] = pd.to_datetime(
+    genotyped_selected_modality_with_patient_data["Study DateTime"]
 )
-genotyped_mg_with_patient_data["DatedxIndex"] = pd.to_datetime(
-    genotyped_mg_with_patient_data["DatedxIndex"], format="%d/%m/%Y"
+genotyped_selected_modality_with_patient_data["DatedxIndex"] = pd.to_datetime(
+    genotyped_selected_modality_with_patient_data["DatedxIndex"], format="%d/%m/%Y"
 )
 
-# calculate time difference in days (positive = mammogram before diagnosis)
-genotyped_mg_with_patient_data["days_to_dx"] = (
-    genotyped_mg_with_patient_data["DatedxIndex"]
-    - genotyped_mg_with_patient_data["Study DateTime"]
+# calculate time difference in days (positive = scan before diagnosis)
+genotyped_selected_modality_with_patient_data["days_to_dx"] = (
+    genotyped_selected_modality_with_patient_data["DatedxIndex"]
+    - genotyped_selected_modality_with_patient_data["Study DateTime"]
 ).dt.days
 
 # separate cases and controls for screening analysis
-genotyped_cases_mg = genotyped_mg_with_patient_data[
-    genotyped_mg_with_patient_data["case_or_control"] == "Case"
+genotyped_cases_selected_modality = genotyped_selected_modality_with_patient_data[
+    genotyped_selected_modality_with_patient_data["case_or_control"] == "Case"
 ].copy()
-genotyped_controls_mg = genotyped_mg_with_patient_data[
-    genotyped_mg_with_patient_data["case_or_control"] == "Control"
-].copy()
-
-# for cases: filter for screening mammograms (> 3 months = 90 days before diagnosis)
-genotyped_case_screening_mammograms = genotyped_cases_mg[
-    genotyped_cases_mg["days_to_dx"] > 90
+genotyped_controls_selected_modality = genotyped_selected_modality_with_patient_data[
+    genotyped_selected_modality_with_patient_data["case_or_control"] == "Control"
 ].copy()
 
-# for cases: filter for mammograms anytime before and including diagnosis month
-genotyped_cases_mg["mammogram_ym"] = genotyped_cases_mg["Study DateTime"].dt.to_period(
-    "M"
-)
-genotyped_cases_mg["diagnosis_ym"] = genotyped_cases_mg["DatedxIndex"].dt.to_period("M")
-genotyped_case_before_dx_month_mammograms = genotyped_cases_mg[
-    genotyped_cases_mg["mammogram_ym"] <= genotyped_cases_mg["diagnosis_ym"]
+# for cases: filter for screening scans (> 3 months = 90 days before diagnosis)
+genotyped_case_screening_scans = genotyped_cases_selected_modality[
+    genotyped_cases_selected_modality["days_to_dx"] > 90
 ].copy()
 
-# for controls: all mammograms are considered (no diagnosis date filter)
-genotyped_control_screening_mammograms = genotyped_controls_mg.copy()
+# for cases: filter for scans anytime before and including diagnosis month
+genotyped_cases_selected_modality["scan_ym"] = genotyped_cases_selected_modality[
+    "Study DateTime"
+].dt.to_period("M")
+genotyped_cases_selected_modality["diagnosis_ym"] = genotyped_cases_selected_modality[
+    "DatedxIndex"
+].dt.to_period("M")
+genotyped_case_before_dx_month_scans = genotyped_cases_selected_modality[
+    genotyped_cases_selected_modality["scan_ym"]
+    <= genotyped_cases_selected_modality["diagnosis_ym"]
+].copy()
 
-# count screening mammograms per patient for cases
+# for controls: all scans are considered (no diagnosis date filter)
+genotyped_control_screening_scans = genotyped_controls_selected_modality.copy()
+
+# count screening scans per patient for cases
 genotyped_case_screening_per_patient = (
-    genotyped_case_screening_mammograms["study_id"].value_counts()
-    if len(genotyped_case_screening_mammograms) > 0
+    genotyped_case_screening_scans["study_id"].value_counts()
+    if len(genotyped_case_screening_scans) > 0
     else pd.Series(dtype=int)
 )
 
-# count mammograms before/including diagnosis month per patient for cases
+# count scans before/including diagnosis month per patient for cases
 genotyped_case_before_dx_month_per_patient = (
-    genotyped_case_before_dx_month_mammograms["study_id"].value_counts()
-    if len(genotyped_case_before_dx_month_mammograms) > 0
+    genotyped_case_before_dx_month_scans["study_id"].value_counts()
+    if len(genotyped_case_before_dx_month_scans) > 0
     else pd.Series(dtype=int)
 )
 
-# count all mammograms per patient for controls
+# count all scans per patient for controls
 genotyped_control_screening_per_patient = (
-    genotyped_control_screening_mammograms["study_id"].value_counts()
-    if len(genotyped_control_screening_mammograms) > 0
+    genotyped_control_screening_scans["study_id"].value_counts()
+    if len(genotyped_control_screening_scans) > 0
     else pd.Series(dtype=int)
 )
 
-# create genotyped-only screening mammograms plot
+# create genotyped-only screening scans plot
 create_screening_mammograms_plot(
     genotyped_case_screening_per_patient,
     genotyped_case_before_dx_month_per_patient,
     genotyped_control_screening_per_patient,
-    genotyped_case_screening_mammograms,
-    genotyped_case_before_dx_month_mammograms,
-    genotyped_control_screening_mammograms,
+    genotyped_case_screening_scans,
+    genotyped_case_before_dx_month_scans,
+    genotyped_control_screening_scans,
     "genotyped",
     plots_dir,
+    SELECTED_MODALITY,
 )
 
 # create genotyped-only time analysis
-genotyped_cases_mg_for_time = genotyped_mg_with_patient_data[
-    genotyped_mg_with_patient_data["case_or_control"] == "Case"
-].copy()
-genotyped_controls_mg_for_time = genotyped_mg_with_patient_data[
-    genotyped_mg_with_patient_data["case_or_control"] == "Control"
-].copy()
+genotyped_cases_selected_modality_for_time = (
+    genotyped_selected_modality_with_patient_data[
+        genotyped_selected_modality_with_patient_data["case_or_control"] == "Case"
+    ].copy()
+)
+genotyped_controls_selected_modality_for_time = (
+    genotyped_selected_modality_with_patient_data[
+        genotyped_selected_modality_with_patient_data["case_or_control"] == "Control"
+    ].copy()
+)
 
-# for controls, calculate time from first mammogram
-if len(genotyped_controls_mg_for_time) > 0:
-    genotyped_controls_mg_for_time = genotyped_controls_mg_for_time.sort_values(
-        "Study DateTime"
+# for controls, calculate time from first scan
+if len(genotyped_controls_selected_modality_for_time) > 0:
+    genotyped_controls_selected_modality_for_time = (
+        genotyped_controls_selected_modality_for_time.sort_values("Study DateTime")
     )
-    genotyped_first_mammogram_dates = genotyped_controls_mg_for_time.groupby(
+    genotyped_first_scan_dates = genotyped_controls_selected_modality_for_time.groupby(
         "study_id"
     )["Study DateTime"].first()
-    genotyped_controls_mg_for_time = genotyped_controls_mg_for_time.merge(
-        genotyped_first_mammogram_dates.rename("first_mammogram_date"),
-        left_on="study_id",
-        right_index=True,
+    genotyped_controls_selected_modality_for_time = (
+        genotyped_controls_selected_modality_for_time.merge(
+            genotyped_first_scan_dates.rename("first_scan_date"),
+            left_on="study_id",
+            right_index=True,
+        )
     )
-    genotyped_controls_mg_for_time["days_from_first_mammogram"] = (
-        genotyped_controls_mg_for_time["Study DateTime"]
-        - genotyped_controls_mg_for_time["first_mammogram_date"]
+    genotyped_controls_selected_modality_for_time["days_from_first_scan"] = (
+        genotyped_controls_selected_modality_for_time["Study DateTime"]
+        - genotyped_controls_selected_modality_for_time["first_scan_date"]
     ).dt.days
 
 # create genotyped-only time analysis plot
 create_time_analysis_plot(
-    genotyped_cases_mg_for_time, genotyped_controls_mg_for_time, "genotyped", plots_dir
+    genotyped_cases_selected_modality_for_time,
+    genotyped_controls_selected_modality_for_time,
+    "genotyped",
+    plots_dir,
+    SELECTED_MODALITY,
 )
 
 print("\n=== ANALYSIS COMPLETE ===")
