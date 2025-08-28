@@ -107,3 +107,9 @@ Directories on HIRO will remain after the files are moved. They can be pruned ma
 ### Performance note
 
 Over VPN, throughput was measured at ~3 MB/s (approximately 4 days per terabyte).
+
+### check how many exams have transferred
+
+```bash
+grep '<f++++++++++' hiro2chimec-2025-08-21.log  | awk '{print $5}' | cut -d/ -f1-2 | sort -u | wc -l
+```
