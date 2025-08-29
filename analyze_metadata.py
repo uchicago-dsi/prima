@@ -275,7 +275,7 @@ def create_screening_mammograms_plot(
             case_years,
             bins=year_bins,
             histtype="step",
-            label=f"cases (n={len(case_screening_per_patient)})",
+            label=f"cases (n={len(case_screening_scans)})",
             color="red",
             linewidth=2,
         )
@@ -283,7 +283,7 @@ def create_screening_mammograms_plot(
             control_years,
             bins=year_bins,
             histtype="step",
-            label=f"controls (n={len(control_screening_per_patient)})",
+            label=f"controls (n={len(control_screening_scans)})",
             color="blue",
             linewidth=2,
         )
