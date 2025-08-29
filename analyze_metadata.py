@@ -36,6 +36,11 @@ parser.add_argument(
     ],
     help="Base modality to analyze (default: MG)",
 )
+parser.add_argument(
+    "--dump-screening-patients",
+    action="store_true",
+    help="Dump CSV of patients with screening scans at least 3 months before diagnosis",
+)
 args = parser.parse_args()
 
 SELECTED_MODALITY = args.modality
@@ -150,7 +155,9 @@ def create_screening_mammograms_plot(
 ):
     """create screening scans plot"""
     modality_label = BASE_MODALITY_LABELS.get(modality, modality.lower())
-    fig, ((ax1, ax2, ax3), (ax4, ax5, ax6)) = plt.subplots(2, 3, figsize=(24, 12))
+    fig, ((ax1, ax2, ax3), (ax4, ax5, ax6), (ax7, ax8, ax9)) = plt.subplots(
+        3, 3, figsize=(24, 18)
+    )
 
     # cases - mammograms >3 months before diagnosis
     if len(case_screening_per_patient) > 0:
@@ -293,6 +300,7 @@ def create_screening_mammograms_plot(
         ax6.set_ylabel(f"number of {modality_label} scans")
         ax6.legend()
         ax6.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+        ax6.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
 
         # rotate x-axis labels if needed
         if max_year - min_year > 10:
@@ -309,6 +317,35 @@ def create_screening_mammograms_plot(
         ax6.set_title(f"screening {modality_label} years\n(cases vs controls)")
         ax6.set_xticks([])
         ax6.set_yticks([])
+
+    # seventh panel - months between screening exam and diagnosis for cases
+    if len(case_screening_scans) > 0:
+        # calculate months between screening exam and diagnosis
+        months_to_dx = (
+            case_screening_scans["days_to_dx"] / 30.44
+        )  # average days per month
+
+        ax7.hist(months_to_dx, bins=30, alpha=0.7, edgecolor="black")
+        ax7.set_title(f"cases\n(months from screening {modality_label} to diagnosis)")
+        ax7.set_xlabel("months from screening to diagnosis")
+        ax7.set_ylabel(f"number of {modality_label} scans")
+        ax7.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+    else:
+        ax7.text(
+            0.5,
+            0.5,
+            "no data",
+            ha="center",
+            va="center",
+            transform=ax7.transAxes,
+        )
+        ax7.set_title(f"cases\n(months from screening {modality_label} to diagnosis)")
+        ax7.set_xticks([])
+        ax7.set_yticks([])
+
+    # hide unused panels
+    ax8.axis("off")
+    ax9.axis("off")
 
     plt.tight_layout()
     plt.savefig(
@@ -731,6 +768,14 @@ selected_modality_scans = metadata[
     metadata["base_modality"] == SELECTED_MODALITY
 ].copy()
 
+# additional filtering for MR modality - only include scans with "BREAST" in description
+if SELECTED_MODALITY == "MR":
+    breast_filter = selected_modality_scans["StudyDescription"].str.contains(
+        "BREAST", case=False, na=False
+    )
+    selected_modality_scans = selected_modality_scans[breast_filter].copy()
+    print("filtered MR scans to only include those with 'BREAST' in description")
+
 selected_modality_per_patient = selected_modality_scans["study_id"].value_counts()
 print(
     f"total {SELECTED_MODALITY} scans: {len(selected_modality_scans):,} (patients: {selected_modality_scans['study_id'].nunique():,})"
@@ -1125,3 +1170,78 @@ create_time_analysis_plot(
 print("\n=== ANALYSIS COMPLETE ===")
 print(f"plots saved to: {plots_dir.absolute()}")
 print("created 'all' and 'genotyped' versions of all plots")
+
+# dump screening patients if requested
+if args.dump_screening_patients:
+    print(f"\n=== DUMPING SCREENING PATIENTS FOR {SELECTED_MODALITY} ===")
+
+    # get case patients with screening scans (>90 days before diagnosis)
+    screening_patients_data = case_screening_scans.copy()
+
+    if len(screening_patients_data) > 0:
+        # merge with chimec_patients to get MRN
+        screening_patients_with_mrn = screening_patients_data.merge(
+            key[["AnonymousID", "MRN"]],
+            left_on="study_id",
+            right_on="AnonymousID",
+            how="left",
+        )
+
+        # create CSV with requested columns
+        csv_data = screening_patients_with_mrn[
+            ["MRN", "study_id", "DatedxIndex", "StudyDescription", "Study DateTime"]
+        ].copy()
+
+        # rename columns for clarity
+        csv_data = csv_data.rename(
+            columns={
+                "study_id": "study_id",
+                "DatedxIndex": "DX_date",
+                "StudyDescription": "scan_description",
+                "Study DateTime": "scan_date",
+            }
+        )
+
+        # sort by patient MRN then scan date
+        csv_data = csv_data.sort_values(["MRN", "scan_date"])
+
+        # save CSV
+        csv_filename = f"screening_patients_{SELECTED_MODALITY.lower()}.csv"
+        csv_data.to_csv(csv_filename, index=False)
+
+        # summary statistics
+        unique_patients = csv_data["MRN"].nunique()
+        total_scans = len(csv_data)
+
+        print(
+            f"patients with screening {SELECTED_MODALITY} scans (≥3 months before DX): {unique_patients:,}"
+        )
+        print(f"total screening {SELECTED_MODALITY} scans: {total_scans:,}")
+        print(f"average scans per patient: {total_scans / unique_patients:.1f}")
+        print(f"CSV saved to: {csv_filename}")
+
+        # bin patients by scan date (every 2 years)
+        print(f"\n--- {SELECTED_MODALITY} screening scans by time period ---")
+        csv_data["scan_year"] = pd.to_datetime(csv_data["scan_date"]).dt.year
+        min_year = csv_data["scan_year"].min()
+        max_year = csv_data["scan_year"].max()
+
+        # create 2-year bins
+        bin_edges = list(
+            range(min_year, max_year + 3, 2)
+        )  # +3 to include the last year
+        csv_data["year_bin"] = pd.cut(
+            csv_data["scan_year"], bins=bin_edges, right=False, include_lowest=True
+        )
+
+        # count scans per bin
+        scans_per_bin = csv_data["year_bin"].value_counts().sort_index()
+
+        for bin_range, count in scans_per_bin.items():
+            print(f"{bin_range}: {count:,} scans")
+
+    else:
+        print(
+            f"no case patients found with screening {SELECTED_MODALITY} scans (≥3 months before diagnosis)"
+        )
+        print("CSV file not created")
