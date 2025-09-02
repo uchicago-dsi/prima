@@ -868,6 +868,27 @@ control_screening_scans = controls_selected_modality.copy()
 print(
     f"case screening scans (>90 days before dx): {len(case_screening_scans):,} ({case_screening_scans['study_id'].nunique() if len(case_screening_scans) > 0 else 0:,} patients)"
 )
+
+# check genotyping coverage in screening cases
+if len(case_screening_scans) > 0:
+    screening_patients_genotyped = case_screening_scans[
+        case_screening_scans["chip"].notna()
+    ]["study_id"].nunique()
+    total_screening_patients = case_screening_scans["study_id"].nunique()
+    print(
+        f"  - screening case patients genotyped: {screening_patients_genotyped:,} / {total_screening_patients:,} ({screening_patients_genotyped / total_screening_patients * 100:.1f}%)"
+    )
+
+    # identify any non-genotyped screening patients
+    non_genotyped_screening = case_screening_scans[case_screening_scans["chip"].isna()][
+        "study_id"
+    ].unique()
+    if len(non_genotyped_screening) > 0:
+        print(
+            f"  - non-genotyped screening case patients: {list(non_genotyped_screening)}"
+        )
+    else:
+        print("  - all screening case patients are genotyped")
 print(
     f"case scans (before/including dx month): {len(case_before_dx_month_scans):,} ({case_before_dx_month_scans['study_id'].nunique() if len(case_before_dx_month_scans) > 0 else 0:,} patients)"
 )
@@ -1026,6 +1047,15 @@ create_modality_distribution_plot(genotyped_metadata, "genotyped", plots_dir)
 genotyped_selected_modality_scans = genotyped_metadata[
     genotyped_metadata["base_modality"] == SELECTED_MODALITY
 ].copy()
+
+# additional filtering for MR modality - only include scans with "BREAST" in description
+if SELECTED_MODALITY == "MR":
+    breast_filter = genotyped_selected_modality_scans["StudyDescription"].str.contains(
+        "BREAST", case=False, na=False
+    )
+    genotyped_selected_modality_scans = genotyped_selected_modality_scans[
+        breast_filter
+    ].copy()
 genotyped_selected_modality_per_patient = genotyped_selected_modality_scans[
     "study_id"
 ].value_counts()
