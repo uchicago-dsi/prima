@@ -57,6 +57,12 @@ def load_and_merge_data():
         print(f"Loaded {len(key):,} rows from study_id-MRN key file.")
         metadata = pd.read_csv(METADATA_FILE)
         print(f"Loaded {len(metadata):,} exam records from raw metadata file.")
+
+        # A small fix: The Accession number is often what we care about, not the old exam_id
+        # Let's rename exam_id to Accession if Accession is missing.
+        if "exam_id" in metadata.columns and "Accession" in metadata.columns:
+            metadata["Accession"] = metadata["Accession"].fillna(metadata["exam_id"])
+
         metadata["base_modality"] = metadata["Modality"].apply(get_base_modality)
         print("  - Added 'base_modality' column.")
     except FileNotFoundError as e:
@@ -79,10 +85,7 @@ def load_and_merge_data():
         db["DatedxIndex"], errors="coerce", dayfirst=True
     )
 
-    conditions = [
-        db["DatedxIndex"].notna(),
-        db["_in_patient_file"] == True,
-    ]
+    conditions = [db["DatedxIndex"].notna(), db["_in_patient_file"] == True]
     choices = ["Case", "Control"]
     db["case_control_status"] = np.select(conditions, choices, default="Unknown")
     print("  - Derived Case/Control status based on DatedxIndex:")
@@ -91,36 +94,81 @@ def load_and_merge_data():
     db.drop(columns=["_in_patient_file"], inplace=True)
     db.dropna(subset=["study_id", "Study DateTime", "StudyDescription"], inplace=True)
 
+    # This column will be populated by check_disk_for_downloads
+    db["is_exported"] = db["Accession"].notna()
+    print(
+        f"Marked {db['is_exported'].sum():,} exams as 'is_exported' based on having an Accession number."
+    )
+
     print(f"\nMaster database created with {len(db):,} total exam records.")
     return db
 
 
 def check_disk_for_downloads(df: pd.DataFrame, basedir: str):
+    """
+    Audits the filesystem to find which exams have been downloaded.
+    Handles various naming conventions (e.g., ACCESSION, ACCESSION-DATE, ACCESSION.tar.xz).
+    """
     print(f"\n--- Phase 2: Auditing Filesystem for Downloads in {basedir} ---")
-    df["is_downloaded"] = False
-    exams_with_accession = df[df["Accession"].notna()]
-    if exams_with_accession.empty:
+
+    # Initialize the new column with False
+    df["is_on_disk"] = False
+
+    # Filter for rows that *could* be checked (have an Accession and study_id)
+    checkable_df = df.dropna(subset=["Accession", "study_id"]).copy()
+    if checkable_df.empty:
         print(
-            "No exams with known Accession Numbers in metadata. Cannot pre-emptively check download status."
+            "No exams with Accession Numbers found in metadata. Cannot check filesystem."
         )
         return df
-    found_accessions = set()
-    if os.path.isdir(basedir):
-        all_patient_dirs = [d for d in os.scandir(basedir) if d.is_dir()]
-        for entry in tqdm(all_patient_dirs, desc="Scanning patient dirs"):
-            for sub_entry in os.scandir(entry.path):
-                accession = re.split(r"[-.]", sub_entry.name)[0]
-                if accession:
-                    found_accessions.add(accession)
-    else:
-        print(f"WARNING: Base directory not found: {basedir}.", file=sys.stderr)
+
+    # --- Optimization: Pre-scan the entire directory structure once ---
     print(
-        f"Found {len(found_accessions):,} unique downloaded accession numbers on disk."
+        "Pre-scanning all patient directories to build an inventory of downloaded files..."
     )
-    downloaded_mask = df["Accession"].isin(found_accessions)
-    df.loc[downloaded_mask, "is_downloaded"] = True
+    # This dictionary will map: {patient_id: {base_accession_1, base_accession_2, ...}}
+    inventory = {}
+    if not os.path.isdir(basedir):
+        print(f"WARNING: Base directory not found: {basedir}", file=sys.stderr)
+    else:
+        # Use os.scandir for better performance than os.listdir
+        patient_dirs = [d for d in os.scandir(basedir) if d.is_dir()]
+        for entry in tqdm(patient_dirs, desc="Building file inventory"):
+            patient_id = entry.name
+            found_accessions = set()
+            try:
+                for item in os.scandir(entry.path):
+                    # Normalize the name: split by common delimiters and take the first part
+                    base_accession = re.split(r"[-.]", item.name)[0]
+                    if base_accession:
+                        found_accessions.add(base_accession)
+                if found_accessions:
+                    inventory[patient_id] = found_accessions
+            except (FileNotFoundError, PermissionError):
+                continue
+    print(f"Inventory complete. Found data for {len(inventory)} patients.")
+
+    # --- Logic to check against the inventory ---
+    def check_row(row):
+        # Ensure study_id is a clean string without decimals for dict lookup
+        patient_id = str(int(row["study_id"]))
+        accession = str(row["Accession"])
+
+        # Check if we have any inventory for this patient, and if the accession is in their set
+        if patient_id in inventory and accession in inventory[patient_id]:
+            return True
+        return False
+
+    print("Matching metadata against file inventory...")
+    # Apply the check only to the relevant subset of the DataFrame
+    on_disk_mask = checkable_df.apply(check_row, axis=1)
+
+    # Update the original DataFrame using the index from our checkable subset
+    # This is safe because on_disk_mask shares its index with checkable_df, which is a slice of df
+    df.loc[on_disk_mask[on_disk_mask].index, "is_on_disk"] = True
+
     print(
-        f"{df['is_downloaded'].sum():,} exams in the database are marked as downloaded."
+        f"  - Marked {df['is_on_disk'].sum():,} exams in the database as 'is_on_disk'."
     )
     return df
 
@@ -137,10 +185,22 @@ def identify_download_targets(
     targets = df[modality_mask].copy()
     print(f"  - Kept {len(targets):,} exams after filtering for modality '{modality}'.")
 
-    mask_downloaded = targets["is_downloaded"] == True
-    targets.loc[mask_downloaded, "rejection_reason"] = "Already on disk"
-    targets = targets[~mask_downloaded]
-    print(f"  - Rejected {mask_downloaded.sum():,} because they are on disk.")
+    # NEW: Check against the on-disk status first
+    mask_on_disk = targets["is_on_disk"] == True
+    targets.loc[mask_on_disk, "rejection_reason"] = "Already on disk"
+    targets = targets[~mask_on_disk]
+    print(f"  - Rejected {mask_on_disk.sum():,} because they are already on disk.")
+
+    # We still check if it's exported, but now it's a secondary check.
+    # An exam could be exported but the sync failed, so it's not on disk.
+    has_accession_mask = targets["is_exported"] == True
+    targets.loc[has_accession_mask, "rejection_reason"] = (
+        "Already exported (but not found on disk - possible sync issue)"
+    )
+    targets = targets[~has_accession_mask]
+    print(
+        f"  - Rejected {has_accession_mask.sum():,} exams already in iBroker's 'Exported' list (but not on disk)."
+    )
 
     if filter_by_genotyping:
         mask_no_chip = targets["chip"].isna()
@@ -158,15 +218,6 @@ def identify_download_targets(
         f"  - Rejected {bad_case_date_mask.sum():,} 'Case' exams that occurred after diagnosis."
     )
 
-    has_accession_mask = targets["Accession"].notna()
-    targets.loc[has_accession_mask, "rejection_reason"] = (
-        "Already has Accession (in exported list)"
-    )
-    targets = targets[~has_accession_mask]
-    print(
-        f"  - Rejected {has_accession_mask.sum():,} exams already in iBroker's 'Exported' list."
-    )
-
     print(f"  = {len(targets):,} final potential target exams identified.")
     return targets.sort_values(by=["study_id", "Study DateTime"])
 
@@ -174,124 +225,94 @@ def identify_download_targets(
 def execute_downloads(targets_df: pd.DataFrame, batch_size: int):
     """Verifies exam availability live and requests exports."""
     if targets_df.empty:
-        return {}, 0
+        return {}, 0, 0
 
     print(
         f"\n--- Phase 4: Executing Downloads (target: {batch_size} successful exports) ---"
     )
     driver = None
-    # This will map the DataFrame index to the outcome
     outcomes = {}
     already_exported_counter = 0
     successfully_exported_counter = 0
-    processed_index = 0
+
+    # Process patient by patient from the sorted target list
+    unique_patients = targets_df["study_id"].unique()
 
     try:
         driver = make_driver()
         login(driver, USERNAME, PASSWORD)
 
-        # Continue processing until we reach the target batch size of successful exports
-        while successfully_exported_counter < batch_size and processed_index < len(
-            targets_df
-        ):
-            # Get the next batch of exams to process
-            remaining_needed = batch_size - successfully_exported_counter
-            # Process a reasonable chunk at a time, but at least what we need
-            chunk_size = max(remaining_needed, 10)
-            current_batch = targets_df.iloc[
-                processed_index : processed_index + chunk_size
-            ].copy()
-
-            if current_batch.empty:
+        for study_id in tqdm(unique_patients, desc="Processing Patients"):
+            if successfully_exported_counter >= batch_size:
+                print(f"\nReached target of {batch_size} successful exports. Stopping.")
                 break
 
+            patient_exams = targets_df[targets_df["study_id"] == study_id]
             print(
-                f"\nProcessing batch {processed_index // 10 + 1}: {len(current_batch)} exams (need {remaining_needed} more successful exports)"
+                f"\nProcessing patient {study_id} (has {len(patient_exams)} target exams)..."
             )
 
-            for study_id, patient_exams in tqdm(
-                current_batch.groupby("study_id"),
-                desc="Processing Patients",
-                leave=False,
-            ):
-                print(
-                    f"\nProcessing patient {study_id} ({len(patient_exams)} exams)..."
+            try:
+                driver.find_element(by="name", value="tbxAssignedID").clear()
+                driver.find_element(by="name", value="tbxAssignedID").send_keys(
+                    str(int(study_id))
                 )
+                driver.find_element(by="name", value="btnFetch").click()
+                wait_aspnet_idle(driver)
+            except Exception as e:
+                print(f"ERROR navigating for study_id {study_id}. Skipping. Error: {e}")
+                for index, _ in patient_exams.iterrows():
+                    outcomes[index] = "Navigation Error"
+                continue
+
+            available_on_page = {}
+            page_rows = driver.find_elements(
+                by="xpath",
+                value="//table[@id='TabContainer1_tabPanel1_gv1']//tr[position()>1]",
+            )
+            for row in page_rows:
                 try:
-                    driver.find_element(by="name", value="tbxAssignedID").clear()
-                    driver.find_element(by="name", value="tbxAssignedID").send_keys(
-                        str(int(study_id))
+                    cells = row.find_elements(by="tag name", value="td")
+                    row_date = pd.to_datetime(cells[2].text).date()
+                    row_desc = cells[3].text.strip()
+                    checkbox = row.find_element(
+                        by="xpath", value=".//input[@type='checkbox']"
                     )
-                    driver.find_element(by="name", value="btnFetch").click()
-                    wait_aspnet_idle(driver)
-                except Exception as e:
-                    print(
-                        f"ERROR navigating for study_id {study_id}. Skipping. Error: {e}"
-                    )
+                    available_on_page[(row_date, row_desc)] = checkbox
+                except Exception:
+                    pass
+
+            requested_this_patient = False
+            for index, target_exam in patient_exams.iterrows():
+                if successfully_exported_counter >= batch_size:
+                    outcomes[index] = "Skipped - Batch full"
                     continue
 
-                # Build a map of what's ACTUALLY available on the live page
-                available_on_page = {}
-                page_rows = driver.find_elements(
-                    by="xpath",
-                    value="//table[@id='TabContainer1_tabPanel1_gv1']//tr[position()>1]",
+                target_key = (
+                    target_exam["Study DateTime"].date(),
+                    target_exam["StudyDescription"],
                 )
-                for row in page_rows:
-                    try:
-                        cells = row.find_elements(by="tag name", value="td")
-                        row_date = pd.to_datetime(cells[2].text).date()
-                        row_desc = cells[3].text.strip()
-                        checkbox = row.find_element(
-                            by="xpath", value=".//input[@type='checkbox']"
-                        )
-                        available_on_page[(row_date, row_desc)] = checkbox
-                    except Exception:
-                        pass
 
-                requested_this_patient = False
-                # Now, check our targets against the live reality
-                for index, target_exam in patient_exams.iterrows():
-                    target_key = (
-                        target_exam["Study DateTime"].date(),
-                        target_exam["StudyDescription"],
-                    )
-
-                    if target_key in available_on_page:
-                        # It's available! Click it.
-                        print(
-                            f"  - Found available exam from {target_key[0]}. Selecting checkbox."
-                        )
-                        available_on_page[target_key].click()
-                        outcomes[index] = "Request Submitted"
-                        successfully_exported_counter += 1
-                        requested_this_patient = True
-                    else:
-                        # It's NOT available - must have been exported already.
-                        print(
-                            f"  - INFO: Exam from {target_key[0]} is no longer available (already exported)."
-                        )
-                        outcomes[index] = "Already Exported"
-                        already_exported_counter += 1
-
-                if requested_this_patient:
-                    print("  Submitting export request for selected exams...")
-                    driver.find_element(by="name", value="btnExport").click()
-                    wait_aspnet_idle(driver)
-                    print("  Export request submitted.")
-
-                # Check if we've reached our target
-                if successfully_exported_counter >= batch_size:
+                if target_key in available_on_page:
                     print(
-                        f"\nReached target of {batch_size} successful exports. Stopping."
+                        f"  - Found available exam from {target_key[0]}. Selecting checkbox."
                     )
-                    break
+                    available_on_page[target_key].click()
+                    outcomes[index] = "Request Submitted"
+                    successfully_exported_counter += 1
+                    requested_this_patient = True
+                else:
+                    print(
+                        f"  - INFO: Exam from {target_key[0]} is no longer available (already exported)."
+                    )
+                    outcomes[index] = "Already Exported"
+                    already_exported_counter += 1
 
-            # Update processed index for next iteration
-            processed_index += len(current_batch)
-
-            # Check if we've reached our target (in case we broke out of inner loop)
-            if successfully_exported_counter >= batch_size:
-                break
+            if requested_this_patient:
+                print("  Submitting export request for selected exams...")
+                driver.find_element(by="name", value="btnExport").click()
+                wait_aspnet_idle(driver)
+                print("  Export request submitted.")
     finally:
         if driver:
             print("Closing webdriver session.")
@@ -349,11 +370,10 @@ def main():
         print("\n--- Summary of Exams to Download ---")
         print(f"Total potential targets: {len(targets)}")
         print(f"Unique patients to process: {targets['study_id'].nunique()}")
-        print(f"First 5 patients: {targets['study_id'].unique().tolist()[:5]}")
 
         proceed = (
             input(
-                f"\nProceed with attempting to export {args.batch_size} exams? (y/n): "
+                f"\nProceed with attempting to export up to {args.batch_size} exams? (y/n): "
             )
             .lower()
             .strip()
@@ -376,9 +396,7 @@ def main():
             print(
                 f"Discovered to be already exported:        {already_exported_count} exams."
             )
-            print(
-                f"Total exams processed:                    {successfully_exported_count + already_exported_count} exams."
-            )
+            print(f"Total exams processed:                    {len(outcomes)} exams.")
         else:
             print("Download cancelled by user.")
 
@@ -392,7 +410,8 @@ def main():
         "DatedxIndex",
         "StudyDescription",
         "Accession",
-        "is_downloaded",
+        "is_exported",  # New name: True if it has an Accession
+        "is_on_disk",  # New column: True if found on filesystem
         "is_target",
         "download_attempt_outcome",
         "export_requested_on",

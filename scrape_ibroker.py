@@ -2,6 +2,7 @@
 # coding: utf-8
 
 import os
+import re
 import sys
 import traceback
 
@@ -21,6 +22,8 @@ from tqdm.auto import tqdm
 username = os.getenv("IBROKER_USERNAME")
 password = os.getenv("IBROKER_PASSWORD")
 
+BASE_DOWNLOAD_DIR = "/gpfs/data/huo-lab/Image/ChiMEC/"
+
 # NEW: Fail fast if environment variables are not set
 if not all([username, password]):
     print(
@@ -35,6 +38,60 @@ BASE = "http://cw2radiis03.uchad.uchospitals.edu"
 
 # read ids once
 study_ids = pd.read_csv(study_id_file)["AnonymousID"].tolist()[::-1]
+
+
+def build_disk_inventory(basedir: str) -> dict:
+    """
+    Performs a one-time, efficient scan of the download directory to build an in-memory
+    inventory of all existing exams and provides a detailed summary.
+
+    Handles various naming conventions (e.g., ACCESSION, ACCESSION-DATE, ACCESSION.tar.xz).
+
+    Args:
+        basedir: The root directory where patient data is stored.
+
+    Returns:
+        A dictionary mapping {patient_id: {set_of_accession_numbers}}.
+    """
+    print("--- Pre-scanning all patient directories to build file inventory ---")
+    inventory = {}
+    total_exam_count = 0
+
+    if not os.path.isdir(basedir):
+        print(f"WARNING: Base download directory not found: {basedir}", file=sys.stderr)
+        print("Inventory will be empty.")
+        return inventory
+
+    try:
+        patient_dirs = [d for d in os.scandir(basedir) if d.is_dir()]
+    except PermissionError:
+        print(
+            f"WARNING: Permission denied to read directory: {basedir}", file=sys.stderr
+        )
+        return inventory
+
+    for entry in tqdm(patient_dirs, desc="Building file inventory"):
+        patient_id = entry.name
+        found_accessions = set()
+        try:
+            for item in os.scandir(entry.path):
+                base_accession = re.split(r"[-.]", item.name)[0]
+                if base_accession:
+                    found_accessions.add(base_accession)
+            if found_accessions:
+                inventory[patient_id] = found_accessions
+                total_exam_count += len(found_accessions)
+        except (FileNotFoundError, PermissionError):
+            continue
+
+    # NEW: Detailed summary print statements
+    patient_count = len(inventory)
+    print("\n--- Inventory Summary ---")
+    print(f"  - Scanned {len(patient_dirs):,} total directories.")
+    print(f"  - Found downloaded data for {patient_count:,} unique patients.")
+    print(f"  - Inventoried a total of {total_exam_count:,} unique exams on disk.")
+    print("-------------------------\n")
+    return inventory
 
 
 def make_driver():
@@ -224,7 +281,8 @@ def parse_all_tables_from_page(page_html: str) -> pd.DataFrame:
     if exported_table_nodes:
         root = exported_table_nodes[0]
         trs = root.xpath(".//tr")
-        if len(trs) > 1:  # Check if there are data rows
+        # Check if there are data rows (more than just a header)
+        if len(trs) > 1 and "no record" not in root.text_content().lower():
             rows = trs[1:]
             # Columns: StudyDT, StudyDescription, Status, Accession, Exported On
             dt_str = [r.xpath("normalize-space(td[1])") for r in rows]
@@ -249,26 +307,16 @@ def parse_all_tables_from_page(page_html: str) -> pd.DataFrame:
             dfs_to_combine.append(df_exported)
 
     # --- Part 2: Parse the "Available" table (gv1) if it exists ---
+    # This is your existing, excellent parsing logic for the "available" table
     available_table_nodes = doc.xpath("//table[@id='TabContainer1_tabPanel1_gv1']")
     if available_table_nodes:
         root = available_table_nodes[0]
         trs = root.xpath(".//tr")
-        if len(trs) > 1:  # Check if there are data rows
+        if len(trs) > 1 and "no record" not in root.text_content().lower():
             rows = trs[1:]
-
-            # This is your original, excellent parsing logic for this table
             modality = [r.xpath("normalize-space(td[2])") for r in rows]
             dt_str = [r.xpath("normalize-space(td[3])") for r in rows]
             desc = [r.xpath("normalize-space(td[4])") for r in rows]
-
-            titles = np.array([r.get("title") or "" for r in rows], dtype=str)
-            mask = np.char.find(np.char.lower(titles), "exported") >= 0
-            exam = np.full(titles.shape, np.nan, dtype=object)
-            if mask.any():
-                extracted = np.array(
-                    [t.split()[-1].split("\\")[-2] for t in titles[mask]], dtype=object
-                )
-                exam[np.where(mask)[0]] = extracted
 
             df_available = pd.DataFrame(
                 {
@@ -277,20 +325,18 @@ def parse_all_tables_from_page(page_html: str) -> pd.DataFrame:
                         pd.Series(dt_str), errors="coerce"
                     ),
                     "StudyDescription": desc,
-                    "exam_id": exam,
                 }
             )
             dfs_to_combine.append(df_available)
 
     # --- Part 3: Combine and return ---
     if not dfs_to_combine:
-        return pd.DataFrame()  # Return empty if no tables were found
+        return pd.DataFrame()
 
-    # concat will intelligently merge, creating NaNs for columns not present in one of the frames
+    # concat will intelligently merge, creating NaNs for columns not present in the other frames
     return pd.concat(dfs_to_combine, ignore_index=True)
 
 
-# --- run ---
 def main():
     driver = None
     try:
@@ -307,8 +353,9 @@ def main():
             driver.quit()
             print("Webdriver closed.")
 
-    # --- Main scraping logic using the HTTP session ---
     try:
+        disk_inventory = build_disk_inventory(BASE_DOWNLOAD_DIR)
+
         page_html, state = http_get_root(session)
         page_html, state = post_link_event(session, state, "lbAll")
 
@@ -334,38 +381,59 @@ def main():
                 f"Output file '{output_file}' not found or is empty. Starting a new run."
             )
             study_ids_to_process = study_ids
+        
+        # FIXME debug
+        study_ids_to_process = [38016682, 93760674]
 
         all_columns = [
             "Modality",
             "Study DateTime",
             "StudyDescription",
-            "exam_id",
             "Status",
             "Accession",
             "Exported On",
             "study_id",
+            "is_on_disk",
         ]
 
         with open(output_file, "a", newline="") as f:
             if not output_exists or os.path.getsize(output_file) == 0:
-                # Write the new, comprehensive header
                 pd.DataFrame(columns=all_columns).to_csv(f, index=False, header=True)
 
             for study_id in tqdm(study_ids_to_process, desc="Scraping Study IDs"):
                 try:
                     page_html, state = post_fetch_grid(session, state, str(study_id))
-
-                    # UPDATED: Single call to the new, powerful parsing function
                     df = parse_all_tables_from_page(page_html)
 
                     if df.empty:
-                        continue
+                        df = pd.DataFrame([{"study_id": study_id}])
 
                     df["study_id"] = study_id
 
-                    # Reorder columns to match the header for consistency
-                    # This will add any missing columns as NaN automatically
+                    # --- FIX: Reindex FIRST to ensure all columns exist ---
                     df = df.reindex(columns=all_columns)
+
+                    # --- SAFER CHECK: Now that we know the columns exist, apply the check ---
+                    def check_row_on_disk(row):
+                        # The 'Accession' column is now guaranteed to exist, even if it's all NaN
+                        accession_val = row.get(
+                            "Accession"
+                        )  # .get() is safer than ['key']
+                        if pd.notna(accession_val):
+                            patient_id_str = str(int(row["study_id"]))
+                            accession_str = str(accession_val)
+                            patient_inventory = disk_inventory.get(
+                                patient_id_str, set()
+                            )
+                            if accession_str in patient_inventory:
+                                return True
+                        return False
+
+                    # Initialize column before applying
+                    df["is_on_disk"] = False
+                    on_disk_mask = df.apply(check_row_on_disk, axis=1)
+                    df.loc[on_disk_mask, "is_on_disk"] = True
+                    # --- End of fix ---
 
                     df.to_csv(f, index=False, header=False)
                     f.flush()
