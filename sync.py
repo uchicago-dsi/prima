@@ -45,21 +45,56 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-
-
 def run_ssh_command(command: list, check: bool = True):
-    full_command = ["ssh", DST_SSH_TARGET] + command
+    """
+    Executes a command on the remote server via SSH. It explicitly sets the
+    MAMBA_ROOT_PREFIX, then uses the full path to the micromamba executable
+    to initialize the shell and activate the 'prima' environment.
+    """
+    # Full path to your micromamba executable on the remote server
+    MICROMAMBA_EXECUTABLE = "/gpfs/data/huo-lab/Image/annawoodard/bin/micromamba"
+
+    # Your custom root prefix for micromamba environments
+    MAMBA_ROOT_PREFIX = "/gpfs/data/huo-lab/Image/annawoodard/micromamba"
+
+    # 1. Export the root prefix variable
+    init_command = f"export MAMBA_ROOT_PREFIX='{MAMBA_ROOT_PREFIX}'"
+
+    # 2. Initialize the shell for micromamba using the full path
+    shell_hook_command = f'eval "$({MICROMAMBA_EXECUTABLE} shell hook -s posix)"'
+    
+    # 3. Command to activate the environment
+    mamba_activate_command = 'micromamba activate prima'
+    
+    # 4. The final user command to run
+    final_command_str = " ".join(command)
+    
+    # Chain them all together. 'set -e' makes the chain fail if any step fails.
+    remote_command_wrapper = (
+        f"set -e && "
+        f"{init_command} && "
+        f"{shell_hook_command} && "
+        f"{mamba_activate_command} && "
+        f"{final_command_str}"
+    )
+
+    # Use 'bash -c' to execute the full command string.
+    full_ssh_command = ["ssh", DST_SSH_TARGET, "bash", "-c", remote_command_wrapper]
+    
     try:
         process = subprocess.run(
-            full_command, check=check, capture_output=True, text=True
+            full_ssh_command, check=check, capture_output=True, text=True,
         )
+        if process.stderr:
+            logging.debug(f"Remote stderr:\n{process.stderr.strip()}")
         return process.stdout, process.stderr
+        
     except subprocess.CalledProcessError as e:
-        logging.error(f"SSH command failed: {' '.join(e.cmd)}")
-        logging.error(f"Stderr: {e.stderr.strip()}")
+        logging.error(f"SSH command failed. Full command executed on remote: '{remote_command_wrapper}'")
+        logging.error(f"  Return Code: {e.returncode}")
+        logging.error(f"  --- Remote Stdout --- \n{e.stdout.strip()}")
+        logging.error(f"  --- Remote Stderr --- \n{e.stderr.strip()}")
         raise
-
-
 def update_remote_inventory():
     logging.info("--- Updating and Running Remote Inventory Script ---")
 
