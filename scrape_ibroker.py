@@ -2,7 +2,6 @@
 # coding: utf-8
 
 import os
-import re
 import sys
 import traceback
 
@@ -17,6 +16,8 @@ from selenium.webdriver.firefox.options import Options
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from tqdm.auto import tqdm
+
+from filesystem_utils import build_disk_inventory
 
 # --- required config: fail if you forget to set these ---
 username = os.getenv("IBROKER_USERNAME")
@@ -38,60 +39,6 @@ BASE = "http://cw2radiis03.uchad.uchospitals.edu"
 
 # read ids once
 study_ids = pd.read_csv(study_id_file)["AnonymousID"].tolist()[::-1]
-
-
-def build_disk_inventory(basedir: str) -> dict:
-    """
-    Performs a one-time, efficient scan of the download directory to build an in-memory
-    inventory of all existing exams and provides a detailed summary.
-
-    Handles various naming conventions (e.g., ACCESSION, ACCESSION-DATE, ACCESSION.tar.xz).
-
-    Args:
-        basedir: The root directory where patient data is stored.
-
-    Returns:
-        A dictionary mapping {patient_id: {set_of_accession_numbers}}.
-    """
-    print("--- Pre-scanning all patient directories to build file inventory ---")
-    inventory = {}
-    total_exam_count = 0
-
-    if not os.path.isdir(basedir):
-        print(f"WARNING: Base download directory not found: {basedir}", file=sys.stderr)
-        print("Inventory will be empty.")
-        return inventory
-
-    try:
-        patient_dirs = [d for d in os.scandir(basedir) if d.is_dir()]
-    except PermissionError:
-        print(
-            f"WARNING: Permission denied to read directory: {basedir}", file=sys.stderr
-        )
-        return inventory
-
-    for entry in tqdm(patient_dirs, desc="Building file inventory"):
-        patient_id = entry.name
-        found_accessions = set()
-        try:
-            for item in os.scandir(entry.path):
-                base_accession = re.split(r"[-.]", item.name)[0]
-                if base_accession:
-                    found_accessions.add(base_accession)
-            if found_accessions:
-                inventory[patient_id] = found_accessions
-                total_exam_count += len(found_accessions)
-        except (FileNotFoundError, PermissionError):
-            continue
-
-    # NEW: Detailed summary print statements
-    patient_count = len(inventory)
-    print("\n--- Inventory Summary ---")
-    print(f"  - Scanned {len(patient_dirs):,} total directories.")
-    print(f"  - Found downloaded data for {patient_count:,} unique patients.")
-    print(f"  - Inventoried a total of {total_exam_count:,} unique exams on disk.")
-    print("-------------------------\n")
-    return inventory
 
 
 def make_driver():

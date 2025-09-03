@@ -3,7 +3,6 @@
 
 import argparse
 import os
-import re
 import sys
 from datetime import datetime
 
@@ -102,75 +101,6 @@ def load_and_merge_data():
 
     print(f"\nMaster database created with {len(db):,} total exam records.")
     return db
-
-
-def check_disk_for_downloads(df: pd.DataFrame, basedir: str):
-    """
-    Audits the filesystem to find which exams have been downloaded.
-    Handles various naming conventions (e.g., ACCESSION, ACCESSION-DATE, ACCESSION.tar.xz).
-    """
-    print(f"\n--- Phase 2: Auditing Filesystem for Downloads in {basedir} ---")
-
-    # Initialize the new column with False
-    df["is_on_disk"] = False
-
-    # Filter for rows that *could* be checked (have an Accession and study_id)
-    checkable_df = df.dropna(subset=["Accession", "study_id"]).copy()
-    if checkable_df.empty:
-        print(
-            "No exams with Accession Numbers found in metadata. Cannot check filesystem."
-        )
-        return df
-
-    # --- Optimization: Pre-scan the entire directory structure once ---
-    print(
-        "Pre-scanning all patient directories to build an inventory of downloaded files..."
-    )
-    # This dictionary will map: {patient_id: {base_accession_1, base_accession_2, ...}}
-    inventory = {}
-    if not os.path.isdir(basedir):
-        print(f"WARNING: Base directory not found: {basedir}", file=sys.stderr)
-    else:
-        # Use os.scandir for better performance than os.listdir
-        patient_dirs = [d for d in os.scandir(basedir) if d.is_dir()]
-        for entry in tqdm(patient_dirs, desc="Building file inventory"):
-            patient_id = entry.name
-            found_accessions = set()
-            try:
-                for item in os.scandir(entry.path):
-                    # Normalize the name: split by common delimiters and take the first part
-                    base_accession = re.split(r"[-.]", item.name)[0]
-                    if base_accession:
-                        found_accessions.add(base_accession)
-                if found_accessions:
-                    inventory[patient_id] = found_accessions
-            except (FileNotFoundError, PermissionError):
-                continue
-    print(f"Inventory complete. Found data for {len(inventory)} patients.")
-
-    # --- Logic to check against the inventory ---
-    def check_row(row):
-        # Ensure study_id is a clean string without decimals for dict lookup
-        patient_id = str(int(row["study_id"]))
-        accession = str(row["Accession"])
-
-        # Check if we have any inventory for this patient, and if the accession is in their set
-        if patient_id in inventory and accession in inventory[patient_id]:
-            return True
-        return False
-
-    print("Matching metadata against file inventory...")
-    # Apply the check only to the relevant subset of the DataFrame
-    on_disk_mask = checkable_df.apply(check_row, axis=1)
-
-    # Update the original DataFrame using the index from our checkable subset
-    # This is safe because on_disk_mask shares its index with checkable_df, which is a slice of df
-    df.loc[on_disk_mask[on_disk_mask].index, "is_on_disk"] = True
-
-    print(
-        f"  - Marked {df['is_on_disk'].sum():,} exams in the database as 'is_on_disk'."
-    )
-    return df
 
 
 def identify_download_targets(

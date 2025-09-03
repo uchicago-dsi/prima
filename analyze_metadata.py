@@ -10,6 +10,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import pandas as pd
 
+from filesystem_utils import update_metadata_with_disk_status
+
 # argument parser
 parser = argparse.ArgumentParser(
     description="Analyze imaging metadata for specified modality"
@@ -56,11 +58,20 @@ chimec_patients = pd.read_csv(
 )
 key = pd.read_csv("/gpfs/data/huo-lab/Image/ChiMEC/study-16352a.csv")
 metadata = pd.read_csv(
-    "/gpfs/data/huo-lab/Image/annawoodard/prima/data/imaging_metadata.csv"
+    "/gpfs/data/huo-lab/Image/annawoodard/prima/data/imaging_metadata_fixed.csv"
 )
+# use the corrected is_on_disk column
+if "is_on_disk_corrected" in metadata.columns:
+    metadata["is_on_disk"] = metadata["is_on_disk_corrected"]
+    print("Using corrected is_on_disk values")
 print(f"ChiMEC patients: {len(chimec_patients):,}")
 print(f"Key table records: {len(key):,}")
 print(f"Metadata records: {len(metadata):,}")
+
+
+# update metadata with current disk status
+BASE_DOWNLOAD_DIR = "/gpfs/data/huo-lab/Image/ChiMEC/"
+metadata = update_metadata_with_disk_status(metadata, BASE_DOWNLOAD_DIR)
 
 
 # helper function to extract base modality
@@ -1737,3 +1748,99 @@ if args.dump_screening_patients:
             f"no case patients found with screening {SELECTED_MODALITY} scans (≥3 months before diagnosis)"
         )
         print("CSV file not created")
+
+# add analysis of disk-only data for manual verification
+print("\n=== DISK-ONLY DATA ANALYSIS ===")
+print("Finding patients with downloaded exams not in database...")
+
+# build filesystem inventory
+basedir = "/gpfs/data/huo-lab/Image/ChiMEC/"
+if Path(basedir).is_dir():
+    from tqdm.auto import tqdm
+
+    # get database accessions
+    db_accessions = set()
+    if "Accession" in metadata.columns:
+        db_accessions = set(
+            metadata[metadata["Accession"].notna()]["Accession"].astype(str)
+        )
+
+    print(f"database contains {len(db_accessions):,} accessions")
+
+    # build inventory of disk accessions by patient
+    import os
+
+    patient_dirs = [d for d in os.scandir(basedir) if d.is_dir()]
+    patients_with_disk_only = {}
+
+    for entry in tqdm(
+        patient_dirs[:500], desc="checking first 500 patients for disk-only data"
+    ):  # limit to avoid long runtime
+        patient_id = entry.name
+        disk_accessions = set()
+        try:
+            for item in os.scandir(entry.path):
+                accession_number = None
+                if item.is_dir():
+                    accession_number = item.name.split("-")[0]
+                elif item.is_file() and item.name.endswith(".tar.xz"):
+                    accession_number = item.name.replace(".tar.xz", "")
+                if accession_number:
+                    disk_accessions.add(accession_number)
+        except:
+            continue
+
+        # find accessions on disk but not in database
+        disk_only = disk_accessions - db_accessions
+        if disk_only:
+            patients_with_disk_only[patient_id] = {
+                "total_on_disk": len(disk_accessions),
+                "in_database": len(disk_accessions.intersection(db_accessions)),
+                "disk_only": len(disk_only),
+                "example_disk_only": sorted(list(disk_only))[:5],  # first 5 examples
+            }
+
+    print(f"found {len(patients_with_disk_only):,} patients with disk-only data")
+
+    if patients_with_disk_only:
+        print("\n=== PATIENTS WITH DOWNLOADED DATA NOT IN DATABASE ===")
+        print("(for manual verification in iBroker)")
+        print()
+
+        # sort by number of disk-only accessions (most first)
+        sorted_patients = sorted(
+            patients_with_disk_only.items(),
+            key=lambda x: x[1]["disk_only"],
+            reverse=True,
+        )
+
+        for i, (patient_id, info) in enumerate(sorted_patients[:10]):  # top 10
+            print(f"{i + 1}. Patient ID: {patient_id}")
+            print(f"   - total exams on disk: {info['total_on_disk']:,}")
+            print(f"   - exams in database: {info['in_database']:,}")
+            print(f"   - exams ONLY on disk: {info['disk_only']:,}")
+            print(
+                f"   - example disk-only accessions: {', '.join(info['example_disk_only'])}"
+            )
+            print()
+
+        if len(sorted_patients) > 10:
+            print(
+                f"... and {len(sorted_patients) - 10:,} more patients with disk-only data"
+            )
+
+        print("=== MANUAL VERIFICATION INSTRUCTIONS ===")
+        print("1. log into iBroker")
+        print("2. search for any of the patient IDs above")
+        print("3. look for the example accession numbers in their imaging history")
+        print(
+            "4. check if these older studies show up in iBroker but weren't included in recent exports"
+        )
+    else:
+        print("no patients found with disk-only data in the sample checked")
+else:
+    print(f"base directory not found: {basedir}")
+
+print("\n=== ANALYSIS COMPLETE ===")
+print(f"plots saved to: {plots_dir.absolute()}")
+print("created 'all' and 'genotyped' versions of all plots")
