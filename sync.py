@@ -45,31 +45,25 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+
+
 def run_ssh_command(command: list, check: bool = True):
     """
-    Executes a command on the remote server via SSH. It explicitly sets the
-    MAMBA_ROOT_PREFIX, then uses the full path to the micromamba executable
-    to initialize the shell and activate the 'prima' environment.
+    Executes a command on the remote server via SSH. This is a non-interactive,
+    'fire-and-forget' execution that waits for completion.
     """
-    # Full path to your micromamba executable on the remote server
-    MICROMAMBA_EXECUTABLE = "/gpfs/data/huo-lab/Image/annawoodard/bin/micromamba"
-
-    # Your custom root prefix for micromamba environments
-    MAMBA_ROOT_PREFIX = "/gpfs/data/huo-lab/Image/annawoodard/micromamba"
-
-    # 1. Export the root prefix variable
+    MICROMAMBA_EXECUTABLE = (
+        "/gpfs/data/huo-lab/Image/annawoodard/bin/micromamba"
+    )
+    MAMBA_ROOT_PREFIX = (
+        "/gpfs/data/huo-lab/Image/annawoodard/micromamba"
+    )
     init_command = f"export MAMBA_ROOT_PREFIX='{MAMBA_ROOT_PREFIX}'"
-
-    # 2. Initialize the shell for micromamba using the full path
-    shell_hook_command = f'eval "$({MICROMAMBA_EXECUTABLE} shell hook -s posix)"'
-    
-    # 3. Command to activate the environment
+    shell_hook_command = (
+        f'eval "$({MICROMAMBA_EXECUTABLE} shell hook -s posix)"'
+    )
     mamba_activate_command = 'micromamba activate prima'
-    
-    # 4. The final user command to run
     final_command_str = " ".join(command)
-    
-    # Chain them all together. 'set -e' makes the chain fail if any step fails.
     remote_command_wrapper = (
         f"set -e && "
         f"{init_command} && "
@@ -78,63 +72,80 @@ def run_ssh_command(command: list, check: bool = True):
         f"{final_command_str}"
     )
 
-    # Use 'bash -c' to execute the full command string.
-    full_ssh_command = ["ssh", DST_SSH_TARGET, "bash", "-c", remote_command_wrapper]
-    
+    # NO '-t' flag. This is a non-interactive execution.
+    full_ssh_command = [
+        "ssh", DST_SSH_TARGET, "bash", "-c", remote_command_wrapper
+    ]
     try:
         process = subprocess.run(
             full_ssh_command, check=check, capture_output=True, text=True,
         )
+        # Log the final stderr at the end for debugging purposes.
         if process.stderr:
             logging.debug(f"Remote stderr:\n{process.stderr.strip()}")
         return process.stdout, process.stderr
-        
     except subprocess.CalledProcessError as e:
-        logging.error(f"SSH command failed. Full command executed on remote: '{remote_command_wrapper}'")
+        logging.error(
+            f"SSH command failed. Full command executed on remote: "
+            f"'{remote_command_wrapper}'"
+        )
         logging.error(f"  Return Code: {e.returncode}")
         logging.error(f"  --- Remote Stdout --- \n{e.stdout.strip()}")
         logging.error(f"  --- Remote Stderr --- \n{e.stderr.strip()}")
         raise
+
+
 def update_remote_inventory():
+    """
+    Ensures the remote fingerprinter is up-to-date, runs it on the server,
+    and downloads the resulting inventory. Progress should be monitored by
+    tailing the log file on the remote server.
+    """
     logging.info("--- Updating and Running Remote Inventory Script ---")
-
-    # 1. Ensure remote repository is up-to-date
-    logging.info(
-        f"Running 'git pull' in remote directory: {REMOTE_REPO_PATH}"
-    )
-    # Note: This assumes you have passwordless SSH or an agent set up.
-    # The 'cd' and 'git pull' are combined to ensure it runs in the
-    # right place.
-    git_command = f"cd {REMOTE_REPO_PATH} && git pull"
-    stdout, stderr = run_ssh_command([git_command])
-    if "Already up to date." not in stdout and stdout:
-        logging.info(f"Git pull output:\n{stdout.strip()}")
-    if stderr:
-        logging.warning(f"Git pull stderr:\n{stderr.strip()}")
-
-    # 2. Define remote script and cache paths based on the repo path
     remote_script = REMOTE_REPO_PATH / "fingerprinter.py"
     remote_cache = REMOTE_REPO_PATH / CACHE_FILE_REL_PATH
+    remote_log_file = REMOTE_REPO_PATH / "data/fingerprinter.log"
 
-    # 3. Run the remote script
+    logging.info(f"Running 'git pull' in remote directory: {REMOTE_REPO_PATH}")
+    git_command = f"cd {REMOTE_REPO_PATH} && git pull"
+    run_ssh_command([git_command])
+
     logging.info(
-        "Running fingerprinter on remote server (this may take a while)..."
+        "Starting remote fingerprinting process... This will take a long time."
     )
-    cmd = [
-        "python", str(remote_script),
-        str(DST_ROOT_REMOTE), str(remote_cache),
-        "--parallel-jobs", str(PARALLEL_JOBS)
-    ]
-    _, stderr = run_ssh_command(cmd)
-    if stderr:
-        logging.info(f"Remote script output:\n{stderr.strip()}")
+    print("\n" + "="*70)
+    print("  MONITORING INSTRUCTIONS:")
+    print("  In a separate terminal, run the following command:")
+    print(f"  ssh {DST_SSH_TARGET} 'tail -f {remote_log_file}'")
+    print("="*70 + "\n")
+    # Run the python script and redirect all its output (stdout and stderr)
+    # to the log file. The 'nohup' command and '&' are not strictly necessary
+    # here since the Python script will block until the SSH command completes,
+    # but it's good practice for long-running jobs.
+    python_command = (
+        f"python -u {remote_script} "  # '-u' for unbuffered output
+        f"{DST_ROOT_REMOTE} {remote_cache} "
+        f"--parallel-jobs {PARALLEL_JOBS} "
+        f"> {remote_log_file} 2>&1"  # Redirect stdout and stderr to log
+    )
 
-    # 4. Download the inventory
+    try:
+        run_ssh_command([python_command])
+        logging.info("Remote fingerprinting completed successfully.")
+    except subprocess.CalledProcessError:
+        logging.error("Remote fingerprinting failed!")
+        logging.error(
+            f"Check the detailed log on the server for errors: "
+            f"{remote_log_file}"
+        )
+        raise
+
     logging.info("Downloading remote inventory cache...")
     LOCAL_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run([
-        "scp", f"{DST_SSH_TARGET}:{remote_cache}", str(LOCAL_CACHE_FILE)
-    ], check=True)
+    subprocess.run(
+        ["scp", f"{DST_SSH_TARGET}:{remote_cache}", str(LOCAL_CACHE_FILE)],
+        check=True
+    )
     logging.info("Remote inventory updated successfully.")
 
 
