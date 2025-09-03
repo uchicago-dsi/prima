@@ -270,18 +270,30 @@ def parse_all_tables_from_page(page_html: str) -> pd.DataFrame:
     """
     Parses the full HTML page to find and extract data from both the "Exported"
     and "Available" studies tables, returning them as a single combined DataFrame.
+
+    This version is robust to missing table IDs and missing tables entirely.
     """
     doc = lxml_html.fromstring(page_html)
     dfs_to_combine = []
 
-    # --- Part 1: Parse the "Exported" table (gvExported) if it exists ---
+    # --- Part 1: Parse the "Exported" table ---
+    # NEW ROBUST XPATH: Find the table that contains a header with the text "Accession".
+    # This is much more reliable than relying on an ID that may not exist.
     exported_table_nodes = doc.xpath(
-        "//table[@id='TabContainer1_tabPanel1_gvExported']"
+        '//table[.//th[contains(text(), "Accession")] or .//td[contains(text(), "Accession")]]'
     )
+
+    # Sometimes the header is not in a <th> but a <td>, so we check both.
+    # The first table found is almost certainly the one we want.
+    if not exported_table_nodes:
+        # Fallback for older GridViews that might use different structures
+        exported_table_nodes = doc.xpath(
+            '//table[contains(.//tr[1]/td[4]/text(), "Accession")]'
+        )
+
     if exported_table_nodes:
         root = exported_table_nodes[0]
         trs = root.xpath(".//tr")
-        # Check if there are data rows (more than just a header)
         if len(trs) > 1 and "no record" not in root.text_content().lower():
             rows = trs[1:]
             # Columns: StudyDT, StudyDescription, Status, Accession, Exported On
@@ -307,7 +319,7 @@ def parse_all_tables_from_page(page_html: str) -> pd.DataFrame:
             dfs_to_combine.append(df_exported)
 
     # --- Part 2: Parse the "Available" table (gv1) if it exists ---
-    # This is your existing, excellent parsing logic for the "available" table
+    # Your existing logic for this is fine as it seems to have a reliable ID.
     available_table_nodes = doc.xpath("//table[@id='TabContainer1_tabPanel1_gv1']")
     if available_table_nodes:
         root = available_table_nodes[0]
@@ -333,7 +345,6 @@ def parse_all_tables_from_page(page_html: str) -> pd.DataFrame:
     if not dfs_to_combine:
         return pd.DataFrame()
 
-    # concat will intelligently merge, creating NaNs for columns not present in the other frames
     return pd.concat(dfs_to_combine, ignore_index=True)
 
 
@@ -381,9 +392,6 @@ def main():
                 f"Output file '{output_file}' not found or is empty. Starting a new run."
             )
             study_ids_to_process = study_ids
-        
-        # FIXME debug
-        study_ids_to_process = [38016682, 93760674]
 
         all_columns = [
             "Modality",
@@ -409,16 +417,10 @@ def main():
                         df = pd.DataFrame([{"study_id": study_id}])
 
                     df["study_id"] = study_id
-
-                    # --- FIX: Reindex FIRST to ensure all columns exist ---
                     df = df.reindex(columns=all_columns)
 
-                    # --- SAFER CHECK: Now that we know the columns exist, apply the check ---
                     def check_row_on_disk(row):
-                        # The 'Accession' column is now guaranteed to exist, even if it's all NaN
-                        accession_val = row.get(
-                            "Accession"
-                        )  # .get() is safer than ['key']
+                        accession_val = row.get("Accession")
                         if pd.notna(accession_val):
                             patient_id_str = str(int(row["study_id"]))
                             accession_str = str(accession_val)
@@ -429,11 +431,9 @@ def main():
                                 return True
                         return False
 
-                    # Initialize column before applying
                     df["is_on_disk"] = False
                     on_disk_mask = df.apply(check_row_on_disk, axis=1)
                     df.loc[on_disk_mask, "is_on_disk"] = True
-                    # --- End of fix ---
 
                     df.to_csv(f, index=False, header=False)
                     f.flush()

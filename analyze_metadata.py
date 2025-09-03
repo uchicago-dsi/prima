@@ -535,6 +535,320 @@ def create_time_analysis_plot(
     plt.close()
 
 
+def create_is_on_disk_plot(
+    case_screening, case_before_dx, controls, chip_status, plots_dir
+):
+    """create bar plot showing is_on_disk status by category"""
+
+    # calculate counts for each category
+    categories = [
+        "cases\n(>3 months before dx)",
+        "cases\n(before/including dx month)",
+        "controls\n(all)",
+    ]
+
+    # count on disk vs not on disk for each category
+    case_screening_on_disk = (
+        case_screening["is_on_disk"].sum() if len(case_screening) > 0 else 0
+    )
+    case_screening_not_on_disk = (
+        len(case_screening) - case_screening_on_disk if len(case_screening) > 0 else 0
+    )
+
+    case_before_dx_on_disk = (
+        case_before_dx["is_on_disk"].sum() if len(case_before_dx) > 0 else 0
+    )
+    case_before_dx_not_on_disk = (
+        len(case_before_dx) - case_before_dx_on_disk if len(case_before_dx) > 0 else 0
+    )
+
+    controls_on_disk = controls["is_on_disk"].sum() if len(controls) > 0 else 0
+    controls_not_on_disk = len(controls) - controls_on_disk if len(controls) > 0 else 0
+
+    on_disk_counts = [case_screening_on_disk, case_before_dx_on_disk, controls_on_disk]
+    not_on_disk_counts = [
+        case_screening_not_on_disk,
+        case_before_dx_not_on_disk,
+        controls_not_on_disk,
+    ]
+
+    # create figure
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    x = range(len(categories))
+    width = 0.35
+
+    # create bars
+    bars1 = ax.bar(
+        [i - width / 2 for i in x],
+        on_disk_counts,
+        width,
+        label="on disk",
+        alpha=0.8,
+        color="green",
+    )
+    bars2 = ax.bar(
+        [i + width / 2 for i in x],
+        not_on_disk_counts,
+        width,
+        label="not on disk",
+        alpha=0.8,
+        color="red",
+    )
+
+    # add labels and title
+    ax.set_xlabel("category")
+    ax.set_ylabel("number of exams")
+    ax.set_title(f"exam download status by category ({chip_status} patients)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(categories)
+    ax.legend()
+    ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+
+    # add value labels on bars
+    for bars in [bars1, bars2]:
+        for bar in bars:
+            height = bar.get_height()
+            if height > 0:
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2.0,
+                    height + 0.01 * max(max(on_disk_counts), max(not_on_disk_counts)),
+                    f"{int(height):,}",
+                    ha="center",
+                    va="bottom",
+                )
+
+    plt.tight_layout()
+    plt.savefig(
+        plots_dir / f"download_status_by_category_{chip_status}.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close()
+
+
+def create_comprehensive_download_status_plot(
+    case_screening, case_before_dx, controls, all_metadata, chip_status, plots_dir
+):
+    """create comprehensive download status plot with multiple panels"""
+
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
+
+    # Panel 1: Download status by category (same as before)
+    categories = [
+        "cases\n(>3 months before dx)",
+        "cases\n(before/including dx month)",
+        "controls\n(all)",
+    ]
+
+    # count on disk vs not on disk for each category
+    case_screening_on_disk = (
+        case_screening["is_on_disk"].sum() if len(case_screening) > 0 else 0
+    )
+    case_screening_not_on_disk = (
+        len(case_screening) - case_screening_on_disk if len(case_screening) > 0 else 0
+    )
+
+    case_before_dx_on_disk = (
+        case_before_dx["is_on_disk"].sum() if len(case_before_dx) > 0 else 0
+    )
+    case_before_dx_not_on_disk = (
+        len(case_before_dx) - case_before_dx_on_disk if len(case_before_dx) > 0 else 0
+    )
+
+    controls_on_disk = controls["is_on_disk"].sum() if len(controls) > 0 else 0
+    controls_not_on_disk = len(controls) - controls_on_disk if len(controls) > 0 else 0
+
+    on_disk_counts = [case_screening_on_disk, case_before_dx_on_disk, controls_on_disk]
+    not_on_disk_counts = [
+        case_screening_not_on_disk,
+        case_before_dx_not_on_disk,
+        controls_not_on_disk,
+    ]
+
+    x = range(len(categories))
+    width = 0.35
+
+    bars1 = ax1.bar(
+        [i - width / 2 for i in x],
+        on_disk_counts,
+        width,
+        label="on disk",
+        alpha=0.8,
+        color="green",
+    )
+    bars2 = ax1.bar(
+        [i + width / 2 for i in x],
+        not_on_disk_counts,
+        width,
+        label="not on disk",
+        alpha=0.8,
+        color="red",
+    )
+
+    ax1.set_xlabel("category")
+    ax1.set_ylabel("number of exams")
+    ax1.set_title(f"download status by category ({chip_status} patients)")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(categories)
+    ax1.legend()
+    ax1.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+
+    # add value labels
+    for bars in [bars1, bars2]:
+        for bar in bars:
+            height = bar.get_height()
+            if height > 0:
+                ax1.text(
+                    bar.get_x() + bar.get_width() / 2.0,
+                    height + 0.01 * max(max(on_disk_counts), max(not_on_disk_counts)),
+                    f"{int(height):,}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=9,
+                )
+
+    # Panel 2: Modality breakdown of downloaded exams
+    downloaded_data = all_metadata[all_metadata["is_on_disk"] == True].copy()
+    if len(downloaded_data) > 0:
+        modality_counts = downloaded_data["base_modality"].value_counts()
+        ax2.bar(
+            range(len(modality_counts)),
+            modality_counts.values,
+            alpha=0.8,
+            color="steelblue",
+        )
+        ax2.set_xlabel("modality")
+        ax2.set_ylabel("number of downloaded exams")
+        ax2.set_title("downloaded exams by modality")
+        ax2.set_xticks(range(len(modality_counts)))
+        ax2.set_xticklabels(modality_counts.index, rotation=45)
+        ax2.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+
+        # add value labels
+        for i, v in enumerate(modality_counts.values):
+            ax2.text(
+                i,
+                v + 0.01 * max(modality_counts.values),
+                f"{v:,}",
+                ha="center",
+                va="bottom",
+                fontsize=9,
+            )
+    else:
+        ax2.text(
+            0.5,
+            0.5,
+            "no downloaded data",
+            ha="center",
+            va="center",
+            transform=ax2.transAxes,
+        )
+        ax2.set_title("downloaded exams by modality")
+
+    # Panel 3: Download rate by modality
+    all_data_combined = pd.concat(
+        [case_screening, case_before_dx, controls], ignore_index=True
+    )
+    if len(all_data_combined) > 0:
+        modality_total = all_data_combined["base_modality"].value_counts()
+        modality_downloaded = all_data_combined[
+            all_data_combined["is_on_disk"] == True
+        ]["base_modality"].value_counts()
+
+        # calculate download rates
+        download_rates = []
+        modalities = []
+        for modality in modality_total.index[:10]:  # top 10 modalities
+            total = modality_total[modality]
+            downloaded = modality_downloaded.get(modality, 0)
+            rate = (downloaded / total) * 100 if total > 0 else 0
+            download_rates.append(rate)
+            modalities.append(f"{modality}\n({downloaded}/{total})")
+
+        bars = ax3.bar(
+            range(len(download_rates)), download_rates, alpha=0.8, color="orange"
+        )
+        ax3.set_xlabel("modality")
+        ax3.set_ylabel("download rate (%)")
+        ax3.set_title("download rate by modality")
+        ax3.set_xticks(range(len(modalities)))
+        ax3.set_xticklabels(modalities, rotation=45, ha="right")
+        ax3.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+
+        # add value labels
+        for i, v in enumerate(download_rates):
+            ax3.text(i, v + 0.5, f"{v:.1f}%", ha="center", va="bottom", fontsize=9)
+    else:
+        ax3.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax3.transAxes)
+        ax3.set_title("download rate by modality")
+
+    # Panel 4: Export vs Download status
+    exported_data = all_metadata[all_metadata["Exported On"].notna()].copy()
+    if len(exported_data) > 0:
+        exported_on_disk = (exported_data["is_on_disk"] == True).sum()
+        exported_not_on_disk = len(exported_data) - exported_on_disk
+
+        labels = ["exported & on disk", "exported & not on disk"]
+        sizes = [exported_on_disk, exported_not_on_disk]
+        colors = ["lightgreen", "lightcoral"]
+
+        ax4.pie(sizes, labels=labels, colors=colors, autopct="%1.1f%%", startangle=90)
+        ax4.set_title(
+            f"export vs download status\n(total exported: {len(exported_data):,})"
+        )
+    else:
+        ax4.text(
+            0.5,
+            0.5,
+            "no exported data",
+            ha="center",
+            va="center",
+            transform=ax4.transAxes,
+        )
+        ax4.set_title("export vs download status")
+
+    plt.tight_layout()
+    plt.savefig(
+        plots_dir / f"comprehensive_download_status_{chip_status}.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close()
+
+
+def create_exported_on_plot(data, plots_dir):
+    """create plot of exported on dates where populated"""
+
+    # filter for records with exported_on dates
+    exported_data = data[data["Exported On"].notna()].copy()
+
+    if len(exported_data) == 0:
+        print("no records with 'Exported On' dates found")
+        return
+
+    print(f"records with 'Exported On' dates: {len(exported_data):,}")
+
+    # create histogram of exported dates
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    # extract dates and create monthly bins
+    exported_dates = exported_data["Exported On"]
+
+    # create histogram
+    ax.hist(exported_dates, bins=50, alpha=0.7, edgecolor="black")
+    ax.set_title("distribution of export dates")
+    ax.set_xlabel("export date")
+    ax.set_ylabel("number of exams exported")
+    ax.tick_params(axis="x", rotation=45)
+
+    plt.tight_layout()
+    plt.savefig(
+        plots_dir / "exported_on_distribution.png", dpi=300, bbox_inches="tight"
+    )
+    plt.close()
+
+
 # find and save missing MRNs
 missing_mrns = chimec_patients[~chimec_patients["MRN"].isin(key["MRN"])]["MRN"].tolist()
 with open("missing_mrns.txt", "w") as f:
@@ -684,21 +998,61 @@ if len(extreme_negative) > 0:
     )
 
 
-def extract_base_modality(modality: str) -> str:
+def extract_modality_from_description(description: str) -> str:
+    """
+    extract modality from study description when modality column is missing
+    """
+    if pd.isna(description):
+        return "Other"
+
+    desc_upper = str(description).upper()
+
+    # mammography patterns
+    if any(keyword in desc_upper for keyword in ["MAM", "MAMM", "BREAST"]):
+        return "MG"
+    # MRI patterns
+    elif desc_upper.startswith("MRI"):
+        return "MR"
+    # CT patterns
+    elif desc_upper.startswith("CT"):
+        return "CT"
+    # ultrasound patterns
+    elif desc_upper.startswith("US"):
+        return "US"
+    # nuclear medicine patterns
+    elif desc_upper.startswith("NM"):
+        return "NM"
+    # x-ray patterns
+    elif desc_upper.startswith("XR"):
+        return "CR"  # treat XR as CR
+    else:
+        return "Other"
+
+
+def extract_base_modality(modality: str, study_description: str = None) -> str:
     """
     extract the base imaging modality from a modality string,
     ignoring derived/secondary DICOM object classes (PR, SR, KO, OT, SC, DOC, XC, CADSR, REG, RTSTRUCT, etc.)
+    if modality is missing, try to extract from study description
 
     Parameters
     ----------
     modality : str
         modality string (e.g., "CT/PR/SR")
+    study_description : str, optional
+        study description to parse if modality is missing
 
     Returns
     -------
     str
         base modality (e.g., "CT"), or "Other" if no base modality is found
     """
+    # if modality is missing, try to extract from study description
+    if pd.isna(modality):
+        if study_description is not None:
+            return extract_modality_from_description(study_description)
+        return "Other"
+
     # set of actual acquisition modalities
     base_modalities = {
         "CR",
@@ -717,15 +1071,17 @@ def extract_base_modality(modality: str) -> str:
         "RG",
     }
 
-    tokens = modality.split("/")
+    tokens = str(modality).split("/")
     for token in tokens:
         if token in base_modalities:
             return token
     return "Other"
 
 
-# add base modality column to metadata
-metadata["base_modality"] = metadata["Modality"].apply(extract_base_modality)
+# add base modality column to metadata (use StudyDescription when Modality is missing)
+metadata["base_modality"] = metadata.apply(
+    lambda row: extract_base_modality(row["Modality"], row["StudyDescription"]), axis=1
+)
 
 print("\n=== BASE MODALITY ANALYSIS ===")
 print("unique base modalities:")
@@ -1196,6 +1552,112 @@ create_time_analysis_plot(
     plots_dir,
     SELECTED_MODALITY,
 )
+
+# create data exploration plots
+print("\n=== CREATING DATA EXPLORATION PLOTS ===")
+
+# convert Exported On column to datetime if it exists
+if "Exported On" in metadata.columns:
+    metadata["Exported On"] = pd.to_datetime(metadata["Exported On"], errors="coerce")
+
+# use the same filtered data as the screening plots for consistency
+# this ensures the download status plots match the screening exam plots
+cases_data = cases_selected_modality.copy()
+controls_data = controls_selected_modality.copy()
+
+# define case categories for exploration (same as screening analysis)
+case_screening_scans_exploration = case_screening_scans.copy()
+case_before_dx_month_scans_exploration = case_before_dx_month_scans.copy()
+control_scans_exploration = control_screening_scans.copy()
+
+# for exported on plot, use all metadata
+metadata_with_patient_data = metadata.merge(
+    chimec_with_study_id[["AnonymousID", "DatedxIndex", "case_or_control", "chip"]],
+    left_on="study_id",
+    right_on="AnonymousID",
+    how="inner",
+)
+# convert Exported On column for the export plot
+if "Exported On" in metadata_with_patient_data.columns:
+    metadata_with_patient_data["Exported On"] = pd.to_datetime(
+        metadata_with_patient_data["Exported On"], errors="coerce"
+    )
+
+print(
+    f"exploration - cases >3 months before dx: {len(case_screening_scans_exploration):,}"
+)
+print(
+    f"exploration - cases before/including dx month: {len(case_before_dx_month_scans_exploration):,}"
+)
+print(f"exploration - controls (all): {len(control_scans_exploration):,}")
+
+# create comprehensive download status plots
+create_comprehensive_download_status_plot(
+    case_screening_scans_exploration,
+    case_before_dx_month_scans_exploration,
+    control_scans_exploration,
+    metadata,
+    "all",
+    plots_dir,
+)
+
+# create comprehensive download status plots for genotyped patients only
+genotyped_case_screening_exploration = genotyped_case_screening_scans.copy()
+genotyped_case_before_dx_exploration = genotyped_case_before_dx_month_scans.copy()
+genotyped_controls_exploration = genotyped_control_screening_scans.copy()
+
+# filter metadata to genotyped patients for the comprehensive plot
+genotyped_metadata = metadata[
+    metadata["study_id"].isin(
+        chimec_with_study_id[chimec_with_study_id["chip"].notna()]["AnonymousID"]
+    )
+]
+
+create_comprehensive_download_status_plot(
+    genotyped_case_screening_exploration,
+    genotyped_case_before_dx_exploration,
+    genotyped_controls_exploration,
+    genotyped_metadata,
+    "genotyped",
+    plots_dir,
+)
+
+# create exported on plot
+create_exported_on_plot(metadata_with_patient_data, plots_dir)
+
+# count and report exams with exported_on date but not on disk
+print("\n=== EXPORTED BUT NOT ON DISK ANALYSIS ===")
+if (
+    "Exported On" in metadata_with_patient_data.columns
+    and "is_on_disk" in metadata_with_patient_data.columns
+):
+    exported_not_on_disk = metadata_with_patient_data[
+        (metadata_with_patient_data["Exported On"].notna())
+        & (metadata_with_patient_data["is_on_disk"] == False)
+    ]
+    print(
+        f"exams with 'Exported On' date but not on disk: {len(exported_not_on_disk):,}"
+    )
+
+    if len(exported_not_on_disk) > 0:
+        # breakdown by case/control
+        exported_not_on_disk_cases = exported_not_on_disk[
+            exported_not_on_disk["case_or_control"] == "Case"
+        ]
+        exported_not_on_disk_controls = exported_not_on_disk[
+            exported_not_on_disk["case_or_control"] == "Control"
+        ]
+
+        print(f"  - cases: {len(exported_not_on_disk_cases):,}")
+        print(f"  - controls: {len(exported_not_on_disk_controls):,}")
+
+        # breakdown by modality
+        print("\nbreakdown by modality:")
+        modality_breakdown = exported_not_on_disk["base_modality"].value_counts()
+        for modality, count in modality_breakdown.head(10).items():
+            print(f"  - {modality}: {count:,}")
+else:
+    print("'Exported On' or 'is_on_disk' column not found in metadata")
 
 print("\n=== ANALYSIS COMPLETE ===")
 print(f"plots saved to: {plots_dir.absolute()}")
