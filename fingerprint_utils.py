@@ -3,6 +3,7 @@
 # SHARED LOGIC for exam fingerprinting.
 
 import hashlib
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
@@ -42,7 +43,7 @@ def create_exam_fingerprint(exam_path: Path) -> Tuple[Optional[ExamFingerprint],
     Returns a tuple: (ExamFingerprint | None, reason_string).
     """
     if not exam_path.is_dir():
-        return None, f"Path is not a directory."
+        return None, "Path is not a directory."
 
     study_uid = None
     file_hashes = set()

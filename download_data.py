@@ -10,6 +10,8 @@ import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
 
+from filesystem_utils import check_disk_for_downloads
+
 # Assuming scrape_ibroker.py is in the same directory or accessible
 from scrape_ibroker import login, make_driver, wait_aspnet_idle
 
@@ -84,7 +86,7 @@ def load_and_merge_data():
         db["DatedxIndex"], errors="coerce", dayfirst=True
     )
 
-    conditions = [db["DatedxIndex"].notna(), db["_in_patient_file"] == True]
+    conditions = [db["DatedxIndex"].notna(), db["_in_patient_file"]]
     choices = ["Case", "Control"]
     db["case_control_status"] = np.select(conditions, choices, default="Unknown")
     print("  - Derived Case/Control status based on DatedxIndex:")
@@ -116,7 +118,7 @@ def identify_download_targets(
     print(f"  - Kept {len(targets):,} exams after filtering for modality '{modality}'.")
 
     # NEW: Check against the on-disk status first
-    mask_on_disk = targets["is_on_disk"] == True
+    mask_on_disk = targets["is_on_disk"]
     targets.loc[mask_on_disk, "rejection_reason"] = "Already on disk"
     targets = targets[~mask_on_disk]
     print(f"  - Rejected {mask_on_disk.sum():,} because they are already on disk.")
