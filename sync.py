@@ -22,9 +22,7 @@ DST_ROOT_REMOTE = Path("/gpfs/data/huo-lab/Image/ChiMEC")
 
 # --- GIT-AWARE PATH CONFIGURATION ---
 # The path to your Git repository ON THE REMOTE SERVER
-REMOTE_REPO_PATH = Path(
-    "/gpfs/data/huo-lab/Image/annawoodard/prima"
-)
+REMOTE_REPO_PATH = Path("/gpfs/data/huo-lab/Image/annawoodard/prima")
 
 # --- LOCAL AND REMOTE CACHE PATHS ---
 # Relative path for the cache file INSIDE the repo
@@ -40,54 +38,33 @@ PARALLEL_JOBS = 8
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("sync.log"),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.FileHandler("sync.log"), logging.StreamHandler()],
 )
 
 
-def run_ssh_command(command: list, check: bool = True):
+def run_ssh_command(command_str: str, check: bool = True):
     """
-    Executes a command on the remote server via SSH. This is a non-interactive,
-    'fire-and-forget' execution that waits for completion.
+    Executes a complete command string on the remote server via SSH.
+    This version is designed to handle complex shell commands with redirection.
     """
-    MICROMAMBA_EXECUTABLE = (
-        "/gpfs/data/huo-lab/Image/annawoodard/bin/micromamba"
-    )
-    MAMBA_ROOT_PREFIX = (
-        "/gpfs/data/huo-lab/Image/annawoodard/micromamba"
-    )
-    init_command = f"export MAMBA_ROOT_PREFIX='{MAMBA_ROOT_PREFIX}'"
-    shell_hook_command = (
-        f'eval "$({MICROMAMBA_EXECUTABLE} shell hook -s posix)"'
-    )
-    mamba_activate_command = 'micromamba activate prima'
-    final_command_str = " ".join(command)
-    remote_command_wrapper = (
-        f"set -e && "
-        f"{init_command} && "
-        f"{shell_hook_command} && "
-        f"{mamba_activate_command} && "
-        f"{final_command_str}"
-    )
+    # Use 'bash -c' to execute the full command string.
+    # The command_str is now expected to contain the full logic, including environment setup.
+    full_ssh_command = ["ssh", DST_SSH_TARGET, "bash", "-c", command_str]
 
-    # NO '-t' flag. This is a non-interactive execution.
-    full_ssh_command = [
-        "ssh", DST_SSH_TARGET, "bash", "-c", remote_command_wrapper
-    ]
     try:
         process = subprocess.run(
-            full_ssh_command, check=check, capture_output=True, text=True,
+            full_ssh_command,
+            check=check,
+            capture_output=True,
+            text=True,
         )
-        # Log the final stderr at the end for debugging purposes.
         if process.stderr:
             logging.debug(f"Remote stderr:\n{process.stderr.strip()}")
         return process.stdout, process.stderr
+
     except subprocess.CalledProcessError as e:
         logging.error(
-            f"SSH command failed. Full command executed on remote: "
-            f"'{remote_command_wrapper}'"
+            f"SSH command failed. Full command executed on remote: '{command_str}'"
         )
         logging.error(f"  Return Code: {e.returncode}")
         logging.error(f"  --- Remote Stdout --- \n{e.stdout.strip()}")
@@ -98,53 +75,70 @@ def run_ssh_command(command: list, check: bool = True):
 def update_remote_inventory():
     """
     Ensures the remote fingerprinter is up-to-date, runs it on the server,
-    and downloads the resulting inventory. Progress should be monitored by
-    tailing the log file on the remote server.
+    and downloads the resulting inventory. Progress is monitored by tailing the log file.
     """
     logging.info("--- Updating and Running Remote Inventory Script ---")
+
     remote_script = REMOTE_REPO_PATH / "fingerprinter.py"
     remote_cache = REMOTE_REPO_PATH / CACHE_FILE_REL_PATH
     remote_log_file = REMOTE_REPO_PATH / "data/fingerprinter.log"
 
+    # --- Step 1: Run git pull ---
     logging.info(f"Running 'git pull' in remote directory: {REMOTE_REPO_PATH}")
-    git_command = f"cd {REMOTE_REPO_PATH} && git pull"
-    run_ssh_command([git_command])
+    # We build a simple command string for this step.
+    git_command_str = f"set -e && cd {REMOTE_REPO_PATH} && git pull"
+    # This doesn't need the full mamba setup, so we can run it simply.
+    run_ssh_command(f"' {git_command_str} '")  # Simple quoting for a simple command.
 
+    # --- Step 2: Build the complex fingerprinter command ---
     logging.info(
         "Starting remote fingerprinting process... This will take a long time."
     )
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("  MONITORING INSTRUCTIONS:")
     print("  In a separate terminal, run the following command:")
     print(f"  ssh {DST_SSH_TARGET} 'tail -f {remote_log_file}'")
-    print("="*70 + "\n")
-    # Run the python script and redirect all its output (stdout and stderr)
-    # to the log file. The 'nohup' command and '&' are not strictly necessary
-    # here since the Python script will block until the SSH command completes,
-    # but it's good practice for long-running jobs.
+    print("=" * 70 + "\n")
+
+    # Define all parts of the command
+    MICROMAMBA_EXECUTABLE = "/gpfs/data/huo-lab/Image/annawoodard/bin/micromamba"
+    MAMBA_ROOT_PREFIX = "/gpfs/data/huo-lab/Image/annawoodard/micromamba"
+    init_command = f"export MAMBA_ROOT_PREFIX='{MAMBA_ROOT_PREFIX}'"
+    shell_hook_command = f'eval "$({MICROMAMBA_EXECUTABLE} shell hook -s posix)"'
+    mamba_activate_command = "micromamba activate prima"
     python_command = (
-        f"python -u {remote_script} "  # '-u' for unbuffered output
+        f"python -u {remote_script} "
         f"{DST_ROOT_REMOTE} {remote_cache} "
-        f"--parallel-jobs {PARALLEL_JOBS} "
-        f"> {remote_log_file} 2>&1"  # Redirect stdout and stderr to log
+        f"--parallel-jobs {PARALLEL_JOBS}"
+    )
+
+    # Combine everything into a single string. The redirection happens *inside* this string.
+    # The entire command is then wrapped in single quotes for SSH.
+    full_remote_command = (
+        f"set -e; "  # Use semicolon for clarity
+        f"{init_command}; "
+        f"{shell_hook_command}; "
+        f"{mamba_activate_command}; "
+        # Redirect the output of the python command to the log file
+        f"{python_command} > {remote_log_file} 2>&1"
     )
 
     try:
-        run_ssh_command([python_command])
+        # Pass the entire, complex string to our runner function
+        run_ssh_command(f"'{full_remote_command}'")
         logging.info("Remote fingerprinting completed successfully.")
     except subprocess.CalledProcessError:
         logging.error("Remote fingerprinting failed!")
         logging.error(
-            f"Check the detailed log on the server for errors: "
-            f"{remote_log_file}"
+            f"Check the detailed log on the server for errors: {remote_log_file}"
         )
         raise
 
+    # --- Step 3: Download the cache ---
     logging.info("Downloading remote inventory cache...")
     LOCAL_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(
-        ["scp", f"{DST_SSH_TARGET}:{remote_cache}", str(LOCAL_CACHE_FILE)],
-        check=True
+        ["scp", f"{DST_SSH_TARGET}:{remote_cache}", str(LOCAL_CACHE_FILE)], check=True
     )
     logging.info("Remote inventory updated successfully.")
 
@@ -156,7 +150,7 @@ def load_destination_inventory() -> Dict[str, Dict[ExamFingerprint, str]]:
         return {}
 
     logging.info(f"Loading destination inventory from {LOCAL_CACHE_FILE}...")
-    with open(LOCAL_CACHE_FILE, 'r') as f:
+    with open(LOCAL_CACHE_FILE, "r") as f:
         raw_data = json.load(f)
         inventory = {}
         for patient_id, exams in raw_data.items():
@@ -169,16 +163,16 @@ def load_destination_inventory() -> Dict[str, Dict[ExamFingerprint, str]]:
 
 
 def rsync_exam_remote(src: Path, patient_id: str, exam_name: str):
-    dest_path_str = (
-        f"{DST_SSH_TARGET}:{DST_ROOT_REMOTE / patient_id / exam_name}"
-    )
+    dest_path_str = f"{DST_SSH_TARGET}:{DST_ROOT_REMOTE / patient_id / exam_name}"
     logging.info(f"RSYNC: {src} -> {dest_path_str}")
-    run_ssh_command([
-        "mkdir", "-p", str(DST_ROOT_REMOTE / patient_id)
-    ])
+    run_ssh_command(["mkdir", "-p", str(DST_ROOT_REMOTE / patient_id)])
     command = [
-        "rsync", "-aH", "--partial", "--info=stats2,progress2",
-        f"{src}/", dest_path_str
+        "rsync",
+        "-aH",
+        "--partial",
+        "--info=stats2,progress2",
+        f"{src}/",
+        dest_path_str,
     ]
     subprocess.run(command, check=True, capture_output=True, text=True)
     logging.info(f"RSYNC successful for {src.name}")
@@ -187,8 +181,7 @@ def rsync_exam_remote(src: Path, patient_id: str, exam_name: str):
 def main(update_inventory: bool, dry_run: bool):
     if dry_run:
         logging.info(
-            "--- DRY RUN MODE ENABLED: "
-            "No files will be moved or transferred. ---"
+            "--- DRY RUN MODE ENABLED: No files will be moved or transferred. ---"
         )
     if update_inventory:
         update_remote_inventory()
@@ -199,9 +192,11 @@ def main(update_inventory: bool, dry_run: bool):
 
     logging.info(f"Discovering source exams in {SRC_ROOT}...")
     source_exams = [
-        p for p_dir in SRC_ROOT.iterdir()
-        if p_dir.is_dir() and not p_dir.name.startswith('_')
-        for p in p_dir.iterdir() if p.is_dir()
+        p
+        for p_dir in SRC_ROOT.iterdir()
+        if p_dir.is_dir() and not p_dir.name.startswith("_")
+        for p in p_dir.iterdir()
+        if p.is_dir()
     ]
     logging.info(f"Found {len(source_exams)} source exams to process.")
 
@@ -210,69 +205,58 @@ def main(update_inventory: bool, dry_run: bool):
 
     stats = {"renamed": 0, "transferred": 0, "skipped": 0, "failed": 0}
 
+    # --- REVERTED: Go back to parallel execution for the source filesystem ---
+    logging.info("Processing source exams in parallel...")
+
     with ProcessPoolExecutor(max_workers=PARALLEL_JOBS) as executor:
         futures = {
             executor.submit(create_exam_fingerprint, path): path
             for path in source_exams
         }
         for future in tqdm(
-            as_completed(futures), total=len(futures),
-            desc="Processing Source Exams"
+            as_completed(futures),
+            total=len(futures),
+            desc="Processing Source Exams (Parallel)",
         ):
             src_path = futures[future]
             try:
-                src_fingerprint = future.result()
+                src_fingerprint, reason = future.result()
+
                 if not src_fingerprint or not src_fingerprint.is_valid():
-                    logging.warning(
-                        f"SKIPPED: Invalid fingerprint for {src_path}"
-                    )
+                    logging.warning(f"SKIPPED: {src_path} - Reason: {reason}")
                     stats["skipped"] += 1
                     continue
 
-                patient_id, new_exam_name = (
-                    src_path.parent.name, src_path.name
-                )
-                match_name = dest_inventory.get(
-                    patient_id, {}
-                ).get(src_fingerprint)
-                delete_queue_path = (
-                    DELETE_QUEUE_DIR / patient_id / new_exam_name
-                )
+                patient_id, new_exam_name = src_path.parent.name, src_path.name
+                match_name = dest_inventory.get(patient_id, {}).get(src_fingerprint)
+                delete_queue_path = DELETE_QUEUE_DIR / patient_id / new_exam_name
 
                 if match_name:
                     if match_name != new_exam_name:
                         logging.info(
-                            f"MATCH: {new_exam_name} is identical to "
-                            f"remote {match_name}."
+                            f"MATCH: {new_exam_name} is identical to remote {match_name}."
                         )
                         old_rem, new_rem = (
-                            DST_ROOT_REMOTE/patient_id/match_name,
-                            DST_ROOT_REMOTE/patient_id/new_exam_name
+                            DST_ROOT_REMOTE / patient_id / match_name,
+                            DST_ROOT_REMOTE / patient_id / new_exam_name,
                         )
                         if dry_run:
                             logging.info(
-                                f"[DRY RUN] WOULD RENAME REMOTE: "
-                                f"{old_rem} -> {new_rem}"
+                                f"[DRY RUN] WOULD RENAME REMOTE: {old_rem} -> {new_rem}"
                             )
                         else:
-                            run_ssh_command(
-                                ["mv", str(old_rem), str(new_rem)]
-                            )
+                            run_ssh_command(["mv", str(old_rem), str(new_rem)])
                             logging.info("RENAME successful on remote.")
                     else:
                         logging.info(
-                            f"MATCH: {new_exam_name} already exists "
-                            "and is up to date."
+                            f"MATCH: {new_exam_name} already exists and is up to date."
                         )
                     stats["renamed"] += 1
                 else:
-                    logging.info(
-                        f"NEW: {new_exam_name} not found. Transferring."
-                    )
+                    logging.info(f"NEW: {new_exam_name} not found. Transferring.")
                     if dry_run:
                         logging.info(
-                            f"[DRY RUN] WOULD TRANSFER: {src_path} -> "
-                            f"{DST_ROOT_REMOTE / patient_id / new_exam_name}"
+                            f"[DRY RUN] WOULD TRANSFER: {src_path} -> {DST_ROOT_REMOTE / patient_id / new_exam_name}"
                         )
                     else:
                         rsync_exam_remote(src_path, patient_id, new_exam_name)
@@ -280,18 +264,17 @@ def main(update_inventory: bool, dry_run: bool):
 
                 if dry_run:
                     logging.info(
-                        f"[DRY RUN] WOULD QUEUE FOR DELETE: "
-                        f"{src_path} -> {delete_queue_path}"
+                        f"[DRY RUN] WOULD QUEUE FOR DELETE: {src_path} -> {delete_queue_path}"
                     )
                 else:
-                    delete_queue_path.parent.mkdir(
-                        parents=True, exist_ok=True
-                    )
+                    delete_queue_path.parent.mkdir(parents=True, exist_ok=True)
                     shutil.move(str(src_path), str(delete_queue_path))
 
             except Exception as e:
-                logging.error(f"FATAL ERROR processing {src_path}: {e}")
+                logging.error(f"FATAL ERROR processing {src_path}", exc_info=True)
                 stats["failed"] += 1
+
+    # --- End of change ---
 
     logging.info("--- Sync Complete ---")
     if dry_run:
@@ -301,9 +284,7 @@ def main(update_inventory: bool, dry_run: bool):
     logging.info(f"Skipped (bad source): {stats['skipped']}")
     logging.info(f"Failed: {stats['failed']}")
     if not dry_run:
-        logging.info(
-            f"Processed source exams moved to: {DELETE_QUEUE_DIR}"
-        )
+        logging.info(f"Processed source exams moved to: {DELETE_QUEUE_DIR}")
 
 
 if __name__ == "__main__":
@@ -311,14 +292,15 @@ if __name__ == "__main__":
         description="Intelligently sync DICOM exams over SSH."
     )
     parser.add_argument(
-        "--update-inventory", action="store_true",
+        "--update-inventory",
+        action="store_true",
         help="Run the fingerprinter on the remote server to update "
-        "the destination inventory cache."
+        "the destination inventory cache.",
     )
     parser.add_argument(
-        "--dry-run", action="store_true",
-        help="Simulate all operations; no files will be moved or "
-             "transferred."
+        "--dry-run",
+        action="store_true",
+        help="Simulate all operations; no files will be moved or transferred.",
     )
     args = parser.parse_args()
     main(update_inventory=args.update_inventory, dry_run=args.dry_run)

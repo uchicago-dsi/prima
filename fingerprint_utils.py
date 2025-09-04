@@ -5,7 +5,7 @@
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import pydicom
 
@@ -13,6 +13,7 @@ import pydicom
 @dataclass(frozen=True)
 class ExamFingerprint:
     """A unique, content-based identifier for an exam."""
+
     study_uid: str
     file_hashes: frozenset[str]
 
@@ -25,62 +26,87 @@ def hash_file(filepath: Path) -> str:
     sha256_hash = hashlib.sha256()
     try:
         with open(filepath, "rb") as f:
-            # Read in chunks to handle large files efficiently
             for byte_block in iter(lambda: f.read(8192), b""):
                 sha256_hash.update(byte_block)
         return sha256_hash.hexdigest()
     except (IOError, PermissionError) as e:
-        # Log this or handle it as needed in the calling script
         raise e
 
 
-def create_exam_fingerprint(exam_path: Path) -> Optional[ExamFingerprint]:
+def create_exam_fingerprint(exam_path: Path) -> Tuple[Optional[ExamFingerprint], str]:
     """
-    Generates a fingerprint for an exam directory by hashing its contents
-    and reading the StudyInstanceUID from the first valid DICOM file.
-    Returns None if the directory is invalid or a fingerprint cannot be
-    created.
+    Generates a fingerprint for an exam directory. This version searches RECURSIVELY
+    for files to handle nested directory structures. It also retains retries for
+    flaky network filesystems.
+
+    Returns a tuple: (ExamFingerprint | None, reason_string).
     """
     if not exam_path.is_dir():
-        return None
+        return None, f"Path is not a directory."
 
     study_uid = None
     file_hashes = set()
 
-    try:
-        # Filter for files, ignore dotfiles (like .DS_Store)
-        files_to_process = [
-            p for p in exam_path.iterdir()
-            if p.is_file() and not p.name.startswith('.')
-        ]
-        if not files_to_process:
-            return None  # Skip empty or non-DICOM directories
+    files_to_process = []
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            # --- KEY CHANGE HERE ---
+            # Use rglob('*') to find ALL files in ALL subdirectories.
+            # This will correctly find the DICOM files in the nested folder.
+            all_items = exam_path.rglob("*")
+            files_to_process = [
+                p for p in all_items if p.is_file() and not p.name.startswith(".")
+            ]
+            # --- End of Key Change ---
 
+            if files_to_process:
+                break
+
+            # If still no files, it might be a true empty dir or a glitch. Retry.
+            time.sleep(1 + attempt)
+        except (IOError, OSError) as e:
+            if attempt < max_retries - 1:
+                time.sleep(1 + attempt)
+                continue
+            else:
+                return (
+                    None,
+                    f"Failed to list directory contents after {max_retries} attempts: {e}",
+                )
+
+    if not files_to_process:
+        return (
+            None,
+            "No valid files found (directory appears to be empty or only contains dotfiles).",
+        )
+
+    try:
         for fpath in files_to_process:
-            file_hashes.add(hash_file(fpath))
-            # Optimization: only try to read DICOM UID if we haven't found
-            # it yet
+            try:
+                file_hashes.add(hash_file(fpath))
+            except (IOError, OSError) as e:
+                return None, f"Failed to read/hash file {fpath.name}: {e}"
+
             if not study_uid:
                 try:
-                    # stop_before_pixels is a crucial optimization
-                    dcm = pydicom.dcmread(
-                        fpath, stop_before_pixels=True
-                    )
+                    dcm = pydicom.dcmread(fpath, stop_before_pixels=True)
                     study_uid = str(dcm.StudyInstanceUID)
                 except pydicom.errors.InvalidDicomError:
-                    # This file is not a DICOM file, which is fine.
-                    # Keep looking.
                     continue
 
         if not study_uid:
-            # This case means we hashed files, but none were valid DICOMs
-            # with a UID
-            return None
+            return (
+                None,
+                f"Processed {len(file_hashes)} file(s), but none contained a valid DICOM StudyInstanceUID.",
+            )
 
-        return ExamFingerprint(
+        fingerprint = ExamFingerprint(
             study_uid=study_uid, file_hashes=frozenset(file_hashes)
         )
+        return fingerprint, "Success"
+
+    except PermissionError as e:
+        return None, f"Permission denied while accessing files: {e}"
     except Exception as e:
-        # Catch any other unexpected errors during processing
-        # The calling script will log this with the path context
-        raise e
+        return None, f"An unexpected error occurred: {e}"
