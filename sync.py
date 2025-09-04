@@ -33,6 +33,7 @@ LOCAL_CACHE_FILE = Path(__file__).resolve().parent / CACHE_FILE_REL_PATH
 # Path to the delete queue on the source share
 DELETE_QUEUE_DIR = SRC_ROOT / "_synced_and_queued_for_deletion"
 PARALLEL_JOBS = 8
+REMOTE_PARALLEL_JOBS = 4  # NEW: For REMOTE processing. Start with 4, maybe try 2.
 # --- END CONFIGURATION ---
 
 logging.basicConfig(
@@ -83,14 +84,22 @@ def update_remote_inventory():
     remote_cache = REMOTE_REPO_PATH / CACHE_FILE_REL_PATH
     remote_log_file = REMOTE_REPO_PATH / "data/fingerprinter.log"
 
-    # --- Step 1: Run git pull ---
     logging.info(f"Running 'git pull' in remote directory: {REMOTE_REPO_PATH}")
-    # We build a simple command string for this step.
-    git_command_str = f"set -e && cd {REMOTE_REPO_PATH} && git pull"
-    # This doesn't need the full mamba setup, so we can run it simply.
-    run_ssh_command(f"' {git_command_str} '")  # Simple quoting for a simple command.
+    git_command_str = (
+        f"'set -e && "
+        f"export GIT_PAGER=cat && "
+        f"export GIT_EDITOR=true && "
+        f"cd {REMOTE_REPO_PATH} && "
+        f"git pull --ff-only'"
+    )
+    try:
+        run_ssh_command(git_command_str)
+    except subprocess.CalledProcessError:
+        logging.error(
+            "Remote 'git pull' failed. Please resolve the git status manually on the server."
+        )
+        raise
 
-    # --- Step 2: Build the complex fingerprinter command ---
     logging.info(
         "Starting remote fingerprinting process... This will take a long time."
     )
@@ -100,32 +109,29 @@ def update_remote_inventory():
     print(f"  ssh {DST_SSH_TARGET} 'tail -f {remote_log_file}'")
     print("=" * 70 + "\n")
 
-    # Define all parts of the command
     MICROMAMBA_EXECUTABLE = "/gpfs/data/huo-lab/Image/annawoodard/bin/micromamba"
     MAMBA_ROOT_PREFIX = "/gpfs/data/huo-lab/Image/annawoodard/micromamba"
     init_command = f"export MAMBA_ROOT_PREFIX='{MAMBA_ROOT_PREFIX}'"
     shell_hook_command = f'eval "$({MICROMAMBA_EXECUTABLE} shell hook -s posix)"'
     mamba_activate_command = "micromamba activate prima"
+
+    # --- KEY CHANGE: Use the new REMOTE_PARALLEL_JOBS variable ---
     python_command = (
         f"python -u {remote_script} "
         f"{DST_ROOT_REMOTE} {remote_cache} "
-        f"--parallel-jobs {PARALLEL_JOBS}"
+        f"--parallel-jobs {REMOTE_PARALLEL_JOBS}"  # Use the new variable
     )
 
-    # Combine everything into a single string. The redirection happens *inside* this string.
-    # The entire command is then wrapped in single quotes for SSH.
     full_remote_command = (
-        f"set -e; "  # Use semicolon for clarity
+        f"'set -e; "
         f"{init_command}; "
         f"{shell_hook_command}; "
         f"{mamba_activate_command}; "
-        # Redirect the output of the python command to the log file
-        f"{python_command} > {remote_log_file} 2>&1"
+        f"{python_command} > {remote_log_file} 2>&1'"
     )
 
     try:
-        # Pass the entire, complex string to our runner function
-        run_ssh_command(f"'{full_remote_command}'")
+        run_ssh_command(full_remote_command)
         logging.info("Remote fingerprinting completed successfully.")
     except subprocess.CalledProcessError:
         logging.error("Remote fingerprinting failed!")
@@ -134,7 +140,6 @@ def update_remote_inventory():
         )
         raise
 
-    # --- Step 3: Download the cache ---
     logging.info("Downloading remote inventory cache...")
     LOCAL_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(
