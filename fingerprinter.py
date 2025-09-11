@@ -68,72 +68,79 @@ def consolidate_checkpoints(final_output_file: Path):
 def main(root_dir: Path, output_file: Path, parallel_jobs: int):
     logging.info(f"Starting remote fingerprinting of {root_dir}")
 
-    # --- Step 1: Prepare for checkpointing ---
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     all_patient_dirs = [d for d in root_dir.iterdir() if d.is_dir()]
 
-    # --- Step 2: Determine which patients still need to be processed ---
     completed_patient_ids = {p.stem for p in CHECKPOINT_DIR.glob("*.json")}
-
     patients_to_process = [
         p for p in all_patient_dirs if p.name not in completed_patient_ids
     ]
 
     logging.info(f"Found {len(all_patient_dirs)} total patients in source directory.")
     logging.info(f"Found {len(completed_patient_ids)} already completed checkpoints.")
+
     if not patients_to_process:
-        logging.info(
-            "All patients have already been fingerprinted. Proceeding to consolidation."
-        )
+        logging.info("All patients already fingerprinted. Proceeding to consolidation.")
     else:
         logging.info(
             f"Resuming... {len(patients_to_process)} patients remaining to be processed."
         )
 
-        # --- Step 3: Run the processing loop for remaining patients ---
+        # Process patients in batches to reduce main process overhead.
+        # Chunk size is a multiple of parallel jobs to keep all workers busy.
+        chunk_size = parallel_jobs * 20  # e.g., 8 jobs * 20 = 160 patients per batch
+        chunk_size = 1
         overall_failure_reasons = {}
+
         with ProcessPoolExecutor(max_workers=parallel_jobs) as executor:
-            futures = {
-                executor.submit(fingerprint_all_exams_for_patient, path): path
-                for path in patients_to_process
-            }
+            # Wrap the main loop in a tqdm bar that tracks patients, not chunks
+            with tqdm(
+                total=len(patients_to_process), desc="Fingerprinting Patients"
+            ) as pbar:
+                for i in range(0, len(patients_to_process), chunk_size):
+                    chunk = patients_to_process[i : i + chunk_size]
 
-            progress = tqdm(
-                as_completed(futures),
-                total=len(futures),
-                desc="Fingerprinting Patients",
-            )
-            for future in progress:
-                try:
-                    patient_id, patient_inventory, failure_reasons = future.result()
+                    futures = {
+                        executor.submit(fingerprint_all_exams_for_patient, path): path
+                        for path in chunk
+                    }
 
-                    # Write the checkpoint file for this patient
-                    if patient_inventory:
-                        with open(CHECKPOINT_DIR / f"{patient_id}.json", "w") as f:
-                            json.dump(patient_inventory, f)
+                    for future in as_completed(futures):
+                        try:
+                            patient_id, patient_inventory, failure_reasons = (
+                                future.result()
+                            )
 
-                    # Update overall failure stats
-                    for reason, count in failure_reasons.items():
-                        overall_failure_reasons[reason] = (
-                            overall_failure_reasons.get(reason, 0) + count
-                        )
+                            if patient_inventory:
+                                with open(
+                                    CHECKPOINT_DIR / f"{patient_id}.json", "w"
+                                ) as f:
+                                    json.dump(patient_inventory, f)
 
-                except Exception as e:
-                    path = futures[future]
-                    logging.error(
-                        f"A master process future failed for patient {path.name}: {e}"
-                    )
+                            for reason, count in failure_reasons.items():
+                                overall_failure_reasons[reason] = (
+                                    overall_failure_reasons.get(reason, 0) + count
+                                )
 
-    # --- Step 4: Consolidate all checkpoints into the final file ---
+                        except Exception as e:
+                            path = futures[future]
+                            logging.error(
+                                f"A master process future failed for patient {path.name}: {e}"
+                            )
+
+                        # Update the single, overarching progress bar
+                        pbar.update(1)
+
+    # Consolidation and summary remain the same
     full_inventory = consolidate_checkpoints(output_file)
-
-    # --- Step 5: Final Summary ---
     total_exams_fingerprinted = sum(len(v) for v in full_inventory.values())
+
     logging.info("\n" + "=" * 50)
     logging.info("--- Fingerprinting Run Complete ---")
     logging.info(f"Total patients in final inventory: {len(full_inventory):,}")
     logging.info(f"Total exams in final inventory:  {total_exams_fingerprinted:,}")
-    if overall_failure_reasons:
+    # Note: Failure summary is now only for the current run, not accumulated.
+    if "overall_failure_reasons" in locals() and overall_failure_reasons:
         logging.info("--- Failure Summary During Run ---")
         for reason, count in sorted(
             overall_failure_reasons.items(), key=lambda item: item[1], reverse=True
