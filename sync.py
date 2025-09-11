@@ -41,6 +41,10 @@ logging.basicConfig(
     handlers=[logging.FileHandler("sync.log"), logging.StreamHandler()],
 )
 
+def _share_usage_gb():
+    """return (used_gb, free_gb, total_gb) for the SRC_ROOT mount via filesystem accounting (fast, no traversal)"""
+    usage = shutil.disk_usage(SRC_ROOT)
+    return usage.used / 1_000_000_000, usage.free / 1_000_000_000, usage.total / 1_000_000_000
 
 def run_ssh_command(command_str: str, check: bool = True):
     """
@@ -227,7 +231,7 @@ def rsync_exam_remote(src: Path, patient_id: str, exam_name: str):
 
 
 def main(update_inventory: bool, dry_run: bool):
-    """drive end-to-end sync of source exams to remote, with explicit remote before/after and verification"""
+    """drive end-to-end sync; verbose, with remote rename verification and fast share-usage GB in heartbeats"""
     from time import monotonic
 
     if dry_run:
@@ -279,14 +283,18 @@ def main(update_inventory: bool, dry_run: bool):
     bytes_log_total = 0
     transfers_done = 0
     processed = 0  # exams we fully handled (any outcome)
+    queued_local_for_delete = 0  # count of local exams moved into delete queue
+
+    # print initial share usage
+    used_gb, free_gb, total_gb = _share_usage_gb()
+    logging.info(
+        f"[USAGE] share {SRC_ROOT}: used {used_gb:.1f} GB / total {total_gb:.1f} GB (free {free_gb:.1f} GB)"
+    )
 
     logging.info("Processing source exams in parallel...")
 
     with ProcessPoolExecutor(max_workers=PARALLEL_JOBS) as executor:
-        futures = {
-            executor.submit(create_exam_fingerprint, path): path
-            for path in source_exams
-        }
+        futures = {executor.submit(create_exam_fingerprint, path): path for path in source_exams}
         pending = set(futures.keys())
         total = len(pending)
 
@@ -306,16 +314,9 @@ def main(update_inventory: bool, dry_run: bool):
                             stats["skipped"] += 1
                             processed += 1
                         else:
-                            patient_id, new_exam_name = (
-                                src_path.parent.name,
-                                src_path.name,
-                            )
-                            match_name = dest_inventory.get(patient_id, {}).get(
-                                src_fingerprint
-                            )
-                            delete_queue_path = (
-                                DELETE_QUEUE_DIR / patient_id / new_exam_name
-                            )
+                            patient_id, new_exam_name = src_path.parent.name, src_path.name
+                            match_name = dest_inventory.get(patient_id, {}).get(src_fingerprint)
+                            delete_queue_path = DELETE_QUEUE_DIR / patient_id / new_exam_name
 
                             if match_name:
                                 old_rem = DST_ROOT_REMOTE / patient_id / match_name
@@ -325,20 +326,11 @@ def main(update_inventory: bool, dry_run: bool):
                                     # show BEFORE
                                     if not dry_run:
                                         pre = subprocess.run(
-                                            [
-                                                "ssh",
-                                                DST_SSH_TARGET,
-                                                "ls",
-                                                "-ld",
-                                                str(old_rem),
-                                            ],
-                                            capture_output=True,
-                                            text=True,
+                                            ["ssh", DST_SSH_TARGET, "ls", "-ld", str(old_rem)],
+                                            capture_output=True, text=True
                                         )
                                         if pre.returncode == 0:
-                                            logging.info(
-                                                f"REMOTE BEFORE: {pre.stdout.strip()}"
-                                            )
+                                            logging.info(f"REMOTE BEFORE: {pre.stdout.strip()}")
                                         else:
                                             logging.warning(
                                                 f"REMOTE BEFORE missing: {old_rem} ({pre.stderr.strip()})"
@@ -350,56 +342,28 @@ def main(update_inventory: bool, dry_run: bool):
                                     )
 
                                     if dry_run:
-                                        logging.info(
-                                            f"[DRY RUN] WOULD RENAME REMOTE: {old_rem} -> {new_rem}"
-                                        )
+                                        logging.info(f"[DRY RUN] WOULD RENAME REMOTE: {old_rem} -> {new_rem}")
                                     else:
                                         subprocess.run(
-                                            [
-                                                "ssh",
-                                                DST_SSH_TARGET,
-                                                "mv",
-                                                str(old_rem),
-                                                str(new_rem),
-                                            ],
-                                            check=True,
-                                            capture_output=True,
-                                            text=True,
+                                            ["ssh", DST_SSH_TARGET, "mv", str(old_rem), str(new_rem)],
+                                            check=True, capture_output=True, text=True,
                                         )
                                         # show AFTER and verify
                                         post = subprocess.run(
-                                            [
-                                                "ssh",
-                                                DST_SSH_TARGET,
-                                                "ls",
-                                                "-ld",
-                                                str(new_rem),
-                                            ],
-                                            capture_output=True,
-                                            text=True,
+                                            ["ssh", DST_SSH_TARGET, "ls", "-ld", str(new_rem)],
+                                            capture_output=True, text=True
                                         )
                                         if post.returncode != 0:
                                             logging.error(
                                                 f"REMOTE VERIFY FAILED after rename: {new_rem} "
                                                 f"({post.stderr.strip()})"
                                             )
-                                            raise RuntimeError(
-                                                "remote rename verify failed"
-                                            )
-                                        logging.info(
-                                            f"REMOTE AFTER:  {post.stdout.strip()}"
-                                        )
+                                            raise RuntimeError("remote rename verify failed")
+                                        logging.info(f"REMOTE AFTER:  {post.stdout.strip()}")
 
                                         gone = subprocess.run(
-                                            [
-                                                "ssh",
-                                                DST_SSH_TARGET,
-                                                "ls",
-                                                "-ld",
-                                                str(old_rem),
-                                            ],
-                                            capture_output=True,
-                                            text=True,
+                                            ["ssh", DST_SSH_TARGET, "ls", "-ld", str(old_rem)],
+                                            capture_output=True, text=True
                                         )
                                         if gone.returncode == 0:
                                             logging.warning(
@@ -419,27 +383,16 @@ def main(update_inventory: bool, dry_run: bool):
                                         )
                                     else:
                                         ver = subprocess.run(
-                                            [
-                                                "ssh",
-                                                DST_SSH_TARGET,
-                                                "ls",
-                                                "-ld",
-                                                str(final_rem),
-                                            ],
-                                            capture_output=True,
-                                            text=True,
+                                            ["ssh", DST_SSH_TARGET, "ls", "-ld", str(final_rem)],
+                                            capture_output=True, text=True
                                         )
                                         if ver.returncode != 0:
                                             logging.error(
                                                 f"REMOTE VERIFY FAILED (no rename): expected {final_rem} "
                                                 f"({ver.stderr.strip()})"
                                             )
-                                            raise RuntimeError(
-                                                "remote verify failed (no-rename match)"
-                                            )
-                                        logging.info(
-                                            f"REMOTE PRESENT: {ver.stdout.strip()}"
-                                        )
+                                            raise RuntimeError("remote verify failed (no-rename match)")
+                                        logging.info(f"REMOTE PRESENT: {ver.stdout.strip()}")
 
                                     logging.info(
                                         f"MATCH (remote found): {new_exam_name} already exists on remote; "
@@ -474,18 +427,15 @@ def main(update_inventory: bool, dry_run: bool):
                                     f"[DRY RUN] WOULD QUEUE FOR DELETE (LOCAL): {src_path} -> {delete_queue_path}"
                                 )
                             else:
-                                delete_queue_path.parent.mkdir(
-                                    parents=True, exist_ok=True
-                                )
+                                delete_queue_path.parent.mkdir(parents=True, exist_ok=True)
                                 shutil.move(str(src_path), str(delete_queue_path))
+                                queued_local_for_delete += 1
                                 logging.info(
                                     f"QUEUED FOR DELETE (LOCAL): moved {src_path} -> {delete_queue_path}"
                                 )
 
                     except Exception:
-                        logging.error(
-                            f"FATAL ERROR processing {src_path}", exc_info=True
-                        )
+                        logging.error(f"FATAL ERROR processing {src_path}", exc_info=True)
                         stats["failed"] += 1
                         processed += 1
 
@@ -497,12 +447,13 @@ def main(update_inventory: bool, dry_run: bool):
                     elapsed = now - t_start
                     mb_log_total = bytes_log_total / 1_000_000
                     mb_net_total = bytes_net_total / 1_000_000
-                    mbps_net = (
-                        (bytes_net_total / elapsed / 1_000_000) if elapsed > 0 else 0.0
-                    )
+                    mbps_net = (bytes_net_total / elapsed / 1_000_000) if elapsed > 0 else 0.0
                     finger_done = total - len(pending)
                     backlog = max(0, finger_done - processed)
                     inflight = min(PARALLEL_JOBS, len(pending))
+
+                    # fast mount usage check
+                    used_gb, free_gb, total_gb = _share_usage_gb()
 
                     logging.info(
                         f"[HEARTBEAT] processed {processed}/{total} | "
@@ -510,7 +461,9 @@ def main(update_inventory: bool, dry_run: bool):
                         f"{stats['remote_renamed']} remote-renamed | "
                         f"overall {(processed / elapsed * 3600.0) if elapsed > 0 else 0.0:.2f} exams/hr, "
                         f"{mbps_net:.2f} MB/s net | "
-                        f"fingerprinting done {finger_done}/{total}, backlog {backlog}, active {inflight}"
+                        f"fingerprinting done {finger_done}/{total}, backlog {backlog}, active {inflight} | "
+                        f"queued_for_delete {queued_local_for_delete} | "
+                        f"share {used_gb:.1f}/{total_gb:.1f} GB used (free {free_gb:.1f} GB)"
                     )
                     last_hb = now
 
@@ -522,17 +475,20 @@ def main(update_inventory: bool, dry_run: bool):
                     finger_done = total - len(pending)
                     backlog = max(0, finger_done - processed)
                     inflight = min(PARALLEL_JOBS, len(pending))
-                    mbps_net = (
-                        (bytes_net_total / elapsed / 1_000_000) if elapsed > 0 else 0.0
-                    )
+                    mbps_net = (bytes_net_total / elapsed / 1_000_000) if elapsed > 0 else 0.0
+
+                    used_gb, free_gb, total_gb = _share_usage_gb()
+
                     logging.info(
                         f"[HEARTBEAT] processed {processed}/{total} | "
-                        f"{transfers_done} transferred (logical {bytes_log_total / 1_000_000:.1f} MB, "
-                        f"net {bytes_net_total / 1_000_000:.1f} MB), "
+                        f"{transfers_done} transferred (logical {bytes_log_total/1_000_000:.1f} MB, "
+                        f"net {bytes_net_total/1_000_000:.1f} MB), "
                         f"{stats['remote_renamed']} remote-renamed | "
                         f"overall {(processed / elapsed * 3600.0) if elapsed > 0 else 0.0:.2f} exams/hr, "
                         f"{mbps_net:.2f} MB/s net | "
-                        f"fingerprinting done {finger_done}/{total}, backlog {backlog}, active {inflight}"
+                        f"fingerprinting done {finger_done}/{total}, backlog {backlog}, active {inflight} | "
+                        f"queued_for_delete {queued_local_for_delete} | "
+                        f"share {used_gb:.1f}/{total_gb:.1f} GB used (free {free_gb:.1f} GB)"
                     )
                     last_hb = now
                     continue
@@ -543,15 +499,12 @@ def main(update_inventory: bool, dry_run: bool):
     logging.info("--- Sync Complete ---")
     if dry_run:
         logging.info("--- (DRY RUN MODE) ---")
-    logging.info(
-        f"Renamed/Matched: {stats['renamed']}  (remote-renamed: {stats['remote_renamed']})"
-    )
+    logging.info(f"Renamed/Matched: {stats['renamed']}  (remote-renamed: {stats['remote_renamed']})")
     logging.info(f"Transferred New: {stats['transferred']}")
     logging.info(f"Skipped (bad source): {stats['skipped']}")
     logging.info(f"Failed: {stats['failed']}")
     if not dry_run:
         logging.info(f"Processed source exams moved to: {DELETE_QUEUE_DIR}")
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
