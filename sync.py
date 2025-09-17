@@ -5,14 +5,13 @@ import json
 import logging
 import shutil
 import subprocess
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict
 
 from tqdm import tqdm
 
 # Import the shared logic
-from fingerprint_utils import ExamFingerprint, create_exam_fingerprint
+from fingerprint_utils import ExamFingerprint
 
 # --- CONFIGURATION ---
 SRC_ROOT = Path("/Volumes/16352A")
@@ -33,6 +32,8 @@ LOCAL_CACHE_FILE = Path(__file__).resolve().parent / CACHE_FILE_REL_PATH
 DELETE_QUEUE_DIR = SRC_ROOT / "_synced_and_queued_for_deletion"
 PARALLEL_JOBS = 4
 REMOTE_PARALLEL_JOBS = 4  # NEW: For REMOTE processing. Start with 4, maybe try 2.
+# File stability check: only process exam dirs where most recent file is older than this
+STABILITY_THRESHOLD_SEC = 300  # 5 minutes
 # --- END CONFIGURATION ---
 
 logging.basicConfig(
@@ -40,12 +41,15 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.FileHandler("sync.log"), logging.StreamHandler()],
 )
+
+
 def _read_uid_quick(exam_path: Path):
     """
     return (study_uid, files_touched) by scanning for the first readable dicom header.
     uses pydicom with stop_before_pixels to avoid payload reads.
     """
     import pydicom
+
     touched = 0
     for p in exam_path.rglob("*"):
         if not p.is_file() or p.name.startswith("."):
@@ -62,6 +66,8 @@ def _read_uid_quick(exam_path: Path):
             # let it fail loudly elsewhere; UID fast path is best-effort
             continue
     return None, touched
+
+
 def _early_hash_match(
     src_exam: Path,
     patient_inventory: Dict[ExamFingerprint, str],
@@ -89,6 +95,7 @@ def _early_hash_match(
          files_hashed, bytes_hashed, confirms_for_<name>, elapsed_s)
     """
     from time import perf_counter
+
     from fingerprint_utils import hash_file
 
     # build per-patient maps
@@ -108,7 +115,7 @@ def _early_hash_match(
                 s.add(name)
 
     candidates = set(name_to_hashes.keys())
-    confirms = {n: 0 for n in candidates}
+    confirms = dict.fromkeys(candidates, 0)
 
     files_hashed = 0
     bytes_hashed = 0
@@ -140,7 +147,9 @@ def _early_hash_match(
         # early exit: unique candidate with enough confirmations
         if len(candidates) == 1:
             (only,) = tuple(candidates)
-            if confirms[only] >= min_confirm or confirms[only] == len(name_to_hashes[only]):
+            if confirms[only] >= min_confirm or confirms[only] == len(
+                name_to_hashes[only]
+            ):
                 elapsed = perf_counter() - t0
                 return only, {
                     "files_hashed": files_hashed,
@@ -164,10 +173,16 @@ def _early_hash_match(
         "elapsed_s": elapsed,
     }
 
+
 def _share_usage_gb():
     """return (used_gb, free_gb, total_gb) for the SRC_ROOT mount via filesystem accounting (fast, no traversal)"""
     usage = shutil.disk_usage(SRC_ROOT)
-    return usage.used / 1_000_000_000, usage.free / 1_000_000_000, usage.total / 1_000_000_000
+    return (
+        usage.used / 1_000_000_000,
+        usage.free / 1_000_000_000,
+        usage.total / 1_000_000_000,
+    )
+
 
 def run_ssh_command(command_str: str, check: bool = True):
     """
@@ -265,6 +280,33 @@ def update_remote_inventory():
     n_exams = sum(len(v) for v in data.values())
     logging.info(f"inventory snapshot: {n_patients:,} patients, {n_exams:,} exams")
 
+
+def _is_exam_stable(exam_path: Path, threshold_sec: int) -> tuple[bool, float]:
+    """
+    check if exam directory is stable (no files modified within threshold_sec)
+
+    returns (is_stable, age_of_most_recent_file_sec)
+    """
+    import time
+
+    now = time.time()
+    most_recent_age = 0.0
+
+    for p in exam_path.rglob("*"):
+        if not p.is_file() or p.name.startswith("."):
+            continue
+        try:
+            st = p.stat()
+            file_age = now - max(st.st_mtime, st.st_ctime)
+            most_recent_age = max(most_recent_age, file_age)
+        except Exception:
+            # if we can't stat a file, assume it's unstable to be safe
+            return False, 0.0
+
+    is_stable = most_recent_age >= threshold_sec
+    return is_stable, most_recent_age
+
+
 def _is_logically_empty(patient_dir: Path):
     """
     return (is_empty, n_subdirs, n_files_non_dot)
@@ -286,7 +328,11 @@ def _is_logically_empty(patient_dir: Path):
             # if we can't stat it, treat as non-empty to be safe
             n_files += 1
     return (n_dirs == 0 and n_files == 0), n_dirs, n_files
-def _prune_empty_patients(patient_dirs: list[Path], min_age_sec: int, dry_run: bool) -> int:
+
+
+def _prune_empty_patients(
+    patient_dirs: list[Path], min_age_sec: int, dry_run: bool
+) -> int:
     """
     remove totally empty patient-level dirs older than min_age_sec; returns count pruned
     """
@@ -315,12 +361,16 @@ def _prune_empty_patients(patient_dirs: list[Path], min_age_sec: int, dry_run: b
             continue
 
         if dry_run:
-            logging.info(f"[PRUNE DRY RUN] would remove empty patient dir {d} (age {age_sec/3600:.1f}h)")
+            logging.info(
+                f"[PRUNE DRY RUN] would remove empty patient dir {d} (age {age_sec / 3600:.1f}h)"
+            )
         else:
             try:
                 d.rmdir()
                 pruned += 1
-                logging.info(f"[PRUNE] removed empty patient dir {d} (age {age_sec/3600:.1f}h)")
+                logging.info(
+                    f"[PRUNE] removed empty patient dir {d} (age {age_sec / 3600:.1f}h)"
+                )
             except Exception as e:
                 logging.warning(f"[PRUNE] failed to remove {d}: {e}")
 
@@ -329,6 +379,8 @@ def _prune_empty_patients(patient_dirs: list[Path], min_age_sec: int, dry_run: b
         f"pruned {pruned}, recent-empty {recent_empty}, nonempty {nonempty}"
     )
     return pruned
+
+
 def _summarize_unknown_patients(unknown_dirs: list[Path]):
     """
     log a one-line summary for each unknown patient root to explain what they are
@@ -347,7 +399,9 @@ def _summarize_unknown_patients(unknown_dirs: list[Path]):
 
         subdirs = [e.name for e in entries if e.is_dir()]
         files = [e.name for e in entries if e.is_file()]
-        is_empty = (len(subdirs) == 0 and all(fn.startswith(".") or fn.lower() == ".ds_store" for fn in files))
+        is_empty = len(subdirs) == 0 and all(
+            fn.startswith(".") or fn.lower() == ".ds_store" for fn in files
+        )
         try:
             age_h = (now - max(d.stat().st_mtime, d.stat().st_ctime)) / 3600.0
         except Exception:
@@ -447,6 +501,7 @@ def rsync_exam_remote(src: Path, patient_id: str, exam_name: str):
     )
     return net_bytes, logical_bytes, dt
 
+
 def main(update_inventory: bool, dry_run: bool):
     """
     drive end-to-end sync with:
@@ -480,10 +535,14 @@ def main(update_inventory: bool, dry_run: bool):
     logging.info(f"Scanning top-level in {SRC_ROOT} for patient directories...")
     top_dirs = [d for d in SRC_ROOT.iterdir() if d.is_dir()]
     patient_dirs = [d for d in top_dirs if d.name.isdigit()]
-    ignored_dirs = [d for d in top_dirs if not d.name.isdigit() and not d.name.startswith('_')]
+    ignored_dirs = [
+        d for d in top_dirs if not d.name.isdigit() and not d.name.startswith("_")
+    ]
     if ignored_dirs:
         sample = ", ".join(sorted(p.name for p in ignored_dirs[:10]))
-        logging.info(f"Ignoring {len(ignored_dirs)} non-patient root dirs: [{sample}...]")
+        logging.info(
+            f"Ignoring {len(ignored_dirs)} non-patient root dirs: [{sample}...]"
+        )
 
     known_pat = [d for d in patient_dirs if d.name in dest_inventory]
     unknown_pat = [d for d in patient_dirs if d.name not in dest_inventory]
@@ -536,13 +595,27 @@ def main(update_inventory: bool, dry_run: bool):
         f"[USAGE mount] {SRC_ROOT}: used {used_gb:.1f} GB / total {total_gb:.1f} GB (free {free_gb:.1f} GB)"
     )
 
-    from tqdm import tqdm
     pbar = tqdm(total=len(source_exams), desc="Processing Source Exams")
 
     for idx, src_path in enumerate(source_exams, 1):
         try:
             patient_id, exam_name = src_path.parent.name, src_path.name
             dest_patient = dest_inventory.get(patient_id, {})
+
+            # ---------- stability check ----------
+            is_stable, most_recent_age = _is_exam_stable(
+                src_path, STABILITY_THRESHOLD_SEC
+            )
+            if not is_stable:
+                logging.info(
+                    f"SKIP UNSTABLE: {exam_name} "
+                    f"(most recent file {most_recent_age / 60:.1f}min old, "
+                    f"need {STABILITY_THRESHOLD_SEC / 60:.1f}min)"
+                )
+                stats["skipped"] += 1
+                processed += 1
+                pbar.update(1)
+                continue
 
             # ---------- UID-first fast path ----------
             uid, touched = _read_uid_quick(src_path)
@@ -561,16 +634,23 @@ def main(update_inventory: bool, dry_run: bool):
                         logging.info(
                             f"UID HIT ({uid}) after touching {touched} files: remote has '{match_name}'. "
                             f"[DRY RUN] WOULD "
-                            + ("rename remote to new name" if match_name != exam_name else "queue local for deletion")
+                            + (
+                                "rename remote to new name"
+                                if match_name != exam_name
+                                else "queue local for deletion"
+                            )
                         )
                     else:
                         ver_target = old_rem if match_name != exam_name else new_rem
                         ver = subprocess.run(
                             ["ssh", DST_SSH_TARGET, "ls", "-ld", str(ver_target)],
-                            capture_output=True, text=True,
+                            capture_output=True,
+                            text=True,
                         )
                         if ver.returncode != 0:
-                            raise RuntimeError(f"remote verify failed for {ver_target}: {ver.stderr.strip()}")
+                            raise RuntimeError(
+                                f"remote verify failed for {ver_target}: {ver.stderr.strip()}"
+                            )
 
                     if match_name != exam_name:
                         logging.info(
@@ -579,8 +659,16 @@ def main(update_inventory: bool, dry_run: bool):
                         )
                         if not dry_run:
                             subprocess.run(
-                                ["ssh", DST_SSH_TARGET, "mv", str(old_rem), str(new_rem)],
-                                check=True, capture_output=True, text=True,
+                                [
+                                    "ssh",
+                                    DST_SSH_TARGET,
+                                    "mv",
+                                    str(old_rem),
+                                    str(new_rem),
+                                ],
+                                check=True,
+                                capture_output=True,
+                                text=True,
                             )
                     else:
                         logging.info(
@@ -600,7 +688,9 @@ def main(update_inventory: bool, dry_run: bool):
                         dst.parent.mkdir(parents=True, exist_ok=True)
                         shutil.move(str(src_path), str(dst))
                         queued_local_for_delete += 1
-                        logging.info(f"QUEUED FOR DELETE (LOCAL): moved {src_path} -> {dst}")
+                        logging.info(
+                            f"QUEUED FOR DELETE (LOCAL): moved {src_path} -> {dst}"
+                        )
 
                     processed += 1
                     pbar.update(1)
@@ -611,11 +701,11 @@ def main(update_inventory: bool, dry_run: bool):
                         used_gb, free_gb, total_gb = _share_usage_gb()
                         logging.info(
                             f"[HEARTBEAT] processed {processed}/{len(source_exams)} | "
-                            f"{transfers_done} transferred (logical {bytes_log_total/1e6:.1f} MB, net {bytes_net_total/1e6:.1f} MB) | "
+                            f"{transfers_done} transferred (logical {bytes_log_total / 1e6:.1f} MB, net {bytes_net_total / 1e6:.1f} MB) | "
                             f"{stats['remote_renamed']} remote-renamed | "
                             f"uid_fastpath {stats['uid_fastpath_hits']}, early_hash {stats['early_hash_hits']}, "
                             f"full_hash {stats['full_hash_fallbacks']} | "
-                            f"overall {(processed/elapsed*3600.0) if elapsed>0 else 0.0:.2f} exams/hr | "
+                            f"overall {(processed / elapsed * 3600.0) if elapsed > 0 else 0.0:.2f} exams/hr | "
                             f"share {used_gb:.1f}/{total_gb:.1f} GB used (free {free_gb:.1f} GB)"
                         )
                         last_hb = now
@@ -625,7 +715,9 @@ def main(update_inventory: bool, dry_run: bool):
             if dest_patient:
                 candidate_set = None
                 if uid:
-                    candidate_set = {name for fp, name in dest_patient.items() if fp.study_uid == uid}
+                    candidate_set = {
+                        name for fp, name in dest_patient.items() if fp.study_uid == uid
+                    }
                     if len(candidate_set) <= 1:
                         candidate_set = None
 
@@ -642,19 +734,27 @@ def main(update_inventory: bool, dry_run: bool):
                         logging.info(
                             f"EARLY-HASH MATCH: {exam_name} == remote '{matched}' "
                             f"(confirmed {ev.get(f'confirms_for_{matched}', 0)} hashes, "
-                            f"{ev['files_hashed']} files, {ev['bytes_hashed']/1e6:.1f} MB hashed in {ev['elapsed_s']:.1f}s) "
+                            f"{ev['files_hashed']} files, {ev['bytes_hashed'] / 1e6:.1f} MB hashed in {ev['elapsed_s']:.1f}s) "
                             f"→ renaming REMOTE to '{exam_name}'"
                         )
                         if not dry_run:
                             subprocess.run(
-                                ["ssh", DST_SSH_TARGET, "mv", str(old_rem), str(new_rem)],
-                                check=True, capture_output=True, text=True,
+                                [
+                                    "ssh",
+                                    DST_SSH_TARGET,
+                                    "mv",
+                                    str(old_rem),
+                                    str(new_rem),
+                                ],
+                                check=True,
+                                capture_output=True,
+                                text=True,
                             )
                     else:
                         logging.info(
                             f"EARLY-HASH MATCH: {exam_name} already present on remote "
                             f"(confirmed {ev.get(f'confirms_for_{matched}', 0)} hashes, "
-                            f"{ev['files_hashed']} files, {ev['bytes_hashed']/1e6:.1f} MB hashed in {ev['elapsed_s']:.1f}s) "
+                            f"{ev['files_hashed']} files, {ev['bytes_hashed'] / 1e6:.1f} MB hashed in {ev['elapsed_s']:.1f}s) "
                             f"→ queue LOCAL for deletion"
                         )
                     stats["remote_renamed"] += int(matched != exam_name)
@@ -671,7 +771,9 @@ def main(update_inventory: bool, dry_run: bool):
                         dst.parent.mkdir(parents=True, exist_ok=True)
                         shutil.move(str(src_path), str(dst))
                         queued_local_for_delete += 1
-                        logging.info(f"QUEUED FOR DELETE (LOCAL): moved {src_path} -> {dst}")
+                        logging.info(
+                            f"QUEUED FOR DELETE (LOCAL): moved {src_path} -> {dst}"
+                        )
 
                     processed += 1
                     pbar.update(1)
@@ -682,11 +784,11 @@ def main(update_inventory: bool, dry_run: bool):
                         used_gb, free_gb, total_gb = _share_usage_gb()
                         logging.info(
                             f"[HEARTBEAT] processed {processed}/{len(source_exams)} | "
-                            f"{transfers_done} transferred (logical {bytes_log_total/1e6:.1f} MB, net {bytes_net_total/1e6:.1f} MB) | "
+                            f"{transfers_done} transferred (logical {bytes_log_total / 1e6:.1f} MB, net {bytes_net_total / 1e6:.1f} MB) | "
                             f"{stats['remote_renamed']} remote-renamed | "
                             f"uid_fastpath {stats['uid_fastpath_hits']}, early_hash {stats['early_hash_hits']}, "
                             f"full_hash {stats['full_hash_fallbacks']} | "
-                            f"overall {(processed/elapsed*3600.0) if elapsed>0 else 0.0:.2f} exams/hr | "
+                            f"overall {(processed / elapsed * 3600.0) if elapsed > 0 else 0.0:.2f} exams/hr | "
                             f"share {used_gb:.1f}/{total_gb:.1f} GB used (free {free_gb:.1f} GB)"
                         )
                         last_hb = now
@@ -736,11 +838,11 @@ def main(update_inventory: bool, dry_run: bool):
             used_gb, free_gb, total_gb = _share_usage_gb()
             logging.info(
                 f"[HEARTBEAT] processed {processed}/{len(source_exams)} | "
-                f"{transfers_done} transferred (logical {bytes_log_total/1e6:.1f} MB, net {bytes_net_total/1e6:.1f} MB) | "
+                f"{transfers_done} transferred (logical {bytes_log_total / 1e6:.1f} MB, net {bytes_net_total / 1e6:.1f} MB) | "
                 f"{stats['remote_renamed']} remote-renamed | "
                 f"uid_fastpath {stats['uid_fastpath_hits']}, early_hash {stats['early_hash_hits']}, "
                 f"full_hash {stats['full_hash_fallbacks']} | "
-                f"overall {(processed/elapsed*3600.0) if elapsed>0 else 0.0:.2f} exams/hr | "
+                f"overall {(processed / elapsed * 3600.0) if elapsed > 0 else 0.0:.2f} exams/hr | "
                 f"share {used_gb:.1f}/{total_gb:.1f} GB used (free {free_gb:.1f} GB)"
             )
             last_hb = now
@@ -761,7 +863,6 @@ def main(update_inventory: bool, dry_run: bool):
     logging.info(
         f"[USAGE mount FINAL] {SRC_ROOT}: used {used_gb:.1f} GB / total {total_gb:.1f} GB (free {free_gb:.1f} GB)"
     )
-
 
 
 if __name__ == "__main__":
