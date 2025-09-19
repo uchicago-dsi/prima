@@ -13,5 +13,10 @@ einops
 h5py
 beautifulsoup4
 selenium
-tqdm
 lxml
+pydicom
+pandas
+pyarrow
+zarr
+numcodecs
+opencv-python-headless

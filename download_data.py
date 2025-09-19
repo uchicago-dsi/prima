@@ -86,7 +86,7 @@ def load_and_merge_data():
         db["DatedxIndex"], errors="coerce", dayfirst=True
     )
 
-    conditions = [db["DatedxIndex"].notna(), db["_in_patient_file"]]
+    conditions = [db["DatedxIndex"].notna(), db["_in_patient_file"].fillna(False)]
     choices = ["Case", "Control"]
     db["case_control_status"] = np.select(conditions, choices, default="Unknown")
     print("  - Derived Case/Control status based on DatedxIndex:")
@@ -125,7 +125,7 @@ def identify_download_targets(
 
     # We still check if it's exported, but now it's a secondary check.
     # An exam could be exported but the sync failed, so it's not on disk.
-    has_accession_mask = targets["is_exported"] == True
+    has_accession_mask = targets["is_exported"]
     targets.loc[has_accession_mask, "rejection_reason"] = (
         "Already exported (but not found on disk - possible sync issue)"
     )
@@ -265,7 +265,7 @@ def main():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=50,
+        default=100,
         help="Max number of exams to request in one run.",
     )
     parser.add_argument(

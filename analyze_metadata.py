@@ -457,7 +457,6 @@ def create_modality_distribution_plot(metadata, chip_status, plots_dir):
         .nunique()
         .sort_values(ascending=False)
     )
-    total_patients = metadata["study_id"].nunique()
     # map modality codes to readable labels
     patient_labels = [
         BASE_MODALITY_LABELS.get(mod, mod) for mod in patient_counts.index
@@ -720,7 +719,7 @@ def create_comprehensive_download_status_plot(
                 )
 
     # Panel 2: Modality breakdown of downloaded exams
-    downloaded_data = all_metadata[all_metadata["is_on_disk"] == True].copy()
+    downloaded_data = all_metadata[all_metadata["is_on_disk"]].copy()
     if len(downloaded_data) > 0:
         modality_counts = downloaded_data["base_modality"].value_counts()
         ax2.bar(
@@ -764,7 +763,7 @@ def create_comprehensive_download_status_plot(
     if len(all_data_combined) > 0:
         modality_total = all_data_combined["base_modality"].value_counts()
         modality_downloaded = all_data_combined[
-            all_data_combined["is_on_disk"] == True
+            all_data_combined["is_on_disk"]
         ]["base_modality"].value_counts()
 
         # calculate download rates
@@ -797,7 +796,7 @@ def create_comprehensive_download_status_plot(
     # Panel 4: Export vs Download status
     exported_data = all_metadata[all_metadata["Exported On"].notna()].copy()
     if len(exported_data) > 0:
-        exported_on_disk = (exported_data["is_on_disk"] == True).sum()
+        exported_on_disk = (exported_data["is_on_disk"]).sum()
         exported_not_on_disk = len(exported_data) - exported_on_disk
 
         labels = ["exported & on disk", "exported & not on disk"]
@@ -1644,7 +1643,7 @@ if (
 ):
     exported_not_on_disk = metadata_with_patient_data[
         (metadata_with_patient_data["Exported On"].notna())
-        & (metadata_with_patient_data["is_on_disk"] == False)
+        & (not metadata_with_patient_data["is_on_disk"])
     ]
     print(
         f"exams with 'Exported On' date but not on disk: {len(exported_not_on_disk):,}"
