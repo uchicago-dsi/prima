@@ -17,8 +17,11 @@ Installation recipe:
 micromamba config append channels conda-forge
 micromamba create -y --name prima python=3.11
 micromamba activate prima
-git clone git@github.com:uchicago-dsi/prima.git
+git clone --recursive git@github.com:uchicago-dsi/prima.git
 cd prima
+git submodule add https://github.com/annawoodard/Mirai vendor/mirai
+git submodule update --init --recursive
+
 micromamba install -y pytorch torchvision pytorch-cuda=12.1 selenium firefox geckodriver ipykernel -c pytorch -c nvidia
 pip install -e . # if developing
 # pip install . # if not developing
