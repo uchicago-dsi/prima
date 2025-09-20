@@ -762,9 +762,9 @@ def create_comprehensive_download_status_plot(
     )
     if len(all_data_combined) > 0:
         modality_total = all_data_combined["base_modality"].value_counts()
-        modality_downloaded = all_data_combined[
-            all_data_combined["is_on_disk"]
-        ]["base_modality"].value_counts()
+        modality_downloaded = all_data_combined[all_data_combined["is_on_disk"]][
+            "base_modality"
+        ].value_counts()
 
         # calculate download rates
         download_rates = []

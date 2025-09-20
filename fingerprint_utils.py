@@ -55,13 +55,18 @@ def create_exam_fingerprint(exam_path: Path) -> Tuple[Optional[ExamFingerprint],
     try:
         list_start = time.perf_counter()
         all_items = exam_path.rglob("*")
-        files_to_process = [p for p in all_items if p.is_file() and not p.name.startswith(".")]
+        files_to_process = [
+            p for p in all_items if p.is_file() and not p.name.startswith(".")
+        ]
         list_s = time.perf_counter() - list_start
     except (IOError, OSError) as e:
         return None, f"Failed to list directory contents: {e}"
 
     if not files_to_process:
-        return None, "No valid files found (directory appears to be empty or only contains dotfiles)."
+        return (
+            None,
+            "No valid files found (directory appears to be empty or only contains dotfiles).",
+        )
 
     approx_bytes = 0
     try:
@@ -95,15 +100,20 @@ def create_exam_fingerprint(exam_path: Path) -> Tuple[Optional[ExamFingerprint],
     if not study_uid:
         total_s = time.perf_counter() - t0
         logging.info(
-            f"[FPRINT] {exam_path.name}: files={len(files_to_process)}, bytes~{approx_bytes/1e6:.1f} MB, "
+            f"[FPRINT] {exam_path.name}: files={len(files_to_process)}, bytes~{approx_bytes / 1e6:.1f} MB, "
             f"list={list_s:.2f}s, hash={hash_s:.2f}s, total={total_s:.2f}s -> no StudyInstanceUID"
         )
-        return None, f"Processed {len(file_hashes)} file(s), but none contained a valid DICOM StudyInstanceUID."
+        return (
+            None,
+            f"Processed {len(file_hashes)} file(s), but none contained a valid DICOM StudyInstanceUID.",
+        )
 
-    fingerprint = ExamFingerprint(study_uid=study_uid, file_hashes=frozenset(file_hashes))
+    fingerprint = ExamFingerprint(
+        study_uid=study_uid, file_hashes=frozenset(file_hashes)
+    )
     total_s = time.perf_counter() - t0
     logging.info(
-        f"[FPRINT] {exam_path.name}: files={len(files_to_process)}, bytes~{approx_bytes/1e6:.1f} MB, "
+        f"[FPRINT] {exam_path.name}: files={len(files_to_process)}, bytes~{approx_bytes / 1e6:.1f} MB, "
         f"list={list_s:.2f}s, hash={hash_s:.2f}s, total={total_s:.2f}s -> uid={study_uid}"
     )
     return fingerprint, "Success"
