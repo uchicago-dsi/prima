@@ -31,7 +31,7 @@ LOCAL_CACHE_FILE = Path(__file__).resolve().parent / CACHE_FILE_REL_PATH
 
 # Path to the delete queue on the source share
 DELETE_QUEUE_DIR = SRC_ROOT / "_synced_and_queued_for_deletion"
-PARALLEL_JOBS = 3  # Reduced from 8 to avoid SSH/I/O contention
+PARALLEL_JOBS = 6  # Increased back up since serialization overhead is now minimal
 REMOTE_PARALLEL_JOBS = 4  # For REMOTE processing. Start with 4, maybe try 2.
 # File stability check: only process exam dirs where most recent file is older than this
 STABILITY_THRESHOLD_SEC = 600
@@ -588,6 +588,7 @@ def process_patient_exams(
     exam_paths: list[Path],
     patient_inventory: Dict[ExamFingerprint, str],
     dry_run: bool,
+    immediate_delete: bool = False,
 ) -> Tuple[str, Dict[str, int], int, int, int]:
     """
     process all exams for a single patient to minimize serialization overhead
@@ -624,7 +625,7 @@ def process_patient_exams(
         try:
             exam_name, exam_stats, net_bytes, logical_bytes, queued = (
                 process_single_exam_internal(
-                    src_path, patient_id, patient_inventory, dry_run
+                    src_path, patient_id, patient_inventory, dry_run, immediate_delete
                 )
             )
 
@@ -654,6 +655,7 @@ def process_single_exam_internal(
     patient_id: str,
     patient_inventory: Dict[ExamFingerprint, str],
     dry_run: bool,
+    immediate_delete: bool = False,
 ) -> Tuple[str, Dict[str, int], int, int, int]:
     """
     internal function to process a single exam (moved from process_single_exam)
@@ -758,15 +760,19 @@ def process_single_exam_internal(
             exam_stats["uid_fastpath_hits"] += 1
 
             if dry_run:
-                logging.info(
-                    f"[DRY RUN] WOULD QUEUE FOR DELETE (LOCAL): {src_path} -> "
-                    f"{DELETE_QUEUE_DIR / patient_id / exam_name}"
-                )
+                action = "DELETE" if immediate_delete else "QUEUE FOR DELETE"
+                logging.info(f"[DRY RUN] WOULD {action} (LOCAL): {src_path}")
             else:
-                dst = DELETE_QUEUE_DIR / patient_id / exam_name
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(src_path), str(dst))
-                logging.info(f"QUEUED FOR DELETE (LOCAL): moved {src_path} -> {dst}")
+                if immediate_delete:
+                    shutil.rmtree(str(src_path))
+                    logging.info(f"DELETED (LOCAL): {src_path}")
+                else:
+                    dst = DELETE_QUEUE_DIR / patient_id / exam_name
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(src_path), str(dst))
+                    logging.info(
+                        f"QUEUED FOR DELETE (LOCAL): moved {src_path} -> {dst}"
+                    )
 
             return exam_name, exam_stats, 0, 0, 1
 
@@ -825,15 +831,19 @@ def process_single_exam_internal(
             exam_stats["early_hash_hits"] += 1
 
             if dry_run:
-                logging.info(
-                    f"[DRY RUN] WOULD QUEUE FOR DELETE (LOCAL): {src_path} -> "
-                    f"{DELETE_QUEUE_DIR / patient_id / exam_name}"
-                )
+                action = "DELETE" if immediate_delete else "QUEUE FOR DELETE"
+                logging.info(f"[DRY RUN] WOULD {action} (LOCAL): {src_path}")
             else:
-                dst = DELETE_QUEUE_DIR / patient_id / exam_name
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(src_path), str(dst))
-                logging.info(f"QUEUED FOR DELETE (LOCAL): moved {src_path} -> {dst}")
+                if immediate_delete:
+                    shutil.rmtree(str(src_path))
+                    logging.info(f"DELETED (LOCAL): {src_path}")
+                else:
+                    dst = DELETE_QUEUE_DIR / patient_id / exam_name
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(src_path), str(dst))
+                    logging.info(
+                        f"QUEUED FOR DELETE (LOCAL): moved {src_path} -> {dst}"
+                    )
 
             return exam_name, exam_stats, 0, 0, 1
 
@@ -852,23 +862,167 @@ def process_single_exam_internal(
 
     # queue local after transfer
     if dry_run:
-        logging.info(
-            f"[DRY RUN] WOULD QUEUE FOR DELETE (LOCAL): {src_path} -> "
-            f"{DELETE_QUEUE_DIR / patient_id / exam_name}"
-        )
+        action = "DELETE" if immediate_delete else "QUEUE FOR DELETE"
+        logging.info(f"[DRY RUN] WOULD {action} (LOCAL): {src_path}")
     else:
-        dst = DELETE_QUEUE_DIR / patient_id / exam_name
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(src_path), str(dst))
-        logging.info(f"QUEUED FOR DELETE (LOCAL): moved {src_path} -> {dst}")
+        if immediate_delete:
+            shutil.rmtree(str(src_path))
+            logging.info(f"DELETED (LOCAL): {src_path}")
+        else:
+            dst = DELETE_QUEUE_DIR / patient_id / exam_name
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src_path), str(dst))
+            logging.info(f"QUEUED FOR DELETE (LOCAL): moved {src_path} -> {dst}")
 
     return exam_name, exam_stats, net_bytes, logical_bytes, 1
+
+
+def process_uid_fastpath_phase(
+    exam_paths: list[Path],
+    dest_inventory: Dict[str, Dict[ExamFingerprint, str]],
+    dry_run: bool,
+    immediate_delete: bool = False,
+) -> Tuple[list[Path], Dict[str, int]]:
+    """
+    First phase: process all exams for UID fastpath matches
+    Returns (remaining_exams_for_transfer, stats)
+    """
+    import shutil  # Import at function level to avoid scoping issues
+
+    remaining_exams = []
+    stats = {
+        "renamed": 0,
+        "skipped": 0,
+        "failed": 0,
+        "remote_renamed": 0,
+        "uid_fastpath_hits": 0,
+    }
+
+    for src_path in exam_paths:
+        try:
+            patient_id = src_path.parent.name
+            exam_name = src_path.name
+            patient_inventory = dest_inventory.get(patient_id, {})
+
+            # stability check
+            is_stable, most_recent_age = _is_exam_stable(
+                src_path, STABILITY_THRESHOLD_SEC
+            )
+            if not is_stable:
+                logging.info(
+                    f"SKIP UNSTABLE: {exam_name} "
+                    f"(most recent file {most_recent_age / 60:.1f}min old, "
+                    f"need {STABILITY_THRESHOLD_SEC / 60:.1f}min)"
+                )
+                stats["skipped"] += 1
+                continue
+
+            # UID fastpath check
+            uid, touched = _read_uid_quick(src_path)
+            if uid and patient_inventory:
+                uid_matches = [
+                    (fp, name)
+                    for fp, name in patient_inventory.items()
+                    if fp.study_uid == uid
+                ]
+                if len(uid_matches) == 1:
+                    fp, match_name = uid_matches[0]
+                    old_rem = DST_ROOT_REMOTE / patient_id / match_name
+                    new_rem = DST_ROOT_REMOTE / patient_id / exam_name
+
+                    # verify remote exists
+                    if not dry_run:
+                        ver_target = old_rem if match_name != exam_name else new_rem
+                        ssh_opts = [
+                            "-o",
+                            "ControlMaster=auto",
+                            "-o",
+                            "ControlPath=~/.ssh/control-%h-%p-%r",
+                            "-o",
+                            "ControlPersist=300",
+                        ]
+                        ver = subprocess.run(
+                            ["ssh"]
+                            + ssh_opts
+                            + [DST_SSH_TARGET, "ls", "-ld", str(ver_target)],
+                            capture_output=True,
+                            text=True,
+                        )
+                        if ver.returncode != 0:
+                            logging.warning(
+                                f"UID match but remote verify failed for {ver_target}, will transfer"
+                            )
+                            remaining_exams.append(src_path)
+                            continue
+
+                    # handle rename or already exists
+                    if match_name != exam_name:
+                        logging.info(
+                            f"UID FASTPATH: {exam_name} == remote '{match_name}' "
+                            f"→ renaming REMOTE to '{exam_name}' (no hashing)"
+                        )
+                        if not dry_run:
+                            ssh_opts = [
+                                "-o",
+                                "ControlMaster=auto",
+                                "-o",
+                                "ControlPath=~/.ssh/control-%h-%p-%r",
+                                "-o",
+                                "ControlPersist=300",
+                            ]
+                            subprocess.run(
+                                ["ssh"]
+                                + ssh_opts
+                                + [DST_SSH_TARGET, "mv", str(old_rem), str(new_rem)],
+                                check=True,
+                                capture_output=True,
+                                text=True,
+                            )
+                        stats["remote_renamed"] += 1
+                    else:
+                        logging.info(
+                            f"UID FASTPATH: {exam_name} already present on remote (verified) – queue local for deletion"
+                        )
+
+                    stats["renamed"] += 1
+                    stats["uid_fastpath_hits"] += 1
+
+                    # handle local deletion/queueing
+                    if dry_run:
+                        action = "DELETE" if immediate_delete else "QUEUE FOR DELETE"
+                        logging.info(f"[DRY RUN] WOULD {action} (LOCAL): {src_path}")
+                    else:
+                        if immediate_delete:
+                            shutil.rmtree(str(src_path))
+                            logging.info(f"DELETED (LOCAL): {src_path}")
+                        else:
+                            dst = DELETE_QUEUE_DIR / patient_id / exam_name
+                            dst.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.move(str(src_path), str(dst))
+                            logging.info(
+                                f"QUEUED FOR DELETE (LOCAL): moved {src_path} -> {dst}"
+                            )
+
+                    continue
+
+            # no UID fastpath match, needs transfer
+            remaining_exams.append(src_path)
+
+        except Exception as e:
+            logging.error(
+                f"FATAL ERROR in UID fastpath for {src_path}: {e}", exc_info=True
+            )
+            stats["failed"] += 1
+            remaining_exams.append(src_path)  # still try to transfer
+
+    return remaining_exams, stats
 
 
 def process_single_exam(
     src_path: Path,
     dest_inventory: Dict[str, Dict[ExamFingerprint, str]],
     dry_run: bool,
+    immediate_delete: bool = False,
 ) -> Tuple[str, Dict[str, int], int, int, int]:
     """
     legacy wrapper for backward compatibility - delegates to internal function
@@ -879,7 +1033,7 @@ def process_single_exam(
         patient_id = src_path.parent.name
         patient_inventory = dest_inventory.get(patient_id, {})
         return process_single_exam_internal(
-            src_path, patient_id, patient_inventory, dry_run
+            src_path, patient_id, patient_inventory, dry_run, immediate_delete
         )
     except Exception:
         logging.error(f"FATAL ERROR processing {src_path}", exc_info=True)
@@ -896,7 +1050,7 @@ def process_single_exam(
         return src_path.name, exam_stats, 0, 0, 0
 
 
-def main(update_inventory: bool, dry_run: bool):
+def main(update_inventory: bool, dry_run: bool, immediate_delete: bool = False):
     """
     drive end-to-end sync with:
       - numeric-only patient discovery
@@ -957,33 +1111,43 @@ def main(update_inventory: bool, dry_run: bool):
     # rebuild patient_dirs after pruning in case some were removed
     patient_dirs = [d for d in SRC_ROOT.iterdir() if d.is_dir() and d.name.isdigit()]
 
-    # ----- group exams by patient for efficient parallelization -----
-    patient_tasks = {}
-    total_exams = 0
+    # ----- collect all exams for two-phase processing -----
+    all_exams = []
     for p_dir in patient_dirs:
-        patient_id = p_dir.name
         exam_paths = [p for p in p_dir.iterdir() if p.is_dir()]
-        if exam_paths:
-            patient_tasks[patient_id] = exam_paths
-            total_exams += len(exam_paths)
+        all_exams.extend(exam_paths)
 
-    logging.info(
-        f"Found {total_exams} source exams across {len(patient_tasks)} patients to process."
+    total_exams = len(all_exams)
+    logging.info(f"Found {total_exams} source exams to process.")
+
+    # ===== PHASE 1: UID FASTPATH (Sequential, Fast) =====
+    logging.info("=== PHASE 1: UID FASTPATH PROCESSING ===")
+    logging.info("Processing all exams for UID matches first (fast, no SSH transfers)")
+
+    phase1_start = monotonic()
+    remaining_exams, phase1_stats = process_uid_fastpath_phase(
+        all_exams, dest_inventory, dry_run, immediate_delete
     )
+    phase1_time = monotonic() - phase1_start
+
+    logging.info(f"Phase 1 complete in {phase1_time:.1f}s:")
+    logging.info(f"  - UID fastpath hits: {phase1_stats['uid_fastpath_hits']}")
+    logging.info(f"  - Remote renamed: {phase1_stats['remote_renamed']}")
+    logging.info(f"  - Skipped (unstable): {phase1_stats['skipped']}")
+    logging.info(f"  - Failed: {phase1_stats['failed']}")
+    logging.info(f"  - Remaining for transfer: {len(remaining_exams)}")
+
+    if not remaining_exams:
+        logging.info("All exams processed via UID fastpath! No transfers needed.")
+        return
+
+    # ===== PHASE 2: TRANSFERS AND HASH MATCHING (Parallel) =====
+    logging.info("=== PHASE 2: TRANSFER PROCESSING ===")
     logging.info(
-        f"Using patient-level parallelization with {PARALLEL_JOBS} workers to minimize serialization overhead."
+        f"Processing {len(remaining_exams)} exams requiring hash matching or transfer"
     )
 
-    # calculate average exams per patient for load balancing insights
-    avg_exams_per_patient = total_exams / len(patient_tasks) if patient_tasks else 0
-    max_exams_per_patient = (
-        max(len(exams) for exams in patient_tasks.values()) if patient_tasks else 0
-    )
-    logging.info(
-        f"Patient workload distribution: avg {avg_exams_per_patient:.1f} exams/patient, max {max_exams_per_patient} exams/patient"
-    )
-
-    stats = {
+    phase2_stats = {
         "renamed": 0,
         "transferred": 0,
         "skipped": 0,
@@ -995,13 +1159,12 @@ def main(update_inventory: bool, dry_run: bool):
     }
 
     HEARTBEAT_SEC = 60
-    t_start = monotonic()
-    last_hb = t_start
+    phase2_start = monotonic()
+    last_hb = phase2_start
     bytes_net_total = 0
     bytes_log_total = 0
     transfers_done = 0
     exams_processed = 0
-    patients_processed = 0
     queued_local_for_delete = 0
 
     used_gb, free_gb, total_gb = _share_usage_gb()
@@ -1009,93 +1172,112 @@ def main(update_inventory: bool, dry_run: bool):
         f"[USAGE mount] {SRC_ROOT}: used {used_gb:.1f} GB / total {total_gb:.1f} GB (free {free_gb:.1f} GB)"
     )
 
-    pbar = tqdm(total=total_exams, desc="Processing Source Exams")
+    pbar = tqdm(total=len(remaining_exams), desc="Processing Transfers")
 
     with ProcessPoolExecutor(max_workers=PARALLEL_JOBS) as executor:
-        # submit patient-level processing tasks (much less serialization overhead)
-        future_to_patient = {
+        # submit individual exam processing tasks (back to exam-level for better load balancing)
+        future_to_exam = {
             executor.submit(
-                process_patient_exams,
-                patient_id,
-                exam_paths,
-                dest_inventory.get(patient_id, {}),  # only relevant patient data
+                process_single_exam,
+                src_path,
+                dest_inventory,
                 dry_run,
-            ): (patient_id, len(exam_paths))
-            for patient_id, exam_paths in patient_tasks.items()
+                immediate_delete,
+            ): src_path
+            for src_path in remaining_exams
         }
 
         # process results as they complete, maintaining heartbeat
-        for future in as_completed(future_to_patient):
-            patient_id, num_exams = future_to_patient[future]
+        for future in as_completed(future_to_exam):
+            src_path = future_to_exam[future]
             try:
-                returned_patient_id, patient_stats, net_bytes, logical_bytes, queued = (
+                exam_name, exam_stats, net_bytes, logical_bytes, queued = (
                     future.result()
                 )
 
                 # update global stats
-                for key, value in patient_stats.items():
-                    stats[key] += value
+                for key, value in exam_stats.items():
+                    phase2_stats[key] += value
 
                 bytes_net_total += net_bytes
                 bytes_log_total += logical_bytes
-                if patient_stats["transferred"] > 0:
-                    transfers_done += patient_stats["transferred"]
+                if exam_stats["transferred"] > 0:
+                    transfers_done += 1
                 queued_local_for_delete += queued
-                exams_processed += num_exams
-                patients_processed += 1
-                pbar.update(num_exams)
+                exams_processed += 1
+                pbar.update(1)
 
                 # heartbeat check
                 now = monotonic()
                 if now - last_hb >= HEARTBEAT_SEC:
-                    elapsed = now - t_start
+                    elapsed = now - phase2_start
                     used_gb, free_gb, total_gb = _share_usage_gb()
                     logging.info(
-                        f"[HEARTBEAT] processed {exams_processed}/{total_exams} exams ({patients_processed}/{len(patient_tasks)} patients) | "
+                        f"[HEARTBEAT] processed {exams_processed}/{len(remaining_exams)} | "
                         f"{transfers_done} transferred (logical {bytes_log_total / 1e6:.1f} MB, net {bytes_net_total / 1e6:.1f} MB) | "
-                        f"{stats['remote_renamed']} remote-renamed | "
-                        f"uid_fastpath {stats['uid_fastpath_hits']}, early_hash {stats['early_hash_hits']}, "
-                        f"full_hash {stats['full_hash_fallbacks']} | "
-                        f"overall {(exams_processed / elapsed * 3600.0) if elapsed > 0 else 0.0:.2f} exams/hr | "
+                        f"{phase2_stats['remote_renamed']} remote-renamed | "
+                        f"early_hash {phase2_stats['early_hash_hits']}, "
+                        f"full_hash {phase2_stats['full_hash_fallbacks']} | "
+                        f"rate {(exams_processed / elapsed * 3600.0) if elapsed > 0 else 0.0:.2f} exams/hr | "
                         f"share {used_gb:.1f}/{total_gb:.1f} GB used (free {free_gb:.1f} GB)"
                     )
                     last_hb = now
 
             except Exception as e:
-                logging.error(
-                    f"FATAL ERROR processing patient {patient_id}: {e}", exc_info=True
-                )
-                stats["failed"] += num_exams  # mark all exams in this patient as failed
-                exams_processed += num_exams
-                patients_processed += 1
-                pbar.update(num_exams)
+                logging.error(f"FATAL ERROR processing {src_path}: {e}", exc_info=True)
+                phase2_stats["failed"] += 1
+                exams_processed += 1
+                pbar.update(1)
 
     pbar.close()
 
-    total_elapsed = monotonic() - t_start
-    logging.info("--- Sync Complete ---")
+    # combine stats from both phases
+    combined_stats = {
+        "renamed": phase1_stats["renamed"] + phase2_stats["renamed"],
+        "transferred": phase2_stats["transferred"],
+        "skipped": phase1_stats["skipped"] + phase2_stats["skipped"],
+        "failed": phase1_stats["failed"] + phase2_stats["failed"],
+        "remote_renamed": phase1_stats["remote_renamed"]
+        + phase2_stats["remote_renamed"],
+        "uid_fastpath_hits": phase1_stats["uid_fastpath_hits"],
+        "early_hash_hits": phase2_stats["early_hash_hits"],
+        "full_hash_fallbacks": phase2_stats["full_hash_fallbacks"],
+    }
+
+    total_elapsed = monotonic() - phase1_start
+    phase2_time = monotonic() - phase2_start
+
+    logging.info("=== SYNC COMPLETE ===")
     logging.info(
-        f"Total processing time: {total_elapsed / 60:.1f} minutes ({total_elapsed:.1f} seconds)"
+        f"Total time: {total_elapsed / 60:.1f} minutes (Phase 1: {phase1_time:.1f}s, Phase 2: {phase2_time:.1f}s)"
     )
     if total_exams > 0:
         logging.info(
-            f"Average processing rate: {total_exams / total_elapsed * 3600:.1f} exams/hour"
+            f"Overall rate: {total_exams / total_elapsed * 3600:.1f} exams/hour"
         )
-        logging.info(
-            f"Average patient processing rate: {len(patient_tasks) / total_elapsed * 3600:.1f} patients/hour"
-        )
+
+    logging.info("PHASE 1 (UID Fastpath):")
+    logging.info(f"  - UID fastpath hits: {phase1_stats['uid_fastpath_hits']}")
+    logging.info(f"  - Remote renamed: {phase1_stats['remote_renamed']}")
+    logging.info(f"  - Skipped (unstable): {phase1_stats['skipped']}")
+
+    logging.info("PHASE 2 (Transfers/Hash Matching):")
+    logging.info(f"  - Transferred new: {phase2_stats['transferred']}")
+    logging.info(f"  - Early hash matches: {phase2_stats['early_hash_hits']}")
+    logging.info(f"  - Remote renamed: {phase2_stats['remote_renamed']}")
+    logging.info(f"  - Failed: {phase2_stats['failed']}")
+
+    logging.info("TOTALS:")
+    logging.info(f"  - Total renamed/matched: {combined_stats['renamed']}")
+    logging.info(f"  - Total transferred: {combined_stats['transferred']}")
+    logging.info(f"  - Total failed: {combined_stats['failed']}")
     logging.info(
-        f"Renamed/Matched: {stats['renamed']}  (remote-renamed: {stats['remote_renamed']}, "
-        f"uid_fastpath: {stats['uid_fastpath_hits']}, early_hash: {stats['early_hash_hits']}, "
-        f"full_hash_fallbacks: {stats['full_hash_fallbacks']})"
+        f"  - Total queued/deleted locally: {queued_local_for_delete + phase1_stats['renamed']}"
     )
-    logging.info(f"Transferred New: {stats['transferred']}")
-    logging.info(f"Skipped (bad source): {stats['skipped']}")
-    logging.info(f"Failed: {stats['failed']}")
-    logging.info(f"Queued locally for deletion: {queued_local_for_delete}")
+
     used_gb, free_gb, total_gb = _share_usage_gb()
     logging.info(
-        f"[USAGE mount FINAL] {SRC_ROOT}: used {used_gb:.1f} GB / total {total_gb:.1f} GB (free {free_gb:.1f} GB)"
+        f"[FINAL USAGE] {SRC_ROOT}: used {used_gb:.1f} GB / total {total_gb:.1f} GB (free {free_gb:.1f} GB)"
     )
 
 
@@ -1114,5 +1296,14 @@ if __name__ == "__main__":
         action="store_true",
         help="Simulate all operations; no files will be moved or transferred.",
     )
+    parser.add_argument(
+        "--immediate-delete",
+        action="store_true",
+        help="Immediately delete local files after sync instead of moving to delete queue.",
+    )
     args = parser.parse_args()
-    main(update_inventory=args.update_inventory, dry_run=args.dry_run)
+    main(
+        update_inventory=args.update_inventory,
+        dry_run=args.dry_run,
+        immediate_delete=args.immediate_delete,
+    )
