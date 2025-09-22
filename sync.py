@@ -31,10 +31,10 @@ LOCAL_CACHE_FILE = Path(__file__).resolve().parent / CACHE_FILE_REL_PATH
 
 # Path to the delete queue on the source share
 DELETE_QUEUE_DIR = SRC_ROOT / "_synced_and_queued_for_deletion"
-PARALLEL_JOBS = 4
-REMOTE_PARALLEL_JOBS = 4  # NEW: For REMOTE processing. Start with 4, maybe try 2.
+PARALLEL_JOBS = 3  # Reduced from 8 to avoid SSH/I/O contention
+REMOTE_PARALLEL_JOBS = 4  # For REMOTE processing. Start with 4, maybe try 2.
 # File stability check: only process exam dirs where most recent file is older than this
-STABILITY_THRESHOLD_SEC = 300  # 5 minutes
+STABILITY_THRESHOLD_SEC = 600
 # --- END CONFIGURATION ---
 
 logging.basicConfig(
@@ -187,7 +187,7 @@ def _share_usage_gb():
 
 def run_ssh_command(command_str: str, check: bool = True):
     """
-    execute a complete command string on the remote via SSH.
+    execute a complete command string on the remote via SSH with connection multiplexing.
 
     important: ssh joins arguments with spaces before handing them to the remote shell.
     to ensure the entire payload is seen as the single argument to `bash -c`, we wrap
@@ -195,7 +195,17 @@ def run_ssh_command(command_str: str, check: bool = True):
     """
     # wrap as one argument to bash -c; escape any single quotes inside
     quoted_cmd = "'" + command_str.replace("'", "'\"'\"'") + "'"
-    full_ssh_command = ["ssh", DST_SSH_TARGET, "bash", "-c", quoted_cmd]
+
+    # use SSH multiplexing for better performance with multiple connections
+    ssh_opts = [
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        "ControlPath=~/.ssh/control-%h-%p-%r",
+        "-o",
+        "ControlPersist=300",
+    ]
+    full_ssh_command = ["ssh"] + ssh_opts + [DST_SSH_TARGET, "bash", "-c", quoted_cmd]
 
     try:
         process = subprocess.run(
@@ -215,6 +225,70 @@ def run_ssh_command(command_str: str, check: bool = True):
         logging.error(f"  Return Code: {e.returncode}")
         logging.error(f"  --- Remote Stdout --- \n{(e.stdout or '').strip()}")
         logging.error(f"  --- Remote Stderr --- \n{(e.stderr or '').strip()}")
+        raise
+
+
+def run_ssh_batch_commands(commands: list[str], check: bool = True):
+    """
+    execute multiple commands in a single SSH session for better efficiency
+
+    returns list of (stdout, stderr) tuples for each command
+    """
+    if not commands:
+        return []
+
+    # combine commands with proper separation and error handling
+    batch_script = []
+    for i, cmd in enumerate(commands):
+        # add command with exit code capture
+        batch_script.append(f"echo '=== COMMAND {i} START ==='")
+        batch_script.append(f"({cmd})")
+        batch_script.append(f"echo '=== COMMAND {i} EXIT $? ==='")
+
+    combined_cmd = " && ".join(batch_script)
+
+    ssh_opts = [
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        "ControlPath=~/.ssh/control-%h-%p-%r",
+        "-o",
+        "ControlPersist=300",
+    ]
+    full_ssh_command = ["ssh"] + ssh_opts + [DST_SSH_TARGET, "bash", "-c", combined_cmd]
+
+    try:
+        process = subprocess.run(
+            full_ssh_command,
+            check=check,
+            capture_output=True,
+            text=True,
+        )
+
+        # parse the combined output back into individual results
+        output_lines = process.stdout.split("\n")
+        results = []
+        current_output = []
+
+        for line in output_lines:
+            if line.startswith("=== COMMAND ") and " START ===" in line:
+                current_output = []
+            elif line.startswith("=== COMMAND ") and " EXIT " in line:
+                exit_code = int(line.split()[-2])
+                results.append(
+                    (
+                        "\n".join(current_output),
+                        process.stderr if exit_code != 0 else "",
+                    )
+                )
+                current_output = []
+            else:
+                current_output.append(line)
+
+        return results
+
+    except subprocess.CalledProcessError as e:
+        logging.error(f"SSH batch command failed: {e}")
         raise
 
 
@@ -456,6 +530,12 @@ def rsync_exam_remote(src: Path, patient_id: str, exam_name: str):
         "--stats",
         "--rsync-path",
         rsync_remote_prefix,
+        "-e",
+        (
+            "ssh -o ControlMaster=auto "
+            "-o ControlPath=~/.ssh/control-%h-%p-%r "
+            "-o ControlPersist=300"
+        ),
         f"{src}/",
         dest_path_str,
     ]
@@ -503,211 +583,304 @@ def rsync_exam_remote(src: Path, patient_id: str, exam_name: str):
     return net_bytes, logical_bytes, dt
 
 
+def process_patient_exams(
+    patient_id: str,
+    exam_paths: list[Path],
+    patient_inventory: Dict[ExamFingerprint, str],
+    dry_run: bool,
+) -> Tuple[str, Dict[str, int], int, int, int]:
+    """
+    process all exams for a single patient to minimize serialization overhead
+
+    returns (patient_id, combined_stats_dict, total_net_bytes, total_logical_bytes, total_queued_for_delete)
+    """
+    import time
+
+    process_start = time.time()
+
+    # initialize combined stats for this patient
+    combined_stats = {
+        "renamed": 0,
+        "transferred": 0,
+        "skipped": 0,
+        "failed": 0,
+        "remote_renamed": 0,
+        "uid_fastpath_hits": 0,
+        "early_hash_hits": 0,
+        "full_hash_fallbacks": 0,
+    }
+
+    total_net_bytes = 0
+    total_logical_bytes = 0
+    total_queued = 0
+
+    serialization_time = time.time() - process_start
+    if serialization_time > 0.1:  # only log if significant
+        logging.info(
+            f"[TIMING] Patient {patient_id}: worker startup took {serialization_time:.2f}s"
+        )
+
+    for src_path in exam_paths:
+        try:
+            exam_name, exam_stats, net_bytes, logical_bytes, queued = (
+                process_single_exam_internal(
+                    src_path, patient_id, patient_inventory, dry_run
+                )
+            )
+
+            # accumulate stats
+            for key, value in exam_stats.items():
+                combined_stats[key] += value
+
+            total_net_bytes += net_bytes
+            total_logical_bytes += logical_bytes
+            total_queued += queued
+
+        except Exception as e:
+            logging.error(f"FATAL ERROR processing {src_path}: {e}", exc_info=True)
+            combined_stats["failed"] += 1
+
+    return (
+        patient_id,
+        combined_stats,
+        total_net_bytes,
+        total_logical_bytes,
+        total_queued,
+    )
+
+
+def process_single_exam_internal(
+    src_path: Path,
+    patient_id: str,
+    patient_inventory: Dict[ExamFingerprint, str],
+    dry_run: bool,
+) -> Tuple[str, Dict[str, int], int, int, int]:
+    """
+    internal function to process a single exam (moved from process_single_exam)
+    now takes patient_id and patient_inventory instead of full dest_inventory
+
+    returns (exam_name, stats_dict, net_bytes, logical_bytes, queued_for_delete)
+    """
+    exam_name = src_path.name
+
+    # initialize stats for this exam
+    exam_stats = {
+        "renamed": 0,
+        "transferred": 0,
+        "skipped": 0,
+        "failed": 0,
+        "remote_renamed": 0,
+        "uid_fastpath_hits": 0,
+        "early_hash_hits": 0,
+        "full_hash_fallbacks": 0,
+    }
+
+    # ---------- stability check ----------
+    is_stable, most_recent_age = _is_exam_stable(src_path, STABILITY_THRESHOLD_SEC)
+    if not is_stable:
+        logging.info(
+            f"SKIP UNSTABLE: {exam_name} "
+            f"(most recent file {most_recent_age / 60:.1f}min old, "
+            f"need {STABILITY_THRESHOLD_SEC / 60:.1f}min)"
+        )
+        exam_stats["skipped"] += 1
+        return exam_name, exam_stats, 0, 0, 0
+
+    # ---------- UID-first fast path ----------
+    uid, touched = _read_uid_quick(src_path)
+    if uid:
+        uid_matches = [
+            (fp, name) for fp, name in patient_inventory.items() if fp.study_uid == uid
+        ]
+        if len(uid_matches) == 1:
+            fp, match_name = uid_matches[0]
+            old_rem = DST_ROOT_REMOTE / patient_id / match_name
+            new_rem = DST_ROOT_REMOTE / patient_id / exam_name
+
+            if dry_run:
+                logging.info(
+                    f"UID HIT ({uid}) after touching {touched} files: remote has '{match_name}'. "
+                    f"[DRY RUN] WOULD "
+                    + (
+                        "rename remote to new name"
+                        if match_name != exam_name
+                        else "queue local for deletion"
+                    )
+                )
+            else:
+                ver_target = old_rem if match_name != exam_name else new_rem
+                ssh_opts = [
+                    "-o",
+                    "ControlMaster=auto",
+                    "-o",
+                    "ControlPath=~/.ssh/control-%h-%p-%r",
+                    "-o",
+                    "ControlPersist=300",
+                ]
+                ver = subprocess.run(
+                    ["ssh"] + ssh_opts + [DST_SSH_TARGET, "ls", "-ld", str(ver_target)],
+                    capture_output=True,
+                    text=True,
+                )
+                if ver.returncode != 0:
+                    raise RuntimeError(
+                        f"remote verify failed for {ver_target}: {ver.stderr.strip()}"
+                    )
+
+            if match_name != exam_name:
+                logging.info(
+                    f"UID FASTPATH: {exam_name} == remote '{match_name}' "
+                    f"→ renaming REMOTE to '{exam_name}' (no hashing)"
+                )
+                if not dry_run:
+                    ssh_opts = [
+                        "-o",
+                        "ControlMaster=auto",
+                        "-o",
+                        "ControlPath=~/.ssh/control-%h-%p-%r",
+                        "-o",
+                        "ControlPersist=300",
+                    ]
+                    subprocess.run(
+                        ["ssh"]
+                        + ssh_opts
+                        + [DST_SSH_TARGET, "mv", str(old_rem), str(new_rem)],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+            else:
+                logging.info(
+                    f"UID FASTPATH: {exam_name} already present on remote (verified) – queue local for deletion"
+                )
+            exam_stats["remote_renamed"] += int(match_name != exam_name)
+            exam_stats["renamed"] += 1
+            exam_stats["uid_fastpath_hits"] += 1
+
+            if dry_run:
+                logging.info(
+                    f"[DRY RUN] WOULD QUEUE FOR DELETE (LOCAL): {src_path} -> "
+                    f"{DELETE_QUEUE_DIR / patient_id / exam_name}"
+                )
+            else:
+                dst = DELETE_QUEUE_DIR / patient_id / exam_name
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src_path), str(dst))
+                logging.info(f"QUEUED FOR DELETE (LOCAL): moved {src_path} -> {dst}")
+
+            return exam_name, exam_stats, 0, 0, 1
+
+    # ---------- UID miss/ambiguous: early-exit hashing ----------
+    if patient_inventory:
+        candidate_set = None
+        if uid:
+            candidate_set = {
+                name for fp, name in patient_inventory.items() if fp.study_uid == uid
+            }
+            if len(candidate_set) <= 1:
+                candidate_set = None
+
+        matched, ev = _early_hash_match(
+            src_exam=src_path,
+            patient_inventory=patient_inventory,
+            candidate_names=candidate_set,
+            min_confirm=5,
+        )
+        if matched:
+            old_rem = DST_ROOT_REMOTE / patient_id / matched
+            new_rem = DST_ROOT_REMOTE / patient_id / exam_name
+            if matched != exam_name:
+                logging.info(
+                    f"EARLY-HASH MATCH: {exam_name} == remote '{matched}' "
+                    f"(confirmed {ev.get(f'confirms_for_{matched}', 0)} hashes, "
+                    f"{ev['files_hashed']} files, {ev['bytes_hashed'] / 1e6:.1f} MB hashed in {ev['elapsed_s']:.1f}s) "
+                    f"→ renaming REMOTE to '{exam_name}'"
+                )
+                if not dry_run:
+                    ssh_opts = [
+                        "-o",
+                        "ControlMaster=auto",
+                        "-o",
+                        "ControlPath=~/.ssh/control-%h-%p-%r",
+                        "-o",
+                        "ControlPersist=300",
+                    ]
+                    subprocess.run(
+                        ["ssh"]
+                        + ssh_opts
+                        + [DST_SSH_TARGET, "mv", str(old_rem), str(new_rem)],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+            else:
+                logging.info(
+                    f"EARLY-HASH MATCH: {exam_name} already present on remote "
+                    f"(confirmed {ev.get(f'confirms_for_{matched}', 0)} hashes, "
+                    f"{ev['files_hashed']} files, {ev['bytes_hashed'] / 1e6:.1f} MB hashed in {ev['elapsed_s']:.1f}s) "
+                    f"→ queue LOCAL for deletion"
+                )
+            exam_stats["remote_renamed"] += int(matched != exam_name)
+            exam_stats["renamed"] += 1
+            exam_stats["early_hash_hits"] += 1
+
+            if dry_run:
+                logging.info(
+                    f"[DRY RUN] WOULD QUEUE FOR DELETE (LOCAL): {src_path} -> "
+                    f"{DELETE_QUEUE_DIR / patient_id / exam_name}"
+                )
+            else:
+                dst = DELETE_QUEUE_DIR / patient_id / exam_name
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src_path), str(dst))
+                logging.info(f"QUEUED FOR DELETE (LOCAL): moved {src_path} -> {dst}")
+
+            return exam_name, exam_stats, 0, 0, 1
+
+    # ---------- Not found: transfer ----------
+    logging.info(f"NEW: {exam_name} not found on remote. Transferring.")
+    if dry_run:
+        logging.info(
+            f"[DRY RUN] WOULD TRANSFER: {src_path} -> "
+            f"{DST_ROOT_REMOTE / patient_id / exam_name}"
+        )
+        exam_stats["transferred"] += 1
+        net_bytes, logical_bytes = 0, 0
+    else:
+        net_bytes, logical_bytes, _ = rsync_exam_remote(src_path, patient_id, exam_name)
+        exam_stats["transferred"] += 1
+
+    # queue local after transfer
+    if dry_run:
+        logging.info(
+            f"[DRY RUN] WOULD QUEUE FOR DELETE (LOCAL): {src_path} -> "
+            f"{DELETE_QUEUE_DIR / patient_id / exam_name}"
+        )
+    else:
+        dst = DELETE_QUEUE_DIR / patient_id / exam_name
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src_path), str(dst))
+        logging.info(f"QUEUED FOR DELETE (LOCAL): moved {src_path} -> {dst}")
+
+    return exam_name, exam_stats, net_bytes, logical_bytes, 1
+
+
 def process_single_exam(
     src_path: Path,
     dest_inventory: Dict[str, Dict[ExamFingerprint, str]],
     dry_run: bool,
 ) -> Tuple[str, Dict[str, int], int, int, int]:
     """
-    process a single exam directory and return results for heartbeat tracking
+    legacy wrapper for backward compatibility - delegates to internal function
 
     returns (exam_name, stats_dict, net_bytes, logical_bytes, queued_for_delete)
     """
     try:
-        patient_id, exam_name = src_path.parent.name, src_path.name
-        dest_patient = dest_inventory.get(patient_id, {})
-
-        # initialize stats for this exam
-        exam_stats = {
-            "renamed": 0,
-            "transferred": 0,
-            "skipped": 0,
-            "failed": 0,
-            "remote_renamed": 0,
-            "uid_fastpath_hits": 0,
-            "early_hash_hits": 0,
-            "full_hash_fallbacks": 0,
-        }
-
-        # ---------- stability check ----------
-        is_stable, most_recent_age = _is_exam_stable(src_path, STABILITY_THRESHOLD_SEC)
-        if not is_stable:
-            logging.info(
-                f"SKIP UNSTABLE: {exam_name} "
-                f"(most recent file {most_recent_age / 60:.1f}min old, "
-                f"need {STABILITY_THRESHOLD_SEC / 60:.1f}min)"
-            )
-            exam_stats["skipped"] += 1
-            return exam_name, exam_stats, 0, 0, 0
-
-        # ---------- UID-first fast path ----------
-        uid, touched = _read_uid_quick(src_path)
-        if uid:
-            uid_matches = [
-                (fp, name) for fp, name in dest_patient.items() if fp.study_uid == uid
-            ]
-            if len(uid_matches) == 1:
-                fp, match_name = uid_matches[0]
-                old_rem = DST_ROOT_REMOTE / patient_id / match_name
-                new_rem = DST_ROOT_REMOTE / patient_id / exam_name
-
-                if dry_run:
-                    logging.info(
-                        f"UID HIT ({uid}) after touching {touched} files: remote has '{match_name}'. "
-                        f"[DRY RUN] WOULD "
-                        + (
-                            "rename remote to new name"
-                            if match_name != exam_name
-                            else "queue local for deletion"
-                        )
-                    )
-                else:
-                    ver_target = old_rem if match_name != exam_name else new_rem
-                    ver = subprocess.run(
-                        ["ssh", DST_SSH_TARGET, "ls", "-ld", str(ver_target)],
-                        capture_output=True,
-                        text=True,
-                    )
-                    if ver.returncode != 0:
-                        raise RuntimeError(
-                            f"remote verify failed for {ver_target}: {ver.stderr.strip()}"
-                        )
-
-                if match_name != exam_name:
-                    logging.info(
-                        f"UID FASTPATH: {exam_name} == remote '{match_name}' "
-                        f"→ renaming REMOTE to '{exam_name}' (no hashing)"
-                    )
-                    if not dry_run:
-                        subprocess.run(
-                            [
-                                "ssh",
-                                DST_SSH_TARGET,
-                                "mv",
-                                str(old_rem),
-                                str(new_rem),
-                            ],
-                            check=True,
-                            capture_output=True,
-                            text=True,
-                        )
-                else:
-                    logging.info(
-                        f"UID FASTPATH: {exam_name} already present on remote (verified) – queue local for deletion"
-                    )
-                exam_stats["remote_renamed"] += int(match_name != exam_name)
-                exam_stats["renamed"] += 1
-                exam_stats["uid_fastpath_hits"] += 1
-
-                if dry_run:
-                    logging.info(
-                        f"[DRY RUN] WOULD QUEUE FOR DELETE (LOCAL): {src_path} -> "
-                        f"{DELETE_QUEUE_DIR / patient_id / exam_name}"
-                    )
-                else:
-                    dst = DELETE_QUEUE_DIR / patient_id / exam_name
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(src_path), str(dst))
-                    logging.info(
-                        f"QUEUED FOR DELETE (LOCAL): moved {src_path} -> {dst}"
-                    )
-
-                return exam_name, exam_stats, 0, 0, 1
-
-        # ---------- UID miss/ambiguous: early-exit hashing ----------
-        if dest_patient:
-            candidate_set = None
-            if uid:
-                candidate_set = {
-                    name for fp, name in dest_patient.items() if fp.study_uid == uid
-                }
-                if len(candidate_set) <= 1:
-                    candidate_set = None
-
-            matched, ev = _early_hash_match(
-                src_exam=src_path,
-                patient_inventory=dest_patient,
-                candidate_names=candidate_set,
-                min_confirm=5,
-            )
-            if matched:
-                old_rem = DST_ROOT_REMOTE / patient_id / matched
-                new_rem = DST_ROOT_REMOTE / patient_id / exam_name
-                if matched != exam_name:
-                    logging.info(
-                        f"EARLY-HASH MATCH: {exam_name} == remote '{matched}' "
-                        f"(confirmed {ev.get(f'confirms_for_{matched}', 0)} hashes, "
-                        f"{ev['files_hashed']} files, {ev['bytes_hashed'] / 1e6:.1f} MB hashed in {ev['elapsed_s']:.1f}s) "
-                        f"→ renaming REMOTE to '{exam_name}'"
-                    )
-                    if not dry_run:
-                        subprocess.run(
-                            [
-                                "ssh",
-                                DST_SSH_TARGET,
-                                "mv",
-                                str(old_rem),
-                                str(new_rem),
-                            ],
-                            check=True,
-                            capture_output=True,
-                            text=True,
-                        )
-                else:
-                    logging.info(
-                        f"EARLY-HASH MATCH: {exam_name} already present on remote "
-                        f"(confirmed {ev.get(f'confirms_for_{matched}', 0)} hashes, "
-                        f"{ev['files_hashed']} files, {ev['bytes_hashed'] / 1e6:.1f} MB hashed in {ev['elapsed_s']:.1f}s) "
-                        f"→ queue LOCAL for deletion"
-                    )
-                exam_stats["remote_renamed"] += int(matched != exam_name)
-                exam_stats["renamed"] += 1
-                exam_stats["early_hash_hits"] += 1
-
-                if dry_run:
-                    logging.info(
-                        f"[DRY RUN] WOULD QUEUE FOR DELETE (LOCAL): {src_path} -> "
-                        f"{DELETE_QUEUE_DIR / patient_id / exam_name}"
-                    )
-                else:
-                    dst = DELETE_QUEUE_DIR / patient_id / exam_name
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(src_path), str(dst))
-                    logging.info(
-                        f"QUEUED FOR DELETE (LOCAL): moved {src_path} -> {dst}"
-                    )
-
-                return exam_name, exam_stats, 0, 0, 1
-
-        # ---------- Not found: transfer ----------
-        logging.info(f"NEW: {exam_name} not found on remote. Transferring.")
-        if dry_run:
-            logging.info(
-                f"[DRY RUN] WOULD TRANSFER: {src_path} -> "
-                f"{DST_ROOT_REMOTE / patient_id / exam_name}"
-            )
-            exam_stats["transferred"] += 1
-            net_bytes, logical_bytes = 0, 0
-        else:
-            net_bytes, logical_bytes, _ = rsync_exam_remote(
-                src_path, patient_id, exam_name
-            )
-            exam_stats["transferred"] += 1
-
-        # queue local after transfer
-        if dry_run:
-            logging.info(
-                f"[DRY RUN] WOULD QUEUE FOR DELETE (LOCAL): {src_path} -> "
-                f"{DELETE_QUEUE_DIR / patient_id / exam_name}"
-            )
-        else:
-            dst = DELETE_QUEUE_DIR / patient_id / exam_name
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(src_path), str(dst))
-            logging.info(f"QUEUED FOR DELETE (LOCAL): moved {src_path} -> {dst}")
-
-        return exam_name, exam_stats, net_bytes, logical_bytes, 1
-
+        patient_id = src_path.parent.name
+        patient_inventory = dest_inventory.get(patient_id, {})
+        return process_single_exam_internal(
+            src_path, patient_id, patient_inventory, dry_run
+        )
     except Exception:
         logging.error(f"FATAL ERROR processing {src_path}", exc_info=True)
         exam_stats = {
@@ -784,12 +957,31 @@ def main(update_inventory: bool, dry_run: bool):
     # rebuild patient_dirs after pruning in case some were removed
     patient_dirs = [d for d in SRC_ROOT.iterdir() if d.is_dir() and d.name.isdigit()]
 
-    # exams: only under numeric patients
-    source_exams = [p for p_dir in patient_dirs for p in p_dir.iterdir() if p.is_dir()]
-    logging.info(f"Found {len(source_exams)} source exams to process.")
+    # ----- group exams by patient for efficient parallelization -----
+    patient_tasks = {}
+    total_exams = 0
+    for p_dir in patient_dirs:
+        patient_id = p_dir.name
+        exam_paths = [p for p in p_dir.iterdir() if p.is_dir()]
+        if exam_paths:
+            patient_tasks[patient_id] = exam_paths
+            total_exams += len(exam_paths)
 
-    # --- the rest of your main stays as in your current implementation ---
-    # below is your existing loop with UID fast path, early-hash, rsync + heartbeats
+    logging.info(
+        f"Found {total_exams} source exams across {len(patient_tasks)} patients to process."
+    )
+    logging.info(
+        f"Using patient-level parallelization with {PARALLEL_JOBS} workers to minimize serialization overhead."
+    )
+
+    # calculate average exams per patient for load balancing insights
+    avg_exams_per_patient = total_exams / len(patient_tasks) if patient_tasks else 0
+    max_exams_per_patient = (
+        max(len(exams) for exams in patient_tasks.values()) if patient_tasks else 0
+    )
+    logging.info(
+        f"Patient workload distribution: avg {avg_exams_per_patient:.1f} exams/patient, max {max_exams_per_patient} exams/patient"
+    )
 
     stats = {
         "renamed": 0,
@@ -808,7 +1000,8 @@ def main(update_inventory: bool, dry_run: bool):
     bytes_net_total = 0
     bytes_log_total = 0
     transfers_done = 0
-    processed = 0
+    exams_processed = 0
+    patients_processed = 0
     queued_local_for_delete = 0
 
     used_gb, free_gb, total_gb = _share_usage_gb()
@@ -816,36 +1009,41 @@ def main(update_inventory: bool, dry_run: bool):
         f"[USAGE mount] {SRC_ROOT}: used {used_gb:.1f} GB / total {total_gb:.1f} GB (free {free_gb:.1f} GB)"
     )
 
-    pbar = tqdm(total=len(source_exams), desc="Processing Source Exams")
+    pbar = tqdm(total=total_exams, desc="Processing Source Exams")
 
     with ProcessPoolExecutor(max_workers=PARALLEL_JOBS) as executor:
-        # submit all exam processing tasks
-        future_to_exam = {
+        # submit patient-level processing tasks (much less serialization overhead)
+        future_to_patient = {
             executor.submit(
-                process_single_exam, src_path, dest_inventory, dry_run
-            ): src_path
-            for src_path in source_exams
+                process_patient_exams,
+                patient_id,
+                exam_paths,
+                dest_inventory.get(patient_id, {}),  # only relevant patient data
+                dry_run,
+            ): (patient_id, len(exam_paths))
+            for patient_id, exam_paths in patient_tasks.items()
         }
 
         # process results as they complete, maintaining heartbeat
-        for future in as_completed(future_to_exam):
-            src_path = future_to_exam[future]
+        for future in as_completed(future_to_patient):
+            patient_id, num_exams = future_to_patient[future]
             try:
-                exam_name, exam_stats, net_bytes, logical_bytes, queued = (
+                returned_patient_id, patient_stats, net_bytes, logical_bytes, queued = (
                     future.result()
                 )
 
                 # update global stats
-                for key, value in exam_stats.items():
+                for key, value in patient_stats.items():
                     stats[key] += value
 
                 bytes_net_total += net_bytes
                 bytes_log_total += logical_bytes
-                if exam_stats["transferred"] > 0:
-                    transfers_done += 1
+                if patient_stats["transferred"] > 0:
+                    transfers_done += patient_stats["transferred"]
                 queued_local_for_delete += queued
-                processed += 1
-                pbar.update(1)
+                exams_processed += num_exams
+                patients_processed += 1
+                pbar.update(num_exams)
 
                 # heartbeat check
                 now = monotonic()
@@ -853,25 +1051,39 @@ def main(update_inventory: bool, dry_run: bool):
                     elapsed = now - t_start
                     used_gb, free_gb, total_gb = _share_usage_gb()
                     logging.info(
-                        f"[HEARTBEAT] processed {processed}/{len(source_exams)} | "
+                        f"[HEARTBEAT] processed {exams_processed}/{total_exams} exams ({patients_processed}/{len(patient_tasks)} patients) | "
                         f"{transfers_done} transferred (logical {bytes_log_total / 1e6:.1f} MB, net {bytes_net_total / 1e6:.1f} MB) | "
                         f"{stats['remote_renamed']} remote-renamed | "
                         f"uid_fastpath {stats['uid_fastpath_hits']}, early_hash {stats['early_hash_hits']}, "
                         f"full_hash {stats['full_hash_fallbacks']} | "
-                        f"overall {(processed / elapsed * 3600.0) if elapsed > 0 else 0.0:.2f} exams/hr | "
+                        f"overall {(exams_processed / elapsed * 3600.0) if elapsed > 0 else 0.0:.2f} exams/hr | "
                         f"share {used_gb:.1f}/{total_gb:.1f} GB used (free {free_gb:.1f} GB)"
                     )
                     last_hb = now
 
             except Exception as e:
-                logging.error(f"FATAL ERROR processing {src_path}: {e}", exc_info=True)
-                stats["failed"] += 1
-                processed += 1
-                pbar.update(1)
+                logging.error(
+                    f"FATAL ERROR processing patient {patient_id}: {e}", exc_info=True
+                )
+                stats["failed"] += num_exams  # mark all exams in this patient as failed
+                exams_processed += num_exams
+                patients_processed += 1
+                pbar.update(num_exams)
 
     pbar.close()
 
+    total_elapsed = monotonic() - t_start
     logging.info("--- Sync Complete ---")
+    logging.info(
+        f"Total processing time: {total_elapsed / 60:.1f} minutes ({total_elapsed:.1f} seconds)"
+    )
+    if total_exams > 0:
+        logging.info(
+            f"Average processing rate: {total_exams / total_elapsed * 3600:.1f} exams/hour"
+        )
+        logging.info(
+            f"Average patient processing rate: {len(patient_tasks) / total_elapsed * 3600:.1f} patients/hour"
+        )
     logging.info(
         f"Renamed/Matched: {stats['renamed']}  (remote-renamed: {stats['remote_renamed']}, "
         f"uid_fastpath: {stats['uid_fastpath_hits']}, early_hash: {stats['early_hash_hits']}, "
