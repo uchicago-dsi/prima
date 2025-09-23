@@ -213,6 +213,36 @@ def parse_results_table_html(table_html: str) -> pd.DataFrame:
     return df
 
 
+KNOWN_MODALITY_PREFIXES = [
+    ("MRI", "MR"),
+    ("MR ", "MR"),
+    ("MAM", "MG"),
+    ("MAM ", "MG"),
+    ("CT", "CT"),
+    ("XR", "CR"),
+    ("US", "US"),
+    ("NM", "NM"),
+    ("PET", "PT"),
+    ("PET/", "PT"),
+]
+
+
+def infer_modality_from_description(description: str | None) -> str | None:
+    if not description or not isinstance(description, str):
+        return None
+    upper_desc = description.strip().upper()
+    for prefix, modality in KNOWN_MODALITY_PREFIXES:
+        if upper_desc.startswith(prefix):
+            return modality
+    if "BREAST" in upper_desc and "MAM" in upper_desc:
+        return "MG"
+    if "BREAST" in upper_desc and "MRI" in upper_desc:
+        return "MR"
+    if "BRAIN" in upper_desc and "MRI" in upper_desc:
+        return "MR"
+    return None
+
+
 def parse_all_tables_from_page(page_html: str) -> pd.DataFrame:
     """
     Parses the full HTML page to find and extract data from both the "Exported"
@@ -263,6 +293,9 @@ def parse_all_tables_from_page(page_html: str) -> pd.DataFrame:
                     ),
                 }
             )
+            df_exported["Modality"] = df_exported["StudyDescription"].map(
+                infer_modality_from_description
+            )
             dfs_to_combine.append(df_exported)
 
     # --- Part 2: Parse the "Available" table (gv1) if it exists ---
@@ -290,9 +323,52 @@ def parse_all_tables_from_page(page_html: str) -> pd.DataFrame:
 
     # --- Part 3: Combine and return ---
     if not dfs_to_combine:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=[
+            "Modality",
+            "Study DateTime",
+            "StudyDescription",
+            "Status",
+            "Accession",
+            "Exported On",
+        ])
 
-    return pd.concat(dfs_to_combine, ignore_index=True)
+    combined = pd.concat(dfs_to_combine, ignore_index=True, sort=False)
+
+    required_cols = {
+        "Modality": pd.Series(dtype="string"),
+        "Study DateTime": pd.Series(dtype="datetime64[ns]"),
+        "StudyDescription": pd.Series(dtype="string"),
+        "Status": pd.Series(dtype="string"),
+        "Accession": pd.Series(dtype="string"),
+        "Exported On": pd.Series(dtype="datetime64[ns]"),
+    }
+    for col, template in required_cols.items():
+        if col not in combined.columns:
+            combined[col] = template
+
+    combined["StudyDescription"] = combined["StudyDescription"].astype("string")
+    combined["Accession"] = combined["Accession"].astype("string").replace({"": pd.NA})
+
+    combined["Modality"] = combined["Modality"].astype("string").replace({"": pd.NA})
+    missing_modality = combined["Modality"].isna()
+    if missing_modality.any():
+        combined.loc[missing_modality, "Modality"] = combined.loc[
+            missing_modality, "StudyDescription"
+        ].map(infer_modality_from_description)
+
+    sort_cols = ["Study DateTime", "StudyDescription"]
+    if combined["Accession"].notna().any():
+        sort_cols.append("Accession")
+
+    combined.sort_values(by=sort_cols, inplace=True)
+
+    subset_cols = ["Study DateTime", "StudyDescription"]
+    if combined["Accession"].notna().any():
+        subset_cols.append("Accession")
+
+    combined.drop_duplicates(subset=subset_cols, keep="first", inplace=True)
+
+    return combined.reset_index(drop=True)
 
 
 def main():
@@ -361,7 +437,16 @@ def main():
                     df = parse_all_tables_from_page(page_html)
 
                     if df.empty:
-                        df = pd.DataFrame([{"study_id": study_id}])
+                        df = pd.DataFrame(columns=all_columns)
+
+                    df["StudyDescription"] = df["StudyDescription"].astype("string")
+                    df["Modality"] = df.get("Modality", pd.Series(dtype="string"))
+                    df["Modality"] = df["Modality"].astype("string")
+                    missing_modalities = df["Modality"].isna() | (df["Modality"] == "")
+                    if missing_modalities.any():
+                        df.loc[missing_modalities, "Modality"] = df.loc[
+                            missing_modalities, "StudyDescription"
+                        ].map(infer_modality_from_description)
 
                     df["study_id"] = study_id
                     df = df.reindex(columns=all_columns)

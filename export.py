@@ -22,6 +22,8 @@ METADATA_FILE = "data/imaging_metadata.csv"
 BASE_DOWNLOAD_DIR = "/gpfs/data/huo-lab/Image/ChiMEC/"
 OUTPUT_DATABASE_FILE = "data/imaging_database_with_status.csv"
 
+MERGE_KEY_COLUMNS = ["study_id", "Study DateTime", "StudyDescription"]
+
 USERNAME = os.getenv("IBROKER_USERNAME")
 PASSWORD = os.getenv("IBROKER_PASSWORD")
 
@@ -70,6 +72,18 @@ def save_current_state(db: pd.DataFrame):
         "Modality",
     ]
     db_final = db[[col for col in final_cols if col in db.columns]].copy()
+    key_cols = [col for col in MERGE_KEY_COLUMNS if col in db_final.columns]
+    if key_cols:
+        before = len(db_final)
+        db_final = (
+            db_final.sort_values(key_cols)
+            .drop_duplicates(subset=key_cols, keep="last")
+            .reset_index(drop=True)
+        )
+        if len(db_final) != before:
+            print(
+                f"  - save_current_state: collapsed {before:,} rows to {len(db_final):,}"
+            )
     db_final.to_csv(OUTPUT_DATABASE_FILE, index=False, date_format="%Y-%m-%d %H:%M:%S")
 
 
@@ -98,7 +112,7 @@ def load_and_merge_data():
     previous_state = None
     if os.path.exists(OUTPUT_DATABASE_FILE):
         try:
-            previous_state = pd.read_csv(OUTPUT_DATABASE_FILE)
+            previous_state = pd.read_csv(OUTPUT_DATABASE_FILE, low_memory=False)
             print(f"Loaded {len(previous_state):,} rows from previous output file.")
         except Exception as e:
             print(f"Warning: Could not load previous output file: {e}")
@@ -120,25 +134,71 @@ def load_and_merge_data():
         db["DatedxIndex"], errors="coerce", dayfirst=True
     )
 
-    conditions = [db["DatedxIndex"].notna(), db["_in_patient_file"].fillna(False)]
+    in_patient_mask = db["_in_patient_file"].astype("boolean").fillna(False)
+    conditions = [db["DatedxIndex"].notna(), in_patient_mask.to_numpy(dtype=bool, na_value=False)]
     choices = ["Case", "Control"]
     db["case_control_status"] = np.select(conditions, choices, default="Unknown")
     print("  - Derived Case/Control status based on DatedxIndex:")
-    print(db["case_control_status"].value_counts().to_string())
+    print(
+        db["case_control_status"].value_counts(dropna=False)
+        .rename_axis("case_control_status")
+        .to_string()
+    )
 
     db.drop(columns=["_in_patient_file"], inplace=True)
     db.dropna(subset=["study_id", "Study DateTime", "StudyDescription"], inplace=True)
+
+    # Prefer rows with accessions when deduplicating exam metadata
+    if "Accession" in db.columns:
+        db["_has_accession"] = db["Accession"].notna().astype(int)
+    else:
+        db["_has_accession"] = 0
+
+    before_exam_dedup = len(db)
+    db = db.sort_values(MERGE_KEY_COLUMNS + ["_has_accession"], ascending=[True, True, True, False]).drop_duplicates(
+        subset=MERGE_KEY_COLUMNS, keep="first"
+    )
+    db.drop(columns=["_has_accession"], inplace=True)
+    if len(db) != before_exam_dedup:
+        print(
+            "  - Deduplicated exam rows on "
+            f"{MERGE_KEY_COLUMNS}: {before_exam_dedup:,} → {len(db):,}"
+        )
 
     # Merge with previous state if available to maintain export status across runs
     if previous_state is not None:
         print("\nStep 1.4: Merging with previous output state...")
         # Use study_id, Study DateTime, and StudyDescription as the merge key
-        merge_cols = ["study_id", "Study DateTime", "StudyDescription"]
+        merge_cols = MERGE_KEY_COLUMNS
 
         # Ensure Study DateTime is datetime in both dataframes for proper merging
         previous_state["Study DateTime"] = pd.to_datetime(
-            previous_state["Study DateTime"]
+            previous_state["Study DateTime"], errors="coerce"
         )
+        if "export_requested_on" in previous_state.columns:
+            previous_state["export_requested_on"] = pd.to_datetime(
+                previous_state["export_requested_on"], errors="coerce"
+            )
+
+        previous_state.dropna(subset=merge_cols, inplace=True)
+
+        previous_state["_export_rank"] = previous_state["is_exported"].fillna(False).astype(int)
+        previous_state["_has_outcome"] = previous_state["download_attempt_outcome"].notna().astype(int)
+        previous_state["_has_export_ts"] = previous_state["export_requested_on"].notna().astype(int)
+
+        prev_before = len(previous_state)
+        previous_state = previous_state.sort_values(
+            merge_cols + ["_export_rank", "_has_export_ts", "_has_outcome"],
+            ascending=[True, True, True, False, False, False],
+        ).drop_duplicates(subset=merge_cols, keep="first")
+        previous_state.drop(
+            columns=["_export_rank", "_has_outcome", "_has_export_ts"], inplace=True
+        )
+        if len(previous_state) != prev_before:
+            print(
+                "  - Previous state dedupe on "
+                f"{merge_cols}: {prev_before:,} → {len(previous_state):,}"
+            )
 
         # Merge previous state, keeping all current records
         db = pd.merge(
@@ -179,8 +239,14 @@ def load_and_merge_data():
             columns=[col for col in db.columns if col.endswith("_prev")], inplace=True
         )
 
+        modality_counts = (
+            db.loc[db["is_exported"], "base_modality"].fillna("<missing>").value_counts()
+        )
         print(f"  - Merged previous export status for {len(previous_state):,} exams")
-        print(f"  - Updated {db['is_exported'].sum():,} exams marked as 'is_exported'")
+        print(
+            "  - Export flags (by base_modality incl. <missing>):\n"
+            + modality_counts.to_string()
+        )
     else:
         # This column will be populated by check_disk_for_downloads
         db["is_exported"] = db["Accession"].notna()
@@ -191,10 +257,28 @@ def load_and_merge_data():
     # Initialize columns that may not exist yet
     if "download_attempt_outcome" not in db.columns:
         db["download_attempt_outcome"] = pd.NA
+    db["download_attempt_outcome"] = db["download_attempt_outcome"].astype("string")
+
     if "export_requested_on" not in db.columns:
         db["export_requested_on"] = pd.NaT
+    db["export_requested_on"] = pd.to_datetime(
+        db["export_requested_on"], errors="coerce"
+    )
+
+    db["is_exported"] = db["is_exported"].fillna(False).astype(bool)
+    if "is_on_disk" not in db.columns:
+        db["is_on_disk"] = False
+
+    disk_counts = (
+        db.loc[db["is_on_disk"], "base_modality"].fillna("<missing>").value_counts()
+    )
 
     print(f"\nMaster database created with {len(db):,} total exam records.")
+    if not disk_counts.empty:
+        print(
+            "  - Currently on disk (by base_modality incl. <missing>):\n"
+            + disk_counts.to_string()
+        )
     return db
 
 
@@ -203,6 +287,15 @@ def identify_download_targets(
 ):
     print("\n--- Phase 3: Identifying Target Exams for Download ---")
     df["rejection_reason"] = ""
+    if "is_on_disk" in df.columns:
+        df["is_on_disk"] = df["is_on_disk"].fillna(False).astype(bool)
+    else:
+        df["is_on_disk"] = False
+
+    if "is_exported" in df.columns:
+        df["is_exported"] = df["is_exported"].fillna(False).astype(bool)
+    else:
+        df["is_exported"] = False
     print(f"Initial pool: {len(df):,} exams")
 
     modality_mask = df["base_modality"] == modality
