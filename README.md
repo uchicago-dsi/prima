@@ -26,6 +26,17 @@ micromamba install -y pytorch torchvision pytorch-cuda=12.1 selenium firefox gec
 pip install -e . # if developing
 # pip install . # if not developing
 pip install -r requirements.txt
+pip install -r requirements-dev.txt  # linting + notebook extras when contributing
+```
+
+Runtime dependencies live in `requirements.txt`; install `requirements-dev.txt` to pick up
+tooling such as Ruff and optional notebook helpers used during development.
+
+Before sending changes, run the project formatters:
+
+```bash
+ruff format .
+ruff check --fix .
 ```
 
 

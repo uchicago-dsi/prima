@@ -1,22 +1,19 @@
+beautifulsoup4
 imageio==2.26.0
+einops
+lxml
 numpy==1.24.2
 omegaconf==2.3.0
+opencv-python-headless
 opencv_python==4.7.0.72
-Pillow==9.5.0
-# scipy==1.9.1
+pandas
+pillow==9.5.0
+psutil
+pyarrow
+pydicom
+requests
+selenium
 setuptools==67.6.0
 tqdm==4.65.0
-ipympl # for interactive notebook
-wandb
-tensorboard
-einops
-h5py
-beautifulsoup4
-selenium
-lxml
-pydicom
-pandas
-pyarrow
 zarr>=2.15
 numcodecs>=0.11
-opencv-python-headless
