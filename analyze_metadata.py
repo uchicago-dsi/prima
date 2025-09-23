@@ -827,8 +827,8 @@ def create_comprehensive_download_status_plot(
     plt.close()
 
 
-def create_exported_on_plot(data, plots_dir):
-    """create plot of exported on dates where populated"""
+def create_comprehensive_export_analysis_plot(data, plots_dir):
+    """create comprehensive export analysis with cumulative progress and velocity"""
 
     # filter for records with exported_on dates
     exported_data = data[data["Exported On"].notna()].copy()
@@ -839,24 +839,185 @@ def create_exported_on_plot(data, plots_dir):
 
     print(f"records with 'Exported On' dates: {len(exported_data):,}")
 
-    # create histogram of exported dates
-    fig, ax = plt.subplots(figsize=(12, 6))
+    # create 2x2 subplot figure
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(20, 16))
 
-    # extract dates and create monthly bins
-    exported_dates = exported_data["Exported On"]
+    # Panel 1: Cumulative Export Progress Over Time
+    exported_data_sorted = exported_data.sort_values("Exported On")
+    exported_data_sorted["cumulative_count"] = range(1, len(exported_data_sorted) + 1)
 
-    # create histogram
-    ax.hist(exported_dates, bins=50, alpha=0.7, edgecolor="black")
-    ax.set_title("distribution of export dates")
-    ax.set_xlabel("export date")
-    ax.set_ylabel("number of exams exported")
-    ax.tick_params(axis="x", rotation=45)
+    ax1.plot(
+        exported_data_sorted["Exported On"],
+        exported_data_sorted["cumulative_count"],
+        linewidth=2,
+        color="steelblue",
+    )
+    ax1.set_title("cumulative export progress over time")
+    ax1.set_xlabel("export date")
+    ax1.set_ylabel("cumulative number of exams exported")
+    ax1.tick_params(axis="x", rotation=45)
+    ax1.grid(True, alpha=0.3)
+
+    # add trend line for recent period (last 30 days of exports)
+    if len(exported_data_sorted) > 30:
+        recent_data = exported_data_sorted.tail(30)
+        if len(recent_data) > 1:
+            # calculate daily export rate from recent period
+            days_span = (
+                recent_data["Exported On"].max() - recent_data["Exported On"].min()
+            ).days
+            if days_span > 0:
+                recent_rate = len(recent_data) / days_span
+                ax1.text(
+                    0.02,
+                    0.98,
+                    f"recent rate: {recent_rate:.1f} exams/day",
+                    transform=ax1.transAxes,
+                    verticalalignment="top",
+                    bbox=dict(
+                        boxstyle="round,pad=0.3", facecolor="lightblue", alpha=0.7
+                    ),
+                )
+
+    # Panel 2: Export Velocity (Daily Export Counts)
+    exported_data["export_date"] = exported_data["Exported On"].dt.date
+    daily_exports = exported_data.groupby("export_date").size()
+
+    ax2.bar(
+        daily_exports.index,
+        daily_exports.values,
+        alpha=0.7,
+        edgecolor="black",
+        width=0.8,
+    )
+    ax2.set_title("daily export velocity")
+    ax2.set_xlabel("export date")
+    ax2.set_ylabel("number of exams exported per day")
+    ax2.tick_params(axis="x", rotation=45)
+    ax2.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+
+    # add moving average if enough data points
+    if len(daily_exports) >= 7:
+        moving_avg = daily_exports.rolling(window=7, center=True).mean()
+        ax2.plot(
+            moving_avg.index,
+            moving_avg.values,
+            color="red",
+            linewidth=2,
+            label="7-day moving average",
+        )
+        ax2.legend()
+
+    # add summary statistics
+    if len(daily_exports) > 0:
+        avg_daily = daily_exports.mean()
+        max_daily = daily_exports.max()
+        ax2.text(
+            0.02,
+            0.98,
+            f"avg: {avg_daily:.1f}/day\nmax: {max_daily}/day",
+            transform=ax2.transAxes,
+            verticalalignment="top",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgreen", alpha=0.7),
+        )
+
+    # Panel 3: Export Distribution by Month
+    exported_data["export_month"] = exported_data["Exported On"].dt.to_period("M")
+    monthly_exports = exported_data.groupby("export_month").size()
+
+    ax3.bar(
+        range(len(monthly_exports)),
+        monthly_exports.values,
+        alpha=0.7,
+        edgecolor="black",
+    )
+    ax3.set_title("monthly export distribution")
+    ax3.set_xlabel("month")
+    ax3.set_ylabel("number of exams exported")
+    ax3.set_xticks(range(len(monthly_exports)))
+    ax3.set_xticklabels([str(m) for m in monthly_exports.index], rotation=45)
+    ax3.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+
+    # add value labels on bars
+    for i, v in enumerate(monthly_exports.values):
+        ax3.text(
+            i,
+            v + 0.01 * max(monthly_exports.values),
+            f"{v:,}",
+            ha="center",
+            va="bottom",
+            fontsize=9,
+        )
+
+    # Panel 4: Export Success Rate Analysis (exported vs downloaded)
+    if "is_on_disk" in exported_data.columns:
+        exported_on_disk = exported_data["is_on_disk"].sum()
+        exported_not_on_disk = len(exported_data) - exported_on_disk
+
+        labels = ["exported & downloaded", "exported & not downloaded"]
+        sizes = [exported_on_disk, exported_not_on_disk]
+        colors = ["lightgreen", "lightcoral"]
+
+        # only create pie chart if there's data
+        if sum(sizes) > 0:
+            wedges, texts, autotexts = ax4.pie(
+                sizes, labels=labels, colors=colors, autopct="%1.1f%%", startangle=90
+            )
+            ax4.set_title(
+                f"export vs download success\n(total exported: {len(exported_data):,})"
+            )
+
+            # add absolute numbers to the pie chart
+            for autotext, size in zip(autotexts, sizes):
+                autotext.set_text(f"{autotext.get_text()}\n({size:,})")
+        else:
+            ax4.text(
+                0.5,
+                0.5,
+                "no export data",
+                ha="center",
+                va="center",
+                transform=ax4.transAxes,
+            )
+            ax4.set_title("export vs download success")
+    else:
+        ax4.text(
+            0.5,
+            0.5,
+            "download status not available",
+            ha="center",
+            va="center",
+            transform=ax4.transAxes,
+        )
+        ax4.set_title("export vs download success")
 
     plt.tight_layout()
     plt.savefig(
-        plots_dir / "exported_on_distribution.png", dpi=300, bbox_inches="tight"
+        plots_dir / "comprehensive_export_analysis.png", dpi=300, bbox_inches="tight"
     )
     plt.close()
+
+    # print summary statistics
+    print("\n=== EXPORT ANALYSIS SUMMARY ===")
+    if len(daily_exports) > 0:
+        print(
+            f"export period: {daily_exports.index.min()} to {daily_exports.index.max()}"
+        )
+        print(f"total days with exports: {len(daily_exports):,}")
+        print(f"average exports per day: {daily_exports.mean():.1f}")
+        print(f"maximum exports in a day: {daily_exports.max():,}")
+        print(f"total exams exported: {len(exported_data):,}")
+
+        # calculate remaining work if we have study data
+        total_studies = len(data)
+        remaining = total_studies - len(exported_data)
+        if remaining > 0 and daily_exports.mean() > 0:
+            days_remaining = remaining / daily_exports.mean()
+            print(f"estimated days to complete at current rate: {days_remaining:.1f}")
+
+    if "is_on_disk" in exported_data.columns:
+        success_rate = (exported_data["is_on_disk"].sum() / len(exported_data)) * 100
+        print(f"export-to-download success rate: {success_rate:.1f}%")
 
 
 # find and save missing MRNs
@@ -1632,8 +1793,8 @@ create_comprehensive_download_status_plot(
     plots_dir,
 )
 
-# create exported on plot
-create_exported_on_plot(metadata_with_patient_data, plots_dir)
+# create comprehensive export analysis plot
+create_comprehensive_export_analysis_plot(metadata_with_patient_data, plots_dir)
 
 # count and report exams with exported_on date but not on disk
 print("\n=== EXPORTED BUT NOT ON DISK ANALYSIS ===")
@@ -1643,7 +1804,7 @@ if (
 ):
     exported_not_on_disk = metadata_with_patient_data[
         (metadata_with_patient_data["Exported On"].notna())
-        & (not metadata_with_patient_data["is_on_disk"])
+        & (~metadata_with_patient_data["is_on_disk"])
     ]
     print(
         f"exams with 'Exported On' date but not on disk: {len(exported_not_on_disk):,}"
@@ -1786,7 +1947,7 @@ if Path(basedir).is_dir():
                     accession_number = item.name.replace(".tar.xz", "")
                 if accession_number:
                     disk_accessions.add(accession_number)
-        except:
+        except (OSError, PermissionError):
             continue
 
         # find accessions on disk but not in database
