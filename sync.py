@@ -33,7 +33,7 @@ LOCAL_CACHE_FILE = Path(__file__).resolve().parent / CACHE_FILE_REL_PATH
 
 # Path to the delete queue on the source share
 DELETE_QUEUE_DIR = SRC_ROOT / "_synced_and_queued_for_deletion"
-PARALLEL_JOBS = 6  # Increased back up since serialization overhead is now minimal
+PARALLEL_JOBS = 4
 REMOTE_PARALLEL_JOBS = 4  # For REMOTE processing. Start with 4, maybe try 2.
 # File stability check: only process exam dirs where most recent file is older than this
 STABILITY_THRESHOLD_SEC = 600
