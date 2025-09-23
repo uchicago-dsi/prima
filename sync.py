@@ -4,7 +4,9 @@ import argparse
 import json
 import logging
 import shutil
+import signal
 import subprocess
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Tuple
@@ -35,6 +37,8 @@ PARALLEL_JOBS = 6  # Increased back up since serialization overhead is now minim
 REMOTE_PARALLEL_JOBS = 4  # For REMOTE processing. Start with 4, maybe try 2.
 # File stability check: only process exam dirs where most recent file is older than this
 STABILITY_THRESHOLD_SEC = 600
+# Auto-restart configuration
+RESTART_DELAY_SEC = 120  # Wait 60 seconds between restarts
 # --- END CONFIGURATION ---
 
 logging.basicConfig(
@@ -42,6 +46,22 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.FileHandler("sync.log"), logging.StreamHandler()],
 )
+
+# Global flag for graceful shutdown
+shutdown_requested = False
+
+
+def signal_handler(signum, frame):
+    """handle SIGINT and SIGTERM for graceful shutdown"""
+    global shutdown_requested
+    logging.info(f"Received signal {signum}. Shutting down gracefully...")
+    shutdown_requested = True
+
+
+def setup_signal_handlers():
+    """setup signal handlers for graceful shutdown"""
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
 
 def _read_uid_quick(exam_path: Path):
@@ -1050,7 +1070,9 @@ def process_single_exam(
         return src_path.name, exam_stats, 0, 0, 0
 
 
-def main(update_inventory: bool, dry_run: bool, immediate_delete: bool = False):
+def run_single_sync(
+    update_inventory: bool, dry_run: bool, immediate_delete: bool = False
+):
     """
     drive end-to-end sync with:
       - numeric-only patient discovery
@@ -1281,6 +1303,74 @@ def main(update_inventory: bool, dry_run: bool, immediate_delete: bool = False):
     )
 
 
+def run_with_auto_restart(
+    update_inventory: bool, dry_run: bool, immediate_delete: bool = False
+):
+    """run sync with automatic restart functionality"""
+    setup_signal_handlers()
+
+    restart_count = 0
+    while not shutdown_requested:
+        restart_count += 1
+
+        if restart_count > 1:
+            logging.info(f"=== AUTO-RESTART #{restart_count} ===")
+        else:
+            logging.info("=== STARTING SYNC ===")
+
+        try:
+            run_single_sync(update_inventory, dry_run, immediate_delete)
+
+            if shutdown_requested:
+                logging.info("Shutdown requested during sync. Exiting.")
+                break
+
+            logging.info(
+                f"Sync completed successfully. Waiting "
+                f"{RESTART_DELAY_SEC} seconds before restart..."
+            )
+
+            # wait for restart delay with periodic checks for shutdown
+            for _ in range(RESTART_DELAY_SEC):
+                if shutdown_requested:
+                    logging.info("Shutdown requested during restart delay. Exiting.")
+                    return
+                time.sleep(1)
+
+        except KeyboardInterrupt:
+            logging.info("Received KeyboardInterrupt. Shutting down gracefully...")
+            break
+        except Exception as e:
+            logging.error(f"Sync failed with error: {e}", exc_info=True)
+            if shutdown_requested:
+                logging.info("Shutdown requested after error. Exiting.")
+                break
+
+            logging.info(
+                f"Waiting {RESTART_DELAY_SEC} seconds before restart after error..."
+            )
+            for _ in range(RESTART_DELAY_SEC):
+                if shutdown_requested:
+                    logging.info(
+                        "Shutdown requested during error restart delay. Exiting."
+                    )
+                    return
+                time.sleep(1)
+
+
+def main(
+    update_inventory: bool,
+    dry_run: bool,
+    immediate_delete: bool = False,
+    auto_restart: bool = False,
+):
+    """main entry point with optional auto-restart"""
+    if auto_restart:
+        run_with_auto_restart(update_inventory, dry_run, immediate_delete)
+    else:
+        run_single_sync(update_inventory, dry_run, immediate_delete)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Intelligently sync DICOM exams over SSH."
@@ -1301,9 +1391,16 @@ if __name__ == "__main__":
         action="store_true",
         help="Immediately delete local files after sync instead of moving to delete queue.",
     )
+    parser.add_argument(
+        "--auto-restart",
+        action="store_true",
+        help="Automatically restart the sync process after completion. "
+        "Use Ctrl+C to stop gracefully.",
+    )
     args = parser.parse_args()
     main(
         update_inventory=args.update_inventory,
         dry_run=args.dry_run,
         immediate_delete=args.immediate_delete,
+        auto_restart=args.auto_restart,
     )
