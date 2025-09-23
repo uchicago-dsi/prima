@@ -49,6 +49,30 @@ def get_base_modality(modality):
     return modality_str.split("/")[0]
 
 
+def save_current_state(db: pd.DataFrame):
+    """Save the current state to the output file."""
+    final_cols = [
+        "study_id",
+        "MRN",
+        "case_control_status",
+        "chip",
+        "base_modality",
+        "Study DateTime",
+        "DatedxIndex",
+        "StudyDescription",
+        "Accession",
+        "is_exported",
+        "is_on_disk",
+        "is_target",
+        "download_attempt_outcome",
+        "export_requested_on",
+        "rejection_reason",
+        "Modality",
+    ]
+    db_final = db[[col for col in final_cols if col in db.columns]].copy()
+    db_final.to_csv(OUTPUT_DATABASE_FILE, index=False, date_format="%Y-%m-%d %H:%M:%S")
+
+
 def load_and_merge_data():
     print("--- Phase 1: Loading and Merging Data ---")
     try:
@@ -69,6 +93,16 @@ def load_and_merge_data():
     except FileNotFoundError as e:
         print(f"ERROR: Input file not found - {e}", file=sys.stderr)
         sys.exit(1)
+
+    # Load previous output file if it exists to maintain state across runs
+    previous_state = None
+    if os.path.exists(OUTPUT_DATABASE_FILE):
+        try:
+            previous_state = pd.read_csv(OUTPUT_DATABASE_FILE)
+            print(f"Loaded {len(previous_state):,} rows from previous output file.")
+        except Exception as e:
+            print(f"Warning: Could not load previous output file: {e}")
+            previous_state = None
 
     print("\nStep 1.1: Merging metadata with key file...")
     db = pd.merge(metadata, key, left_on="study_id", right_on="AnonymousID", how="left")
@@ -95,11 +129,70 @@ def load_and_merge_data():
     db.drop(columns=["_in_patient_file"], inplace=True)
     db.dropna(subset=["study_id", "Study DateTime", "StudyDescription"], inplace=True)
 
-    # This column will be populated by check_disk_for_downloads
-    db["is_exported"] = db["Accession"].notna()
-    print(
-        f"Marked {db['is_exported'].sum():,} exams as 'is_exported' based on having an Accession number."
-    )
+    # Merge with previous state if available to maintain export status across runs
+    if previous_state is not None:
+        print("\nStep 1.4: Merging with previous output state...")
+        # Use study_id, Study DateTime, and StudyDescription as the merge key
+        merge_cols = ["study_id", "Study DateTime", "StudyDescription"]
+
+        # Ensure Study DateTime is datetime in both dataframes for proper merging
+        previous_state["Study DateTime"] = pd.to_datetime(
+            previous_state["Study DateTime"]
+        )
+
+        # Merge previous state, keeping all current records
+        db = pd.merge(
+            db,
+            previous_state[
+                merge_cols
+                + ["is_exported", "download_attempt_outcome", "export_requested_on"]
+            ],
+            on=merge_cols,
+            how="left",
+            suffixes=("", "_prev"),
+        )
+
+        # Update is_exported status from previous state, but don't override if current data has Accession
+        has_accession = db["Accession"].notna()
+        db.loc[has_accession, "is_exported"] = True
+
+        # Only update from previous state if the column exists
+        if "is_exported_prev" in db.columns:
+            db.loc[~has_accession, "is_exported"] = db.loc[
+                ~has_accession, "is_exported_prev"
+            ].fillna(False)
+        else:
+            db.loc[~has_accession, "is_exported"] = False
+
+        # Update download attempt outcomes from previous state
+        if "download_attempt_outcome_prev" in db.columns:
+            db["download_attempt_outcome"] = db["download_attempt_outcome_prev"].fillna(
+                db["download_attempt_outcome"]
+            )
+        if "export_requested_on_prev" in db.columns:
+            db["export_requested_on"] = db["export_requested_on_prev"].fillna(
+                db["export_requested_on"]
+            )
+
+        # Clean up temporary columns
+        db.drop(
+            columns=[col for col in db.columns if col.endswith("_prev")], inplace=True
+        )
+
+        print(f"  - Merged previous export status for {len(previous_state):,} exams")
+        print(f"  - Updated {db['is_exported'].sum():,} exams marked as 'is_exported'")
+    else:
+        # This column will be populated by check_disk_for_downloads
+        db["is_exported"] = db["Accession"].notna()
+        print(
+            f"Marked {db['is_exported'].sum():,} exams as 'is_exported' based on having an Accession number."
+        )
+
+    # Initialize columns that may not exist yet
+    if "download_attempt_outcome" not in db.columns:
+        db["download_attempt_outcome"] = pd.NA
+    if "export_requested_on" not in db.columns:
+        db["export_requested_on"] = pd.NaT
 
     print(f"\nMaster database created with {len(db):,} total exam records.")
     return db
@@ -117,7 +210,6 @@ def identify_download_targets(
     targets = df[modality_mask].copy()
     print(f"  - Kept {len(targets):,} exams after filtering for modality '{modality}'.")
 
-    # NEW: Check against the on-disk status first
     mask_on_disk = targets["is_on_disk"]
     targets.loc[mask_on_disk, "rejection_reason"] = "Already on disk"
     targets = targets[~mask_on_disk]
@@ -125,13 +217,14 @@ def identify_download_targets(
 
     # We still check if it's exported, but now it's a secondary check.
     # An exam could be exported but the sync failed, so it's not on disk.
-    has_accession_mask = targets["is_exported"]
-    targets.loc[has_accession_mask, "rejection_reason"] = (
+    # This includes exams with Accession numbers AND exams discovered as already exported in previous runs
+    already_exported_mask = targets["is_exported"]
+    targets.loc[already_exported_mask, "rejection_reason"] = (
         "Already exported (but not found on disk - possible sync issue)"
     )
-    targets = targets[~has_accession_mask]
+    targets = targets[~already_exported_mask]
     print(
-        f"  - Rejected {has_accession_mask.sum():,} exams already in iBroker's 'Exported' list (but not on disk)."
+        f"  - Rejected {already_exported_mask.sum():,} exams already exported (from previous runs or iBroker's 'Exported' list)."
     )
 
     if filter_by_genotyping:
@@ -154,7 +247,9 @@ def identify_download_targets(
     return targets.sort_values(by=["study_id", "Study DateTime"])
 
 
-def execute_downloads(targets_df: pd.DataFrame, batch_size: int):
+def execute_downloads(
+    targets_df: pd.DataFrame, batch_size: int, full_db: pd.DataFrame = None
+):
     """Verifies exam availability live and requests exports."""
     if targets_df.empty:
         return {}, 0, 0
@@ -240,11 +335,24 @@ def execute_downloads(targets_df: pd.DataFrame, batch_size: int):
                     outcomes[index] = "Already Exported"
                     already_exported_counter += 1
 
+                    # Mark as exported in the full database if provided
+                    if full_db is not None:
+                        full_db.loc[index, "is_exported"] = True
+                        full_db.loc[index, "download_attempt_outcome"] = (
+                            "Already Exported"
+                        )
+
             if requested_this_patient:
                 print("  Submitting export request for selected exams...")
                 driver.find_element(by="name", value="btnExport").click()
                 wait_aspnet_idle(driver)
                 print("  Export request submitted.")
+
+            # Save state periodically after each patient to preserve progress
+            # This includes discoveries of already exported exams
+            if full_db is not None:
+                save_current_state(full_db)
+                print("  - State saved to disk.")
     finally:
         if driver:
             print("Closing webdriver session.")
@@ -265,7 +373,7 @@ def main():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=200,
+        default=50,
         help="Max number of exams to request in one run.",
     )
     parser.add_argument(
@@ -293,8 +401,11 @@ def main():
 
     db["is_target"] = False
     db.loc[targets.index, "is_target"] = True
-    db["download_attempt_outcome"] = pd.NA
-    db["export_requested_on"] = pd.NaT
+
+    # Only initialize download_attempt_outcome for NEW targets, preserve previous outcomes
+    new_targets_mask = db["is_target"] & db["download_attempt_outcome"].isna()
+    db.loc[new_targets_mask, "download_attempt_outcome"] = pd.NA
+    db.loc[new_targets_mask, "export_requested_on"] = pd.NaT
 
     if targets.empty:
         print("\nNo new exams to download based on the current criteria.")
@@ -312,7 +423,7 @@ def main():
         )
         if proceed == "y":
             outcomes, already_exported_count, successfully_exported_count = (
-                execute_downloads(targets, args.batch_size)
+                execute_downloads(targets, args.batch_size, full_db=db)
             )
 
             if outcomes:
@@ -320,6 +431,8 @@ def main():
                     db.loc[index, "download_attempt_outcome"] = outcome
                     if outcome == "Request Submitted":
                         db.loc[index, "export_requested_on"] = datetime.now()
+                    elif outcome == "Already Exported":
+                        db.loc[index, "is_exported"] = True
 
             print("\n--- Run Summary ---")
             print(
@@ -332,27 +445,8 @@ def main():
         else:
             print("Download cancelled by user.")
 
-    final_cols = [
-        "study_id",
-        "MRN",
-        "case_control_status",
-        "chip",
-        "base_modality",
-        "Study DateTime",
-        "DatedxIndex",
-        "StudyDescription",
-        "Accession",
-        "is_exported",  # New name: True if it has an Accession
-        "is_on_disk",  # New column: True if found on filesystem
-        "is_target",
-        "download_attempt_outcome",
-        "export_requested_on",
-        "rejection_reason",
-        "Modality",
-    ]
-    db_final = db[[col for col in final_cols if col in db.columns]].copy()
-
-    db_final.to_csv(OUTPUT_DATABASE_FILE, index=False, date_format="%Y-%m-%d %H:%M:%S")
+    # Save final state
+    save_current_state(db)
     print(
         f"\nProcess complete. A full snapshot of this run has been saved to '{OUTPUT_DATABASE_FILE}'"
     )
