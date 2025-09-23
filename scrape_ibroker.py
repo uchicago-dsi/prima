@@ -323,14 +323,16 @@ def parse_all_tables_from_page(page_html: str) -> pd.DataFrame:
 
     # --- Part 3: Combine and return ---
     if not dfs_to_combine:
-        return pd.DataFrame(columns=[
-            "Modality",
-            "Study DateTime",
-            "StudyDescription",
-            "Status",
-            "Accession",
-            "Exported On",
-        ])
+        return pd.DataFrame(
+            columns=[
+                "Modality",
+                "Study DateTime",
+                "StudyDescription",
+                "Status",
+                "Accession",
+                "Exported On",
+            ]
+        )
 
     combined = pd.concat(dfs_to_combine, ignore_index=True, sort=False)
 

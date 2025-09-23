@@ -135,12 +135,16 @@ def load_and_merge_data():
     )
 
     in_patient_mask = db["_in_patient_file"].astype("boolean").fillna(False)
-    conditions = [db["DatedxIndex"].notna(), in_patient_mask.to_numpy(dtype=bool, na_value=False)]
+    conditions = [
+        db["DatedxIndex"].notna(),
+        in_patient_mask.to_numpy(dtype=bool, na_value=False),
+    ]
     choices = ["Case", "Control"]
     db["case_control_status"] = np.select(conditions, choices, default="Unknown")
     print("  - Derived Case/Control status based on DatedxIndex:")
     print(
-        db["case_control_status"].value_counts(dropna=False)
+        db["case_control_status"]
+        .value_counts(dropna=False)
         .rename_axis("case_control_status")
         .to_string()
     )
@@ -155,9 +159,9 @@ def load_and_merge_data():
         db["_has_accession"] = 0
 
     before_exam_dedup = len(db)
-    db = db.sort_values(MERGE_KEY_COLUMNS + ["_has_accession"], ascending=[True, True, True, False]).drop_duplicates(
-        subset=MERGE_KEY_COLUMNS, keep="first"
-    )
+    db = db.sort_values(
+        MERGE_KEY_COLUMNS + ["_has_accession"], ascending=[True, True, True, False]
+    ).drop_duplicates(subset=MERGE_KEY_COLUMNS, keep="first")
     db.drop(columns=["_has_accession"], inplace=True)
     if len(db) != before_exam_dedup:
         print(
@@ -182,9 +186,15 @@ def load_and_merge_data():
 
         previous_state.dropna(subset=merge_cols, inplace=True)
 
-        previous_state["_export_rank"] = previous_state["is_exported"].fillna(False).astype(int)
-        previous_state["_has_outcome"] = previous_state["download_attempt_outcome"].notna().astype(int)
-        previous_state["_has_export_ts"] = previous_state["export_requested_on"].notna().astype(int)
+        previous_state["_export_rank"] = (
+            previous_state["is_exported"].fillna(False).astype(int)
+        )
+        previous_state["_has_outcome"] = (
+            previous_state["download_attempt_outcome"].notna().astype(int)
+        )
+        previous_state["_has_export_ts"] = (
+            previous_state["export_requested_on"].notna().astype(int)
+        )
 
         prev_before = len(previous_state)
         previous_state = previous_state.sort_values(
@@ -240,7 +250,9 @@ def load_and_merge_data():
         )
 
         modality_counts = (
-            db.loc[db["is_exported"], "base_modality"].fillna("<missing>").value_counts()
+            db.loc[db["is_exported"], "base_modality"]
+            .fillna("<missing>")
+            .value_counts()
         )
         print(f"  - Merged previous export status for {len(previous_state):,} exams")
         print(
