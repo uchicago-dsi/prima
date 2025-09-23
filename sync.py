@@ -1387,20 +1387,19 @@ if __name__ == "__main__":
         help="Simulate all operations; no files will be moved or transferred.",
     )
     parser.add_argument(
-        "--immediate-delete",
+        "--no-immediate-delete",
         action="store_true",
-        help="Immediately delete local files after sync instead of moving to delete queue.",
+        help="Move local files to delete queue instead of immediately deleting them.",
     )
     parser.add_argument(
-        "--auto-restart",
+        "--no-auto-restart",
         action="store_true",
-        help="Automatically restart the sync process after completion. "
-        "Use Ctrl+C to stop gracefully.",
+        help="Run sync once and exit instead of automatically restarting.",
     )
     args = parser.parse_args()
     main(
         update_inventory=args.update_inventory,
         dry_run=args.dry_run,
-        immediate_delete=args.immediate_delete,
-        auto_restart=args.auto_restart,
+        immediate_delete=not args.no_immediate_delete,
+        auto_restart=not args.no_auto_restart,
     )
