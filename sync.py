@@ -39,6 +39,9 @@ REMOTE_PARALLEL_JOBS = 4  # For REMOTE processing. Start with 4, maybe try 2.
 STABILITY_THRESHOLD_SEC = 600
 # Auto-restart configuration
 RESTART_DELAY_SEC = 120  # Wait 60 seconds between restarts
+# Cap how many exam directories we fully handle in a single run.
+# Set to None to disable the cap.
+MAX_EXAMS_PER_RUN: int | None = 50
 # --- END CONFIGURATION ---
 
 logging.basicConfig(
@@ -951,14 +954,26 @@ def process_uid_fastpath_phase(
     dest_inventory: Dict[str, Dict[ExamFingerprint, str]],
     dry_run: bool,
     immediate_delete: bool = False,
-) -> Tuple[list[Path], Dict[str, int]]:
+    max_exams: int | None = None,
+) -> Tuple[list[Path], Dict[str, int], int, list[Path]]:
     """
-    First phase: process all exams for UID fastpath matches
-    Returns (remaining_exams_for_transfer, stats)
+    First phase: process exam directories for UID fastpath matches.
+
+    Parameters
+    ----------
+    max_exams : Optional[int]
+        Cap on how many exams to touch during this run. Remaining directories are
+        returned so they can be deferred to the next restart.
+
+    Returns
+    -------
+    tuple
+        (exams_requiring_transfer, stats_dict, processed_count, deferred_dirs)
     """
     import shutil  # Import at function level to avoid scoping issues
 
-    remaining_exams = []
+    remaining_exams: list[Path] = []
+    deferred_exams: list[Path] = []
     stats = {
         "renamed": 0,
         "skipped": 0,
@@ -966,8 +981,14 @@ def process_uid_fastpath_phase(
         "remote_renamed": 0,
         "uid_fastpath_hits": 0,
     }
+    processed = 0
 
-    for src_path in exam_paths:
+    for idx, src_path in enumerate(exam_paths):
+        if max_exams is not None and processed >= max_exams:
+            deferred_exams.extend(exam_paths[idx:])
+            break
+
+        processed += 1
         try:
             patient_id = src_path.parent.name
             exam_name = src_path.name
@@ -1084,7 +1105,7 @@ def process_uid_fastpath_phase(
             stats["failed"] += 1
             remaining_exams.append(src_path)  # still try to transfer
 
-    return remaining_exams, stats
+    return remaining_exams, stats, processed, deferred_exams
 
 
 def process_single_exam(
@@ -1190,14 +1211,23 @@ def run_single_sync(
 
     total_exams = len(all_exams)
     logging.info(f"Found {total_exams} source exams to process.")
+    max_exams_this_run = (
+        MAX_EXAMS_PER_RUN if (MAX_EXAMS_PER_RUN is None or MAX_EXAMS_PER_RUN > 0) else None
+    )
 
     # ===== PHASE 1: UID FASTPATH (Sequential, Fast) =====
     logging.info("=== PHASE 1: UID FASTPATH PROCESSING ===")
     logging.info("Processing all exams for UID matches first (fast, no SSH transfers)")
 
     phase1_start = monotonic()
-    remaining_exams, phase1_stats = process_uid_fastpath_phase(
-        all_exams, dest_inventory, dry_run, immediate_delete
+    remaining_exams, phase1_stats, phase1_processed, deferred_exams = (
+        process_uid_fastpath_phase(
+            all_exams,
+            dest_inventory,
+            dry_run,
+            immediate_delete,
+            max_exams=max_exams_this_run,
+        )
     )
     phase1_time = monotonic() - phase1_start
 
@@ -1207,9 +1237,22 @@ def run_single_sync(
     logging.info(f"  - Skipped (unstable): {phase1_stats['skipped']}")
     logging.info(f"  - Failed: {phase1_stats['failed']}")
     logging.info(f"  - Remaining for transfer: {len(remaining_exams)}")
+    logging.info(f"  - Exams touched this run: {phase1_processed}")
+
+    if deferred_exams:
+        logging.info(
+            f"Run cap reached ({max_exams_this_run}); deferring {len(deferred_exams)} exams until next pass."
+            if max_exams_this_run is not None
+            else f"Deferred {len(deferred_exams)} exams for later processing."
+        )
 
     if not remaining_exams:
-        logging.info("All exams processed via UID fastpath! No transfers needed.")
+        if deferred_exams:
+            logging.info(
+                "Run cap reached with no transfers left in quota; will resume on next restart."
+            )
+        else:
+            logging.info("All exams processed via UID fastpath! No transfers needed.")
         return
 
     # ===== PHASE 2: TRANSFERS AND HASH MATCHING (Parallel) =====
@@ -1235,15 +1278,22 @@ def run_single_sync(
     bytes_net_total = 0
     bytes_log_total = 0
     transfers_done = 0
-    exams_processed = 0
+    phase2_completed = 0
     queued_local_for_delete = 0
+
+    initial_completed = max(0, phase1_processed - len(remaining_exams))
+    total_known = total_exams
 
     used_gb, free_gb, total_gb = _share_usage_gb()
     logging.info(
         f"[USAGE mount] {SRC_ROOT}: used {used_gb:.1f} GB / total {total_gb:.1f} GB (free {free_gb:.1f} GB)"
     )
 
-    pbar = tqdm(total=len(remaining_exams), desc="Processing Transfers")
+    pbar = tqdm(
+        total=total_known,
+        initial=initial_completed,
+        desc="Processing Exams",
+    )
 
     with ProcessPoolExecutor(max_workers=PARALLEL_JOBS) as executor:
         # submit individual exam processing tasks (back to exam-level for better load balancing)
@@ -1275,7 +1325,7 @@ def run_single_sync(
                 if exam_stats["transferred"] > 0:
                     transfers_done += 1
                 queued_local_for_delete += queued
-                exams_processed += 1
+                phase2_completed += 1
                 pbar.update(1)
 
                 # heartbeat check
@@ -1284,12 +1334,12 @@ def run_single_sync(
                     elapsed = now - phase2_start
                     used_gb, free_gb, total_gb = _share_usage_gb()
                     logging.info(
-                        f"[HEARTBEAT] processed {exams_processed}/{len(remaining_exams)} | "
+                        f"[HEARTBEAT] processed {initial_completed + phase2_completed}/{total_known} | "
                         f"{transfers_done} transferred (logical {bytes_log_total / 1e6:.1f} MB, net {bytes_net_total / 1e6:.1f} MB) | "
                         f"{phase2_stats['remote_renamed']} remote-renamed | "
                         f"early_hash {phase2_stats['early_hash_hits']}, "
                         f"full_hash {phase2_stats['full_hash_fallbacks']} | "
-                        f"rate {(exams_processed / elapsed * 3600.0) if elapsed > 0 else 0.0:.2f} exams/hr | "
+                        f"rate {((initial_completed + phase2_completed) / elapsed * 3600.0) if elapsed > 0 else 0.0:.2f} exams/hr | "
                         f"share {used_gb:.1f}/{total_gb:.1f} GB used (free {free_gb:.1f} GB)"
                     )
                     last_hb = now
@@ -1297,7 +1347,7 @@ def run_single_sync(
             except Exception as e:
                 logging.error(f"FATAL ERROR processing {src_path}: {e}", exc_info=True)
                 phase2_stats["failed"] += 1
-                exams_processed += 1
+                phase2_completed += 1
                 pbar.update(1)
 
     pbar.close()
@@ -1317,15 +1367,19 @@ def run_single_sync(
 
     total_elapsed = monotonic() - phase1_start
     phase2_time = monotonic() - phase2_start
+    total_completed_this_run = initial_completed + phase2_completed
 
     logging.info("=== SYNC COMPLETE ===")
     logging.info(
         f"Total time: {total_elapsed / 60:.1f} minutes (Phase 1: {phase1_time:.1f}s, Phase 2: {phase2_time:.1f}s)"
     )
-    if total_exams > 0:
+    if total_elapsed > 0 and total_completed_this_run > 0:
         logging.info(
-            f"Overall rate: {total_exams / total_elapsed * 3600:.1f} exams/hour"
+            f"Overall rate (this run): {total_completed_this_run / total_elapsed * 3600:.1f} exams/hour"
         )
+    logging.info(
+        f"Processed {total_completed_this_run}/{total_exams} known exams this pass."
+    )
 
     logging.info("PHASE 1 (UID Fastpath):")
     logging.info(f"  - UID fastpath hits: {phase1_stats['uid_fastpath_hits']}")
@@ -1345,6 +1399,10 @@ def run_single_sync(
     logging.info(
         f"  - Total queued/deleted locally: {queued_local_for_delete + phase1_stats['renamed']}"
     )
+    if deferred_exams:
+        logging.info(
+            f"  - Deferred for next run (due to cap): {len(deferred_exams)}"
+        )
 
     used_gb, free_gb, total_gb = _share_usage_gb()
     logging.info(
