@@ -33,7 +33,7 @@ LOCAL_CACHE_FILE = Path(__file__).resolve().parent / CACHE_FILE_REL_PATH
 
 # Path to the delete queue on the source share
 DELETE_QUEUE_DIR = SRC_ROOT / "_synced_and_queued_for_deletion"
-PARALLEL_JOBS = 4
+PARALLEL_JOBS = 1
 REMOTE_PARALLEL_JOBS = 4  # For REMOTE processing. Start with 4, maybe try 2.
 # File stability check: only process exam dirs where most recent file is older than this
 STABILITY_THRESHOLD_SEC = 600
@@ -561,11 +561,60 @@ def rsync_exam_remote(src: Path, patient_id: str, exam_name: str):
     ]
 
     t0 = monotonic()
-    proc = subprocess.run(command, check=True, capture_output=True, text=True)
-    dt = monotonic() - t0
+    proc = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
 
-    # combine both streams; different rsync builds print stats on either
-    combined = f"{proc.stdout or ''}\n{proc.stderr or ''}"
+    combined_lines: list[str] = []
+    last_progress_line = ""
+    last_heartbeat = t0
+
+    assert proc.stdout is not None  # silences type checkers
+    def should_log(msg: str) -> bool:
+        if "to-chk=" in msg:
+            return True
+        lowered = msg.lower()
+        if "error" in lowered:
+            return True
+        prefixes = (
+            "number of ",
+            "total transferred file size",
+            "total file size",
+            "total bytes sent",
+            "total bytes received",
+            "sent ",
+            "speedup is ",
+        )
+        return lowered.startswith(prefixes)
+
+    for line in proc.stdout:
+        combined_lines.append(line)
+        msg = line.rstrip()
+        if msg and should_log(msg):
+            logging.info(f"[RSYNC] {msg}")
+        if "to-chk=" in msg:
+            last_progress_line = msg
+
+        now = monotonic()
+        if now - last_heartbeat >= 60:
+            elapsed = now - t0
+            hb = (
+                f"[RSYNC HEARTBEAT] {src.name}: elapsed {elapsed:.0f}s"
+                + (f" | progress: {last_progress_line}" if last_progress_line else "")
+            )
+            logging.info(hb)
+            last_heartbeat = now
+
+    proc.wait()
+    dt = monotonic() - t0
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, command)
+
+    combined = "".join(combined_lines)
 
     # parse network bytes actually moved: "sent X bytes  received Y bytes"
     sent_bytes = 0
