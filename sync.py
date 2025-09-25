@@ -1220,13 +1220,12 @@ def run_single_sync(
     logging.info("Processing all exams for UID matches first (fast, no SSH transfers)")
 
     phase1_start = monotonic()
-    remaining_exams, phase1_stats, phase1_processed, deferred_exams = (
+    transfer_candidates, phase1_stats, phase1_processed, deferred_exams = (
         process_uid_fastpath_phase(
             all_exams,
             dest_inventory,
             dry_run,
             immediate_delete,
-            max_exams=max_exams_this_run,
         )
     )
     phase1_time = monotonic() - phase1_start
@@ -1236,13 +1235,24 @@ def run_single_sync(
     logging.info(f"  - Remote renamed: {phase1_stats['remote_renamed']}")
     logging.info(f"  - Skipped (unstable): {phase1_stats['skipped']}")
     logging.info(f"  - Failed: {phase1_stats['failed']}")
-    logging.info(f"  - Remaining for transfer: {len(remaining_exams)}")
+    total_transfer_candidates = len(transfer_candidates)
+    logging.info(f"  - Remaining for transfer: {total_transfer_candidates}")
     logging.info(f"  - Exams touched this run: {phase1_processed}")
+
+    remaining_exams = transfer_candidates
+    if max_exams_this_run is not None and total_transfer_candidates > max_exams_this_run:
+        remaining_exams = transfer_candidates[:max_exams_this_run]
+        deferred_exams.extend(transfer_candidates[max_exams_this_run:])
+
+    if total_transfer_candidates != len(remaining_exams):
+        logging.info(
+            f"  - Transfers scheduled this run: {len(remaining_exams)} (cap {max_exams_this_run})"
+        )
 
     if deferred_exams:
         logging.info(
             f"Run cap reached ({max_exams_this_run}); deferring {len(deferred_exams)} exams until next pass."
-            if max_exams_this_run is not None
+            if max_exams_this_run is not None and total_transfer_candidates != len(remaining_exams)
             else f"Deferred {len(deferred_exams)} exams for later processing."
         )
 
@@ -1281,7 +1291,7 @@ def run_single_sync(
     phase2_completed = 0
     queued_local_for_delete = 0
 
-    initial_completed = max(0, phase1_processed - len(remaining_exams))
+    initial_completed = max(0, phase1_processed - total_transfer_candidates)
     total_known = total_exams
 
     used_gb, free_gb, total_gb = _share_usage_gb()
