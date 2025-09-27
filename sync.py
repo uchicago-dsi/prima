@@ -1240,19 +1240,20 @@ def run_single_sync(
     logging.info(f"  - Exams touched this run: {phase1_processed}")
 
     remaining_exams = transfer_candidates
+    cap_deferrals = 0
     if max_exams_this_run is not None and total_transfer_candidates > max_exams_this_run:
         remaining_exams = transfer_candidates[:max_exams_this_run]
-        deferred_exams.extend(transfer_candidates[max_exams_this_run:])
-
-    if total_transfer_candidates != len(remaining_exams):
+        deferred_chunk = transfer_candidates[max_exams_this_run:]
+        cap_deferrals = len(deferred_chunk)
+        deferred_exams.extend(deferred_chunk)
         logging.info(
-            f"  - Transfers scheduled this run: {len(remaining_exams)} (cap {max_exams_this_run})"
+            f"  - Transfer cap active ({max_exams_this_run}); scheduling {len(remaining_exams)} now, deferring {cap_deferrals} for the next pass."
         )
 
     if deferred_exams:
         logging.info(
-            f"Run cap reached ({max_exams_this_run}); deferring {len(deferred_exams)} exams until next pass."
-            if max_exams_this_run is not None and total_transfer_candidates != len(remaining_exams)
+            f"Deferred {len(deferred_exams)} exams from earlier stage for later processing."
+            if cap_deferrals == 0
             else f"Deferred {len(deferred_exams)} exams for later processing."
         )
 
@@ -1458,6 +1459,19 @@ def run_with_auto_restart(
             logging.info("Received KeyboardInterrupt. Shutting down gracefully...")
             break
         except Exception as e:
+            mount_missing = isinstance(e, FileNotFoundError) and (
+                getattr(e, "filename", None) == str(SRC_ROOT)
+            )
+            if mount_missing:
+                logging.error(
+                    f"Source root {SRC_ROOT} is unavailable; stopping auto-restart.",
+                    exc_info=True,
+                )
+                logging.info(
+                    "Auto-restart halted. Remount the source share and restart the sync manually."
+                )
+                return
+
             logging.error(f"Sync failed with error: {e}", exc_info=True)
             if shutdown_requested:
                 logging.info("Shutdown requested after error. Exiting.")
