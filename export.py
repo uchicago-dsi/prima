@@ -4,7 +4,9 @@
 import argparse
 import os
 import sys
+import tempfile
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -20,7 +22,14 @@ CHIMEC_PATIENTS_FILE = "/gpfs/data/phs/groups/Projects/Huo_projects/SPORE/annawo
 KEY_FILE = "/gpfs/data/huo-lab/Image/ChiMEC/study-16352a.csv"
 METADATA_FILE = "data/imaging_metadata.csv"
 BASE_DOWNLOAD_DIR = "/gpfs/data/huo-lab/Image/ChiMEC/"
-OUTPUT_DATABASE_FILE = "data/imaging_database_with_status.csv"
+METADATA_EXTRA_COLUMNS = [
+    "is_exported",
+    "download_attempt_outcome",
+    "export_requested_on",
+]
+
+
+METADATA_BASE_COLUMNS: list[str] = []
 
 MERGE_KEY_COLUMNS = ["study_id", "Study DateTime", "StudyDescription"]
 
@@ -51,40 +60,69 @@ def get_base_modality(modality):
     return modality_str.split("/")[0]
 
 
+def _atomic_write_csv(df: pd.DataFrame, path: str | Path, **kwargs) -> None:
+    """Write a CSV via a temp file and replace atomically."""
+
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=output_path.parent, prefix=f".{output_path.name}", suffix=".tmp"
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as tmp_file:
+            df.to_csv(tmp_file, **kwargs)
+        os.replace(tmp_path, output_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
 def save_current_state(db: pd.DataFrame):
-    """Save the current state to the output file."""
-    final_cols = [
-        "study_id",
-        "MRN",
-        "case_control_status",
-        "chip",
-        "base_modality",
-        "Study DateTime",
-        "DatedxIndex",
-        "StudyDescription",
-        "Accession",
-        "is_exported",
-        "is_on_disk",
-        "is_target",
-        "download_attempt_outcome",
-        "export_requested_on",
-        "rejection_reason",
-        "Modality",
-    ]
-    db_final = db[[col for col in final_cols if col in db.columns]].copy()
-    key_cols = [col for col in MERGE_KEY_COLUMNS if col in db_final.columns]
+    """Persist export state back into the metadata file atomically."""
+
+    if not METADATA_BASE_COLUMNS:
+        raise RuntimeError(
+            "Metadata columns are unknown; load_and_merge_data must run before saving."
+        )
+
+    working = db.copy()
+    for column in METADATA_EXTRA_COLUMNS:
+        if column not in working.columns:
+            working[column] = pd.NA
+
+    persist_columns: list[str] = []
+    seen = set()
+    for column in METADATA_BASE_COLUMNS + METADATA_EXTRA_COLUMNS:
+        if column in working.columns and column not in seen:
+            persist_columns.append(column)
+            seen.add(column)
+
+    metadata_subset = working[persist_columns].copy()
+
+    key_cols = [col for col in MERGE_KEY_COLUMNS if col in metadata_subset.columns]
     if key_cols:
-        before = len(db_final)
-        db_final = (
-            db_final.sort_values(key_cols)
+        before = len(metadata_subset)
+        metadata_subset = (
+            metadata_subset.sort_values(key_cols)
             .drop_duplicates(subset=key_cols, keep="last")
             .reset_index(drop=True)
         )
-        if len(db_final) != before:
+        if len(metadata_subset) != before:
             print(
-                f"  - save_current_state: collapsed {before:,} rows to {len(db_final):,}"
+                "  - save_current_state: collapsed "
+                f"{before:,} rows to {len(metadata_subset):,}"
             )
-    db_final.to_csv(OUTPUT_DATABASE_FILE, index=False, date_format="%Y-%m-%d %H:%M:%S")
+
+    if "is_target" in metadata_subset.columns:
+        metadata_subset = metadata_subset.drop(columns=["is_target"])
+
+    _atomic_write_csv(
+        metadata_subset,
+        METADATA_FILE,
+        index=False,
+        date_format="%Y-%m-%d %H:%M:%S",
+    )
 
 
 def load_and_merge_data():
@@ -97,6 +135,9 @@ def load_and_merge_data():
         metadata = pd.read_csv(METADATA_FILE)
         print(f"Loaded {len(metadata):,} exam records from raw metadata file.")
 
+        global METADATA_BASE_COLUMNS
+        METADATA_BASE_COLUMNS = list(metadata.columns)
+
         # A small fix: The Accession number is often what we care about, not the old exam_id
         # Let's rename exam_id to Accession if Accession is missing.
         if "exam_id" in metadata.columns and "Accession" in metadata.columns:
@@ -104,19 +145,46 @@ def load_and_merge_data():
 
         metadata["base_modality"] = metadata["Modality"].apply(get_base_modality)
         print("  - Added 'base_modality' column.")
+
+        if "Exported On" in metadata.columns:
+            metadata["Exported On"] = pd.to_datetime(
+                metadata["Exported On"], errors="coerce"
+            )
+
+        if "is_exported" not in metadata.columns:
+            metadata["is_exported"] = False
+
+        status_series = metadata.get("Status")
+        if status_series is not None:
+            exported_status_mask = (
+                status_series.fillna("")
+                .astype(str)
+                .str.strip()
+                .str.lower()
+                .isin({"already exported", "exported"})
+            )
+            metadata.loc[exported_status_mask, "is_exported"] = True
+
+        if "Exported On" in metadata.columns:
+            exported_on_mask = metadata["Exported On"].notna()
+            metadata.loc[exported_on_mask, "is_exported"] = True
+
+        metadata["is_exported"] = metadata["is_exported"].fillna(False).astype(bool)
+
+        if "download_attempt_outcome" not in metadata.columns:
+            metadata["download_attempt_outcome"] = pd.NA
+        metadata["download_attempt_outcome"] = metadata["download_attempt_outcome"].astype(
+            "string"
+        )
+
+        if "export_requested_on" not in metadata.columns:
+            metadata["export_requested_on"] = pd.NaT
+        metadata["export_requested_on"] = pd.to_datetime(
+            metadata["export_requested_on"], errors="coerce"
+        )
     except FileNotFoundError as e:
         print(f"ERROR: Input file not found - {e}", file=sys.stderr)
         sys.exit(1)
-
-    # Load previous output file if it exists to maintain state across runs
-    previous_state = None
-    if os.path.exists(OUTPUT_DATABASE_FILE):
-        try:
-            previous_state = pd.read_csv(OUTPUT_DATABASE_FILE, low_memory=False)
-            print(f"Loaded {len(previous_state):,} rows from previous output file.")
-        except Exception as e:
-            print(f"Warning: Could not load previous output file: {e}")
-            previous_state = None
 
     print("\nStep 1.1: Merging metadata with key file...")
     db = pd.merge(metadata, key, left_on="study_id", right_on="AnonymousID", how="left")
@@ -169,102 +237,18 @@ def load_and_merge_data():
             f"{MERGE_KEY_COLUMNS}: {before_exam_dedup:,} → {len(db):,}"
         )
 
-    # Merge with previous state if available to maintain export status across runs
-    if previous_state is not None:
-        print("\nStep 1.4: Merging with previous output state...")
-        # Use study_id, Study DateTime, and StudyDescription as the merge key
-        merge_cols = MERGE_KEY_COLUMNS
+    has_accession = db["Accession"].notna()
+    db.loc[has_accession, "is_exported"] = True
 
-        # Ensure Study DateTime is datetime in both dataframes for proper merging
-        previous_state["Study DateTime"] = pd.to_datetime(
-            previous_state["Study DateTime"], errors="coerce"
-        )
-        if "export_requested_on" in previous_state.columns:
-            previous_state["export_requested_on"] = pd.to_datetime(
-                previous_state["export_requested_on"], errors="coerce"
-            )
+    db["is_exported"] = db["is_exported"].fillna(False).astype(bool)
 
-        previous_state.dropna(subset=merge_cols, inplace=True)
-
-        previous_state["_export_rank"] = (
-            previous_state["is_exported"].fillna(False).astype(int)
-        )
-        previous_state["_has_outcome"] = (
-            previous_state["download_attempt_outcome"].notna().astype(int)
-        )
-        previous_state["_has_export_ts"] = (
-            previous_state["export_requested_on"].notna().astype(int)
-        )
-
-        prev_before = len(previous_state)
-        previous_state = previous_state.sort_values(
-            merge_cols + ["_export_rank", "_has_export_ts", "_has_outcome"],
-            ascending=[True, True, True, False, False, False],
-        ).drop_duplicates(subset=merge_cols, keep="first")
-        previous_state.drop(
-            columns=["_export_rank", "_has_outcome", "_has_export_ts"], inplace=True
-        )
-        if len(previous_state) != prev_before:
-            print(
-                "  - Previous state dedupe on "
-                f"{merge_cols}: {prev_before:,} → {len(previous_state):,}"
-            )
-
-        # Merge previous state, keeping all current records
-        db = pd.merge(
-            db,
-            previous_state[
-                merge_cols
-                + ["is_exported", "download_attempt_outcome", "export_requested_on"]
-            ],
-            on=merge_cols,
-            how="left",
-            suffixes=("", "_prev"),
-        )
-
-        # Update is_exported status from previous state, but don't override if current data has Accession
-        has_accession = db["Accession"].notna()
-        db.loc[has_accession, "is_exported"] = True
-
-        # Only update from previous state if the column exists
-        if "is_exported_prev" in db.columns:
-            db.loc[~has_accession, "is_exported"] = db.loc[
-                ~has_accession, "is_exported_prev"
-            ].fillna(False)
-        else:
-            db.loc[~has_accession, "is_exported"] = False
-
-        # Update download attempt outcomes from previous state
-        if "download_attempt_outcome_prev" in db.columns:
-            db["download_attempt_outcome"] = db["download_attempt_outcome_prev"].fillna(
-                db["download_attempt_outcome"]
-            )
-        if "export_requested_on_prev" in db.columns:
-            db["export_requested_on"] = db["export_requested_on_prev"].fillna(
-                db["export_requested_on"]
-            )
-
-        # Clean up temporary columns
-        db.drop(
-            columns=[col for col in db.columns if col.endswith("_prev")], inplace=True
-        )
-
-        modality_counts = (
-            db.loc[db["is_exported"], "base_modality"]
-            .fillna("<missing>")
-            .value_counts()
-        )
-        print(f"  - Merged previous export status for {len(previous_state):,} exams")
-        print(
-            "  - Export flags (by base_modality incl. <missing>):\n"
-            + modality_counts.to_string()
-        )
-    else:
-        # This column will be populated by check_disk_for_downloads
-        db["is_exported"] = db["Accession"].notna()
-        print(
-            f"Marked {db['is_exported'].sum():,} exams as 'is_exported' based on having an Accession number."
-        )
+    modality_counts = (
+        db.loc[db["is_exported"], "base_modality"].fillna("<missing>").value_counts()
+    )
+    print(
+        "  - Export flags (by base_modality incl. <missing>):\n"
+        + (modality_counts.to_string() if not modality_counts.empty else "<none>")
+    )
 
     # Initialize columns that may not exist yet
     if "download_attempt_outcome" not in db.columns:
@@ -415,6 +399,7 @@ def execute_downloads(
                     pass
 
             requested_this_patient = False
+            requested_indices = []
             for index, target_exam in patient_exams.iterrows():
                 if successfully_exported_counter >= batch_size:
                     outcomes[index] = "Skipped - Batch full"
@@ -433,6 +418,13 @@ def execute_downloads(
                     outcomes[index] = "Request Submitted"
                     successfully_exported_counter += 1
                     requested_this_patient = True
+                    requested_indices.append(index)
+                    if full_db is not None:
+                        full_db.loc[index, "download_attempt_outcome"] = (
+                            "Request Submitted"
+                        )
+                        if "Status" in full_db.columns:
+                            full_db.loc[index, "Status"] = "Request Submitted"
                 else:
                     print(
                         f"  - INFO: Exam from {target_key[0]} is no longer available (already exported)."
@@ -446,12 +438,21 @@ def execute_downloads(
                         full_db.loc[index, "download_attempt_outcome"] = (
                             "Already Exported"
                         )
+                        if "Status" in full_db.columns:
+                            full_db.loc[index, "Status"] = "Already Exported"
+                        if "Exported On" in full_db.columns:
+                            if pd.isna(full_db.loc[index, "Exported On"]):
+                                full_db.loc[index, "Exported On"] = pd.Timestamp.now()
 
             if requested_this_patient:
                 print("  Submitting export request for selected exams...")
                 driver.find_element(by="name", value="btnExport").click()
                 wait_aspnet_idle(driver)
                 print("  Export request submitted.")
+                if full_db is not None and requested_indices:
+                    submission_ts = pd.Timestamp.now()
+                    for idx in requested_indices:
+                        full_db.loc[idx, "export_requested_on"] = submission_ts
 
             # Save state periodically after each patient to preserve progress
             # This includes discoveries of already exported exams
@@ -534,10 +535,16 @@ def main():
             if outcomes:
                 for index, outcome in outcomes.items():
                     db.loc[index, "download_attempt_outcome"] = outcome
+                    if "Status" in db.columns:
+                        db.loc[index, "Status"] = outcome
                     if outcome == "Request Submitted":
-                        db.loc[index, "export_requested_on"] = datetime.now()
+                        db.loc[index, "export_requested_on"] = pd.Timestamp.now()
                     elif outcome == "Already Exported":
                         db.loc[index, "is_exported"] = True
+                        if "Exported On" in db.columns and pd.isna(
+                            db.loc[index, "Exported On"]
+                        ):
+                            db.loc[index, "Exported On"] = pd.Timestamp.now()
 
             print("\n--- Run Summary ---")
             print(
@@ -553,7 +560,7 @@ def main():
     # Save final state
     save_current_state(db)
     print(
-        f"\nProcess complete. A full snapshot of this run has been saved to '{OUTPUT_DATABASE_FILE}'"
+        f"\nProcess complete. Metadata updates have been written to '{METADATA_FILE}'"
     )
 
 
