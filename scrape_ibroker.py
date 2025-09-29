@@ -50,6 +50,9 @@ def make_driver():
     o.set_preference("permissions.default.image", 2)
     o.set_preference("browser.cache.disk.enable", False)
     o.set_preference("browser.cache.memory.enable", False)
+    o.set_preference(
+        "network.proxy.type", 0
+    )  # force direct connections; ignore env proxy vars
     return webdriver.Firefox(options=o)
 
 

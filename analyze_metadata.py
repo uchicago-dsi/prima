@@ -58,7 +58,7 @@ chimec_patients = pd.read_csv(
 )
 key = pd.read_csv("/gpfs/data/huo-lab/Image/ChiMEC/study-16352a.csv")
 metadata = pd.read_csv(
-    "/gpfs/data/huo-lab/Image/annawoodard/prima/data/imaging_metadata_fixed.csv"
+    "/gpfs/data/huo-lab/Image/annawoodard/prima/data/imaging_metadata.csv"
 )
 # use the corrected is_on_disk column
 if "is_on_disk_corrected" in metadata.columns:

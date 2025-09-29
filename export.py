@@ -478,7 +478,7 @@ def main():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=50,
+        default=100,
         help="Max number of exams to request in one run.",
     )
     parser.add_argument(
