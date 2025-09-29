@@ -5,6 +5,7 @@ import argparse
 import os
 import sys
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -35,6 +36,43 @@ MERGE_KEY_COLUMNS = ["study_id", "Study DateTime", "StudyDescription"]
 
 USERNAME = os.getenv("IBROKER_USERNAME")
 PASSWORD = os.getenv("IBROKER_PASSWORD")
+
+
+def _parse_wait_interval(value: str) -> float:
+    """Parse an interval string into seconds.
+
+    Accepts plain seconds (e.g., ``3600``), or values with a unit suffix:
+    ``Xs`` for seconds, ``Xm`` for minutes, ``Xh`` for hours.``X`` may be a
+    float. Raises ``argparse.ArgumentTypeError`` for invalid inputs.
+    """
+
+    normalized = value.strip().lower()
+    if not normalized:
+        raise argparse.ArgumentTypeError("wait interval must be non-empty")
+
+    unit_multipliers = {"s": 1, "m": 60, "h": 3600}
+
+    suffix = normalized[-1]
+    if suffix in unit_multipliers:
+        number_portion = normalized[:-1]
+        if not number_portion:
+            raise argparse.ArgumentTypeError(
+                "wait interval must include a numeric component"
+            )
+        try:
+            magnitude = float(number_portion)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"could not parse wait interval '{value}'"
+            ) from exc
+        return magnitude * unit_multipliers[suffix]
+
+    try:
+        return float(normalized)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"could not parse wait interval '{value}'"
+        ) from exc
 
 
 def get_base_modality(modality):
@@ -467,34 +505,14 @@ def execute_downloads(
     return outcomes, already_exported_counter, successfully_exported_counter
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Identify and download ChiMEC imaging exams."
-    )
-    parser.add_argument(
-        "--no-genotyping-filter",
-        action="store_true",
-        help="Include patients without genotyping data.",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=100,
-        help="Max number of exams to request in one run.",
-    )
-    parser.add_argument(
-        "--modality",
-        type=str,
-        default="MG",
-        help="Base modality to filter for (e.g., MG, MR, CT).",
-    )
-    args = parser.parse_args()
+def run_export_cycle(args, cycle_number: int):
+    """Run a single export pass and return summary stats."""
 
-    if not all([USERNAME, PASSWORD]):
-        print(
-            "ERROR: IBROKER_USERNAME and IBROKER_PASSWORD must be set.", file=sys.stderr
-        )
-        sys.exit(1)
+    cycle_banner = (
+        f"\n=== Export cycle {cycle_number} started at "
+        f"{datetime.now():%Y-%m-%d %H:%M:%S} ==="
+    )
+    print(cycle_banner)
 
     db = load_and_merge_data()
     db = check_disk_for_downloads(db, BASE_DOWNLOAD_DIR)
@@ -513,6 +531,10 @@ def main():
     db.loc[new_targets_mask, "download_attempt_outcome"] = pd.NA
     db.loc[new_targets_mask, "export_requested_on"] = pd.NaT
 
+    outcomes = {}
+    already_exported_count = 0
+    successfully_exported_count = 0
+
     if targets.empty:
         print("\nNo new exams to download based on the current criteria.")
     else:
@@ -520,13 +542,20 @@ def main():
         print(f"Total potential targets: {len(targets)}")
         print(f"Unique patients to process: {targets['study_id'].nunique()}")
 
-        proceed = (
-            input(
-                f"\nProceed with attempting to export up to {args.batch_size} exams? (y/n): "
+        proceed = "y" if args.auto_confirm else None
+        if proceed == "y":
+            print(
+                f"Auto-confirm enabled; attempting to export up to {args.batch_size} exams."
             )
-            .lower()
-            .strip()
-        )
+        else:
+            proceed = (
+                input(
+                    f"\nProceed with attempting to export up to {args.batch_size} exams? (y/n): "
+                )
+                .lower()
+                .strip()
+            )
+
         if proceed == "y":
             outcomes, already_exported_count, successfully_exported_count = (
                 execute_downloads(targets, args.batch_size, full_db=db)
@@ -546,7 +575,7 @@ def main():
                         ):
                             db.loc[index, "Exported On"] = pd.Timestamp.now()
 
-            print("\n--- Run Summary ---")
+            print("\n--- Cycle Summary ---")
             print(
                 f"Successfully submitted export requests for: {successfully_exported_count} exams."
             )
@@ -555,13 +584,103 @@ def main():
             )
             print(f"Total exams processed:                    {len(outcomes)} exams.")
         else:
-            print("Download cancelled by user.")
+            print("Cycle cancelled by user response.")
 
     # Save final state
     save_current_state(db)
     print(
-        f"\nProcess complete. Metadata updates have been written to '{METADATA_FILE}'"
+        f"\nCycle complete. Metadata updates have been written to '{METADATA_FILE}'"
     )
+
+    return {
+        "submitted": successfully_exported_count,
+        "already_exported": already_exported_count,
+        "processed": len(outcomes),
+        "targets_considered": len(targets),
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Identify and download ChiMEC imaging exams."
+    )
+    parser.add_argument(
+        "--no-genotyping-filter",
+        action="store_true",
+        help="Include patients without genotyping data.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=100,
+        help="Max number of exams to request per cycle.",
+    )
+    parser.add_argument(
+        "--modality",
+        type=str,
+        default="MG",
+        help="Base modality to filter for (e.g., MG, MR, CT).",
+    )
+    parser.add_argument(
+        "--loop-wait",
+        type=_parse_wait_interval,
+        default=0.0,
+        help=(
+            "Seconds to wait between cycles. Accepts plain seconds (e.g. 3600) or "
+            "values with units like 60m or 1h. Set to 0 to run a single cycle."
+        ),
+    )
+    parser.add_argument(
+        "--max-cycles",
+        type=int,
+        default=1,
+        help=(
+            "Number of cycles to run. Use 0 for unlimited cycles when --loop-wait > 0."
+        ),
+    )
+    parser.add_argument(
+        "--auto-confirm",
+        action="store_true",
+        help="Proceed without interactive confirmation prompts.",
+    )
+
+    args = parser.parse_args()
+
+    if not all([USERNAME, PASSWORD]):
+        print(
+            "ERROR: IBROKER_USERNAME and IBROKER_PASSWORD must be set.", file=sys.stderr
+        )
+        sys.exit(1)
+
+    cycles_run = 0
+    try:
+        while True:
+            cycles_run += 1
+            run_export_cycle(args, cycles_run)
+
+            max_cycles = args.max_cycles
+            if max_cycles > 0 and cycles_run >= max_cycles:
+                break
+
+            wait_seconds = args.loop_wait
+            if wait_seconds <= 0:
+                break
+
+            print(
+                f"\nWaiting {wait_seconds:.1f} seconds before starting the next cycle..."
+            )
+            try:
+                time.sleep(wait_seconds)
+            except KeyboardInterrupt:
+                print("\nLoop interrupted during wait; exiting.")
+                break
+    except KeyboardInterrupt:
+        print("\nLoop interrupted; exiting.")
+
+    if cycles_run:
+        print(
+            f"\nRan {cycles_run} cycle{'s' if cycles_run != 1 else ''}."
+        )
 
 
 if __name__ == "__main__":
