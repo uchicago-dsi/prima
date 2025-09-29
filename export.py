@@ -346,6 +346,30 @@ def identify_download_targets(
     # An exam could be exported but the sync failed, so it's not on disk.
     # This includes exams with Accession numbers AND exams discovered as already exported in previous runs
     already_exported_mask = targets["is_exported"]
+    exported_missing_disk = targets[already_exported_mask]
+    if not exported_missing_disk.empty:
+        print("  - Sample of exported-but-not-on-disk exams:")
+        debug_columns = [
+            "study_id",
+            "Accession",
+            "Study DateTime",
+            "StudyDescription",
+            "download_attempt_outcome",
+            "Exported On",
+        ]
+        available_debug_columns = [
+            column for column in debug_columns if column in exported_missing_disk.columns
+        ]
+        for _, row in exported_missing_disk.head(10).iterrows():
+            details = []
+            for column in available_debug_columns:
+                value = row[column]
+                if pd.isna(value):
+                    value_repr = "<missing>"
+                else:
+                    value_repr = str(value)
+                details.append(f"{column}={value_repr}")
+            print("    " + ", ".join(details))
     targets.loc[already_exported_mask, "rejection_reason"] = (
         "Already exported (but not found on disk - possible sync issue)"
     )
