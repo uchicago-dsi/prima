@@ -54,6 +54,52 @@ logging.basicConfig(
 shutdown_requested = False
 
 
+def _log_remote_debug(ver_target: Path, ssh_opts: list[str]) -> None:
+    """Log remote directory state to help debug verification failures."""
+
+    remote_parent = ver_target.parent
+    try:
+        list_cmd = subprocess.run(
+            ["ssh"] + ssh_opts + [DST_SSH_TARGET, "ls", "-l", str(remote_parent)],
+            capture_output=True,
+            text=True,
+        )
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logging.error(
+            "Diagnostic ssh listing for %s failed to launch: %s",
+            remote_parent,
+            exc,
+        )
+        return
+
+    if list_cmd.returncode == 0:
+        listing = list_cmd.stdout.strip()
+        if listing:
+            lines = listing.splitlines()
+            if len(lines) > 20:
+                logging.error(
+                    "Remote directory %s contents (first 20 of %s entries):",
+                    remote_parent,
+                    len(lines),
+                )
+                lines = lines[:20]
+            else:
+                logging.error("Remote directory %s contents:", remote_parent)
+            for line in lines:
+                logging.error("    %s", line)
+        else:
+            logging.error(
+                "Remote directory %s is empty (ls returned no entries).", remote_parent
+            )
+    else:
+        logging.error(
+            "Unable to list remote directory %s (rc=%s): %s",
+            remote_parent,
+            list_cmd.returncode,
+            list_cmd.stderr.strip(),
+        )
+
+
 def signal_handler(signum, frame):
     """handle SIGINT and SIGTERM for graceful shutdown"""
     global shutdown_requested
@@ -577,6 +623,7 @@ def rsync_exam_remote(src: Path, patient_id: str, exam_name: str):
     last_heartbeat = t0
 
     assert proc.stdout is not None  # silences type checkers
+
     def should_log(msg: str) -> bool:
         if "to-chk=" in msg:
             return True
@@ -605,9 +652,8 @@ def rsync_exam_remote(src: Path, patient_id: str, exam_name: str):
         now = monotonic()
         if now - last_heartbeat >= 60:
             elapsed = now - t0
-            hb = (
-                f"[RSYNC HEARTBEAT] {src.name}: elapsed {elapsed:.0f}s"
-                + (f" | progress: {last_progress_line}" if last_progress_line else "")
+            hb = f"[RSYNC HEARTBEAT] {src.name}: elapsed {elapsed:.0f}s" + (
+                f" | progress: {last_progress_line}" if last_progress_line else ""
             )
             logging.info(hb)
             last_heartbeat = now
@@ -797,6 +843,18 @@ def process_single_exam_internal(
                     text=True,
                 )
                 if ver.returncode != 0:
+                    logging.error(
+                        "Remote verify failed (UID fastpath) for patient=%s exam=%s uid=%s",
+                        patient_id,
+                        exam_name,
+                        uid,
+                    )
+                    logging.error("Local source path: %s", src_path)
+                    logging.error(
+                        "ssh stderr: %s",
+                        ver.stderr.strip() or "<empty>",
+                    )
+                    _log_remote_debug(ver_target, ssh_opts)
                     raise RuntimeError(
                         f"remote verify failed for {ver_target}: {ver.stderr.strip()}"
                     )
@@ -1042,6 +1100,18 @@ def process_uid_fastpath_phase(
                             logging.warning(
                                 f"UID match but remote verify failed for {ver_target}, will transfer"
                             )
+                            logging.warning(
+                                "Local source path: %s | patient=%s exam=%s uid=%s",
+                                src_path,
+                                patient_id,
+                                exam_name,
+                                uid,
+                            )
+                            logging.warning(
+                                "ssh stderr: %s",
+                                ver.stderr.strip() or "<empty>",
+                            )
+                            _log_remote_debug(ver_target, ssh_opts)
                             remaining_exams.append(src_path)
                             continue
 
@@ -1212,7 +1282,9 @@ def run_single_sync(
     total_exams = len(all_exams)
     logging.info(f"Found {total_exams} source exams to process.")
     max_exams_this_run = (
-        MAX_EXAMS_PER_RUN if (MAX_EXAMS_PER_RUN is None or MAX_EXAMS_PER_RUN > 0) else None
+        MAX_EXAMS_PER_RUN
+        if (MAX_EXAMS_PER_RUN is None or MAX_EXAMS_PER_RUN > 0)
+        else None
     )
 
     # ===== PHASE 1: UID FASTPATH (Sequential, Fast) =====
@@ -1241,7 +1313,10 @@ def run_single_sync(
 
     remaining_exams = transfer_candidates
     cap_deferrals = 0
-    if max_exams_this_run is not None and total_transfer_candidates > max_exams_this_run:
+    if (
+        max_exams_this_run is not None
+        and total_transfer_candidates > max_exams_this_run
+    ):
         remaining_exams = transfer_candidates[:max_exams_this_run]
         deferred_chunk = transfer_candidates[max_exams_this_run:]
         cap_deferrals = len(deferred_chunk)
@@ -1411,9 +1486,7 @@ def run_single_sync(
         f"  - Total queued/deleted locally: {queued_local_for_delete + phase1_stats['renamed']}"
     )
     if deferred_exams:
-        logging.info(
-            f"  - Deferred for next run (due to cap): {len(deferred_exams)}"
-        )
+        logging.info(f"  - Deferred for next run (due to cap): {len(deferred_exams)}")
 
     used_gb, free_gb, total_gb = _share_usage_gb()
     logging.info(
