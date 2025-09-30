@@ -624,6 +624,165 @@ def run_export_cycle(args, cycle_number: int):
     }
 
 
+def audit_remote_export_status(
+    audit_df: pd.DataFrame,
+    full_db: pd.DataFrame | None = None,
+    max_exams: int | None = None,
+) -> dict[str, int]:
+    """Verify availability of pending exams without requesting exports."""
+
+    if audit_df.empty:
+        return {"audited": 0, "marked_exported": 0, "still_available": 0}
+
+    driver = None
+    audited = 0
+    marked_exported = 0
+    still_available = 0
+
+    unique_patients = audit_df["study_id"].unique()
+
+    try:
+        driver = make_driver()
+        login(driver, USERNAME, PASSWORD)
+
+        for study_id in tqdm(unique_patients, desc="Auditing Patients"):
+            patient_exams = audit_df[audit_df["study_id"] == study_id]
+
+            try:
+                driver.find_element(by="name", value="tbxAssignedID").clear()
+                driver.find_element(by="name", value="tbxAssignedID").send_keys(
+                    str(int(study_id))
+                )
+                driver.find_element(by="name", value="btnFetch").click()
+                wait_aspnet_idle(driver)
+            except Exception as exc:
+                print(
+                    f"ERROR navigating during audit for study_id {study_id}. Skipping. Error: {exc}"
+                )
+                continue
+
+            available_on_page = {}
+            page_rows = driver.find_elements(
+                by="xpath",
+                value="//table[@id='TabContainer1_tabPanel1_gv1']//tr[position()>1]",
+            )
+            for row in page_rows:
+                try:
+                    cells = row.find_elements(by="tag name", value="td")
+                    row_date = pd.to_datetime(cells[2].text).date()
+                    row_desc = cells[3].text.strip()
+                    available_on_page[(row_date, row_desc)] = True
+                except Exception:
+                    continue
+
+            for index, pending_exam in patient_exams.iterrows():
+                if max_exams is not None and audited >= max_exams:
+                    break
+
+                study_datetime = pending_exam.get("Study DateTime")
+                study_desc = pending_exam.get("StudyDescription")
+                if pd.isna(study_datetime) or pd.isna(study_desc):
+                    continue
+
+                target_key = (pd.to_datetime(study_datetime).date(), study_desc)
+
+                audited += 1
+                if target_key in available_on_page:
+                    still_available += 1
+                    if full_db is not None:
+                        full_db.loc[index, "download_attempt_outcome"] = "Audit: Available"
+                else:
+                    marked_exported += 1
+                    if full_db is not None:
+                        full_db.loc[index, "is_exported"] = True
+                        full_db.loc[index, "download_attempt_outcome"] = (
+                            "Audit: Already Exported"
+                        )
+                        if "Status" in full_db.columns:
+                            full_db.loc[index, "Status"] = "Already Exported"
+                        if "Exported On" in full_db.columns and pd.isna(
+                            full_db.loc[index, "Exported On"]
+                        ):
+                            full_db.loc[index, "Exported On"] = pd.Timestamp.now()
+
+            if max_exams is not None and audited >= max_exams:
+                break
+    finally:
+        if driver:
+            print("Closing webdriver session from audit.")
+            driver.quit()
+
+    return {
+        "audited": audited,
+        "marked_exported": marked_exported,
+        "still_available": still_available,
+    }
+
+
+def refresh_export_status(args, cycle_number: int):
+    """Optionally reconcile export status during the wait window."""
+
+    print(
+        f"\n=== Refresh cycle {cycle_number}: auditing export status before next run ==="
+    )
+
+    refresh_db = load_and_merge_data()
+    refresh_db = check_disk_for_downloads(refresh_db, BASE_DOWNLOAD_DIR)
+
+    modality = args.modality.upper()
+    base_modality = refresh_db.get("base_modality")
+    if base_modality is None:
+        base_modality = pd.Series(pd.NA, index=refresh_db.index)
+
+    is_on_disk_series = refresh_db.get("is_on_disk")
+    if is_on_disk_series is None:
+        is_on_disk_series = pd.Series(False, index=refresh_db.index)
+    else:
+        is_on_disk_series = is_on_disk_series.fillna(False)
+
+    is_exported_series = refresh_db.get("is_exported")
+    if is_exported_series is None:
+        is_exported_series = pd.Series(False, index=refresh_db.index)
+    else:
+        is_exported_series = is_exported_series.fillna(False)
+
+    candidates = refresh_db[
+        (base_modality == modality)
+        & (~is_on_disk_series)
+        & (~is_exported_series)
+    ].copy()
+
+    if candidates.empty:
+        print("No pending exams require status reconciliation.")
+        return
+
+    max_to_audit = args.refresh_limit if args.refresh_limit > 0 else None
+    if max_to_audit is not None:
+        subset = candidates.sort_values(by=["Study DateTime", "study_id"]).head(
+            max_to_audit
+        )
+    else:
+        subset = candidates.sort_values(by=["Study DateTime", "study_id"])
+
+    print(
+        f"Auditing {len(subset)} exam(s) out of {len(candidates)} pending for modality {modality}."
+    )
+
+    audit_stats = audit_remote_export_status(subset, full_db=refresh_db, max_exams=max_to_audit)
+
+    print(
+        "Audit summary: "
+        f"checked {audit_stats['audited']} exams — "
+        f"marked {audit_stats['marked_exported']} as exported, "
+        f"{audit_stats['still_available']} still available."
+    )
+
+    save_current_state(refresh_db)
+    print(
+        f"Audit metadata persisted to '{METADATA_FILE}'."
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Identify and download ChiMEC imaging exams."
@@ -667,6 +826,20 @@ def main():
         action="store_true",
         help="Proceed without interactive confirmation prompts.",
     )
+    parser.add_argument(
+        "--refresh-export-status",
+        action="store_true",
+        help=(
+            "During the wait window, audit pending exams against iBroker to mark "
+            "newly exported exams."
+        ),
+    )
+    parser.add_argument(
+        "--refresh-limit",
+        type=int,
+        default=0,
+        help="Max number of exams to audit during each refresh cycle (0 means all).",
+    )
 
     args = parser.parse_args()
 
@@ -689,6 +862,14 @@ def main():
             wait_seconds = args.loop_wait
             if wait_seconds <= 0:
                 break
+
+            if args.refresh_export_status:
+                try:
+                    refresh_export_status(args, cycles_run)
+                except Exception as exc:
+                    print(
+                        f"\nWARNING: Refresh step failed with error: {exc}. Continuing to wait."
+                    )
 
             print(
                 f"\nWaiting {wait_seconds:.1f} seconds before starting the next cycle..."
