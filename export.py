@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# coding: utf-8
 
 import argparse
 import os
@@ -211,9 +210,9 @@ def load_and_merge_data():
 
         if "download_attempt_outcome" not in metadata.columns:
             metadata["download_attempt_outcome"] = pd.NA
-        metadata["download_attempt_outcome"] = metadata["download_attempt_outcome"].astype(
-            "string"
-        )
+        metadata["download_attempt_outcome"] = metadata[
+            "download_attempt_outcome"
+        ].astype("string")
 
         if "export_requested_on" not in metadata.columns:
             metadata["export_requested_on"] = pd.NaT
@@ -358,7 +357,9 @@ def identify_download_targets(
             "Exported On",
         ]
         available_debug_columns = [
-            column for column in debug_columns if column in exported_missing_disk.columns
+            column
+            for column in debug_columns
+            if column in exported_missing_disk.columns
         ]
         for _, row in exported_missing_disk.head(10).iterrows():
             details = []
@@ -612,15 +613,14 @@ def run_export_cycle(args, cycle_number: int):
 
     # Save final state
     save_current_state(db)
-    print(
-        f"\nCycle complete. Metadata updates have been written to '{METADATA_FILE}'"
-    )
+    print(f"\nCycle complete. Metadata updates have been written to '{METADATA_FILE}'")
 
     return {
         "submitted": successfully_exported_count,
         "already_exported": already_exported_count,
         "processed": len(outcomes),
         "targets_considered": len(targets),
+        "target_indices": targets.index.tolist(),
     }
 
 
@@ -690,7 +690,9 @@ def audit_remote_export_status(
                 if target_key in available_on_page:
                     still_available += 1
                     if full_db is not None:
-                        full_db.loc[index, "download_attempt_outcome"] = "Audit: Available"
+                        full_db.loc[index, "download_attempt_outcome"] = (
+                            "Audit: Available"
+                        )
                 else:
                     marked_exported += 1
                     if full_db is not None:
@@ -719,7 +721,12 @@ def audit_remote_export_status(
     }
 
 
-def refresh_export_status(args, cycle_number: int):
+def refresh_export_status(
+    args,
+    cycle_number: int,
+    *,
+    target_indices: list[int] | None = None,
+):
     """Optionally reconcile export status during the wait window."""
 
     print(
@@ -747,9 +754,7 @@ def refresh_export_status(args, cycle_number: int):
         is_exported_series = is_exported_series.fillna(False)
 
     candidates = refresh_db[
-        (base_modality == modality)
-        & (~is_on_disk_series)
-        & (~is_exported_series)
+        (base_modality == modality) & (~is_on_disk_series) & (~is_exported_series)
     ].copy()
 
     if candidates.empty:
@@ -757,18 +762,36 @@ def refresh_export_status(args, cycle_number: int):
         return
 
     max_to_audit = args.refresh_limit if args.refresh_limit > 0 else None
-    if max_to_audit is not None:
-        subset = candidates.sort_values(by=["Study DateTime", "study_id"]).head(
-            max_to_audit
-        )
+    priority_indices = set(target_indices or [])
+    if priority_indices:
+        priority_mask = candidates.index.isin(priority_indices)
+        candidates["__priority"] = priority_mask.astype(int)
     else:
-        subset = candidates.sort_values(by=["Study DateTime", "study_id"])
+        candidates["__priority"] = 0
+
+    subset = candidates.sort_values(
+        by=["__priority", "Study DateTime", "study_id"],
+        ascending=[False, True, True],
+    )
+    subset = subset.drop(columns="__priority")
+    candidates = candidates.drop(columns="__priority")
+
+    if max_to_audit is not None:
+        subset = subset.head(max_to_audit)
+
+    priority_count = (
+        subset.index.isin(priority_indices).sum() if priority_indices else 0
+    )
 
     print(
         f"Auditing {len(subset)} exam(s) out of {len(candidates)} pending for modality {modality}."
     )
+    if priority_indices:
+        print(f"  - Priority exams (from current target list): {priority_count}")
 
-    audit_stats = audit_remote_export_status(subset, full_db=refresh_db, max_exams=max_to_audit)
+    audit_stats = audit_remote_export_status(
+        subset, full_db=refresh_db, max_exams=max_to_audit
+    )
 
     print(
         "Audit summary: "
@@ -778,9 +801,7 @@ def refresh_export_status(args, cycle_number: int):
     )
 
     save_current_state(refresh_db)
-    print(
-        f"Audit metadata persisted to '{METADATA_FILE}'."
-    )
+    print(f"Audit metadata persisted to '{METADATA_FILE}'.")
 
 
 def main():
@@ -850,10 +871,12 @@ def main():
         sys.exit(1)
 
     cycles_run = 0
+    last_target_indices: list[int] | None = None
     try:
         while True:
             cycles_run += 1
-            run_export_cycle(args, cycles_run)
+            cycle_result = run_export_cycle(args, cycles_run)
+            last_target_indices = cycle_result.get("target_indices")
 
             max_cycles = args.max_cycles
             if max_cycles > 0 and cycles_run >= max_cycles:
@@ -865,7 +888,11 @@ def main():
 
             if args.refresh_export_status:
                 try:
-                    refresh_export_status(args, cycles_run)
+                    refresh_export_status(
+                        args,
+                        cycles_run,
+                        target_indices=last_target_indices,
+                    )
                 except Exception as exc:
                     print(
                         f"\nWARNING: Refresh step failed with error: {exc}. Continuing to wait."
@@ -883,9 +910,7 @@ def main():
         print("\nLoop interrupted; exiting.")
 
     if cycles_run:
-        print(
-            f"\nRan {cycles_run} cycle{'s' if cycles_run != 1 else ''}."
-        )
+        print(f"\nRan {cycles_run} cycle{'s' if cycles_run != 1 else ''}.")
 
 
 if __name__ == "__main__":
