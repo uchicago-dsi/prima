@@ -97,6 +97,306 @@ def get_base_modality(modality):
     return modality_str.split("/")[0]
 
 
+def analyze_export_timeline(missing_exams_df: pd.DataFrame) -> None:
+    """Analyze timeline patterns for exported-but-not-on-disk exams."""
+
+    print("\n--- Timeline Analysis for Exported-but-Not-on-Disk Exams ---")
+
+    current_time = pd.Timestamp.now()
+
+    # Analyze export_requested_on timeline
+    if "export_requested_on" in missing_exams_df.columns:
+        requested_times = pd.to_datetime(
+            missing_exams_df["export_requested_on"], errors="coerce"
+        )
+        valid_requested = requested_times.dropna()
+
+        if not valid_requested.empty:
+            time_since_request = current_time - valid_requested
+            days_since = time_since_request.dt.total_seconds() / (24 * 3600)
+
+            print(f"\nTime since export request (n={len(valid_requested)}):")
+            print("  (When THIS script requested exports via web interface)")
+            bins = [0, 1, 3, 7, 14, 30, 90, float("inf")]
+
+            for i, (bin_min, bin_max) in enumerate(zip(bins[:-1], bins[1:])):
+                if bin_max == float("inf"):
+                    count = (days_since >= bin_min).sum()
+                    label = f">{bin_min} days"
+                else:
+                    count = ((days_since >= bin_min) & (days_since < bin_max)).sum()
+                    label = f"{bin_min}-{bin_max} days"
+                print(f"  {label}: {count} exams")
+
+    # Analyze Exported On timeline
+    if "Exported On" in missing_exams_df.columns:
+        exported_times = pd.to_datetime(
+            missing_exams_df["Exported On"], errors="coerce"
+        )
+        valid_exported = exported_times.dropna()
+
+        if not valid_exported.empty:
+            time_since_export = current_time - valid_exported
+            days_since = time_since_export.dt.total_seconds() / (24 * 3600)
+
+            print(f"\nTime since export completion (n={len(valid_exported)}):")
+            print(
+                "  (When exams were marked as exported in the system, from any source)"
+            )
+            for i, (bin_min, bin_max) in enumerate(zip(bins[:-1], bins[1:])):
+                if bin_max == float("inf"):
+                    count = (days_since >= bin_min).sum()
+                    label = f">{bin_min} days"
+                else:
+                    count = ((days_since >= bin_min) & (days_since < bin_max)).sum()
+                    label = f"{bin_min}-{bin_max} days"
+                print(f"  {label}: {count} exams")
+
+
+def investigate_file_system(
+    missing_exams_df: pd.DataFrame, base_download_dir: str
+) -> pd.DataFrame:
+    """Investigate file system for missing exams and return enhanced dataframe."""
+
+    print("\n--- File System Investigation ---")
+
+    enhanced_df = missing_exams_df.copy()
+
+    # Add expected file paths
+    enhanced_df["expected_base_path"] = enhanced_df["study_id"].apply(
+        lambda x: Path(base_download_dir) / str(int(x)) if pd.notna(x) else None
+    )
+
+    # Check what actually exists
+    path_exists = []
+    files_found_at_root = []
+    total_files_recursive = []
+    subdirs_found = []
+    dir_contents = []
+    accession_found_on_disk = []
+
+    for idx, row in enhanced_df.iterrows():
+        base_path = row["expected_base_path"]
+        expected_accession = (
+            str(row.get("Accession", "")).strip()
+            if pd.notna(row.get("Accession"))
+            else None
+        )
+
+        if base_path and base_path.exists():
+            path_exists.append(True)
+            try:
+                contents = list(base_path.iterdir())
+                files_only = [f for f in contents if f.is_file()]
+                dirs_only = [f for f in contents if f.is_dir()]
+                files_found_at_root.append(len(files_only))
+                subdirs_found.append(len(dirs_only))
+
+                # Count total files recursively
+                total_recursive = sum(1 for _ in base_path.rglob("*") if _.is_file())
+                total_files_recursive.append(total_recursive)
+
+                # Check if expected accession matches any subdirectory
+                found_accession = False
+                if expected_accession and dirs_only:
+                    for d in dirs_only:
+                        # Extract accession from directory name (before first dash)
+                        dir_accession = d.name.split("-")[0]
+                        if dir_accession == expected_accession:
+                            found_accession = True
+                            break
+                accession_found_on_disk.append(found_accession)
+
+                # Show both files and directories
+                file_names = [f.name for f in files_only[:3]]
+                dir_names = [f.name for f in dirs_only[:3]]
+
+                content_parts = []
+                if file_names:
+                    content_parts.append(f"FILES: {', '.join(file_names)}")
+                if dir_names:
+                    content_parts.append(f"DIRS: {', '.join(dir_names)}")
+                if not content_parts:
+                    content_parts.append("EMPTY")
+
+                dir_contents.append("; ".join(content_parts))
+            except Exception as e:
+                files_found_at_root.append(0)
+                total_files_recursive.append(0)
+                subdirs_found.append(0)
+                accession_found_on_disk.append(False)
+                dir_contents.append(f"Error: {e}")
+        else:
+            path_exists.append(False)
+            files_found_at_root.append(0)
+            total_files_recursive.append(0)
+            subdirs_found.append(0)
+            accession_found_on_disk.append(False)
+            dir_contents.append("Path does not exist")
+
+    enhanced_df["path_exists"] = path_exists
+    enhanced_df["files_at_root"] = files_found_at_root
+    enhanced_df["total_files_recursive"] = total_files_recursive
+    enhanced_df["subdirs_count"] = subdirs_found
+    enhanced_df["accession_dir_exists"] = accession_found_on_disk
+    enhanced_df["directory_contents"] = dir_contents
+
+    # Summary statistics
+    existing_paths = sum(path_exists)
+    total_files_at_root = sum(files_found_at_root)
+    total_files_all = sum(total_files_recursive)
+
+    has_accession = enhanced_df["Accession"].notna()
+    accession_match = enhanced_df["accession_dir_exists"]
+    has_subdirs = enhanced_df["subdirs_count"] > 0
+    path_exists_mask = enhanced_df["path_exists"]
+
+    print(
+        f"Study directories that exist on disk: {existing_paths}/{len(missing_exams_df)} ({existing_paths / len(missing_exams_df) * 100:.1f}%)"
+    )
+    print(f"  └─ Total files recursively: {total_files_all:,}")
+    print(f"  └─ Files at root level only: {total_files_at_root}")
+
+    print("\nWhy are these 'missing'?")
+    print(
+        f"  └─ Missing accession number in DB: {(~has_accession & path_exists_mask).sum()}"
+    )
+    print(
+        f"  └─ Accession in DB but directory doesn't match: {(has_accession & ~accession_match & has_subdirs).sum()}"
+    )
+    print(
+        f"  └─ Directory exists but is empty: {(path_exists_mask & (enhanced_df['total_files_recursive'] == 0)).sum()}"
+    )
+    print(f"  └─ Accession directory found on disk: {accession_match.sum()}")
+
+    # Show examples of accession mismatches
+    mismatch_mask = has_accession & ~accession_match & has_subdirs & path_exists_mask
+    if mismatch_mask.sum() > 0:
+        print(f"\nAccession MISMATCH examples ({mismatch_mask.sum()} total):")
+        print("  DB has accession, but no matching subdirectory found")
+        for idx, row in enhanced_df[mismatch_mask].head(3).iterrows():
+            study_id = row.get("study_id", "unknown")
+            expected = row.get("Accession", "N/A")
+            contents = row.get("directory_contents", "unknown")
+            total = row.get("total_files_recursive", 0)
+            print(
+                f"  {study_id}: expected accession={expected}, found {contents}, {total} files total"
+            )
+        if mismatch_mask.sum() > 3:
+            print(f"  ... and {mismatch_mask.sum() - 3} more")
+
+    # Show examples where accession matches
+    if accession_match.sum() > 0:
+        print(
+            f"\nAccession MATCHES but still marked missing ({accession_match.sum()} total):"
+        )
+        print("  This suggests check_disk_for_downloads() is working correctly")
+        print(
+            "  but these exams might have OTHER issues (wrong modality, wrong study, etc.)"
+        )
+        for idx, row in enhanced_df[accession_match].head(3).iterrows():
+            study_id = row.get("study_id", "unknown")
+            accession = row.get("Accession", "N/A")
+            total = row.get("total_files_recursive", 0)
+            print(f"  {study_id}: accession={accession}, {total} files found")
+        if accession_match.sum() > 3:
+            print(f"  ... and {accession_match.sum() - 3} more")
+
+    # Show examples of missing accession in DB
+    missing_acc_mask = ~has_accession & path_exists_mask
+    if missing_acc_mask.sum() > 0:
+        print(f"\nMissing accession in DB ({missing_acc_mask.sum()} total):")
+        print("  These cannot be verified because DB has no accession number")
+        for idx, row in enhanced_df[missing_acc_mask].head(3).iterrows():
+            study_id = row.get("study_id", "unknown")
+            contents = row.get("directory_contents", "unknown")
+            total = row.get("total_files_recursive", 0)
+            print(f"  {study_id}: {contents}, {total} files total")
+        if missing_acc_mask.sum() > 3:
+            print(f"  ... and {missing_acc_mask.sum() - 3} more")
+
+    return enhanced_df
+
+
+def save_missing_exams_debug_csv(
+    missing_exams_df: pd.DataFrame, base_download_dir: str
+) -> None:
+    """Save comprehensive debug information for missing exams to CSV."""
+
+    print("\n--- Saving Missing Exams Debug CSV ---")
+
+    # Create enhanced dataframe with file system investigation
+    enhanced_df = investigate_file_system(missing_exams_df, base_download_dir)
+
+    # Add timeline information
+    current_time = pd.Timestamp.now()
+
+    if "export_requested_on" in enhanced_df.columns:
+        requested_times = pd.to_datetime(
+            enhanced_df["export_requested_on"], errors="coerce"
+        )
+        enhanced_df["days_since_export_request"] = (
+            current_time - requested_times
+        ).dt.total_seconds() / (24 * 3600)
+
+    if "Exported On" in enhanced_df.columns:
+        exported_times = pd.to_datetime(enhanced_df["Exported On"], errors="coerce")
+        enhanced_df["days_since_export_completion"] = (
+            current_time - exported_times
+        ).dt.total_seconds() / (24 * 3600)
+
+    # Remove MRN and other sensitive columns
+    columns_to_exclude = ["MRN", "AnonymousID"]
+    debug_columns = [
+        col for col in enhanced_df.columns if col not in columns_to_exclude
+    ]
+    debug_df = enhanced_df[debug_columns].copy()
+
+    # Save to CSV
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    debug_filename = f"data/missing_exams_debug_{timestamp}.csv"
+    Path("data").mkdir(exist_ok=True)
+
+    debug_df.to_csv(debug_filename, index=False)
+    print(f"Debug information saved to: {debug_filename}")
+    print(f"Columns included: {len(debug_columns)}")
+    print(f"Exams analyzed: {len(debug_df)}")
+
+
+def print_export_history_summary(missing_exams_df: pd.DataFrame) -> None:
+    """Print summary of export attempt history for missing exams."""
+
+    print("\n--- Export History Analysis ---")
+
+    if "download_attempt_outcome" in missing_exams_df.columns:
+        outcome_counts = missing_exams_df["download_attempt_outcome"].value_counts(
+            dropna=False
+        )
+        print("Download attempt outcomes:")
+        for outcome, count in outcome_counts.items():
+            if pd.isna(outcome):
+                print(f"  <NA>: {count}")
+            elif outcome == "Already Exported":
+                print(f"  {outcome}: {count} (discovered during main export loop)")
+            elif outcome == "Audit: Already Exported":
+                print(f"  {outcome}: {count} (discovered during audit process)")
+            else:
+                print(f"  {outcome}: {count}")
+
+    if "Status" in missing_exams_df.columns:
+        status_counts = missing_exams_df["Status"].value_counts(dropna=False)
+        print("\nStatus distribution:")
+        for status, count in status_counts.items():
+            print(f"  {status}: {count}")
+
+    # Check for patterns in accession numbers
+    if "Accession" in missing_exams_df.columns:
+        has_accession = missing_exams_df["Accession"].notna().sum()
+        print(
+            f"\nExams with Accession numbers: {has_accession}/{len(missing_exams_df)} ({has_accession / len(missing_exams_df) * 100:.1f}%)"
+        )
+
+
 def _atomic_write_csv(df: pd.DataFrame, path: str | Path, **kwargs) -> None:
     """Write a CSV via a temp file and replace atomically."""
 
@@ -350,6 +650,14 @@ def identify_download_targets(
         f"  - Rejected {already_exported_mask.sum():,} exams because already exported, but not on disk."
     )
     if not exported_missing_disk.empty:
+        print("  - Found exported-but-not-on-disk exams!")
+        print(f"  - Total missing exams: {len(exported_missing_disk)}")
+
+        # Run comprehensive debugging analysis
+        analyze_export_timeline(exported_missing_disk)
+        print_export_history_summary(exported_missing_disk)
+        save_missing_exams_debug_csv(exported_missing_disk, BASE_DOWNLOAD_DIR)
+
         print("  - Sample of exported-but-not-on-disk exams:")
         debug_columns = [
             "study_id",
@@ -644,6 +952,7 @@ def audit_remote_export_status(
         driver = make_driver()
         login(driver, USERNAME, PASSWORD)
 
+        patients_processed = 0
         for study_id in tqdm(unique_patients, desc="Auditing Patients"):
             patient_exams = audit_df[audit_df["study_id"] == study_id]
 
@@ -706,10 +1015,14 @@ def audit_remote_export_status(
                         ):
                             full_db.loc[index, "Exported On"] = pd.Timestamp.now()
 
-            # Save state after each patient to preserve audit progress
-            if full_db is not None:
+            patients_processed += 1
+
+            # Save state every 20 patients to preserve audit progress
+            if full_db is not None and patients_processed % 20 == 0:
                 save_current_state(full_db)
-                print(f"  - Audit state saved after patient {study_id}.")
+                print(
+                    f"  - Audit state saved after {patients_processed} patients (patient {study_id})."
+                )
 
             if max_exams is not None and audited >= max_exams:
                 break
