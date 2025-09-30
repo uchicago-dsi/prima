@@ -346,6 +346,9 @@ def identify_download_targets(
     # This includes exams with Accession numbers AND exams discovered as already exported in previous runs
     already_exported_mask = targets["is_exported"]
     exported_missing_disk = targets[already_exported_mask]
+    print(
+        f"  - Rejected {already_exported_mask.sum():,} exams because already exported, but not on disk."
+    )
     if not exported_missing_disk.empty:
         print("  - Sample of exported-but-not-on-disk exams:")
         debug_columns = [
@@ -375,10 +378,6 @@ def identify_download_targets(
         "Already exported (but not found on disk - possible sync issue)"
     )
     targets = targets[~already_exported_mask]
-    print(
-        f"  - Rejected {already_exported_mask.sum():,} exams already exported (from previous runs or iBroker's 'Exported' list)."
-    )
-
     if filter_by_genotyping:
         mask_no_chip = targets["chip"].isna()
         targets.loc[mask_no_chip, "rejection_reason"] = "No genotyping data"
@@ -707,6 +706,11 @@ def audit_remote_export_status(
                         ):
                             full_db.loc[index, "Exported On"] = pd.Timestamp.now()
 
+            # Save state after each patient to preserve audit progress
+            if full_db is not None:
+                save_current_state(full_db)
+                print(f"  - Audit state saved after patient {study_id}.")
+
             if max_exams is not None and audited >= max_exams:
                 break
     finally:
@@ -816,7 +820,7 @@ def main():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=100,
+        default=20,
         help="Max number of exams to request per cycle.",
     )
     parser.add_argument(
@@ -828,7 +832,7 @@ def main():
     parser.add_argument(
         "--loop-wait",
         type=_parse_wait_interval,
-        default=0.0,
+        default="1h",
         help=(
             "Seconds to wait between cycles. Accepts plain seconds (e.g. 3600) or "
             "values with units like 60m or 1h. Set to 0 to run a single cycle."
@@ -837,7 +841,7 @@ def main():
     parser.add_argument(
         "--max-cycles",
         type=int,
-        default=1,
+        default=0,
         help=(
             "Number of cycles to run. Use 0 for unlimited cycles when --loop-wait > 0."
         ),
