@@ -423,13 +423,14 @@ def _save_debug_figure(
             accession_number = get_tag(ds, (0x0008, 0x0050), "unknown_accession")
 
         if status == "SUCCESS":
-            # for successful files, organize by study_id/accession_number
-            study_dir = debug_dir / exam_id
-            accession_dir = study_dir / accession_number
+            # for successful files, organize by success/patient_id/accession_number
+            success_dir = debug_dir / "success"
+            patient_dir = success_dir / patient_id
+            accession_dir = patient_dir / accession_number
             accession_dir.mkdir(parents=True, exist_ok=True)
             exam_dir = accession_dir
         else:
-            # for failed files, organize by patient_id/fail_reason/exam_id
+            # for failed files, organize by failed/patient_id/fail_reason/exam_id
             # clean up reason for directory name (remove spaces, special chars, fix double underscores)
             clean_reason = (
                 reason_or_view.replace(" ", "_")
@@ -447,7 +448,8 @@ def _save_debug_figure(
             # remove leading/trailing underscores
             clean_reason = clean_reason.strip("_")
 
-            patient_dir = debug_dir / patient_id
+            failed_dir = debug_dir / "failed"
+            patient_dir = failed_dir / patient_id
             reason_dir = patient_dir / clean_reason
             exam_dir = reason_dir / exam_id
             exam_dir.mkdir(parents=True, exist_ok=True)
@@ -460,11 +462,11 @@ def _save_debug_figure(
 
         if status == "SUCCESS":
             logger.debug(
-                f"    Saved debug figure: {exam_id}/{accession_number}/{out_name}"
+                f"    Saved debug figure: success/{patient_id}/{accession_number}/{out_name}"
             )
         else:
             logger.debug(
-                f"    Saved debug figure: {patient_id}/{clean_reason}/{exam_id}/{out_name}"
+                f"    Saved debug figure: failed/{patient_id}/{clean_reason}/{exam_id}/{out_name}"
             )
     except Exception as e:
         logger.warning(f"    Failed to save debug figure for {path.name}: {e}")
@@ -724,7 +726,17 @@ def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List
             "exam_status": "no_valid_dicoms",
             "total_files": len(dcm_files),
             "failed_files": len(failed_files),
+            "total_dicoms": len(dcm_files),
+            "valid_dicoms": 0,
+            "for_presentation_dicoms": 0,
+            "valid_views": 0,
+            "has_four_views": False,
         }
+
+    # check if exam has all four required views (L-CC, L-MLO, R-CC, R-MLO)
+    view_keys = set((r["laterality"], r["view"]) for r in rows)
+    required_views = {("L", "CC"), ("L", "MLO"), ("R", "CC"), ("R", "MLO")}
+    has_four_views = len(view_keys & required_views) == 4
 
     # return successful exam data
     return {
@@ -732,6 +744,11 @@ def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List
         "exam_status": "success",
         "total_files": len(dcm_files),
         "failed_files": len(failed_files),
+        "total_dicoms": len(dcm_files),
+        "valid_dicoms": len(rows),
+        "for_presentation_dicoms": sum(r["for_presentation"] for r in rows),
+        "valid_views": len(view_keys),
+        "has_four_views": has_four_views,
     }
 
 
@@ -782,10 +799,13 @@ def discover_dicoms(
 
     all_rows = []
     exam_stats = {
-        "successful_exams": 0,
-        "failed_exams": 0,
-        "total_files": 0,
-        "failed_files": 0,
+        "total_exams": len(exam_dirs),
+        "exams_with_valid_dicoms": 0,
+        "exams_with_four_views": 0,
+        "total_dicoms": 0,
+        "valid_dicoms": 0,
+        "for_presentation_dicoms": 0,
+        "failed_dicoms": 0,
     }
 
     with ProcessPoolExecutor(max_workers=workers) as executor:
@@ -803,17 +823,20 @@ def discover_dicoms(
             try:
                 result = future.result()
                 all_rows.extend(result["rows"])
-                exam_stats["total_files"] += result["total_files"]
-                exam_stats["failed_files"] += result["failed_files"]
+                exam_stats["total_dicoms"] += result["total_dicoms"]
+                exam_stats["valid_dicoms"] += result["valid_dicoms"]
+                exam_stats["for_presentation_dicoms"] += result[
+                    "for_presentation_dicoms"
+                ]
+                exam_stats["failed_dicoms"] += result["failed_files"]
 
                 if result["exam_status"] == "success":
-                    exam_stats["successful_exams"] += 1
-                else:
-                    exam_stats["failed_exams"] += 1
+                    exam_stats["exams_with_valid_dicoms"] += 1
+                    if result["has_four_views"]:
+                        exam_stats["exams_with_four_views"] += 1
 
             except Exception as e:
                 logger.error(f"failed to process {exam_path}: {e}")
-                exam_stats["failed_exams"] += 1
                 # don't re-raise, just continue processing
 
     logger.info(f"collected metadata from {len(all_rows)} DICOM files")
@@ -821,24 +844,36 @@ def discover_dicoms(
 
     # print summary statistics
     logger.info("\n=== PROCESSING SUMMARY ===")
-    logger.info(f"Total exams processed: {len(exam_dirs)}")
-    logger.info(f"  - Successful exams: {exam_stats['successful_exams']}")
-    logger.info(f"  - Failed exams (no valid DICOMs): {exam_stats['failed_exams']}")
-    logger.info(f"Total DICOM files processed: {exam_stats['total_files']}")
-    logger.info(f"  - Successfully processed: {len(all_rows)}")
-    logger.info(f"  - Failed/skipped: {exam_stats['failed_files']}")
+    logger.info(f"Total exams processed: {exam_stats['total_exams']}")
+    logger.info(f"Total views (DICOM files) processed: {exam_stats['total_dicoms']}")
 
     if not df.empty:
-        logger.info(f"Unique patients with valid DICOMs: {df['patient_id'].nunique()}")
-        logger.info(f"Unique exams with valid DICOMs: {df['exam_id'].nunique()}")
+        logger.info(f"Unique patients: {df['patient_id'].nunique()}")
+        logger.info(f"Unique exams with valid views: {df['exam_id'].nunique()}")
 
-        # view breakdown
+    logger.info("\n=== FILTERING FLOW ===")
+    logger.info(f"1. Total exams: {exam_stats['total_exams']}")
+    logger.info(
+        f"2. Exams with valid views: {exam_stats['exams_with_valid_dicoms']} (lost {exam_stats['total_exams'] - exam_stats['exams_with_valid_dicoms']} exams)"
+    )
+    logger.info(
+        f"3. Exams with all four required views (L-CC, L-MLO, R-CC, R-MLO): {exam_stats['exams_with_four_views']} (lost {exam_stats['exams_with_valid_dicoms'] - exam_stats['exams_with_four_views']} exams)"
+    )
+
+    logger.info("\n=== VIEW-LEVEL STATISTICS ===")
+    logger.info(f"Total views processed: {exam_stats['total_dicoms']}")
+    logger.info(f"  - Valid views (passed all checks): {exam_stats['valid_dicoms']}")
+    logger.info(f"  - For presentation views: {exam_stats['for_presentation_dicoms']}")
+    logger.info(f"  - Failed views: {exam_stats['failed_dicoms']}")
+
+    if not df.empty:
+        # view breakdown by type
         view_counts = df.groupby(["laterality", "view"]).size()
-        logger.info("Views found:")
+        logger.info("\nViews by type:")
         for (lat, view), count in view_counts.items():
-            logger.info(f"  {lat}-{view}: {count} files")
+            logger.info(f"  {lat}-{view}: {count} views")
     else:
-        logger.warning("No valid DICOMs found in any exam!")
+        logger.warning("No valid views found in any exam!")
 
     return df
 
