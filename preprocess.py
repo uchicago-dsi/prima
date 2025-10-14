@@ -56,6 +56,10 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
+import matplotlib
+
+matplotlib.use("Agg")  # non-interactive backend
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pydicom
@@ -139,6 +143,7 @@ class PreprocessConfig:
     workers: int
     summary: bool
     max_exams: Optional[int]
+    debug_dir: Optional[Path]
 
 
 # ------------- DICOM helpers -------------
@@ -293,7 +298,113 @@ def hash_file_sha256(path: Path, chunk: int = 1024 * 1024) -> str:
 # ------------- Discovery & selection -------------
 
 
-def _process_exam_dir(exam_path: Path) -> List[Dict]:
+def _save_debug_figure(
+    ds: FileDataset, path: Path, status: str, reason_or_view: str, debug_dir: Path
+) -> None:
+    """Save debug figure showing pixel data and DICOM tags.
+
+    status: 'SUCCESS' or 'FAILED'
+    reason_or_view: if failed, the reason; if success, the laterality and view (e.g., 'L CC')
+    """
+    try:
+        # create figure with two subplots
+        fig = plt.figure(figsize=(16, 10))
+
+        # left: pixel data
+        ax_img = plt.subplot(1, 2, 1)
+        try:
+            pixel_array = ds.pixel_array
+            ax_img.imshow(pixel_array, cmap="gray")
+            ax_img.set_title(f"Pixel Data\n{ds.Rows}x{ds.Columns}")
+            ax_img.axis("off")
+        except Exception as e:
+            ax_img.text(
+                0.5,
+                0.5,
+                f"Cannot display pixel data:\n{e}",
+                ha="center",
+                va="center",
+                transform=ax_img.transAxes,
+            )
+            ax_img.axis("off")
+
+        # right: DICOM tags
+        ax_text = plt.subplot(1, 2, 2)
+        ax_text.axis("off")
+
+        # collect tag info
+        tag_lines = [
+            f"File: {path.name}",
+            f"Exam: {path.parent.name}",
+            f"Patient: {path.parent.parent.name}",
+            f"Status: {status}",
+        ]
+
+        if status == "FAILED":
+            tag_lines.append(f"Reason: {reason_or_view}")
+        else:
+            tag_lines.append(f"View: {reason_or_view}")
+            tag_lines.append(
+                f"For Presentation: {get_tag(ds, (0x0008, 0x0068), 'N/A')}"
+            )
+
+        tag_lines.extend(
+            [
+                "",
+                "TAGS WE'RE LOOKING FOR:",
+                f"  (0x0020,0x0062) Laterality: {get_tag(ds, (0x0020, 0x0062), 'MISSING')}",
+                f"  (0x0020,0x0060) ImageLaterality: {get_tag(ds, (0x0020, 0x0060), 'MISSING')}",
+                f"  (0x0018,0x5101) ViewPosition: {get_tag(ds, (0x0018, 0x5101), 'MISSING')}",
+                f"  (0x0008,0x0068) PresentationIntentType: {get_tag(ds, (0x0008, 0x0068), 'MISSING')}",
+                "",
+                "ALL TAGS IN THIS FILE:",
+                "-" * 60,
+            ]
+        )
+
+        for elem in ds:
+            if elem.VR == "SQ":
+                tag_lines.append(f"{elem.tag} {elem.name}: <sequence>")
+            else:
+                try:
+                    value_str = str(elem.value)
+                    if len(value_str) > 80:
+                        value_str = value_str[:80] + "..."
+                    tag_lines.append(f"{elem.tag} {elem.name}: {value_str}")
+                except Exception:
+                    tag_lines.append(f"{elem.tag} {elem.name}: <cannot display>")
+
+        # render text
+        text_content = "\n".join(tag_lines)
+        ax_text.text(
+            0,
+            1,
+            text_content,
+            verticalalignment="top",
+            fontsize=7,
+            family="monospace",
+            transform=ax_text.transAxes,
+        )
+
+        # save figure organized by patient/exam
+        patient_name = path.parent.parent.name
+        exam_name = path.parent.name
+        patient_dir = debug_dir / patient_name
+        exam_dir = patient_dir / exam_name
+        exam_dir.mkdir(parents=True, exist_ok=True)
+
+        out_name = f"{status}_{path.stem}.png"
+        out_path = exam_dir / out_name
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=100, bbox_inches="tight")
+        plt.close(fig)
+
+        logger.debug(f"    Saved debug figure: {patient_name}/{exam_name}/{out_name}")
+    except Exception as e:
+        logger.warning(f"    Failed to save debug figure for {path.name}: {e}")
+
+
+def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List[Dict]:
     """Process all DICOMs in a single exam directory.
 
     walks subdirectories under exam_path to find all .dcm files
@@ -320,20 +431,30 @@ def _process_exam_dir(exam_path: Path) -> List[Dict]:
             sop_uid = get_tag(ds, (0x0008, 0x0018))
 
             if patient_id is None or study_uid is None or sop_uid is None:
-                logger.warning(f"  SKIP: {p.name} - missing patient/study/SOP IDs")
-                failed_files.append((p, "missing IDs", ds))
+                reason = "missing patient/study/SOP IDs"
+                logger.warning(f"  SKIP: {p.name} - {reason}")
+                failed_files.append((p, reason, ds))
+                if debug_dir:
+                    _save_debug_figure(ds, p, "FAILED", reason, debug_dir)
                 continue
 
             # try to get laterality and view
             try:
                 lat, vp = infer_view_fields(ds)
             except ValueError as e:
-                logger.warning(f"  SKIP: {p.name} - {e}")
-                failed_files.append((p, str(e), ds))
+                reason = str(e)
+                logger.warning(f"  SKIP: {p.name} - {reason}")
+                failed_files.append((p, reason, ds))
+                if debug_dir:
+                    _save_debug_figure(ds, p, "FAILED", reason, debug_dir)
                 continue
 
             present = is_for_presentation(ds)
             logger.info(f"  OK: {p.name} - {lat} {vp}, for_presentation={present}")
+
+            # save debug figure for successful DICOMs too
+            if debug_dir:
+                _save_debug_figure(ds, p, "SUCCESS", f"{lat} {vp}", debug_dir)
 
             rows.append(
                 {
@@ -412,7 +533,10 @@ def _process_exam_dir(exam_path: Path) -> List[Dict]:
 
 
 def discover_dicoms(
-    raw_dir: Path, max_exams: Optional[int] = None, workers: int = 1
+    raw_dir: Path,
+    max_exams: Optional[int] = None,
+    workers: int = 1,
+    debug_dir: Optional[Path] = None,
 ) -> pd.DataFrame:
     """Scan `raw_dir` for exam directories and extract DICOM tags in parallel.
 
@@ -444,6 +568,11 @@ def discover_dicoms(
     if not exam_dirs:
         raise RuntimeError("no exam directories found")
 
+    # create debug directory if requested
+    if debug_dir:
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"debug output will be saved to: {debug_dir}")
+
     # process exams in parallel
     logger.info(f"processing exams with {workers} workers...")
     from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -451,7 +580,7 @@ def discover_dicoms(
     all_rows = []
     with ProcessPoolExecutor(max_workers=workers) as executor:
         futures = {
-            executor.submit(_process_exam_dir, exam_path): exam_path
+            executor.submit(_process_exam_dir, exam_path, debug_dir): exam_path
             for exam_path in exam_dirs
         }
         for future in tqdm(
@@ -605,10 +734,14 @@ def preprocess(cfg: PreprocessConfig) -> None:
     logger.info(f"workers: {cfg.workers}")
     if cfg.max_exams:
         logger.info(f"max exams (debug mode): {cfg.max_exams}")
+    if cfg.debug_dir:
+        logger.info(f"debug dir: {cfg.debug_dir}")
 
     # discovery
     logger.info("discovering DICOMs...")
-    views_df = discover_dicoms(raw, max_exams=cfg.max_exams, workers=cfg.workers)
+    views_df = discover_dicoms(
+        raw, max_exams=cfg.max_exams, workers=cfg.workers, debug_dir=cfg.debug_dir
+    )
     logger.info(f"found {len(views_df)} DICOM files")
 
     # selection to full quad
@@ -991,6 +1124,13 @@ def parse_args() -> PreprocessConfig:
         default=None,
         help="limit number of exams to process (for debugging)",
     )
+    p.add_argument(
+        "--debug-dir",
+        dest="debug_dir",
+        type=Path,
+        default=None,
+        help="save debug figures for skipped DICOMs to this directory",
+    )
     # optional extras
     p.add_argument("--emit-csv", dest="emit_csv", type=Path)
     p.add_argument("--labels", dest="labels_parquet", type=Path)
@@ -1013,6 +1153,7 @@ def parse_args() -> PreprocessConfig:
         workers=args.workers,
         summary=args.summary,
         max_exams=args.max_exams,
+        debug_dir=args.debug_dir,
     ), args
 
 
