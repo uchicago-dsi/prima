@@ -50,6 +50,7 @@ import argparse
 import hashlib
 import logging
 import os
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -71,6 +72,8 @@ from pydicom.dataset import FileDataset
 from pydicom.tag import Tag
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+
+from metadata_utils import extract_base_modality
 
 logger = logging.getLogger(__name__)
 
@@ -209,9 +212,21 @@ def infer_view_fields(ds: FileDataset) -> Tuple[str, str]:
 
 
 def is_for_presentation(ds: FileDataset) -> bool:
-    """True if PresentationIntentType == 'FOR PRESENTATION'."""
+    """True if PresentationIntentType == 'FOR PRESENTATION'.
+
+    Checks both (0x0008, 0x0068) PresentationIntentType and (0x0008, 0x0069) Presentation Intent Type.
+    """
+    # Try PresentationIntentType first (0x0008, 0x0068)
     pit = get_tag(ds, (0x0008, 0x0068), "")
-    return str(pit).strip().upper() == "FOR PRESENTATION"
+    if pit and str(pit).strip().upper() == "FOR PRESENTATION":
+        return True
+
+    # Try Presentation Intent Type (0x0008, 0x0069) as fallback
+    pit_alt = get_tag(ds, (0x0008, 0x0069), "")
+    if pit_alt and str(pit_alt).strip().upper() == "FOR PRESENTATION":
+        return True
+
+    return False
 
 
 def has_implant(ds: FileDataset) -> bool:
@@ -299,12 +314,19 @@ def hash_file_sha256(path: Path, chunk: int = 1024 * 1024) -> str:
 
 
 def _save_debug_figure(
-    ds: FileDataset, path: Path, status: str, reason_or_view: str, debug_dir: Path
+    ds: FileDataset,
+    path: Path,
+    status: str,
+    reason_or_view: str,
+    debug_dir: Path,
+    patient_id: str = None,
+    exam_id: str = None,
 ) -> None:
     """Save debug figure showing pixel data and DICOM tags.
 
     status: 'SUCCESS' or 'FAILED'
     reason_or_view: if failed, the reason; if success, the laterality and view (e.g., 'L CC')
+    Organizes debug files by: debug_dir/patient_id/fail_reason/exam_id/
     """
     try:
         # create figure with two subplots
@@ -356,6 +378,7 @@ def _save_debug_figure(
                 f"  (0x0020,0x0060) ImageLaterality: {get_tag(ds, (0x0020, 0x0060), 'MISSING')}",
                 f"  (0x0018,0x5101) ViewPosition: {get_tag(ds, (0x0018, 0x5101), 'MISSING')}",
                 f"  (0x0008,0x0068) PresentationIntentType: {get_tag(ds, (0x0008, 0x0068), 'MISSING')}",
+                f"  (0x0008,0x0069) Presentation Intent Type: {get_tag(ds, (0x0008, 0x0069), 'MISSING')}",
                 "",
                 "ALL TAGS IN THIS FILE:",
                 "-" * 60,
@@ -386,11 +409,27 @@ def _save_debug_figure(
             transform=ax_text.transAxes,
         )
 
-        # save figure organized by patient/exam
-        patient_name = path.parent.parent.name
-        exam_name = path.parent.name
-        patient_dir = debug_dir / patient_name
-        exam_dir = patient_dir / exam_name
+        # save figure organized by patient_id/fail_reason/exam_id
+        # use provided patient_id and exam_id if available, otherwise extract from path
+        if patient_id is None:
+            patient_id = path.parent.parent.name
+        if exam_id is None:
+            exam_id = path.parent.name
+
+        # clean up reason for directory name (remove spaces, special chars)
+        clean_reason = (
+            reason_or_view.replace(" ", "_")
+            .replace("/", "_")
+            .replace("\\", "_")
+            .replace(":", "_")
+        )
+        clean_reason = "".join(c for c in clean_reason if c.isalnum() or c in "_-")[
+            :50
+        ]  # limit length
+
+        patient_dir = debug_dir / patient_id
+        reason_dir = patient_dir / clean_reason
+        exam_dir = reason_dir / exam_id
         exam_dir.mkdir(parents=True, exist_ok=True)
 
         out_name = f"{status}_{path.stem}.png"
@@ -399,9 +438,73 @@ def _save_debug_figure(
         plt.savefig(out_path, dpi=100, bbox_inches="tight")
         plt.close(fig)
 
-        logger.debug(f"    Saved debug figure: {patient_name}/{exam_name}/{out_name}")
+        logger.debug(
+            f"    Saved debug figure: {patient_id}/{clean_reason}/{exam_id}/{out_name}"
+        )
     except Exception as e:
         logger.warning(f"    Failed to save debug figure for {path.name}: {e}")
+
+
+def _check_and_move_non_mammogram_exam(exam_path: Path) -> bool:
+    """Check if exam is mammogram; if not, move to modality-specific directory.
+
+    Returns True if exam was moved (non-mammogram), False if it's a mammogram.
+    """
+    # check if exam path still exists (might have been moved by another process)
+    if not exam_path.exists():
+        logger.warning(f"Exam path {exam_path} no longer exists, skipping")
+        return True
+
+    # collect first dicom file to check modality
+    first_dcm = None
+    for root, dirs, files in os.walk(exam_path):
+        for name in files:
+            if name.endswith(".dcm"):
+                first_dcm = Path(root) / name
+                break
+        if first_dcm:
+            break
+
+    if not first_dcm:
+        logger.warning(f"No DICOM files found in {exam_path}, skipping modality check")
+        return False
+
+    # read modality from first DICOM
+    try:
+        ds = read_dicom(first_dcm)
+        modality_raw = get_tag(ds, (0x0008, 0x0060), default="")
+        study_description = get_tag(ds, (0x0008, 0x1030), default="")
+        base_modality = extract_base_modality(modality_raw, study_description)
+
+        logger.info(f"Exam modality: {modality_raw} -> base: {base_modality}")
+
+        # if it's a mammogram, don't move
+        if base_modality == "MG":
+            return False
+
+        # move to modality-specific directory
+        # structure: /gpfs/data/huo-lab/Image/ChiMEC/{modality}/patient_id/exam_id
+        patient_dir = exam_path.parent
+        patient_id = patient_dir.name
+        exam_id = exam_path.name
+        chimec_root = patient_dir.parent
+
+        # create modality directory
+        modality_root = chimec_root / base_modality
+        new_patient_dir = modality_root / patient_id
+        new_exam_path = new_patient_dir / exam_id
+
+        # move the exam directory
+        logger.info(f"Moving non-mammogram exam from {exam_path} to {new_exam_path}")
+        new_patient_dir.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(exam_path), str(new_exam_path))
+        logger.info(f"Successfully moved {base_modality} exam to {new_exam_path}")
+
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to check/move exam {exam_path}: {e}")
+        return False
 
 
 def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List[Dict]:
@@ -410,6 +513,11 @@ def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List
     walks subdirectories under exam_path to find all .dcm files
     """
     logger.info(f"\n=== Processing exam: {exam_path} ===")
+
+    # check modality and move if not mammogram
+    if _check_and_move_non_mammogram_exam(exam_path):
+        logger.info(f"Exam {exam_path} is not a mammogram, skipping preprocessing")
+        return []
 
     # collect all dicom files first
     dcm_files = []

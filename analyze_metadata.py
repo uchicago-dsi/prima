@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 from filesystem_utils import update_metadata_with_disk_status
+from metadata_utils import extract_base_modality
 
 # argument parser
 parser = argparse.ArgumentParser(
@@ -72,42 +73,6 @@ print(f"Metadata records: {len(metadata):,}")
 # update metadata with current disk status
 BASE_DOWNLOAD_DIR = "/gpfs/data/huo-lab/Image/ChiMEC/"
 metadata = update_metadata_with_disk_status(metadata, BASE_DOWNLOAD_DIR)
-
-
-# helper function to extract base modality
-def get_base_modality(modality):
-    """
-    extract base modality from full modality string
-    examples: 'MG' -> 'MG', 'MR' -> 'MR', 'CT' -> 'CT', etc.
-    """
-    if pd.isna(modality):
-        return None
-
-    modality_str = str(modality).upper()
-
-    # common base modalities
-    if "MG" in modality_str:
-        return "MG"
-    elif "MR" in modality_str:
-        return "MR"
-    elif "CT" in modality_str:
-        return "CT"
-    elif "US" in modality_str:
-        return "US"
-    elif "CR" in modality_str:
-        return "CR"
-    elif "DX" in modality_str:
-        return "DX"
-    elif "NM" in modality_str:
-        return "NM"
-    elif "PT" in modality_str:
-        return "PT"
-    else:
-        return modality_str  # return as is if no match found
-
-
-# add base modality column to metadata
-metadata["base_modality"] = metadata["Modality"].apply(get_base_modality)
 
 # modality labels for plotting
 BASE_MODALITY_LABELS = {
@@ -1167,86 +1132,6 @@ if len(extreme_negative) > 0:
     print(
         f"most extreme case: {min_record['time_to_diagnosis']:.0f} days ({min_record['time_to_diagnosis'] / 365.25:.1f} years) after diagnosis"
     )
-
-
-def extract_modality_from_description(description: str) -> str:
-    """
-    extract modality from study description when modality column is missing
-    """
-    if pd.isna(description):
-        return "Other"
-
-    desc_upper = str(description).upper()
-
-    # mammography patterns
-    if any(keyword in desc_upper for keyword in ["MAM", "MAMM", "BREAST"]):
-        return "MG"
-    # MRI patterns
-    elif desc_upper.startswith("MRI"):
-        return "MR"
-    # CT patterns
-    elif desc_upper.startswith("CT"):
-        return "CT"
-    # ultrasound patterns
-    elif desc_upper.startswith("US"):
-        return "US"
-    # nuclear medicine patterns
-    elif desc_upper.startswith("NM"):
-        return "NM"
-    # x-ray patterns
-    elif desc_upper.startswith("XR"):
-        return "CR"  # treat XR as CR
-    else:
-        return "Other"
-
-
-def extract_base_modality(modality: str, study_description: str = None) -> str:
-    """
-    extract the base imaging modality from a modality string,
-    ignoring derived/secondary DICOM object classes (PR, SR, KO, OT, SC, DOC, XC, CADSR, REG, RTSTRUCT, etc.)
-    if modality is missing, try to extract from study description
-
-    Parameters
-    ----------
-    modality : str
-        modality string (e.g., "CT/PR/SR")
-    study_description : str, optional
-        study description to parse if modality is missing
-
-    Returns
-    -------
-    str
-        base modality (e.g., "CT"), or "Other" if no base modality is found
-    """
-    # if modality is missing, try to extract from study description
-    if pd.isna(modality):
-        if study_description is not None:
-            return extract_modality_from_description(study_description)
-        return "Other"
-
-    # set of actual acquisition modalities
-    base_modalities = {
-        "CR",
-        "DX",
-        "MG",
-        "US",
-        "CT",
-        "MR",
-        "NM",
-        "PT",
-        "XA",
-        "RF",
-        "ES",
-        "XC",
-        "PX",
-        "RG",
-    }
-
-    tokens = str(modality).split("/")
-    for token in tokens:
-        if token in base_modalities:
-            return token
-    return "Other"
 
 
 # add base modality column to metadata (use StudyDescription when Modality is missing)
