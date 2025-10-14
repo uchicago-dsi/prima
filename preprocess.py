@@ -28,10 +28,9 @@ Usage example
 python prima_pipeline.py preprocess \
   --raw /data/prima/raw \
   --sot /data/prima/sot \
-  --out /data/prima/mirai-prep \
-  --genotype /data/prima/sot/genotype.parquet \
-  --site ucmed \
-  --workers 8
+  --out /data/prima/mirai-prep
+
+Defaults: --site ucmed, --workers 8, --genotype uses ChiMEC 2025 October phenotype CSV
 
 Dependencies (install explicitly):
   pip install pydicom numpy pandas pyarrow zarr numcodecs opencv-python-headless einops tqdm
@@ -49,6 +48,8 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import logging
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,6 +67,8 @@ from pydicom.dataset import FileDataset
 from pydicom.tag import Tag
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
 
 # hard requirements mirrored from Mirai
 IMG_W = 1664
@@ -131,10 +134,11 @@ class PreprocessConfig:
     raw_dir: Path
     sot_dir: Path
     out_dir: Path
-    genotype_parquet: Path
+    genotype_csv: Path
     site: str
     workers: int
     summary: bool
+    max_exams: Optional[int]
 
 
 # ------------- DICOM helpers -------------
@@ -289,47 +293,183 @@ def hash_file_sha256(path: Path, chunk: int = 1024 * 1024) -> str:
 # ------------- Discovery & selection -------------
 
 
-def discover_dicoms(raw_dir: Path) -> pd.DataFrame:
-    """Scan `raw_dir` recursively for DICOMs and extract minimal tags.
+def _process_exam_dir(exam_path: Path) -> List[Dict]:
+    """Process all DICOMs in a single exam directory.
 
-    builds one row per file; heavy pixel operations are deferred.
+    walks subdirectories under exam_path to find all .dcm files
     """
+    logger.info(f"\n=== Processing exam: {exam_path} ===")
+
+    # collect all dicom files first
+    dcm_files = []
+    for root, dirs, files in os.walk(exam_path):
+        for name in files:
+            if name.endswith(".dcm"):
+                dcm_files.append(Path(root) / name)
+
+    logger.info(f"Found {len(dcm_files)} DICOM files in exam")
+
     rows = []
-    for p in raw_dir.rglob("*.dcm"):
-        ds = read_dicom(p)
-        patient_id = get_tag(ds, (0x0010, 0x0020))
-        study_uid = get_tag(ds, (0x0020, 0x000D))
-        sop_uid = get_tag(ds, (0x0008, 0x0018))
-        if patient_id is None or study_uid is None or sop_uid is None:
-            raise ValueError(f"missing key ids in {p}")
-        lat, vp = infer_view_fields(ds)
-        present = is_for_presentation(ds)
-        rows.append(
-            {
-                "patient_id": patient_id,
-                "exam_id": study_uid,
-                "sop_instance_uid": sop_uid,
-                "laterality": lat,
-                "view": vp,
-                "dicom_path": str(p.resolve()),
-                "rows": int(ds.Rows),
-                "cols": int(ds.Columns),
-                "photometric_interpretation": str(
-                    ds.get("PhotometricInterpretation", "")
-                ),
-                "bits_stored": int(ds.get("BitsStored", ds.get("BitsAllocated", 16))),
-                "acquisition_time": get_tag(ds, (0x0008, 0x0032), ""),
-                "is_marked_up": is_marked_up(ds),
-                "has_implant": has_implant(ds),
-                "for_presentation": present,
-                "sha256": hash_file_sha256(p),
-                "device_manufacturer": str(ds.get("Manufacturer", "")),
-                "device_model": str(ds.get("ManufacturerModelName", "")),
-                "study_date": get_tag(ds, (0x0008, 0x0020), ""),
-                "accession_number": get_tag(ds, (0x0008, 0x0050), ""),
-            }
-        )
-    df = pd.DataFrame(rows)
+    failed_files = []
+
+    for p in dcm_files:
+        try:
+            ds = read_dicom(p)
+            patient_id = get_tag(ds, (0x0010, 0x0020))
+            study_uid = get_tag(ds, (0x0020, 0x000D))
+            sop_uid = get_tag(ds, (0x0008, 0x0018))
+
+            if patient_id is None or study_uid is None or sop_uid is None:
+                logger.warning(f"  SKIP: {p.name} - missing patient/study/SOP IDs")
+                failed_files.append((p, "missing IDs", ds))
+                continue
+
+            # try to get laterality and view
+            try:
+                lat, vp = infer_view_fields(ds)
+            except ValueError as e:
+                logger.warning(f"  SKIP: {p.name} - {e}")
+                failed_files.append((p, str(e), ds))
+                continue
+
+            present = is_for_presentation(ds)
+            logger.info(f"  OK: {p.name} - {lat} {vp}, for_presentation={present}")
+
+            rows.append(
+                {
+                    "patient_id": patient_id,
+                    "exam_id": study_uid,
+                    "sop_instance_uid": sop_uid,
+                    "laterality": lat,
+                    "view": vp,
+                    "dicom_path": str(p.resolve()),
+                    "rows": int(ds.Rows),
+                    "cols": int(ds.Columns),
+                    "photometric_interpretation": str(
+                        ds.get("PhotometricInterpretation", "")
+                    ),
+                    "bits_stored": int(
+                        ds.get("BitsStored", ds.get("BitsAllocated", 16))
+                    ),
+                    "acquisition_time": get_tag(ds, (0x0008, 0x0032), ""),
+                    "is_marked_up": is_marked_up(ds),
+                    "has_implant": has_implant(ds),
+                    "for_presentation": present,
+                    "sha256": hash_file_sha256(p),
+                    "device_manufacturer": str(ds.get("Manufacturer", "")),
+                    "device_model": str(ds.get("ManufacturerModelName", "")),
+                    "study_date": get_tag(ds, (0x0008, 0x0020), ""),
+                    "accession_number": get_tag(ds, (0x0008, 0x0050), ""),
+                }
+            )
+        except Exception as e:
+            logger.error(f"  ERROR: {p.name} - unexpected error: {e}")
+            failed_files.append((p, f"unexpected error: {e}", None))
+
+    logger.info("\nExam summary:")
+    logger.info(f"  Total files: {len(dcm_files)}")
+    logger.info(f"  Successfully processed: {len(rows)}")
+    logger.info(f"  Failed/skipped: {len(failed_files)}")
+
+    if rows:
+        views = {}
+        for r in rows:
+            key = (r["laterality"], r["view"])
+            if key not in views:
+                views[key] = []
+            views[key].append(r["for_presentation"])
+        logger.info("  Views found:")
+        for (lat, vw), pres_list in sorted(views.items()):
+            for_pres = sum(pres_list)
+            logger.info(
+                f"    {lat}-{vw}: {len(pres_list)} total, {for_pres} for_presentation"
+            )
+
+    # if we got NO valid rows, dump debug info and exit
+    if not rows:
+        logger.error(f"\n=== FATAL: No valid DICOMs found in exam {exam_path} ===")
+        logger.error("Dumping first failed DICOM for debugging:")
+        if failed_files:
+            p, reason, ds = failed_files[0]
+            logger.error(f"File: {p}")
+            logger.error(f"Reason: {reason}")
+            if ds is not None:
+                logger.error("\nAll DICOM tags:")
+                for elem in ds:
+                    if elem.VR == "SQ":
+                        logger.error(f"  {elem.tag} {elem.name}: <sequence>")
+                        continue
+                    try:
+                        value_str = str(elem.value)
+                        if len(value_str) > 100:
+                            value_str = value_str[:100] + "..."
+                        logger.error(f"  {elem.tag} {elem.name}: {value_str}")
+                    except Exception:
+                        logger.error(f"  {elem.tag} {elem.name}: <cannot display>")
+        raise RuntimeError(f"No valid DICOMs with laterality/view in exam {exam_path}")
+
+    return rows
+
+
+def discover_dicoms(
+    raw_dir: Path, max_exams: Optional[int] = None, workers: int = 1
+) -> pd.DataFrame:
+    """Scan `raw_dir` for exam directories and extract DICOM tags in parallel.
+
+    assumes structure: raw_dir/patient_id/exam_id/[series_dirs]/file.dcm
+    walks to exam level, then processes each exam in parallel
+    """
+    logger.info(f"scanning for exam directories in: {raw_dir}")
+    exam_dirs = []
+
+    # walk to depth 2: patient_id/exam_id
+    for patient_name in os.listdir(raw_dir):
+        patient_path = raw_dir / patient_name
+        if not patient_path.is_dir():
+            continue
+        for exam_name in os.listdir(patient_path):
+            exam_path = patient_path / exam_name
+            if exam_path.is_dir():
+                exam_dirs.append(exam_path)
+                if max_exams is not None and len(exam_dirs) >= max_exams:
+                    logger.info(
+                        f"reached --max-exams limit of {max_exams}, stopping scan"
+                    )
+                    break
+        if max_exams is not None and len(exam_dirs) >= max_exams:
+            break
+
+    logger.info(f"found {len(exam_dirs)} exam directories")
+
+    if not exam_dirs:
+        raise RuntimeError("no exam directories found")
+
+    # process exams in parallel
+    logger.info(f"processing exams with {workers} workers...")
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    all_rows = []
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(_process_exam_dir, exam_path): exam_path
+            for exam_path in exam_dirs
+        }
+        for future in tqdm(
+            as_completed(futures),
+            total=len(futures),
+            desc="processing exams",
+            unit="exam",
+        ):
+            exam_path = futures[future]
+            try:
+                rows = future.result()
+                all_rows.extend(rows)
+            except Exception as e:
+                logger.error(f"failed to process {exam_path}: {e}")
+                raise  # re-raise to stop execution for debugging
+
+    logger.info(f"collected metadata from {len(all_rows)} DICOM files")
+    df = pd.DataFrame(all_rows)
     if df.empty:
         raise RuntimeError("no DICOMs found")
     return df
@@ -458,11 +598,23 @@ def preprocess(cfg: PreprocessConfig) -> None:
     sot = cfg.sot_dir
     out = cfg.out_dir
 
+    logger.info("=== starting preprocessing ===")
+    logger.info(f"raw dir: {raw}")
+    logger.info(f"sot dir: {sot}")
+    logger.info(f"out dir: {out}")
+    logger.info(f"workers: {cfg.workers}")
+    if cfg.max_exams:
+        logger.info(f"max exams (debug mode): {cfg.max_exams}")
+
     # discovery
-    views_df = discover_dicoms(raw)
+    logger.info("discovering DICOMs...")
+    views_df = discover_dicoms(raw, max_exams=cfg.max_exams, workers=cfg.workers)
+    logger.info(f"found {len(views_df)} DICOM files")
 
     # selection to full quad
+    logger.info("selecting full quad exams...")
     sel_df = select_full_quad(views_df)
+    logger.info(f"selected {len(sel_df)} views from full quad exams")
 
     # exams table
     exams = (
@@ -487,18 +639,24 @@ def preprocess(cfg: PreprocessConfig) -> None:
     exams["ibroker_study_id"] = None
 
     # genotype join determines cohort
-    geno = pd.read_parquet(cfg.genotype_parquet)
-    if "patient_id" not in geno.columns:
-        raise KeyError("genotype.parquet must have column 'patient_id'")
+    logger.info(f"loading genotype CSV: {cfg.genotype_csv}")
+    geno = pd.read_csv(cfg.genotype_csv)
+    if "PUB_id" not in geno.columns:
+        raise KeyError("genotype CSV must have column 'PUB_id'")
+    geno = geno.rename(columns={"PUB_id": "patient_id"})
+    logger.info(f"loaded {len(geno)} genotype records")
 
+    logger.info("joining with genotype...")
     exams = exams.merge(
         geno[["patient_id"]].drop_duplicates().assign(has_geno=True),
         on="patient_id",
         how="left",
     )
     exams["has_geno"] = exams["has_geno"].fillna(False)
+    logger.info(f"exams with genotype: {exams['has_geno'].sum()}")
 
     # write SoT tables
+    logger.info(f"writing SoT tables to {sot}...")
     sot.mkdir(parents=True, exist_ok=True)
     sel_df[VIEWS_COLS].to_parquet(sot / "views.parquet", index=False)
     exams[EXAMS_COLS].to_parquet(sot / "exams.parquet", index=False)
@@ -507,23 +665,27 @@ def preprocess(cfg: PreprocessConfig) -> None:
         ["patient_id", "patient_hash", "exam_id", "study_date"]
     ]
     cohort.to_parquet(sot / "cohort.parquet", index=False)
+    logger.info("wrote views.parquet, exams.parquet, cohort.parquet")
 
     # if summary-only, stop here
     if cfg.summary:
-        print("=== summary-only: wrote SoT, skipped zarr cache ===")
-        print(f"SoT dir: {sot}")
+        logger.info("=== summary-only: wrote SoT, skipped zarr cache ===")
+        logger.info(f"SoT dir: {sot}")
         return
 
     # zarr cache + manifest for the cohort
+    logger.info(f"preparing zarr cache in {out}...")
     prep_dir = out / "zarr"
     prep_dir.mkdir(parents=True, exist_ok=True)
 
     manifest_rows: List[Dict] = []
 
+    logger.info("grouping exams for zarr writing...")
     grouped = {k: v for k, v in sel_df.groupby("exam_id")}
     targets = [
         (eid, grouped[eid]) for eid in cohort["exam_id"].tolist() if eid in grouped
     ]
+    logger.info(f"will write {len(targets)} exams to zarr with {cfg.workers} workers")
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -552,9 +714,11 @@ def preprocess(cfg: PreprocessConfig) -> None:
                     }
                 )
 
+    logger.info(f"writing manifest with {len(manifest_rows)} rows...")
     manifest = pd.DataFrame(manifest_rows)
     manifest_path = out / "manifest.parquet"
     manifest.to_parquet(manifest_path, index=False)
+    logger.info(f"wrote manifest to {manifest_path}")
 
     # QC summary
     total_files = len(views_df)
@@ -568,15 +732,15 @@ def preprocess(cfg: PreprocessConfig) -> None:
         .rename(columns={"size": "n_views"})
     )
 
-    print("=== QC summary ===")
-    print(f"dicom files indexed: {total_files}")
-    print(f"unique exams: {total_exams}")
-    print(f"full-quad exams: {full_exams}")
-    print(f"cohort (full-quad ∩ has-geno): {cohort_exams}")
-    print("views by vendor/model:")
-    print(vendor_counts.to_string(index=False))
-    print(f"written SoT: {sot}")
-    print(f"written cache manifest: {manifest_path}")
+    logger.info("=== QC summary ===")
+    logger.info(f"dicom files indexed: {total_files}")
+    logger.info(f"unique exams: {total_exams}")
+    logger.info(f"full-quad exams: {full_exams}")
+    logger.info(f"cohort (full-quad ∩ has-geno): {cohort_exams}")
+    logger.info("views by vendor/model:")
+    logger.info(f"\n{vendor_counts.to_string(index=False)}")
+    logger.info(f"written SoT: {sot}")
+    logger.info(f"written cache manifest: {manifest_path}")
 
 
 # ------------- Consumer helpers -------------
@@ -796,18 +960,37 @@ def ingest_mirai_predictions(prediction_csv: Path, out_parquet: Path) -> None:
 def parse_args() -> PreprocessConfig:
     """Parse CLI arguments into a PreprocessConfig.
 
-    all arguments are required; fail if missing.
+    defaults: raw=/gpfs/data/huo-lab/Image/ChiMEC/, sot=raw/sot, out=raw/out
     """
     p = argparse.ArgumentParser(
         description="Build SoT + Mirai-compatible Zarr cache (no PNGs)"
     )
-    p.add_argument("--raw", dest="raw_dir", type=Path, required=True)
-    p.add_argument("--sot", dest="sot_dir", type=Path, required=True)
-    p.add_argument("--out", dest="out_dir", type=Path, required=True)
-    p.add_argument("--genotype", dest="genotype_parquet", type=Path, required=True)
-    p.add_argument("--site", dest="site", type=str, required=True)
-    p.add_argument("--workers", dest="workers", type=int, required=True)
+    p.add_argument(
+        "--raw",
+        dest="raw_dir",
+        type=Path,
+        default=Path("/gpfs/data/huo-lab/Image/ChiMEC/"),
+    )
+    p.add_argument("--sot", dest="sot_dir", type=Path, default=None)
+    p.add_argument("--out", dest="out_dir", type=Path, default=None)
+    p.add_argument(
+        "--genotype",
+        dest="genotype_csv",
+        type=Path,
+        default=Path(
+            "/gpfs/data/phs/groups/Projects/Huo_projects/SPORE/annawoodard/Phenotype_ChiMEC_2025October4.csv"
+        ),
+    )
+    p.add_argument("--site", dest="site", type=str, default="ucmed")
+    p.add_argument("--workers", dest="workers", type=int, default=8)
     p.add_argument("--summary", dest="summary", action="store_true")
+    p.add_argument(
+        "--max-exams",
+        dest="max_exams",
+        type=int,
+        default=None,
+        help="limit number of exams to process (for debugging)",
+    )
     # optional extras
     p.add_argument("--emit-csv", dest="emit_csv", type=Path)
     p.add_argument("--labels", dest="labels_parquet", type=Path)
@@ -816,29 +999,55 @@ def parse_args() -> PreprocessConfig:
     p.add_argument("--mirai-repo", dest="mirai_repo", type=Path)
     args = p.parse_args()
 
+    # derive sot and out from raw if not provided
+    raw_dir = args.raw_dir
+    sot_dir = args.sot_dir if args.sot_dir is not None else raw_dir / "sot"
+    out_dir = args.out_dir if args.out_dir is not None else raw_dir / "out"
+
     return PreprocessConfig(
-        raw_dir=args.raw_dir,
-        sot_dir=args.sot_dir,
-        out_dir=args.out_dir,
-        genotype_parquet=args.genotype_parquet,
+        raw_dir=raw_dir,
+        sot_dir=sot_dir,
+        out_dir=out_dir,
+        genotype_csv=args.genotype_csv,
         site=args.site,
         workers=args.workers,
         summary=args.summary,
+        max_exams=args.max_exams,
     ), args
 
 
 def main() -> None:
     """Entrypoint for the CLI."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    logger.info("parsing arguments...")
     cfg, args = parse_args()
+    logger.info("configuration loaded")
+    logger.info(f"  raw_dir: {cfg.raw_dir}")
+    logger.info(f"  sot_dir: {cfg.sot_dir}")
+    logger.info(f"  out_dir: {cfg.out_dir}")
+    logger.info(f"  genotype_csv: {cfg.genotype_csv}")
+    logger.info(f"  site: {cfg.site}")
+    logger.info(f"  workers: {cfg.workers}")
+    logger.info(f"  summary: {cfg.summary}")
+    logger.info(f"  max_exams: {cfg.max_exams or 'unlimited'}")
+
+    logger.info("validating configuration...")
     if cfg.workers <= 0:
         raise ValueError("workers must be > 0")
     if cfg.raw_dir == cfg.out_dir:
         raise ValueError("out_dir must differ from raw_dir")
+    logger.info("configuration valid")
 
     preprocess(cfg)
 
     # emit Mirai CSV if requested
     if args.emit_csv is not None:
+        logger.info("generating Mirai CSV...")
         if args.labels_parquet is None:
             raise ValueError(
                 "--emit-csv requires --labels with years_to_cancer/years_to_last_followup/split_group"
@@ -846,10 +1055,11 @@ def main() -> None:
         write_mirai_csv(
             cfg.out_dir / "manifest.parquet", args.labels_parquet, args.emit_csv
         )
-        print(f"wrote Mirai CSV → {args.emit_csv}")
+        logger.info(f"wrote Mirai CSV → {args.emit_csv}")
 
     # materialize per-view embeddings if requested
     if args.features_out is not None:
+        logger.info("materializing per-view embeddings...")
         if args.img_encoder_snapshot is None:
             raise ValueError(
                 "--features-out requires --img-encoder-snapshot (Mirai ResNet18 weights)"
@@ -860,7 +1070,11 @@ def main() -> None:
             cfg.out_dir / "manifest.parquet",
             args.features_out,
         )
-        print(f"wrote per-view embeddings → {args.features_out / 'per_view.parquet'}")
+        logger.info(
+            f"wrote per-view embeddings → {args.features_out / 'per_view.parquet'}"
+        )
+
+    logger.info("=== preprocessing complete ===")
 
 
 if __name__ == "__main__":

@@ -103,6 +103,7 @@ def analyze_export_timeline(missing_exams_df: pd.DataFrame) -> None:
     print("\n--- Timeline Analysis for Exported-but-Not-on-Disk Exams ---")
 
     current_time = pd.Timestamp.now()
+    bins = [0, 1, 3, 7, 14, 30, 90, float("inf")]
 
     # Analyze export_requested_on timeline
     if "export_requested_on" in missing_exams_df.columns:
@@ -117,7 +118,6 @@ def analyze_export_timeline(missing_exams_df: pd.DataFrame) -> None:
 
             print(f"\nTime since export request (n={len(valid_requested)}):")
             print("  (When THIS script requested exports via web interface)")
-            bins = [0, 1, 3, 7, 14, 30, 90, float("inf")]
 
             for i, (bin_min, bin_max) in enumerate(zip(bins[:-1], bins[1:])):
                 if bin_max == float("inf"):

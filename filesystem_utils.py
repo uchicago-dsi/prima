@@ -193,7 +193,13 @@ def check_disk_for_downloads(df: pd.DataFrame, basedir: str) -> pd.DataFrame:
     # update the original DataFrame using the index from our checkable subset
     df.loc[on_disk_mask[on_disk_mask].index, "is_on_disk"] = True
 
+    on_disk_count = df["is_on_disk"].sum()
+    print(f"  - Marked {on_disk_count:,} exams in the database as 'is_on_disk'.")
+
+    # show how many of the on-disk exams have accession numbers
+    on_disk_with_accession = df[df["is_on_disk"]]["Accession"].notna().sum()
     print(
-        f"  - Marked {df['is_on_disk'].sum():,} exams in the database as 'is_on_disk'."
+        f"  - Exams on disk with Accession numbers: {on_disk_with_accession:,}/{on_disk_count:,} ({on_disk_with_accession / on_disk_count * 100:.1f}%)"
     )
+
     return df
