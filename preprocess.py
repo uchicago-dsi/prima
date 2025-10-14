@@ -543,7 +543,21 @@ def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List
                 logger.warning(f"  SKIP: {p.name} - {reason}")
                 failed_files.append((p, reason, ds))
                 if debug_dir:
-                    _save_debug_figure(ds, p, "FAILED", reason, debug_dir)
+                    _save_debug_figure(
+                        ds, p, "FAILED", reason, debug_dir, patient_id, study_uid
+                    )
+                continue
+
+            # check presentation intent first
+            present = is_for_presentation(ds)
+            if not present:
+                reason = "not for presentation"
+                logger.warning(f"  SKIP: {p.name} - {reason}")
+                failed_files.append((p, reason, ds))
+                if debug_dir:
+                    _save_debug_figure(
+                        ds, p, "FAILED", reason, debug_dir, patient_id, study_uid
+                    )
                 continue
 
             # try to get laterality and view
@@ -554,15 +568,18 @@ def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List
                 logger.warning(f"  SKIP: {p.name} - {reason}")
                 failed_files.append((p, reason, ds))
                 if debug_dir:
-                    _save_debug_figure(ds, p, "FAILED", reason, debug_dir)
+                    _save_debug_figure(
+                        ds, p, "FAILED", reason, debug_dir, patient_id, study_uid
+                    )
                 continue
 
-            present = is_for_presentation(ds)
             logger.info(f"  OK: {p.name} - {lat} {vp}, for_presentation={present}")
 
             # save debug figure for successful DICOMs too
             if debug_dir:
-                _save_debug_figure(ds, p, "SUCCESS", f"{lat} {vp}", debug_dir)
+                _save_debug_figure(
+                    ds, p, "SUCCESS", f"{lat} {vp}", debug_dir, patient_id, study_uid
+                )
 
             rows.append(
                 {
@@ -599,6 +616,17 @@ def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List
     logger.info(f"  Total files: {len(dcm_files)}")
     logger.info(f"  Successfully processed: {len(rows)}")
     logger.info(f"  Failed/skipped: {len(failed_files)}")
+
+    # report failure reasons
+    if failed_files:
+        from collections import Counter
+
+        failure_reasons = Counter()
+        for p, reason, ds in failed_files:
+            failure_reasons[reason] += 1
+        logger.info("  Failure reasons:")
+        for reason, count in failure_reasons.most_common():
+            logger.info(f"    {reason}: {count} files")
 
     if rows:
         views = {}
@@ -709,6 +737,21 @@ def discover_dicoms(
     df = pd.DataFrame(all_rows)
     if df.empty:
         raise RuntimeError("no DICOMs found")
+
+    # print summary statistics
+    if not df.empty:
+        logger.info("\n=== PROCESSING SUMMARY ===")
+        logger.info(f"Total exams processed: {len(exam_dirs)}")
+        logger.info(f"Total DICOMs processed: {len(all_rows)}")
+        logger.info(f"Unique patients: {df['patient_id'].nunique()}")
+        logger.info(f"Unique exams: {df['exam_id'].nunique()}")
+
+        # view breakdown
+        view_counts = df.groupby(["laterality", "view"]).size()
+        logger.info("Views found:")
+        for (lat, view), count in view_counts.items():
+            logger.info(f"  {lat}-{view}: {count} files")
+
     return df
 
 
