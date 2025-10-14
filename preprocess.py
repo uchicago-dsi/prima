@@ -503,8 +503,6 @@ def _check_and_move_non_mammogram_exam(exam_path: Path) -> bool:
         study_description = get_tag(ds, (0x0008, 0x1030), default="")
         base_modality = extract_base_modality(modality_raw, study_description)
 
-        logger.info(f"Exam modality: {modality_raw} -> base: {base_modality}")
-
         # if it's a mammogram, don't move
         if base_modality == "MG":
             return False
@@ -539,11 +537,13 @@ def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List
 
     walks subdirectories under exam_path to find all .dcm files
     """
-    logger.info(f"\n=== Processing exam: {exam_path} ===")
+    if debug_dir:
+        logger.info(f"\n=== Processing exam: {exam_path} ===")
 
     # check modality and move if not mammogram
     if _check_and_move_non_mammogram_exam(exam_path):
-        logger.info(f"Exam {exam_path} is not a mammogram, skipping preprocessing")
+        if debug_dir:
+            logger.info(f"Exam {exam_path} is not a mammogram, skipping preprocessing")
         return []
 
     # collect all dicom files first
@@ -553,7 +553,8 @@ def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List
             if name.endswith(".dcm"):
                 dcm_files.append(Path(root) / name)
 
-    logger.info(f"Found {len(dcm_files)} DICOM files in exam")
+    if debug_dir:
+        logger.info(f"Found {len(dcm_files)} DICOM files in exam")
 
     rows = []
     failed_files = []
@@ -568,7 +569,8 @@ def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List
 
             if patient_id is None or study_uid is None or sop_uid is None:
                 reason = "missing patient/study/SOP IDs"
-                logger.warning(f"  SKIP: {p.name} - {reason}")
+                if debug_dir:
+                    logger.warning(f"  SKIP: {p.name} - {reason}")
                 failed_files.append((p, reason, ds))
                 if debug_dir:
                     _save_debug_figure(
@@ -587,7 +589,8 @@ def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List
             present = is_for_presentation(ds)
             if not present:
                 reason = "not for presentation"
-                logger.warning(f"  SKIP: {p.name} - {reason}")
+                if debug_dir:
+                    logger.warning(f"  SKIP: {p.name} - {reason}")
                 failed_files.append((p, reason, ds))
                 if debug_dir:
                     _save_debug_figure(
@@ -607,7 +610,8 @@ def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List
                 lat, vp = infer_view_fields(ds)
             except ValueError as e:
                 reason = str(e)
-                logger.warning(f"  SKIP: {p.name} - {reason}")
+                if debug_dir:
+                    logger.warning(f"  SKIP: {p.name} - {reason}")
                 failed_files.append((p, reason, ds))
                 if debug_dir:
                     _save_debug_figure(
@@ -622,7 +626,8 @@ def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List
                     )
                 continue
 
-            logger.info(f"  OK: {p.name} - {lat} {vp}, for_presentation={present}")
+            if debug_dir:
+                logger.info(f"  OK: {p.name} - {lat} {vp}, for_presentation={present}")
 
             # save debug figure for successful DICOMs too
             if debug_dir:
@@ -665,26 +670,28 @@ def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List
                 }
             )
         except Exception as e:
-            logger.error(f"  ERROR: {p.name} - unexpected error: {e}")
+            if debug_dir:
+                logger.error(f"  ERROR: {p.name} - unexpected error: {e}")
             failed_files.append((p, f"unexpected error: {e}", None))
 
-    logger.info("\nExam summary:")
-    logger.info(f"  Total files: {len(dcm_files)}")
-    logger.info(f"  Successfully processed: {len(rows)}")
-    logger.info(f"  Failed/skipped: {len(failed_files)}")
+    if debug_dir:
+        logger.info("\nExam summary:")
+        logger.info(f"  Total files: {len(dcm_files)}")
+        logger.info(f"  Successfully processed: {len(rows)}")
+        logger.info(f"  Failed/skipped: {len(failed_files)}")
 
-    # report failure reasons
-    if failed_files:
-        from collections import Counter
+        # report failure reasons
+        if failed_files:
+            from collections import Counter
 
-        failure_reasons = Counter()
-        for p, reason, ds in failed_files:
-            failure_reasons[reason] += 1
-        logger.info("  Failure reasons:")
-        for reason, count in failure_reasons.most_common():
-            logger.info(f"    {reason}: {count} files")
+            failure_reasons = Counter()
+            for p, reason, ds in failed_files:
+                failure_reasons[reason] += 1
+            logger.info("  Failure reasons:")
+            for reason, count in failure_reasons.most_common():
+                logger.info(f"    {reason}: {count} files")
 
-    if rows:
+    if rows and debug_dir:
         views = {}
         for r in rows:
             key = (r["laterality"], r["view"])
@@ -699,7 +706,7 @@ def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List
             )
 
     # if we got NO valid rows, log the issue but don't raise an error
-    if not rows:
+    if not rows and debug_dir:
         logger.warning(f"\n=== NO VALID DICOMs found in exam {exam_path} ===")
         logger.warning("Dumping first failed DICOM for debugging:")
         if failed_files:
@@ -813,6 +820,7 @@ def discover_dicoms(
             executor.submit(_process_exam_dir, exam_path, debug_dir): exam_path
             for exam_path in exam_dirs
         }
+        # show progress bar for exam processing (always enabled, regardless of debug_dir)
         for future in tqdm(
             as_completed(futures),
             total=len(futures),
@@ -839,7 +847,7 @@ def discover_dicoms(
                 logger.error(f"failed to process {exam_path}: {e}")
                 # don't re-raise, just continue processing
 
-    logger.info(f"collected metadata from {len(all_rows)} DICOM files")
+    logger.info(f"collected metadata from {len(all_rows)} valid views")
     df = pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
 
     # print summary statistics
@@ -1385,7 +1393,7 @@ def parse_args() -> PreprocessConfig:
         dest="genotype_csv",
         type=Path,
         default=Path(
-            "/gpfs/data/phs/groups/Projects/Huo_projects/SPORE/annawoodard/Phenotype_ChiMEC_2025October4.csv"
+            "/gpfs/data/phs/groups/Projects/Huo_projects/SPORE/annawoodard/Phenotype_ChiMEC_2025Oct4.csv"
         ),
     )
     p.add_argument("--site", dest="site", type=str, default="ucmed")
