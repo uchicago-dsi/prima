@@ -321,12 +321,16 @@ def _save_debug_figure(
     debug_dir: Path,
     patient_id: str = None,
     exam_id: str = None,
+    accession_number: str = None,
 ) -> None:
     """Save debug figure showing pixel data and DICOM tags.
 
     status: 'SUCCESS' or 'FAILED'
     reason_or_view: if failed, the reason; if success, the laterality and view (e.g., 'L CC')
-    Organizes debug files by: debug_dir/patient_id/fail_reason/exam_id/
+    input data: /patient_id/accession_number/exam_id/
+    Organizes debug files by:
+      - SUCCESS: debug_dir/success/patient_id/accession_number/
+      - FAILED: debug_dir/failed/patient_id/fail_reason/exam_id/
     """
     try:
         # create figure with two subplots
@@ -410,27 +414,43 @@ def _save_debug_figure(
         )
 
         # save figure organized by patient_id/fail_reason/exam_id
-        # use provided patient_id and exam_id if available, otherwise extract from path
+        # use provided patient_id, exam_id, and accession_number if available, otherwise extract from path
         if patient_id is None:
             patient_id = path.parent.parent.name
         if exam_id is None:
             exam_id = path.parent.name
+        if accession_number is None:
+            accession_number = get_tag(ds, (0x0008, 0x0050), "unknown_accession")
 
-        # clean up reason for directory name (remove spaces, special chars)
-        clean_reason = (
-            reason_or_view.replace(" ", "_")
-            .replace("/", "_")
-            .replace("\\", "_")
-            .replace(":", "_")
-        )
-        clean_reason = "".join(c for c in clean_reason if c.isalnum() or c in "_-")[
-            :50
-        ]  # limit length
+        if status == "SUCCESS":
+            # for successful files, organize by study_id/accession_number
+            study_dir = debug_dir / exam_id
+            accession_dir = study_dir / accession_number
+            accession_dir.mkdir(parents=True, exist_ok=True)
+            exam_dir = accession_dir
+        else:
+            # for failed files, organize by patient_id/fail_reason/exam_id
+            # clean up reason for directory name (remove spaces, special chars, fix double underscores)
+            clean_reason = (
+                reason_or_view.replace(" ", "_")
+                .replace("/", "_")
+                .replace("\\", "_")
+                .replace(":", "_")
+            )
+            clean_reason = "".join(c for c in clean_reason if c.isalnum() or c in "_-")[
+                :50
+            ]  # limit length
+            # fix multiple underscores in a row
+            import re
 
-        patient_dir = debug_dir / patient_id
-        reason_dir = patient_dir / clean_reason
-        exam_dir = reason_dir / exam_id
-        exam_dir.mkdir(parents=True, exist_ok=True)
+            clean_reason = re.sub(r"_+", "_", clean_reason)
+            # remove leading/trailing underscores
+            clean_reason = clean_reason.strip("_")
+
+            patient_dir = debug_dir / patient_id
+            reason_dir = patient_dir / clean_reason
+            exam_dir = reason_dir / exam_id
+            exam_dir.mkdir(parents=True, exist_ok=True)
 
         out_name = f"{status}_{path.stem}.png"
         out_path = exam_dir / out_name
@@ -438,9 +458,14 @@ def _save_debug_figure(
         plt.savefig(out_path, dpi=100, bbox_inches="tight")
         plt.close(fig)
 
-        logger.debug(
-            f"    Saved debug figure: {patient_id}/{clean_reason}/{exam_id}/{out_name}"
-        )
+        if status == "SUCCESS":
+            logger.debug(
+                f"    Saved debug figure: {exam_id}/{accession_number}/{out_name}"
+            )
+        else:
+            logger.debug(
+                f"    Saved debug figure: {patient_id}/{clean_reason}/{exam_id}/{out_name}"
+            )
     except Exception as e:
         logger.warning(f"    Failed to save debug figure for {path.name}: {e}")
 
@@ -537,6 +562,7 @@ def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List
             patient_id = get_tag(ds, (0x0010, 0x0020))
             study_uid = get_tag(ds, (0x0020, 0x000D))
             sop_uid = get_tag(ds, (0x0008, 0x0018))
+            accession_number = get_tag(ds, (0x0008, 0x0050))
 
             if patient_id is None or study_uid is None or sop_uid is None:
                 reason = "missing patient/study/SOP IDs"
@@ -544,7 +570,14 @@ def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List
                 failed_files.append((p, reason, ds))
                 if debug_dir:
                     _save_debug_figure(
-                        ds, p, "FAILED", reason, debug_dir, patient_id, study_uid
+                        ds,
+                        p,
+                        "FAILED",
+                        reason,
+                        debug_dir,
+                        patient_id,
+                        study_uid,
+                        accession_number,
                     )
                 continue
 
@@ -556,7 +589,14 @@ def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List
                 failed_files.append((p, reason, ds))
                 if debug_dir:
                     _save_debug_figure(
-                        ds, p, "FAILED", reason, debug_dir, patient_id, study_uid
+                        ds,
+                        p,
+                        "FAILED",
+                        reason,
+                        debug_dir,
+                        patient_id,
+                        study_uid,
+                        accession_number,
                     )
                 continue
 
@@ -569,7 +609,14 @@ def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List
                 failed_files.append((p, reason, ds))
                 if debug_dir:
                     _save_debug_figure(
-                        ds, p, "FAILED", reason, debug_dir, patient_id, study_uid
+                        ds,
+                        p,
+                        "FAILED",
+                        reason,
+                        debug_dir,
+                        patient_id,
+                        study_uid,
+                        accession_number,
                     )
                 continue
 
@@ -578,7 +625,14 @@ def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List
             # save debug figure for successful DICOMs too
             if debug_dir:
                 _save_debug_figure(
-                    ds, p, "SUCCESS", f"{lat} {vp}", debug_dir, patient_id, study_uid
+                    ds,
+                    p,
+                    "SUCCESS",
+                    f"{lat} {vp}",
+                    debug_dir,
+                    patient_id,
+                    study_uid,
+                    accession_number,
                 )
 
             rows.append(
@@ -642,30 +696,43 @@ def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List
                 f"    {lat}-{vw}: {len(pres_list)} total, {for_pres} for_presentation"
             )
 
-    # if we got NO valid rows, dump debug info and exit
+    # if we got NO valid rows, log the issue but don't raise an error
     if not rows:
-        logger.error(f"\n=== FATAL: No valid DICOMs found in exam {exam_path} ===")
-        logger.error("Dumping first failed DICOM for debugging:")
+        logger.warning(f"\n=== NO VALID DICOMs found in exam {exam_path} ===")
+        logger.warning("Dumping first failed DICOM for debugging:")
         if failed_files:
             p, reason, ds = failed_files[0]
-            logger.error(f"File: {p}")
-            logger.error(f"Reason: {reason}")
+            logger.warning(f"File: {p}")
+            logger.warning(f"Reason: {reason}")
             if ds is not None:
-                logger.error("\nAll DICOM tags:")
+                logger.warning("\nAll DICOM tags:")
                 for elem in ds:
                     if elem.VR == "SQ":
-                        logger.error(f"  {elem.tag} {elem.name}: <sequence>")
+                        logger.warning(f"  {elem.tag} {elem.name}: <sequence>")
                         continue
                     try:
                         value_str = str(elem.value)
                         if len(value_str) > 100:
                             value_str = value_str[:100] + "..."
-                        logger.error(f"  {elem.tag} {elem.name}: {value_str}")
+                        logger.warning(f"  {elem.tag} {elem.name}: {value_str}")
                     except Exception:
-                        logger.error(f"  {elem.tag} {elem.name}: <cannot display>")
-        raise RuntimeError(f"No valid DICOMs with laterality/view in exam {exam_path}")
+                        logger.warning(f"  {elem.tag} {elem.name}: <cannot display>")
 
-    return rows
+        # return empty rows and exam status
+        return {
+            "rows": [],
+            "exam_status": "no_valid_dicoms",
+            "total_files": len(dcm_files),
+            "failed_files": len(failed_files),
+        }
+
+    # return successful exam data
+    return {
+        "rows": rows,
+        "exam_status": "success",
+        "total_files": len(dcm_files),
+        "failed_files": len(failed_files),
+    }
 
 
 def discover_dicoms(
@@ -714,6 +781,13 @@ def discover_dicoms(
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
     all_rows = []
+    exam_stats = {
+        "successful_exams": 0,
+        "failed_exams": 0,
+        "total_files": 0,
+        "failed_files": 0,
+    }
+
     with ProcessPoolExecutor(max_workers=workers) as executor:
         futures = {
             executor.submit(_process_exam_dir, exam_path, debug_dir): exam_path
@@ -727,30 +801,44 @@ def discover_dicoms(
         ):
             exam_path = futures[future]
             try:
-                rows = future.result()
-                all_rows.extend(rows)
+                result = future.result()
+                all_rows.extend(result["rows"])
+                exam_stats["total_files"] += result["total_files"]
+                exam_stats["failed_files"] += result["failed_files"]
+
+                if result["exam_status"] == "success":
+                    exam_stats["successful_exams"] += 1
+                else:
+                    exam_stats["failed_exams"] += 1
+
             except Exception as e:
                 logger.error(f"failed to process {exam_path}: {e}")
-                raise  # re-raise to stop execution for debugging
+                exam_stats["failed_exams"] += 1
+                # don't re-raise, just continue processing
 
     logger.info(f"collected metadata from {len(all_rows)} DICOM files")
-    df = pd.DataFrame(all_rows)
-    if df.empty:
-        raise RuntimeError("no DICOMs found")
+    df = pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
 
     # print summary statistics
+    logger.info("\n=== PROCESSING SUMMARY ===")
+    logger.info(f"Total exams processed: {len(exam_dirs)}")
+    logger.info(f"  - Successful exams: {exam_stats['successful_exams']}")
+    logger.info(f"  - Failed exams (no valid DICOMs): {exam_stats['failed_exams']}")
+    logger.info(f"Total DICOM files processed: {exam_stats['total_files']}")
+    logger.info(f"  - Successfully processed: {len(all_rows)}")
+    logger.info(f"  - Failed/skipped: {exam_stats['failed_files']}")
+
     if not df.empty:
-        logger.info("\n=== PROCESSING SUMMARY ===")
-        logger.info(f"Total exams processed: {len(exam_dirs)}")
-        logger.info(f"Total DICOMs processed: {len(all_rows)}")
-        logger.info(f"Unique patients: {df['patient_id'].nunique()}")
-        logger.info(f"Unique exams: {df['exam_id'].nunique()}")
+        logger.info(f"Unique patients with valid DICOMs: {df['patient_id'].nunique()}")
+        logger.info(f"Unique exams with valid DICOMs: {df['exam_id'].nunique()}")
 
         # view breakdown
         view_counts = df.groupby(["laterality", "view"]).size()
         logger.info("Views found:")
         for (lat, view), count in view_counts.items():
             logger.info(f"  {lat}-{view}: {count} files")
+    else:
+        logger.warning("No valid DICOMs found in any exam!")
 
     return df
 
