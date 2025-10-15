@@ -135,7 +135,10 @@ def load_progress_state(state_file: Path) -> Tuple[int, List[Path]]:
 def move_exam_to_modality_directory(
     exam_path: Path, base_modality: str, dry_run: bool = False
 ) -> bool:
-    """Move an exam to its appropriate modality directory.
+    """Move an exam to its appropriate modality directory using atomic move operation.
+
+    Uses shutil.move() which performs a metadata-only operation on the same filesystem,
+    making it much faster than copy+delete operations.
 
     Returns:
         True if exam was moved (or would be moved in dry run), False if move failed
@@ -164,24 +167,9 @@ def move_exam_to_modality_directory(
         # Create parent directories
         new_patient_dir.mkdir(parents=True, exist_ok=True)
 
-        # Use atomic move: copy first, then delete only if copy succeeds
-        logger.info(f"Copying {base_modality} exam to {new_exam_path}")
-        shutil.copytree(str(exam_path), str(new_exam_path), dirs_exist_ok=True)
-
-        # Verify the copy was successful
-        copied_files = list(new_exam_path.rglob("*.dcm"))
-        original_files = list(exam_path.rglob("*.dcm"))
-
-        if len(copied_files) != len(original_files):
-            logger.error(
-                f"Copy verification failed: {len(copied_files)} vs {len(original_files)} files"
-            )
-            shutil.rmtree(str(new_exam_path), ignore_errors=True)
-            return False
-
-        # Only delete original if copy was successful
-        logger.info(f"Copy successful, removing original from {exam_path}")
-        shutil.rmtree(str(exam_path))
+        # Use atomic move operation (metadata-only on same filesystem)
+        logger.info(f"Moving {base_modality} exam from {exam_path} to {new_exam_path}")
+        shutil.move(str(exam_path), str(new_exam_path))
         logger.info(f"Successfully moved {base_modality} exam to {new_exam_path}")
 
         return True
