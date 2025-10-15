@@ -44,20 +44,17 @@ Notes
 
 """
 
-from __future__ import annotations
-
 import argparse
 import hashlib
 import logging
 import os
-import shutil
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
 import matplotlib
+import psutil
 
 matplotlib.use("Agg")  # non-interactive backend
 import matplotlib.pyplot as plt
@@ -73,9 +70,19 @@ from pydicom.tag import Tag
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from metadata_utils import extract_base_modality
-
 logger = logging.getLogger(__name__)
+
+
+def log_memory_usage(context: str = "") -> None:
+    """Log current memory usage for debugging."""
+    try:
+        process = psutil.Process()
+        memory_info = process.memory_info()
+        memory_mb = memory_info.rss / 1024 / 1024
+        logger.debug(f"Memory usage {context}: {memory_mb:.1f} MB")
+    except Exception:
+        pass  # don't fail if psutil isn't available
+
 
 # hard requirements mirrored from Mirai
 IMG_W = 1664
@@ -131,22 +138,33 @@ VIEWS_COLS = [
 ]
 
 
-@dataclass(frozen=True)
 class PreprocessConfig:
     """Immutable configuration for preprocessing.
 
     All paths are required. No defaults to avoid accidental misconfiguration.
     """
 
-    raw_dir: Path
-    sot_dir: Path
-    out_dir: Path
-    genotype_csv: Path
-    site: str
-    workers: int
-    summary: bool
-    max_exams: Optional[int]
-    debug_dir: Optional[Path]
+    def __init__(
+        self,
+        raw_dir,
+        sot_dir,
+        out_dir,
+        genotype_csv,
+        site,
+        workers,
+        summary,
+        max_exams,
+        debug_dir,
+    ):
+        self.raw_dir = raw_dir
+        self.sot_dir = sot_dir
+        self.out_dir = out_dir
+        self.genotype_csv = genotype_csv
+        self.site = site
+        self.workers = workers
+        self.summary = summary
+        self.max_exams = max_exams
+        self.debug_dir = debug_dir
 
 
 # ------------- DICOM helpers -------------
@@ -472,291 +490,275 @@ def _save_debug_figure(
         logger.warning(f"    Failed to save debug figure for {path.name}: {e}")
 
 
-def _check_and_move_non_mammogram_exam(exam_path: Path) -> bool:
-    """Check if exam is mammogram; if not, move to modality-specific directory.
-
-    Returns True if exam was moved (non-mammogram), False if it's a mammogram.
-    """
-    # check if exam path still exists (might have been moved by another process)
-    if not exam_path.exists():
-        logger.warning(f"Exam path {exam_path} no longer exists, skipping")
-        return True
-
-    # collect first dicom file to check modality
-    first_dcm = None
-    for root, dirs, files in os.walk(exam_path):
-        for name in files:
-            if name.endswith(".dcm"):
-                first_dcm = Path(root) / name
-                break
-        if first_dcm:
-            break
-
-    if not first_dcm:
-        logger.warning(f"No DICOM files found in {exam_path}, skipping modality check")
-        return False
-
-    # read modality from first DICOM
-    try:
-        ds = read_dicom(first_dcm)
-        modality_raw = get_tag(ds, (0x0008, 0x0060), default="")
-        study_description = get_tag(ds, (0x0008, 0x1030), default="")
-        base_modality = extract_base_modality(modality_raw, study_description)
-
-        # if it's a mammogram, don't move
-        if base_modality == "MG":
-            return False
-
-        # move to modality-specific directory
-        # structure: /gpfs/data/huo-lab/Image/ChiMEC/{modality}/patient_id/exam_id
-        patient_dir = exam_path.parent
-        patient_id = patient_dir.name
-        exam_id = exam_path.name
-        chimec_root = patient_dir.parent
-
-        # create modality directory
-        modality_root = chimec_root / base_modality
-        new_patient_dir = modality_root / patient_id
-        new_exam_path = new_patient_dir / exam_id
-
-        # move the exam directory
-        logger.info(f"Moving non-mammogram exam from {exam_path} to {new_exam_path}")
-        new_patient_dir.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(exam_path), str(new_exam_path))
-        logger.info(f"Successfully moved {base_modality} exam to {new_exam_path}")
-
-        return True
-
-    except Exception as e:
-        logger.error(f"Failed to check/move exam {exam_path}: {e}")
-        return False
-
-
 def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List[Dict]:
     """Process all DICOMs in a single exam directory.
 
     walks subdirectories under exam_path to find all .dcm files
     """
-    if debug_dir:
-        logger.info(f"\n=== Processing exam: {exam_path} ===")
-
-    # check modality and move if not mammogram
-    if _check_and_move_non_mammogram_exam(exam_path):
+    try:
+        log_memory_usage(f"start_exam_{exam_path.name}")
         if debug_dir:
-            logger.info(f"Exam {exam_path} is not a mammogram, skipping preprocessing")
-        return []
+            logger.info(f"\n=== Processing exam: {exam_path} ===")
 
-    # collect all dicom files first
-    dcm_files = []
-    for root, dirs, files in os.walk(exam_path):
-        for name in files:
-            if name.endswith(".dcm"):
-                dcm_files.append(Path(root) / name)
-
-    if debug_dir:
-        logger.info(f"Found {len(dcm_files)} DICOM files in exam")
-
-    rows = []
-    failed_files = []
-
-    for p in dcm_files:
-        try:
-            ds = read_dicom(p)
-            patient_id = get_tag(ds, (0x0010, 0x0020))
-            study_uid = get_tag(ds, (0x0020, 0x000D))
-            sop_uid = get_tag(ds, (0x0008, 0x0018))
-            accession_number = get_tag(ds, (0x0008, 0x0050))
-
-            if patient_id is None or study_uid is None or sop_uid is None:
-                reason = "missing patient/study/SOP IDs"
-                if debug_dir:
-                    logger.warning(f"  SKIP: {p.name} - {reason}")
-                failed_files.append((p, reason, ds))
-                if debug_dir:
-                    _save_debug_figure(
-                        ds,
-                        p,
-                        "FAILED",
-                        reason,
-                        debug_dir,
-                        patient_id,
-                        study_uid,
-                        accession_number,
-                    )
-                continue
-
-            # check presentation intent first
-            present = is_for_presentation(ds)
-            if not present:
-                reason = "not for presentation"
-                if debug_dir:
-                    logger.warning(f"  SKIP: {p.name} - {reason}")
-                failed_files.append((p, reason, ds))
-                if debug_dir:
-                    _save_debug_figure(
-                        ds,
-                        p,
-                        "FAILED",
-                        reason,
-                        debug_dir,
-                        patient_id,
-                        study_uid,
-                        accession_number,
-                    )
-                continue
-
-            # try to get laterality and view
-            try:
-                lat, vp = infer_view_fields(ds)
-            except ValueError as e:
-                reason = str(e)
-                if debug_dir:
-                    logger.warning(f"  SKIP: {p.name} - {reason}")
-                failed_files.append((p, reason, ds))
-                if debug_dir:
-                    _save_debug_figure(
-                        ds,
-                        p,
-                        "FAILED",
-                        reason,
-                        debug_dir,
-                        patient_id,
-                        study_uid,
-                        accession_number,
-                    )
-                continue
-
-            if debug_dir:
-                logger.info(f"  OK: {p.name} - {lat} {vp}, for_presentation={present}")
-
-            # save debug figure for successful DICOMs too
-            if debug_dir:
-                _save_debug_figure(
-                    ds,
-                    p,
-                    "SUCCESS",
-                    f"{lat} {vp}",
-                    debug_dir,
-                    patient_id,
-                    study_uid,
-                    accession_number,
-                )
-
-            rows.append(
-                {
-                    "patient_id": patient_id,
-                    "exam_id": study_uid,
-                    "sop_instance_uid": sop_uid,
-                    "laterality": lat,
-                    "view": vp,
-                    "dicom_path": str(p.resolve()),
-                    "rows": int(ds.Rows),
-                    "cols": int(ds.Columns),
-                    "photometric_interpretation": str(
-                        ds.get("PhotometricInterpretation", "")
-                    ),
-                    "bits_stored": int(
-                        ds.get("BitsStored", ds.get("BitsAllocated", 16))
-                    ),
-                    "acquisition_time": get_tag(ds, (0x0008, 0x0032), ""),
-                    "is_marked_up": is_marked_up(ds),
-                    "has_implant": has_implant(ds),
-                    "for_presentation": present,
-                    "sha256": hash_file_sha256(p),
-                    "device_manufacturer": str(ds.get("Manufacturer", "")),
-                    "device_model": str(ds.get("ManufacturerModelName", "")),
-                    "study_date": get_tag(ds, (0x0008, 0x0020), ""),
-                    "accession_number": get_tag(ds, (0x0008, 0x0050), ""),
-                }
-            )
-        except Exception as e:
-            if debug_dir:
-                logger.error(f"  ERROR: {p.name} - unexpected error: {e}")
-            failed_files.append((p, f"unexpected error: {e}", None))
-
-    if debug_dir:
-        logger.info("\nExam summary:")
-        logger.info(f"  Total files: {len(dcm_files)}")
-        logger.info(f"  Successfully processed: {len(rows)}")
-        logger.info(f"  Failed/skipped: {len(failed_files)}")
-
-        # report failure reasons
-        if failed_files:
-            from collections import Counter
-
-            failure_reasons = Counter()
-            for p, reason, ds in failed_files:
-                failure_reasons[reason] += 1
-            logger.info("  Failure reasons:")
-            for reason, count in failure_reasons.most_common():
-                logger.info(f"    {reason}: {count} files")
-
-    if rows and debug_dir:
-        views = {}
-        for r in rows:
-            key = (r["laterality"], r["view"])
-            if key not in views:
-                views[key] = []
-            views[key].append(r["for_presentation"])
-        logger.info("  Views found:")
-        for (lat, vw), pres_list in sorted(views.items()):
-            for_pres = sum(pres_list)
-            logger.info(
-                f"    {lat}-{vw}: {len(pres_list)} total, {for_pres} for_presentation"
-            )
-
-    # if we got NO valid rows, log the issue but don't raise an error
-    if not rows and debug_dir:
-        logger.warning(f"\n=== NO VALID DICOMs found in exam {exam_path} ===")
-        logger.warning("Dumping first failed DICOM for debugging:")
-        if failed_files:
-            p, reason, ds = failed_files[0]
-            logger.warning(f"File: {p}")
-            logger.warning(f"Reason: {reason}")
-            if ds is not None:
-                logger.warning("\nAll DICOM tags:")
-                for elem in ds:
-                    if elem.VR == "SQ":
-                        logger.warning(f"  {elem.tag} {elem.name}: <sequence>")
-                        continue
-                    try:
-                        value_str = str(elem.value)
-                        if len(value_str) > 100:
-                            value_str = value_str[:100] + "..."
-                        logger.warning(f"  {elem.tag} {elem.name}: {value_str}")
-                    except Exception:
-                        logger.warning(f"  {elem.tag} {elem.name}: <cannot display>")
-
-        # return empty rows and exam status
+        # check if exam path still exists (race condition protection)
+        if not exam_path.exists():
+            logger.warning(f"Exam path {exam_path} no longer exists, skipping")
+            return {
+                "rows": [],
+                "exam_status": "path_not_found",
+                "total_files": 0,
+                "failed_files": 0,
+                "total_dicoms": 0,
+                "valid_dicoms": 0,
+                "for_presentation_dicoms": 0,
+                "valid_views": 0,
+                "has_four_views": False,
+            }
+    except Exception as e:
+        logger.error(f"Error in exam setup for {exam_path}: {e}")
         return {
             "rows": [],
-            "exam_status": "no_valid_dicoms",
-            "total_files": len(dcm_files),
-            "failed_files": len(failed_files),
-            "total_dicoms": len(dcm_files),
+            "exam_status": "setup_error",
+            "total_files": 0,
+            "failed_files": 0,
+            "total_dicoms": 0,
             "valid_dicoms": 0,
             "for_presentation_dicoms": 0,
             "valid_views": 0,
             "has_four_views": False,
         }
 
-    # check if exam has all four required views (L-CC, L-MLO, R-CC, R-MLO)
-    view_keys = set((r["laterality"], r["view"]) for r in rows)
-    required_views = {("L", "CC"), ("L", "MLO"), ("R", "CC"), ("R", "MLO")}
-    has_four_views = len(view_keys & required_views) == 4
+    try:
+        # collect all dicom files first
+        dcm_files = []
+        for root, dirs, files in os.walk(exam_path):
+            for name in files:
+                if name.endswith(".dcm"):
+                    dcm_files.append(Path(root) / name)
 
-    # return successful exam data
-    return {
-        "rows": rows,
-        "exam_status": "success",
-        "total_files": len(dcm_files),
-        "failed_files": len(failed_files),
-        "total_dicoms": len(dcm_files),
-        "valid_dicoms": len(rows),
-        "for_presentation_dicoms": sum(r["for_presentation"] for r in rows),
-        "valid_views": len(view_keys),
-        "has_four_views": has_four_views,
-    }
+        if debug_dir:
+            logger.info(f"Found {len(dcm_files)} DICOM files in exam")
+
+        rows = []
+        failed_files = []
+
+        for p in dcm_files:
+            try:
+                ds = read_dicom(p)
+                patient_id = get_tag(ds, (0x0010, 0x0020))
+                study_uid = get_tag(ds, (0x0020, 0x000D))
+                sop_uid = get_tag(ds, (0x0008, 0x0018))
+                accession_number = get_tag(ds, (0x0008, 0x0050))
+
+                if patient_id is None or study_uid is None or sop_uid is None:
+                    reason = "missing patient/study/SOP IDs"
+                    if debug_dir:
+                        logger.warning(f"  SKIP: {p.name} - {reason}")
+                    failed_files.append((p, reason, ds))
+                    if debug_dir:
+                        _save_debug_figure(
+                            ds,
+                            p,
+                            "FAILED",
+                            reason,
+                            debug_dir,
+                            patient_id,
+                            study_uid,
+                            accession_number,
+                        )
+                    continue
+
+                # check presentation intent first
+                present = is_for_presentation(ds)
+                if not present:
+                    reason = "not for presentation"
+                    if debug_dir:
+                        logger.warning(f"  SKIP: {p.name} - {reason}")
+                    failed_files.append((p, reason, ds))
+                    if debug_dir:
+                        _save_debug_figure(
+                            ds,
+                            p,
+                            "FAILED",
+                            reason,
+                            debug_dir,
+                            patient_id,
+                            study_uid,
+                            accession_number,
+                        )
+                    continue
+
+                # try to get laterality and view
+                try:
+                    lat, vp = infer_view_fields(ds)
+                except ValueError as e:
+                    reason = str(e)
+                    if debug_dir:
+                        logger.warning(f"  SKIP: {p.name} - {reason}")
+                    failed_files.append((p, reason, ds))
+                    if debug_dir:
+                        _save_debug_figure(
+                            ds,
+                            p,
+                            "FAILED",
+                            reason,
+                            debug_dir,
+                            patient_id,
+                            study_uid,
+                            accession_number,
+                        )
+                    continue
+
+                if debug_dir:
+                    logger.info(
+                        f"  OK: {p.name} - {lat} {vp}, for_presentation={present}"
+                    )
+
+                # save debug figure for successful DICOMs too
+                if debug_dir:
+                    _save_debug_figure(
+                        ds,
+                        p,
+                        "SUCCESS",
+                        f"{lat} {vp}",
+                        debug_dir,
+                        patient_id,
+                        study_uid,
+                        accession_number,
+                    )
+
+                rows.append(
+                    {
+                        "patient_id": patient_id,
+                        "exam_id": study_uid,
+                        "sop_instance_uid": sop_uid,
+                        "laterality": lat,
+                        "view": vp,
+                        "dicom_path": str(p.resolve()),
+                        "rows": int(ds.Rows),
+                        "cols": int(ds.Columns),
+                        "photometric_interpretation": str(
+                            ds.get("PhotometricInterpretation", "")
+                        ),
+                        "bits_stored": int(
+                            ds.get("BitsStored", ds.get("BitsAllocated", 16))
+                        ),
+                        "acquisition_time": get_tag(ds, (0x0008, 0x0032), ""),
+                        "is_marked_up": is_marked_up(ds),
+                        "has_implant": has_implant(ds),
+                        "for_presentation": present,
+                        "sha256": hash_file_sha256(p),
+                        "device_manufacturer": str(ds.get("Manufacturer", "")),
+                        "device_model": str(ds.get("ManufacturerModelName", "")),
+                        "study_date": get_tag(ds, (0x0008, 0x0020), ""),
+                        "accession_number": get_tag(ds, (0x0008, 0x0050), ""),
+                    }
+                )
+            except Exception as e:
+                if debug_dir:
+                    logger.error(f"  ERROR: {p.name} - unexpected error: {e}")
+                failed_files.append((p, f"unexpected error: {e}", None))
+
+        if debug_dir:
+            logger.info("\nExam summary:")
+            logger.info(f"  Total files: {len(dcm_files)}")
+            logger.info(f"  Successfully processed: {len(rows)}")
+            logger.info(f"  Failed/skipped: {len(failed_files)}")
+
+            # report failure reasons
+            if failed_files:
+                from collections import Counter
+
+                failure_reasons = Counter()
+                for p, reason, ds in failed_files:
+                    failure_reasons[reason] += 1
+                logger.info("  Failure reasons:")
+                for reason, count in failure_reasons.most_common():
+                    logger.info(f"    {reason}: {count} files")
+
+        if rows and debug_dir:
+            views = {}
+            for r in rows:
+                key = (r["laterality"], r["view"])
+                if key not in views:
+                    views[key] = []
+                views[key].append(r["for_presentation"])
+            logger.info("  Views found:")
+            for (lat, vw), pres_list in sorted(views.items()):
+                for_pres = sum(pres_list)
+                logger.info(
+                    f"    {lat}-{vw}: {len(pres_list)} total, {for_pres} for_presentation"
+                )
+
+        # if we got NO valid rows, log the issue but don't raise an error
+        if not rows and debug_dir:
+            logger.warning(f"\n=== NO VALID DICOMs found in exam {exam_path} ===")
+            logger.warning("Dumping first failed DICOM for debugging:")
+            if failed_files:
+                p, reason, ds = failed_files[0]
+                logger.warning(f"File: {p}")
+                logger.warning(f"Reason: {reason}")
+                if ds is not None:
+                    logger.warning("\nAll DICOM tags:")
+                    for elem in ds:
+                        if elem.VR == "SQ":
+                            logger.warning(f"  {elem.tag} {elem.name}: <sequence>")
+                            continue
+                        try:
+                            value_str = str(elem.value)
+                            if len(value_str) > 100:
+                                value_str = value_str[:100] + "..."
+                            logger.warning(f"  {elem.tag} {elem.name}: {value_str}")
+                        except Exception:
+                            logger.warning(
+                                f"  {elem.tag} {elem.name}: <cannot display>"
+                            )
+
+            # return empty rows and exam status
+            return {
+                "rows": [],
+                "exam_status": "no_valid_dicoms",
+                "total_files": len(dcm_files),
+                "failed_files": len(failed_files),
+                "total_dicoms": len(dcm_files),
+                "valid_dicoms": 0,
+                "for_presentation_dicoms": 0,
+                "valid_views": 0,
+                "has_four_views": False,
+            }
+
+        # check if exam has all four required views (L-CC, L-MLO, R-CC, R-MLO)
+        view_keys = set((r["laterality"], r["view"]) for r in rows)
+        required_views = {("L", "CC"), ("L", "MLO"), ("R", "CC"), ("R", "MLO")}
+        has_four_views = len(view_keys & required_views) == 4
+
+        # return successful exam data
+        log_memory_usage(f"end_exam_{exam_path.name}")
+        return {
+            "rows": rows,
+            "exam_status": "success",
+            "total_files": len(dcm_files),
+            "failed_files": len(failed_files),
+            "total_dicoms": len(dcm_files),
+            "valid_dicoms": len(rows),
+            "for_presentation_dicoms": sum(r["for_presentation"] for r in rows),
+            "valid_views": len(view_keys),
+            "has_four_views": has_four_views,
+        }
+    except Exception as e:
+        logger.error(f"Unexpected error processing exam {exam_path}: {e}")
+        log_memory_usage(f"error_exam_{exam_path.name}")
+        return {
+            "rows": [],
+            "exam_status": "processing_error",
+            "total_files": 0,
+            "failed_files": 0,
+            "total_dicoms": 0,
+            "valid_dicoms": 0,
+            "for_presentation_dicoms": 0,
+            "valid_views": 0,
+            "has_four_views": False,
+        }
 
 
 def discover_dicoms(
@@ -822,14 +824,20 @@ def discover_dicoms(
         }
         # show progress bar for exam processing (always enabled, regardless of debug_dir)
         for future in tqdm(
-            as_completed(futures),
+            as_completed(futures, timeout=300),  # 5 minute timeout per exam
             total=len(futures),
             desc="processing exams",
             unit="exam",
         ):
             exam_path = futures[future]
             try:
-                result = future.result()
+                result = future.result(timeout=60)  # 1 minute timeout for result
+
+                # handle case where result might be None
+                if result is None:
+                    logger.error(f"got None result for {exam_path}")
+                    continue
+
                 all_rows.extend(result["rows"])
                 exam_stats["total_dicoms"] += result["total_dicoms"]
                 exam_stats["valid_dicoms"] += result["valid_dicoms"]
@@ -843,6 +851,9 @@ def discover_dicoms(
                     if result["has_four_views"]:
                         exam_stats["exams_with_four_views"] += 1
 
+            except TimeoutError:
+                logger.error(f"timeout processing {exam_path}")
+                # don't re-raise, just continue processing
             except Exception as e:
                 logger.error(f"failed to process {exam_path}: {e}")
                 # don't re-raise, just continue processing
@@ -1397,7 +1408,7 @@ def parse_args() -> PreprocessConfig:
         ),
     )
     p.add_argument("--site", dest="site", type=str, default="ucmed")
-    p.add_argument("--workers", dest="workers", type=int, default=8)
+    p.add_argument("--workers", dest="workers", type=int, default=4)
     p.add_argument("--summary", dest="summary", action="store_true")
     p.add_argument(
         "--max-exams",

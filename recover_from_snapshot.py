@@ -62,7 +62,7 @@ def safe_copy_exam(source_exam: Path, dest_exam: Path, dry_run: bool = False) ->
     Returns True if copy was successful (or would be in dry-run mode).
     """
     if dry_run:
-        logger.info(f"[DRY RUN] Would copy: {source_exam} -> {dest_exam}")
+        # Don't log individual exams in dry-run mode to avoid overwhelming output
         return True
 
     # Check if destination already exists
@@ -108,6 +108,11 @@ def safe_copy_exam(source_exam: Path, dest_exam: Path, dry_run: bool = False) ->
         return False
 
 
+def get_exam_key(patient_id: str, exam_id: str) -> str:
+    """Create a unique key for an exam."""
+    return f"{patient_id}/{exam_id}"
+
+
 def find_missing_exams(snapshot_dir: Path, current_dir: Path):
     """Find exams that exist in snapshot but are missing from current directory.
 
@@ -144,6 +149,133 @@ def find_missing_exams(snapshot_dir: Path, current_dir: Path):
                 missing_exams[patient_id].append(exam_dir)
 
     return missing_exams
+
+
+def find_exams_in_modality_dirs(current_dir: Path, modalities=None):
+    """Find all exams in modality-specific directories.
+
+    Returns a dict mapping exam_key -> modality_name.
+    """
+    if modalities is None:
+        modalities = ["CR", "MR", "US", "Other"]
+
+    modality_exams = {}
+
+    logger.info("\nVerifying exams in modality directories...")
+
+    for modality in modalities:
+        modality_dir = current_dir / modality
+
+        if not modality_dir.exists():
+            continue
+
+        # Find all patient directories in modality dir
+        for patient_dir in modality_dir.iterdir():
+            if not patient_dir.is_dir():
+                continue
+
+            patient_id = patient_dir.name
+
+            # Find all exam directories
+            for exam_dir in patient_dir.iterdir():
+                if not exam_dir.is_dir():
+                    continue
+
+                exam_id = exam_dir.name
+                exam_key = get_exam_key(patient_id, exam_id)
+
+                if exam_key in modality_exams:
+                    logger.warning(
+                        f"Duplicate exam found: {exam_key} in both "
+                        f"{modality_exams[exam_key]} and {modality}"
+                    )
+                else:
+                    modality_exams[exam_key] = modality
+
+    return modality_exams
+
+
+def verify_against_modality_dirs(missing_exams_dict, current_dir: Path):
+    """Verify that missing exams match what's in modality directories.
+
+    Returns True if verification passes, False otherwise.
+    """
+    # Convert missing exams to set of exam keys
+    missing_keys = set()
+    for patient_id, exam_list in missing_exams_dict.items():
+        for exam_path in exam_list:
+            exam_id = exam_path.name
+            exam_key = get_exam_key(patient_id, exam_id)
+            missing_keys.add(exam_key)
+
+    # Find exams in modality directories
+    modality_exams = find_exams_in_modality_dirs(current_dir)
+    modality_keys = set(modality_exams.keys())
+
+    # Compare the sets
+    in_both = missing_keys & modality_keys
+    missing_not_in_modality = missing_keys - modality_keys
+    in_modality_not_missing = modality_keys - missing_keys
+
+    # Report results
+    logger.info("\n" + "=" * 80)
+    logger.info("VERIFICATION AGAINST MODALITY DIRECTORIES")
+    logger.info("=" * 80)
+    logger.info(f"Exams to recover: {len(missing_keys)}")
+    logger.info(f"Exams in modality directories: {len(modality_keys)}")
+    logger.info(f"Exams in both (correctly moved): {len(in_both)}")
+
+    # Breakdown by modality
+    if modality_exams:
+        logger.info("\nBreakdown by modality:")
+        modality_counts = defaultdict(int)
+        for exam_key in modality_keys:
+            modality_counts[modality_exams[exam_key]] += 1
+
+        for modality, count in sorted(modality_counts.items()):
+            logger.info(f"  {modality}: {count} exams")
+
+    verification_passed = True
+
+    if missing_not_in_modality:
+        logger.error(
+            f"\n✗ WARNING: {len(missing_not_in_modality)} exams are in snapshot but NOT in patient dirs OR modality dirs!"
+        )
+        logger.error("These exams exist in the snapshot but are missing from BOTH:")
+        logger.error("  1. Patient directories (e.g., /ChiMEC/12345678/2O12345)")
+        logger.error("  2. Modality directories (e.g., /ChiMEC/CR/, /ChiMEC/MR/, etc.)")
+        logger.error("\nThese exams appear to be LOST and need recovery. First 10:")
+        for exam_key in sorted(missing_not_in_modality)[:10]:
+            logger.error(f"  {exam_key}")
+
+        if len(missing_not_in_modality) > 10:
+            logger.error(f"  ... and {len(missing_not_in_modality) - 10} more")
+
+        verification_passed = False
+
+    if in_modality_not_missing:
+        logger.warning(
+            f"\n⚠ WARNING: {len(in_modality_not_missing)} exams in modality directories are NOT missing from patient dirs!"
+        )
+        logger.warning("These are duplicates that exist in both locations. First 10:")
+        for exam_key in sorted(in_modality_not_missing)[:10]:
+            modality = modality_exams[exam_key]
+            logger.warning(f"  {exam_key} (in {modality})")
+
+        if len(in_modality_not_missing) > 10:
+            logger.warning(f"  ... and {len(in_modality_not_missing) - 10} more")
+
+        verification_passed = False
+
+    if verification_passed and len(in_both) == len(missing_keys):
+        logger.info(
+            "\n✓ VERIFICATION PASSED: All exams to recover are accounted for in modality directories"
+        )
+        logger.info(
+            "✓ After recovery, it will be safe to delete the modality directories"
+        )
+
+    return verification_passed
 
 
 def main():
@@ -255,6 +387,9 @@ Examples:
     if len(missing_exams) > 20:
         logger.info(f"  ... and {len(missing_exams) - 20} more patients")
 
+    # Verify against modality directories
+    verify_against_modality_dirs(missing_exams, args.current_dir)
+
     # Apply max-exams limit if specified
     if args.max_exams:
         logger.info(f"\nLimiting recovery to {args.max_exams} exams (--max-exams)")
@@ -302,7 +437,10 @@ Examples:
 
     # Final summary
     logger.info("\n" + "=" * 80)
-    logger.info("RECOVERY COMPLETE")
+    if args.dry_run:
+        logger.info("DRY RUN COMPLETE")
+    else:
+        logger.info("RECOVERY COMPLETE")
     logger.info("=" * 80)
 
     if args.dry_run:
