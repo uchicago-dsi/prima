@@ -3,12 +3,19 @@
 # SHARED LOGIC for exam fingerprinting.
 
 import hashlib
+import logging
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 
 import pydicom
+
+# suppress pydicom VR UI validation warnings for non-standard UIDs
+warnings.filterwarnings("ignore", message=".*Invalid value for VR UI.*", append=True)
+# also set pydicom logging level to suppress warnings at the source
+logging.getLogger("pydicom.valuerep").setLevel(logging.ERROR)
 
 
 @dataclass(frozen=True)
@@ -44,7 +51,6 @@ def create_exam_fingerprint(exam_path: Path) -> Tuple[Optional[ExamFingerprint],
     returns (ExamFingerprint|None, reason)
     """
     import logging
-    import time
 
     if not exam_path.is_dir():
         return None, "Path is not a directory."

@@ -19,9 +19,12 @@ References: Mirai README + supplementary material
 This script does five things:
 1) indexes DICOMs and selects the canonical four views per exam
 2) performs minimal QC and prints a summary
-3) writes SoT Parquet tables (exams, views, cohort) joined with genotype
+3) writes SoT Parquet tables (exams, views, cohort) for all full-quad exams
 4) writes a Zarr cache per exam with four uint16 arrays (L_CC, L_MLO, R_CC, R_MLO)
 5) emits a manifest.parquet pointing to the per-exam Zarr groups
+
+Supports incremental processing: use --incremental to only process new exams
+and append to existing SoT tables. Genotype filtering is done downstream.
 
 Usage example
 -------------
@@ -30,7 +33,7 @@ python prima_pipeline.py preprocess \
   --sot /data/prima/sot \
   --out /data/prima/mirai-prep
 
-Defaults: --site ucmed, --workers 8, --genotype uses ChiMEC 2025 October phenotype CSV
+Defaults: --site ucmed, --workers 8
 
 Dependencies (install explicitly):
   pip install pydicom numpy pandas pyarrow zarr numcodecs opencv-python-headless einops tqdm
@@ -46,9 +49,13 @@ Notes
 
 import argparse
 import hashlib
+import json
 import logging
 import os
+import signal
 import sys
+import time
+import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -70,7 +77,27 @@ from pydicom.tag import Tag
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
+# suppress pydicom VR UI validation warnings for non-standard UIDs
+warnings.filterwarnings("ignore", message=".*Invalid value for VR UI.*", append=True)
+# also set pydicom logging level to suppress warnings at the source
+logging.getLogger("pydicom.valuerep").setLevel(logging.ERROR)
+
 logger = logging.getLogger(__name__)
+
+# global flag for graceful shutdown
+shutdown_requested = False
+
+
+def signal_handler(signum, frame):
+    """handle SIGINT/SIGTERM gracefully"""
+    global shutdown_requested
+    logger.info(f"received signal {signum}, initiating graceful shutdown...")
+    shutdown_requested = True
+
+
+# register signal handlers
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 
 def log_memory_usage(context: str = "") -> None:
@@ -82,6 +109,15 @@ def log_memory_usage(context: str = "") -> None:
         logger.debug(f"Memory usage {context}: {memory_mb:.1f} MB")
     except Exception:
         pass  # don't fail if psutil isn't available
+
+
+def get_memory_usage_mb() -> float:
+    """Get current memory usage in MB, return 0 if unavailable."""
+    try:
+        process = psutil.Process()
+        return process.memory_info().rss / 1024 / 1024
+    except Exception:
+        return 0.0
 
 
 # hard requirements mirrored from Mirai
@@ -112,7 +148,6 @@ EXAMS_COLS = [
     "n_views_present",
     "has_full_quad",
     "ibroker_study_id",
-    "has_geno",
 ]
 
 VIEWS_COLS = [
@@ -137,6 +172,15 @@ VIEWS_COLS = [
     "accession_number",
 ]
 
+DICOM_TAGS_COLS = [
+    "sop_instance_uid",
+    "tag_group",
+    "tag_element",
+    "tag_keyword",
+    "vr",
+    "value",
+]
+
 
 class PreprocessConfig:
     """Immutable configuration for preprocessing.
@@ -149,22 +193,26 @@ class PreprocessConfig:
         raw_dir,
         sot_dir,
         out_dir,
-        genotype_csv,
         site,
         workers,
         summary,
         max_exams,
         debug_dir,
+        chunk_size=100,
+        no_resume=False,
+        incremental=False,
     ):
         self.raw_dir = raw_dir
         self.sot_dir = sot_dir
         self.out_dir = out_dir
-        self.genotype_csv = genotype_csv
         self.site = site
         self.workers = workers
         self.summary = summary
         self.max_exams = max_exams
         self.debug_dir = debug_dir
+        self.chunk_size = chunk_size
+        self.no_resume = no_resume
+        self.incremental = incremental
 
 
 # ------------- DICOM helpers -------------
@@ -209,6 +257,55 @@ def get_tag(
         v = ds[t].value
         return str(v)
     return default
+
+
+def extract_all_tags(ds: FileDataset, sop_instance_uid: str) -> List[Dict[str, str]]:
+    """Extract all DICOM tags as rows for a table structure.
+
+    parameters
+    ----------
+    ds : FileDataset
+        dicom dataset
+    sop_instance_uid : str
+        unique identifier to link tags to the view
+
+    returns
+    -------
+    List[Dict[str, str]]
+        list of tag records, each with sop_instance_uid, tag_group, tag_element, tag_keyword, vr, and value
+    """
+    tag_rows = []
+    for tag in ds.dir():
+        try:
+            element = ds[tag]
+            tag_keyword = element.keyword if hasattr(element, "keyword") else ""
+
+            # convert value to string, handling special cases
+            if hasattr(element, "value"):
+                if element.VR == "SQ":
+                    value_str = f"<Sequence with {len(element.value)} items>"
+                elif element.VR in ["OB", "OW", "OF", "OD"]:
+                    value_str = f"<Binary data: {len(element.value)} bytes>"
+                else:
+                    value_str = str(element.value)
+            else:
+                value_str = ""
+
+            tag_rows.append(
+                {
+                    "sop_instance_uid": sop_instance_uid,
+                    "tag_group": f"{element.tag.group:04X}",
+                    "tag_element": f"{element.tag.element:04X}",
+                    "tag_keyword": tag_keyword,
+                    "vr": element.VR if hasattr(element, "VR") else "",
+                    "value": value_str,
+                }
+            )
+        except Exception:
+            # skip problematic tags silently
+            pass
+
+    return tag_rows
 
 
 def infer_view_fields(ds: FileDataset) -> Tuple[str, str]:
@@ -490,7 +587,9 @@ def _save_debug_figure(
         logger.warning(f"    Failed to save debug figure for {path.name}: {e}")
 
 
-def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List[Dict]:
+def _process_exam_dir(
+    exam_path: Path, debug_dir: Optional[Path] = None
+) -> Tuple[List[Dict], List[Dict]]:
     """Process all DICOMs in a single exam directory.
 
     walks subdirectories under exam_path to find all .dcm files
@@ -505,6 +604,7 @@ def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List
             logger.warning(f"Exam path {exam_path} no longer exists, skipping")
             return {
                 "rows": [],
+                "tag_rows": [],
                 "exam_status": "path_not_found",
                 "total_files": 0,
                 "failed_files": 0,
@@ -518,6 +618,7 @@ def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List
         logger.error(f"Error in exam setup for {exam_path}: {e}")
         return {
             "rows": [],
+            "tag_rows": [],
             "exam_status": "setup_error",
             "total_files": 0,
             "failed_files": 0,
@@ -540,6 +641,7 @@ def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List
             logger.info(f"Found {len(dcm_files)} DICOM files in exam")
 
         rows = []
+        tag_rows = []
         failed_files = []
 
         for p in dcm_files:
@@ -627,33 +729,37 @@ def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List
                         accession_number,
                     )
 
-                rows.append(
-                    {
-                        "patient_id": patient_id,
-                        "exam_id": study_uid,
-                        "sop_instance_uid": sop_uid,
-                        "laterality": lat,
-                        "view": vp,
-                        "dicom_path": str(p.resolve()),
-                        "rows": int(ds.Rows),
-                        "cols": int(ds.Columns),
-                        "photometric_interpretation": str(
-                            ds.get("PhotometricInterpretation", "")
-                        ),
-                        "bits_stored": int(
-                            ds.get("BitsStored", ds.get("BitsAllocated", 16))
-                        ),
-                        "acquisition_time": get_tag(ds, (0x0008, 0x0032), ""),
-                        "is_marked_up": is_marked_up(ds),
-                        "has_implant": has_implant(ds),
-                        "for_presentation": present,
-                        "sha256": hash_file_sha256(p),
-                        "device_manufacturer": str(ds.get("Manufacturer", "")),
-                        "device_model": str(ds.get("ManufacturerModelName", "")),
-                        "study_date": get_tag(ds, (0x0008, 0x0020), ""),
-                        "accession_number": get_tag(ds, (0x0008, 0x0050), ""),
-                    }
-                )
+                # prepare base row data
+                row_data = {
+                    "patient_id": patient_id,
+                    "exam_id": study_uid,
+                    "sop_instance_uid": sop_uid,
+                    "laterality": lat,
+                    "view": vp,
+                    "dicom_path": str(p.resolve()),
+                    "rows": int(ds.Rows),
+                    "cols": int(ds.Columns),
+                    "photometric_interpretation": str(
+                        ds.get("PhotometricInterpretation", "")
+                    ),
+                    "bits_stored": int(
+                        ds.get("BitsStored", ds.get("BitsAllocated", 16))
+                    ),
+                    "acquisition_time": get_tag(ds, (0x0008, 0x0032), ""),
+                    "is_marked_up": is_marked_up(ds),
+                    "has_implant": has_implant(ds),
+                    "for_presentation": present,
+                    "sha256": hash_file_sha256(p),
+                    "device_manufacturer": str(ds.get("Manufacturer", "")),
+                    "device_model": str(ds.get("ManufacturerModelName", "")),
+                    "study_date": get_tag(ds, (0x0008, 0x0020), ""),
+                    "accession_number": get_tag(ds, (0x0008, 0x0050), ""),
+                }
+
+                rows.append(row_data)
+
+                # extract all DICOM tags for this image
+                tag_rows.extend(extract_all_tags(ds, sop_uid))
             except Exception as e:
                 if debug_dir:
                     logger.error(f"  ERROR: {p.name} - unexpected error: {e}")
@@ -717,6 +823,7 @@ def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List
             # return empty rows and exam status
             return {
                 "rows": [],
+                "tag_rows": [],
                 "exam_status": "no_valid_dicoms",
                 "total_files": len(dcm_files),
                 "failed_files": len(failed_files),
@@ -736,6 +843,7 @@ def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List
         log_memory_usage(f"end_exam_{exam_path.name}")
         return {
             "rows": rows,
+            "tag_rows": tag_rows,
             "exam_status": "success",
             "total_files": len(dcm_files),
             "failed_files": len(failed_files),
@@ -750,6 +858,7 @@ def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List
         log_memory_usage(f"error_exam_{exam_path.name}")
         return {
             "rows": [],
+            "tag_rows": [],
             "exam_status": "processing_error",
             "total_files": 0,
             "failed_files": 0,
@@ -761,17 +870,254 @@ def _process_exam_dir(exam_path: Path, debug_dir: Optional[Path] = None) -> List
         }
 
 
+def list_checkpoints(
+    checkpoint_dir: Path = Path("data/discovery_checkpoints"),
+) -> List[Dict]:
+    """list all available checkpoints with metadata"""
+    if not checkpoint_dir.exists():
+        logger.info("no checkpoint directory found")
+        return []
+
+    checkpoints = []
+    for checkpoint_file in checkpoint_dir.glob("discovery_*.json"):
+        try:
+            with open(checkpoint_file, "r") as f:
+                data = json.load(f)
+
+            checkpoint_info = {
+                "file": checkpoint_file.name,
+                "path": str(checkpoint_file),
+                "processed_exams": len(data.get("processed_exams", [])),
+                "total_exams": data.get("total_exams", 0),
+                "progress_pct": (
+                    len(data.get("processed_exams", []))
+                    / max(data.get("total_exams", 1), 1)
+                )
+                * 100,
+                "timestamp": data.get("timestamp", 0),
+                "total_rows": len(data.get("all_rows", [])),
+            }
+            checkpoints.append(checkpoint_info)
+        except Exception as e:
+            logger.warning(f"failed to read checkpoint {checkpoint_file}: {e}")
+
+    return sorted(checkpoints, key=lambda x: x["timestamp"], reverse=True)
+
+
+def show_checkpoint_status(
+    checkpoint_dir: Path = Path("data/discovery_checkpoints"),
+) -> None:
+    """show status of all checkpoints"""
+    checkpoints = list_checkpoints(checkpoint_dir)
+
+    if not checkpoints:
+        print("No checkpoints found")
+        return
+
+    print(f"\nFound {len(checkpoints)} checkpoint(s) in {checkpoint_dir}")
+    print("-" * 80)
+
+    for i, cp in enumerate(checkpoints, 1):
+        timestamp_str = time.strftime(
+            "%Y-%m-%d %H:%M:%S", time.localtime(cp["timestamp"])
+        )
+        print(f"{i}. {cp['file']}")
+        print(
+            f"   Progress: {cp['processed_exams']}/{cp['total_exams']} exams ({cp['progress_pct']:.1f}%)"
+        )
+        print(f"   Rows collected: {cp['total_rows']:,}")
+        print(f"   Last updated: {timestamp_str}")
+        print()
+
+
+def monitor_progress(
+    checkpoint_dir: Path = Path("data/discovery_checkpoints"), interval: int = 30
+) -> None:
+    """monitor preprocessing progress by watching checkpoints"""
+    logger.info(f"monitoring progress in {checkpoint_dir} (interval: {interval}s)")
+    logger.info("press Ctrl+C to stop monitoring")
+
+    last_checkpoint = None
+
+    try:
+        while not shutdown_requested:
+            checkpoints = list_checkpoints(checkpoint_dir)
+
+            if checkpoints:
+                latest = checkpoints[0]  # sorted by timestamp desc
+
+                if last_checkpoint is None:
+                    last_checkpoint = latest
+                    logger.info(
+                        f"monitoring started - {latest['processed_exams']}/{latest['total_exams']} exams processed"
+                    )
+                else:
+                    # check for progress
+                    if latest["processed_exams"] > last_checkpoint["processed_exams"]:
+                        rate = (
+                            latest["processed_exams"]
+                            - last_checkpoint["processed_exams"]
+                        ) / interval
+                        eta_seconds = (
+                            latest["total_exams"] - latest["processed_exams"]
+                        ) / max(rate, 0.001)
+                        eta_hours = eta_seconds / 3600
+
+                        logger.info(
+                            f"progress: {latest['processed_exams']}/{latest['total_exams']} exams "
+                            f"({latest['progress_pct']:.1f}%) - "
+                            f"rate: {rate:.1f} exams/sec - "
+                            f"ETA: {eta_hours:.1f}h"
+                        )
+
+                        last_checkpoint = latest
+                    elif latest["timestamp"] > last_checkpoint["timestamp"]:
+                        # checkpoint updated but no progress (might be error handling)
+                        logger.info(
+                            f"checkpoint updated - {latest['processed_exams']}/{latest['total_exams']} exams processed"
+                        )
+                        last_checkpoint = latest
+            else:
+                if last_checkpoint is None:
+                    logger.info("waiting for checkpoint to appear...")
+                else:
+                    logger.warning("no checkpoints found - processing may have failed")
+
+            time.sleep(interval)
+
+    except KeyboardInterrupt:
+        logger.info("monitoring stopped by user")
+
+    logger.info("monitoring ended")
+
+
+def resume_from_checkpoint(
+    checkpoint_file: Path,
+    raw_dir: Path,
+    max_exams: Optional[int] = None,
+    workers: int = 4,
+) -> None:
+    """resume preprocessing from a specific checkpoint"""
+    if not checkpoint_file.exists():
+        logger.error(f"checkpoint file not found: {checkpoint_file}")
+        return
+
+    logger.info(f"resuming from checkpoint: {checkpoint_file}")
+
+    try:
+        views_df, tags_df = discover_dicoms(
+            raw_dir=raw_dir,
+            max_exams=max_exams,
+            workers=workers,
+            debug_dir=None,
+            chunk_size=100,
+            resume_from_checkpoint=True,
+        )
+        logger.info(
+            f"resumed processing completed, collected {len(views_df)} views and {len(tags_df)} tag records"
+        )
+    except Exception as e:
+        logger.error(f"failed to resume processing: {e}")
+        raise
+
+
+def cleanup_old_checkpoints(checkpoint_dir: Path, max_age_days: int = 7) -> None:
+    """remove checkpoint files older than max_age_days"""
+    cutoff_time = time.time() - (max_age_days * 24 * 3600)
+
+    for checkpoint_file in checkpoint_dir.glob("discovery_*.json"):
+        try:
+            if checkpoint_file.stat().st_mtime < cutoff_time:
+                checkpoint_file.unlink()
+                logger.info(f"removed old checkpoint: {checkpoint_file.name}")
+        except Exception as e:
+            logger.warning(
+                f"failed to remove old checkpoint {checkpoint_file.name}: {e}"
+            )
+
+
+def clean_checkpoints(
+    checkpoint_dir: Path = Path("data/discovery_checkpoints"),
+    max_age_days: int = 7,
+    keep_latest: bool = True,
+) -> None:
+    """clean old checkpoints"""
+    if not checkpoint_dir.exists():
+        logger.info("no checkpoint directory found")
+        return
+
+    cutoff_time = time.time() - (max_age_days * 24 * 3600)
+    checkpoints = list_checkpoints(checkpoint_dir)
+
+    if not checkpoints:
+        logger.info("no checkpoints to clean")
+        return
+
+    # keep the latest checkpoint if requested
+    if keep_latest and checkpoints:
+        checkpoints = checkpoints[1:]
+
+    removed_count = 0
+    for cp in checkpoints:
+        if cp["timestamp"] < cutoff_time:
+            try:
+                Path(cp["path"]).unlink()
+                logger.info(f"removed old checkpoint: {cp['file']}")
+                removed_count += 1
+            except Exception as e:
+                logger.warning(f"failed to remove {cp['file']}: {e}")
+
+    logger.info(f"cleaned {removed_count} old checkpoints")
+
+
+def _combine_staging_files(staging_dir: Path, pattern: str) -> pd.DataFrame:
+    """Combine multiple parquet files matching a pattern."""
+    import glob
+
+    files = sorted(glob.glob(str(staging_dir / pattern)))
+    if not files:
+        return pd.DataFrame()
+    dfs = [pd.read_parquet(f) for f in files]
+    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+
+
 def discover_dicoms(
     raw_dir: Path,
     max_exams: Optional[int] = None,
     workers: int = 1,
     debug_dir: Optional[Path] = None,
-) -> pd.DataFrame:
+    chunk_size: int = 100,
+    resume_from_checkpoint: bool = True,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Scan `raw_dir` for exam directories and extract DICOM tags in parallel.
 
     assumes structure: raw_dir/patient_id/exam_id/[series_dirs]/file.dcm
-    walks to exam level, then processes each exam in parallel
+    walks to exam level, then processes each exam in parallel with checkpointing
+
+    Args:
+        raw_dir: Root directory containing patient/exam structure
+        max_exams: Maximum number of exams to process (for debugging)
+        workers: Number of parallel workers
+        debug_dir: Directory for debug output
+        chunk_size: Number of exams to process in each chunk
+        resume_from_checkpoint: Whether to resume from existing checkpoints
     """
+    import time
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    # setup checkpoint directory
+    checkpoint_dir = Path("data/discovery_checkpoints")
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # cleanup old checkpoints
+    cleanup_old_checkpoints(checkpoint_dir)
+
+    # generate checkpoint filename based on raw_dir and parameters
+    raw_dir_hash = hashlib.md5(str(raw_dir).encode()).hexdigest()[:8]
+    checkpoint_file = (
+        checkpoint_dir / f"discovery_{raw_dir_hash}_{max_exams or 'all'}.json"
+    )
+
     logger.info(f"scanning for exam directories in: {raw_dir}")
     exam_dirs = []
 
@@ -802,11 +1148,15 @@ def discover_dicoms(
         debug_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"debug output will be saved to: {debug_dir}")
 
-    # process exams in parallel
-    logger.info(f"processing exams with {workers} workers...")
-    from concurrent.futures import ProcessPoolExecutor, as_completed
+    # load or initialize checkpoint state
+    # use a staging directory for incremental parquet writes
+    staging_dir = (
+        checkpoint_dir / f"staging_{hashlib.md5(str(raw_dir).encode()).hexdigest()[:8]}"
+    )
+    staging_dir.mkdir(parents=True, exist_ok=True)
 
-    all_rows = []
+    processed_exams = set()
+    chunk_counter = 0  # track which chunk we're on for file naming
     exam_stats = {
         "total_exams": len(exam_dirs),
         "exams_with_valid_dicoms": 0,
@@ -815,60 +1165,194 @@ def discover_dicoms(
         "valid_dicoms": 0,
         "for_presentation_dicoms": 0,
         "failed_dicoms": 0,
+        "failed_exams": 0,
     }
 
-    with ProcessPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(_process_exam_dir, exam_path, debug_dir): exam_path
-            for exam_path in exam_dirs
+    if resume_from_checkpoint and checkpoint_file.exists():
+        logger.info(f"loading checkpoint from {checkpoint_file}")
+        try:
+            with open(checkpoint_file, "r") as f:
+                checkpoint_data = json.load(f)
+            processed_exams = set(checkpoint_data.get("processed_exams", []))
+            chunk_counter = checkpoint_data.get("chunk_counter", 0)
+            exam_stats.update(checkpoint_data.get("exam_stats", exam_stats))
+            logger.info(
+                f"resuming from checkpoint: {len(processed_exams)} exams already processed, at chunk {chunk_counter}"
+            )
+        except Exception as e:
+            logger.warning(f"failed to load checkpoint: {e}, starting fresh")
+
+    # filter out already processed exams
+    remaining_exams = [exam for exam in exam_dirs if str(exam) not in processed_exams]
+    logger.info(
+        f"processing {len(remaining_exams)} remaining exams (skipping {len(processed_exams)} already processed)"
+    )
+
+    if not remaining_exams:
+        logger.info("all exams already processed, loading from staging files")
+        # combine all staging files
+        views_df = _combine_staging_files(staging_dir, "views_chunk_*.parquet")
+        tags_df = _combine_staging_files(staging_dir, "tags_chunk_*.parquet")
+        return views_df, tags_df
+
+    # process exams in chunks
+    logger.info(f"processing exams with {workers} workers in chunks of {chunk_size}...")
+
+    def save_checkpoint():
+        """save current progress to checkpoint file"""
+        checkpoint_data = {
+            "processed_exams": list(processed_exams),
+            "chunk_counter": chunk_counter,
+            "exam_stats": exam_stats,
+            "timestamp": time.time(),
+            "total_exams": len(exam_dirs),
         }
-        # show progress bar for exam processing (always enabled, regardless of debug_dir)
-        for future in tqdm(
-            as_completed(futures, timeout=300),  # 5 minute timeout per exam
-            total=len(futures),
-            desc="processing exams",
-            unit="exam",
-        ):
-            exam_path = futures[future]
-            try:
-                result = future.result(timeout=60)  # 1 minute timeout for result
+        with open(checkpoint_file, "w") as f:
+            json.dump(checkpoint_data, f, indent=2)
 
-                # handle case where result might be None
-                if result is None:
-                    logger.error(f"got None result for {exam_path}")
-                    continue
+    num_chunks = (len(remaining_exams) + chunk_size - 1) // chunk_size
+    chunk_ranges = range(0, len(remaining_exams), chunk_size)
 
-                all_rows.extend(result["rows"])
-                exam_stats["total_dicoms"] += result["total_dicoms"]
-                exam_stats["valid_dicoms"] += result["valid_dicoms"]
-                exam_stats["for_presentation_dicoms"] += result[
-                    "for_presentation_dicoms"
-                ]
-                exam_stats["failed_dicoms"] += result["failed_files"]
+    for chunk_start in tqdm(
+        chunk_ranges,
+        desc="processing chunks",
+        unit="chunk",
+        total=num_chunks,
+        position=0,
+    ):
+        # check for shutdown request
+        if shutdown_requested:
+            logger.info(
+                "shutdown requested, saving checkpoint and exiting gracefully..."
+            )
+            save_checkpoint()
+            views_df = _combine_staging_files(staging_dir, "views_chunk_*.parquet")
+            tags_df = _combine_staging_files(staging_dir, "tags_chunk_*.parquet")
+            return views_df, tags_df
 
-                if result["exam_status"] == "success":
-                    exam_stats["exams_with_valid_dicoms"] += 1
-                    if result["has_four_views"]:
-                        exam_stats["exams_with_four_views"] += 1
+        chunk_end = min(chunk_start + chunk_size, len(remaining_exams))
+        chunk_exams = remaining_exams[chunk_start:chunk_end]
 
-            except TimeoutError:
-                logger.error(f"timeout processing {exam_path}")
-                # don't re-raise, just continue processing
-            except Exception as e:
-                logger.error(f"failed to process {exam_path}: {e}")
-                # don't re-raise, just continue processing
+        logger.info(
+            f"processing chunk {chunk_start // chunk_size + 1}/{num_chunks}: exams {chunk_start + 1}-{chunk_end} of {len(remaining_exams)}"
+        )
 
-    logger.info(f"collected metadata from {len(all_rows)} valid views")
-    df = pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
+        chunk_start_mem = get_memory_usage_mb()
+        chunk_max_mem = chunk_start_mem
+
+        # accumulate rows for this chunk only
+        chunk_rows = []
+        chunk_tag_rows = []
+
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(_process_exam_dir, exam_path, debug_dir): exam_path
+                for exam_path in chunk_exams
+            }
+
+            # process chunk with progress bar
+            for future in tqdm(
+                as_completed(futures, timeout=600),  # 10 minute timeout per chunk
+                total=len(futures),
+                desc=f"chunk {chunk_start // chunk_size + 1}/{num_chunks}",
+                unit="exam",
+                position=1,
+                leave=False,
+            ):
+                exam_path = futures[future]
+                try:
+                    result = future.result(timeout=120)  # 2 minute timeout per exam
+
+                    # handle case where result might be None
+                    if result is None:
+                        logger.error(f"got None result for {exam_path}")
+                        exam_stats["failed_exams"] += 1
+                        continue
+
+                    chunk_rows.extend(result["rows"])
+                    chunk_tag_rows.extend(result["tag_rows"])
+                    exam_stats["total_dicoms"] += result["total_dicoms"]
+                    exam_stats["valid_dicoms"] += result["valid_dicoms"]
+                    exam_stats["for_presentation_dicoms"] += result[
+                        "for_presentation_dicoms"
+                    ]
+                    exam_stats["failed_dicoms"] += result["failed_files"]
+
+                    if result["exam_status"] == "success":
+                        exam_stats["exams_with_valid_dicoms"] += 1
+                        if result["has_four_views"]:
+                            exam_stats["exams_with_four_views"] += 1
+                    else:
+                        exam_stats["failed_exams"] += 1
+
+                    # mark as processed
+                    processed_exams.add(str(exam_path))
+
+                    # track peak memory
+                    current_mem = get_memory_usage_mb()
+                    chunk_max_mem = max(chunk_max_mem, current_mem)
+
+                except TimeoutError:
+                    logger.error(f"timeout processing {exam_path}")
+                    exam_stats["failed_exams"] += 1
+                    processed_exams.add(
+                        str(exam_path)
+                    )  # mark as processed to avoid retry
+                except Exception as e:
+                    logger.error(f"failed to process {exam_path}: {e}")
+                    exam_stats["failed_exams"] += 1
+                    processed_exams.add(
+                        str(exam_path)
+                    )  # mark as processed to avoid retry
+
+        # write chunk data to staging files
+        if chunk_rows:
+            chunk_views_df = pd.DataFrame(chunk_rows)
+            chunk_tags_df = pd.DataFrame(chunk_tag_rows)
+
+            views_file = staging_dir / f"views_chunk_{chunk_counter:04d}.parquet"
+            tags_file = staging_dir / f"tags_chunk_{chunk_counter:04d}.parquet"
+
+            chunk_views_df.to_parquet(views_file, index=False)
+            chunk_tags_df.to_parquet(tags_file, index=False)
+
+            logger.info(
+                f"wrote chunk {chunk_counter} to staging: {len(chunk_rows)} views, {len(chunk_tag_rows)} tags"
+            )
+
+        chunk_counter += 1
+
+        # save checkpoint after each chunk
+        save_checkpoint()
+        chunk_end_mem = get_memory_usage_mb()
+        mem_delta = chunk_end_mem - chunk_start_mem
+        logger.info(
+            f"chunk completed, checkpoint saved | "
+            f"memory: start={chunk_start_mem:.0f}MB, peak={chunk_max_mem:.0f}MB, "
+            f"end={chunk_end_mem:.0f}MB, delta={mem_delta:+.0f}MB"
+        )
+
+    # final checkpoint save
+    save_checkpoint()
+    logger.info("all processing completed. final checkpoint saved.")
+
+    # combine all staging files
+    logger.info("combining staging files...")
+    views_df = _combine_staging_files(staging_dir, "views_chunk_*.parquet")
+    tags_df = _combine_staging_files(staging_dir, "tags_chunk_*.parquet")
+
+    logger.info(
+        f"loaded {len(views_df)} views and {len(tags_df)} DICOM tag records from staging"
+    )
 
     # print summary statistics
     logger.info("\n=== PROCESSING SUMMARY ===")
     logger.info(f"Total exams processed: {exam_stats['total_exams']}")
     logger.info(f"Total views (DICOM files) processed: {exam_stats['total_dicoms']}")
 
-    if not df.empty:
-        logger.info(f"Unique patients: {df['patient_id'].nunique()}")
-        logger.info(f"Unique exams with valid views: {df['exam_id'].nunique()}")
+    if not views_df.empty:
+        logger.info(f"Unique patients: {views_df['patient_id'].nunique()}")
+        logger.info(f"Unique exams with valid views: {views_df['exam_id'].nunique()}")
 
     logger.info("\n=== FILTERING FLOW ===")
     logger.info(f"1. Total exams: {exam_stats['total_exams']}")
@@ -885,16 +1369,21 @@ def discover_dicoms(
     logger.info(f"  - For presentation views: {exam_stats['for_presentation_dicoms']}")
     logger.info(f"  - Failed views: {exam_stats['failed_dicoms']}")
 
-    if not df.empty:
+    if not views_df.empty:
         # view breakdown by type
-        view_counts = df.groupby(["laterality", "view"]).size()
+        view_counts = views_df.groupby(["laterality", "view"]).size()
         logger.info("\nViews by type:")
         for (lat, view), count in view_counts.items():
             logger.info(f"  {lat}-{view}: {count} views")
     else:
         logger.warning("No valid views found in any exam!")
 
-    return df
+    if not tags_df.empty:
+        logger.info(
+            f"\nDICOM tags: {tags_df['tag_keyword'].nunique()} unique tags across {len(tags_df)} records"
+        )
+
+    return views_df, tags_df
 
 
 def select_full_quad(df_views: pd.DataFrame) -> pd.DataFrame:
@@ -1032,15 +1521,57 @@ def preprocess(cfg: PreprocessConfig) -> None:
 
     # discovery
     logger.info("discovering DICOMs...")
-    views_df = discover_dicoms(
-        raw, max_exams=cfg.max_exams, workers=cfg.workers, debug_dir=cfg.debug_dir
-    )
-    logger.info(f"found {len(views_df)} DICOM files")
+
+    if cfg.incremental and (sot / "views.parquet").exists():
+        logger.info("incremental mode: loading existing views...")
+        existing_views = pd.read_parquet(sot / "views.parquet")
+        existing_exam_ids = set(existing_views["exam_id"].unique())
+        logger.info(f"found {len(existing_exam_ids)} existing exams")
+
+        # discover new DICOMs
+        views_df, tags_df = discover_dicoms(
+            raw,
+            max_exams=cfg.max_exams,
+            workers=cfg.workers,
+            debug_dir=cfg.debug_dir,
+            chunk_size=cfg.chunk_size,
+            resume_from_checkpoint=not cfg.no_resume,
+        )
+
+        # filter out already processed exams
+        new_views = views_df[~views_df["exam_id"].isin(existing_exam_ids)]
+        logger.info(
+            f"found {len(new_views)} new DICOM files from {new_views['exam_id'].nunique()} new exams"
+        )
+
+        if len(new_views) == 0:
+            logger.info("no new exams found, nothing to process")
+            return
+
+        views_df = new_views
+        # filter tags to match filtered views
+        new_sop_uids = set(new_views["sop_instance_uid"])
+        tags_df = tags_df[tags_df["sop_instance_uid"].isin(new_sop_uids)]
+    else:
+        views_df, tags_df = discover_dicoms(
+            raw,
+            max_exams=cfg.max_exams,
+            workers=cfg.workers,
+            debug_dir=cfg.debug_dir,
+            chunk_size=cfg.chunk_size,
+            resume_from_checkpoint=not cfg.no_resume,
+        )
+        logger.info(f"found {len(views_df)} DICOM files")
 
     # selection to full quad
     logger.info("selecting full quad exams...")
     sel_df = select_full_quad(views_df)
     logger.info(f"selected {len(sel_df)} views from full quad exams")
+
+    # filter tags to match selected views only
+    selected_sop_uids = set(sel_df["sop_instance_uid"])
+    tags_df = tags_df[tags_df["sop_instance_uid"].isin(selected_sop_uids)]
+    logger.info(f"retained {len(tags_df)} DICOM tag records for selected views")
 
     # exams table
     exams = (
@@ -1064,34 +1595,70 @@ def preprocess(cfg: PreprocessConfig) -> None:
     exams["site"] = cfg.site
     exams["ibroker_study_id"] = None
 
-    # genotype join determines cohort
-    logger.info(f"loading genotype CSV: {cfg.genotype_csv}")
-    geno = pd.read_csv(cfg.genotype_csv)
-    if "PUB_id" not in geno.columns:
-        raise KeyError("genotype CSV must have column 'PUB_id'")
-    geno = geno.rename(columns={"PUB_id": "patient_id"})
-    logger.info(f"loaded {len(geno)} genotype records")
-
-    logger.info("joining with genotype...")
-    exams = exams.merge(
-        geno[["patient_id"]].drop_duplicates().assign(has_geno=True),
-        on="patient_id",
-        how="left",
-    )
-    exams["has_geno"] = exams["has_geno"].fillna(False)
-    logger.info(f"exams with genotype: {exams['has_geno'].sum()}")
-
     # write SoT tables
     logger.info(f"writing SoT tables to {sot}...")
     sot.mkdir(parents=True, exist_ok=True)
-    sel_df[VIEWS_COLS].to_parquet(sot / "views.parquet", index=False)
-    exams[EXAMS_COLS].to_parquet(sot / "exams.parquet", index=False)
 
-    cohort = exams[(exams["has_full_quad"]) & (exams["has_geno"])][
-        ["patient_id", "patient_hash", "exam_id", "study_date"]
-    ]
-    cohort.to_parquet(sot / "cohort.parquet", index=False)
-    logger.info("wrote views.parquet, exams.parquet, cohort.parquet")
+    if cfg.incremental and (sot / "views.parquet").exists():
+        # append to existing tables
+        logger.info("appending to existing SoT tables...")
+        existing_views = pd.read_parquet(sot / "views.parquet")
+        existing_exams = pd.read_parquet(sot / "exams.parquet")
+
+        # combine new and existing data
+        combined_views = pd.concat(
+            [existing_views, sel_df[VIEWS_COLS]], ignore_index=True
+        )
+        combined_exams = pd.concat(
+            [existing_exams, exams[EXAMS_COLS]], ignore_index=True
+        )
+
+        # remove duplicates (in case of re-processing)
+        combined_views = combined_views.drop_duplicates(
+            subset=["exam_id", "sop_instance_uid"]
+        )
+        combined_exams = combined_exams.drop_duplicates(
+            subset=["patient_id", "exam_id"]
+        )
+
+        combined_views.to_parquet(sot / "views.parquet", index=False)
+        combined_exams.to_parquet(sot / "exams.parquet", index=False)
+
+        # append tags
+        if (sot / "dicom_tags.parquet").exists():
+            existing_tags = pd.read_parquet(sot / "dicom_tags.parquet")
+            combined_tags = pd.concat(
+                [existing_tags, tags_df[DICOM_TAGS_COLS]], ignore_index=True
+            )
+            combined_tags = combined_tags.drop_duplicates(
+                subset=["sop_instance_uid", "tag_group", "tag_element"]
+            )
+            combined_tags.to_parquet(sot / "dicom_tags.parquet", index=False)
+        else:
+            tags_df[DICOM_TAGS_COLS].to_parquet(sot / "dicom_tags.parquet", index=False)
+
+        # update cohort with all full-quad exams
+        cohort = combined_exams[combined_exams["has_full_quad"]][
+            ["patient_id", "patient_hash", "exam_id", "study_date"]
+        ]
+        cohort.to_parquet(sot / "cohort.parquet", index=False)
+        logger.info(
+            "updated views.parquet, exams.parquet, dicom_tags.parquet, cohort.parquet"
+        )
+    else:
+        # write new tables
+        sel_df[VIEWS_COLS].to_parquet(sot / "views.parquet", index=False)
+        exams[EXAMS_COLS].to_parquet(sot / "exams.parquet", index=False)
+        tags_df[DICOM_TAGS_COLS].to_parquet(sot / "dicom_tags.parquet", index=False)
+
+        # create cohort of all full-quad exams (genotype filtering done downstream)
+        cohort = exams[exams["has_full_quad"]][
+            ["patient_id", "patient_hash", "exam_id", "study_date"]
+        ]
+        cohort.to_parquet(sot / "cohort.parquet", index=False)
+        logger.info(
+            "wrote views.parquet, exams.parquet, dicom_tags.parquet, cohort.parquet"
+        )
 
     # if summary-only, stop here
     if cfg.summary:
@@ -1113,6 +1680,12 @@ def preprocess(cfg: PreprocessConfig) -> None:
     ]
     logger.info(f"will write {len(targets)} exams to zarr with {cfg.workers} workers")
 
+    # load existing manifest if incremental
+    existing_manifest = None
+    if cfg.incremental and (out / "manifest.parquet").exists():
+        existing_manifest = pd.read_parquet(out / "manifest.parquet")
+        logger.info(f"loaded existing manifest with {len(existing_manifest)} entries")
+
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     with ThreadPoolExecutor(max_workers=cfg.workers) as ex:
@@ -1122,6 +1695,13 @@ def preprocess(cfg: PreprocessConfig) -> None:
         for fut in tqdm(
             as_completed(futs), total=len(futs), desc="writing zarr", unit="exam"
         ):
+            if shutdown_requested:
+                logger.info(
+                    "shutdown requested during zarr writing, cancelling remaining tasks..."
+                )
+                ex.shutdown(wait=False, cancel_futures=True)
+                break
+
             zpath, shapes = fut.result()
             eid = futs[fut]
             grp_df = grouped[eid]
@@ -1140,8 +1720,24 @@ def preprocess(cfg: PreprocessConfig) -> None:
                     }
                 )
 
+    if shutdown_requested:
+        logger.warning("shutdown requested, skipping manifest write")
+        logger.info(f"partial zarr cache written to {prep_dir}")
+        return
+
     logger.info(f"writing manifest with {len(manifest_rows)} rows...")
     manifest = pd.DataFrame(manifest_rows)
+
+    if cfg.incremental and existing_manifest is not None:
+        # combine with existing manifest
+        combined_manifest = pd.concat([existing_manifest, manifest], ignore_index=True)
+        # remove duplicates
+        combined_manifest = combined_manifest.drop_duplicates(
+            subset=["patient_id", "exam_id", "laterality", "view"]
+        )
+        manifest = combined_manifest
+        logger.info(f"combined manifest now has {len(manifest)} total entries")
+
     manifest_path = out / "manifest.parquet"
     manifest.to_parquet(manifest_path, index=False)
     logger.info(f"wrote manifest to {manifest_path}")
@@ -1162,7 +1758,7 @@ def preprocess(cfg: PreprocessConfig) -> None:
     logger.info(f"dicom files indexed: {total_files}")
     logger.info(f"unique exams: {total_exams}")
     logger.info(f"full-quad exams: {full_exams}")
-    logger.info(f"cohort (full-quad ∩ has-geno): {cohort_exams}")
+    logger.info(f"cohort (full-quad exams): {cohort_exams}")
     logger.info("views by vendor/model:")
     logger.info(f"\n{vendor_counts.to_string(index=False)}")
     logger.info(f"written SoT: {sot}")
@@ -1383,32 +1979,23 @@ def ingest_mirai_predictions(prediction_csv: Path, out_parquet: Path) -> None:
 # ------------- CLI -------------
 
 
-def parse_args() -> PreprocessConfig:
-    """Parse CLI arguments into a PreprocessConfig.
+def parse_args():
+    """Parse CLI arguments and handle different commands."""
+    parser = argparse.ArgumentParser(description="prima preprocessing pipeline")
+    subparsers = parser.add_subparsers(dest="command", help="available commands")
 
-    defaults: raw=/gpfs/data/huo-lab/Image/ChiMEC/, sot=raw/sot, out=raw/out
-    """
-    p = argparse.ArgumentParser(
-        description="Build SoT + Mirai-compatible Zarr cache (no PNGs)"
-    )
+    # preprocess command
+    p = subparsers.add_parser("preprocess", help="run full preprocessing pipeline")
     p.add_argument(
         "--raw",
         dest="raw_dir",
         type=Path,
-        default=Path("/gpfs/data/huo-lab/Image/ChiMEC/"),
+        default=Path("/gpfs/data/huo-lab/Image/ChiMEC/MG"),
     )
     p.add_argument("--sot", dest="sot_dir", type=Path, default=None)
     p.add_argument("--out", dest="out_dir", type=Path, default=None)
-    p.add_argument(
-        "--genotype",
-        dest="genotype_csv",
-        type=Path,
-        default=Path(
-            "/gpfs/data/phs/groups/Projects/Huo_projects/SPORE/annawoodard/Phenotype_ChiMEC_2025Oct4.csv"
-        ),
-    )
     p.add_argument("--site", dest="site", type=str, default="ucmed")
-    p.add_argument("--workers", dest="workers", type=int, default=4)
+    p.add_argument("--workers", dest="workers", type=int, default=32)
     p.add_argument("--summary", dest="summary", action="store_true")
     p.add_argument(
         "--max-exams",
@@ -1424,30 +2011,109 @@ def parse_args() -> PreprocessConfig:
         default=None,
         help="save debug figures for skipped DICOMs to this directory",
     )
+    p.add_argument(
+        "--chunk-size",
+        dest="chunk_size",
+        type=int,
+        default=100,
+        help="number of exams to process in each chunk (default: 100)",
+    )
+    p.add_argument(
+        "--no-resume",
+        dest="no_resume",
+        action="store_true",
+        help="don't resume from checkpoint, start fresh",
+    )
+    p.add_argument(
+        "--incremental",
+        dest="incremental",
+        action="store_true",
+        help="incremental mode: only process new exams, append to existing SoT tables",
+    )
     # optional extras
     p.add_argument("--emit-csv", dest="emit_csv", type=Path)
     p.add_argument("--labels", dest="labels_parquet", type=Path)
     p.add_argument("--features-out", dest="features_out", type=Path)
     p.add_argument("--img-encoder-snapshot", dest="img_encoder_snapshot", type=Path)
     p.add_argument("--mirai-repo", dest="mirai_repo", type=Path)
-    args = p.parse_args()
 
-    # derive sot and out from raw if not provided
-    raw_dir = args.raw_dir
-    sot_dir = args.sot_dir if args.sot_dir is not None else raw_dir / "sot"
-    out_dir = args.out_dir if args.out_dir is not None else raw_dir / "out"
+    # checkpoint management commands
+    cp = subparsers.add_parser("checkpoint", help="manage checkpoints")
+    cp.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        default=Path("data/discovery_checkpoints"),
+        help="directory containing checkpoints",
+    )
+    cp_subparsers = cp.add_subparsers(dest="cp_command", help="checkpoint commands")
 
-    return PreprocessConfig(
-        raw_dir=raw_dir,
-        sot_dir=sot_dir,
-        out_dir=out_dir,
-        genotype_csv=args.genotype_csv,
-        site=args.site,
-        workers=args.workers,
-        summary=args.summary,
-        max_exams=args.max_exams,
-        debug_dir=args.debug_dir,
-    ), args
+    cp_subparsers.add_parser("list", help="list all checkpoints")
+    cp_subparsers.add_parser("status", help="show checkpoint status")
+
+    clean_parser = cp_subparsers.add_parser("clean", help="clean old checkpoints")
+    clean_parser.add_argument(
+        "--max-age-days",
+        type=int,
+        default=7,
+        help="remove checkpoints older than N days",
+    )
+    clean_parser.add_argument(
+        "--keep-latest",
+        action="store_true",
+        default=True,
+        help="keep the latest checkpoint",
+    )
+
+    resume_parser = cp_subparsers.add_parser("resume", help="resume from checkpoint")
+    resume_parser.add_argument(
+        "checkpoint_file", type=Path, help="checkpoint file to resume from"
+    )
+    resume_parser.add_argument(
+        "--raw-dir", type=Path, required=True, help="raw data directory"
+    )
+    resume_parser.add_argument("--max-exams", type=int, help="limit number of exams")
+    resume_parser.add_argument(
+        "--workers", type=int, default=4, help="number of workers"
+    )
+
+    # monitor command
+    monitor_parser = subparsers.add_parser(
+        "monitor", help="monitor preprocessing progress"
+    )
+    monitor_parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        default=Path("data/discovery_checkpoints"),
+        help="directory containing checkpoints",
+    )
+    monitor_parser.add_argument(
+        "--interval", type=int, default=30, help="monitoring interval in seconds"
+    )
+
+    args = parser.parse_args()
+
+    if args.command == "preprocess":
+        # derive sot and out from raw if not provided
+        raw_dir = args.raw_dir
+        sot_dir = args.sot_dir if args.sot_dir is not None else raw_dir / "sot"
+        out_dir = args.out_dir if args.out_dir is not None else raw_dir / "out"
+
+        cfg = PreprocessConfig(
+            raw_dir=raw_dir,
+            sot_dir=sot_dir,
+            out_dir=out_dir,
+            site=args.site,
+            workers=args.workers,
+            summary=args.summary,
+            max_exams=args.max_exams,
+            debug_dir=args.debug_dir,
+            chunk_size=args.chunk_size,
+            no_resume=args.no_resume,
+            incremental=args.incremental,
+        )
+        return cfg, args
+    else:
+        return None, args
 
 
 def main() -> None:
@@ -1460,55 +2126,88 @@ def main() -> None:
 
     logger.info("parsing arguments...")
     cfg, args = parse_args()
-    logger.info("configuration loaded")
-    logger.info(f"  raw_dir: {cfg.raw_dir}")
-    logger.info(f"  sot_dir: {cfg.sot_dir}")
-    logger.info(f"  out_dir: {cfg.out_dir}")
-    logger.info(f"  genotype_csv: {cfg.genotype_csv}")
-    logger.info(f"  site: {cfg.site}")
-    logger.info(f"  workers: {cfg.workers}")
-    logger.info(f"  summary: {cfg.summary}")
-    logger.info(f"  max_exams: {cfg.max_exams or 'unlimited'}")
 
-    logger.info("validating configuration...")
-    if cfg.workers <= 0:
-        raise ValueError("workers must be > 0")
-    if cfg.raw_dir == cfg.out_dir:
-        raise ValueError("out_dir must differ from raw_dir")
-    logger.info("configuration valid")
+    if args.command == "preprocess":
+        logger.info("configuration loaded")
+        logger.info(f"  raw_dir: {cfg.raw_dir}")
+        logger.info(f"  sot_dir: {cfg.sot_dir}")
+        logger.info(f"  out_dir: {cfg.out_dir}")
+        logger.info(f"  site: {cfg.site}")
+        logger.info(f"  workers: {cfg.workers}")
+        logger.info(f"  summary: {cfg.summary}")
+        logger.info(f"  max_exams: {cfg.max_exams or 'unlimited'}")
 
-    preprocess(cfg)
+        logger.info("validating configuration...")
+        if cfg.workers <= 0:
+            raise ValueError("workers must be > 0")
+        if cfg.raw_dir == cfg.out_dir:
+            raise ValueError("out_dir must differ from raw_dir")
+        logger.info("configuration valid")
 
-    # emit Mirai CSV if requested
-    if args.emit_csv is not None:
-        logger.info("generating Mirai CSV...")
-        if args.labels_parquet is None:
-            raise ValueError(
-                "--emit-csv requires --labels with years_to_cancer/years_to_last_followup/split_group"
+        preprocess(cfg)
+
+        # emit Mirai CSV if requested
+        if args.emit_csv is not None:
+            logger.info("generating Mirai CSV...")
+            if args.labels_parquet is None:
+                raise ValueError(
+                    "--emit-csv requires --labels with years_to_cancer/years_to_last_followup/split_group"
+                )
+            write_mirai_csv(
+                cfg.out_dir / "manifest.parquet", args.labels_parquet, args.emit_csv
             )
-        write_mirai_csv(
-            cfg.out_dir / "manifest.parquet", args.labels_parquet, args.emit_csv
-        )
-        logger.info(f"wrote Mirai CSV → {args.emit_csv}")
+            logger.info(f"wrote Mirai CSV → {args.emit_csv}")
 
-    # materialize per-view embeddings if requested
-    if args.features_out is not None:
-        logger.info("materializing per-view embeddings...")
-        if args.img_encoder_snapshot is None:
-            raise ValueError(
-                "--features-out requires --img-encoder-snapshot (Mirai ResNet18 weights)"
+        # materialize per-view embeddings if requested
+        if args.features_out is not None:
+            logger.info("materializing per-view embeddings...")
+            if args.img_encoder_snapshot is None:
+                raise ValueError(
+                    "--features-out requires --img-encoder-snapshot (Mirai ResNet18 weights)"
+                )
+            materialize_mirai_embeddings(
+                args.mirai_repo,
+                args.img_encoder_snapshot,
+                cfg.out_dir / "manifest.parquet",
+                args.features_out,
             )
-        materialize_mirai_embeddings(
-            args.mirai_repo,
-            args.img_encoder_snapshot,
-            cfg.out_dir / "manifest.parquet",
-            args.features_out,
-        )
-        logger.info(
-            f"wrote per-view embeddings → {args.features_out / 'per_view.parquet'}"
-        )
+            logger.info(
+                f"wrote per-view embeddings → {args.features_out / 'per_view.parquet'}"
+            )
 
-    logger.info("=== preprocessing complete ===")
+        logger.info("=== preprocessing complete ===")
+
+    elif args.command == "checkpoint":
+        if args.cp_command == "list":
+            checkpoints = list_checkpoints(args.checkpoint_dir)
+            if checkpoints:
+                for cp in checkpoints:
+                    print(
+                        f"{cp['file']}: {cp['processed_exams']}/{cp['total_exams']} exams"
+                    )
+            else:
+                print("No checkpoints found")
+
+        elif args.cp_command == "status":
+            show_checkpoint_status(args.checkpoint_dir)
+
+        elif args.cp_command == "clean":
+            clean_checkpoints(args.checkpoint_dir, args.max_age_days, args.keep_latest)
+
+        elif args.cp_command == "resume":
+            resume_from_checkpoint(
+                args.checkpoint_file, args.raw_dir, args.max_exams, args.workers
+            )
+
+        else:
+            print("Available checkpoint commands: list, status, clean, resume")
+
+    elif args.command == "monitor":
+        monitor_progress(args.checkpoint_dir, args.interval)
+
+    else:
+        print("Available commands: preprocess, checkpoint, monitor")
+        print("Use --help for more information")
 
 
 if __name__ == "__main__":

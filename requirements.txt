@@ -17,3 +17,7 @@ setuptools==67.6.0
 tqdm==4.65.0
 zarr>=2.15
 numcodecs>=0.11
+pillow>=10.0.0
+pylibjpeg>=2.0 
+pylibjpeg-openjpeg>=2.0
+gdcm>=3.0.10

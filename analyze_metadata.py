@@ -65,6 +65,12 @@ metadata = pd.read_csv(
 if "is_on_disk_corrected" in metadata.columns:
     metadata["is_on_disk"] = metadata["is_on_disk_corrected"]
     print("Using corrected is_on_disk values")
+
+# add base modality column to metadata (use StudyDescription when Modality is missing)
+metadata["base_modality"] = metadata.apply(
+    lambda row: extract_base_modality(row["Modality"], row["StudyDescription"]), axis=1
+)
+
 print(f"ChiMEC patients: {len(chimec_patients):,}")
 print(f"Key table records: {len(key):,}")
 print(f"Metadata records: {len(metadata):,}")
@@ -1133,12 +1139,6 @@ if len(extreme_negative) > 0:
         f"most extreme case: {min_record['time_to_diagnosis']:.0f} days ({min_record['time_to_diagnosis'] / 365.25:.1f} years) after diagnosis"
     )
 
-
-# add base modality column to metadata (use StudyDescription when Modality is missing)
-metadata["base_modality"] = metadata.apply(
-    lambda row: extract_base_modality(row["Modality"], row["StudyDescription"]), axis=1
-)
-
 print("\n=== BASE MODALITY ANALYSIS ===")
 print("unique base modalities:")
 print(metadata["base_modality"].value_counts())
@@ -1222,6 +1222,13 @@ print(
     f"{SELECTED_MODALITY} scans with patient data: {len(selected_modality_with_patient_data)}"
 )
 
+# CUT FLOW ANALYSIS - trace where scans are filtered out
+print(f"\n=== {SELECTED_MODALITY} CUT FLOW ANALYSIS ===")
+print(f"Starting with: {len(selected_modality_scans):,} {SELECTED_MODALITY} scans")
+print(
+    f"After merge with patient data: {len(selected_modality_with_patient_data):,} scans"
+)
+
 # genotyping coverage in imaging population
 total_imaging_patients = selected_modality_with_patient_data["study_id"].nunique()
 genotyped_imaging = selected_modality_with_patient_data[
@@ -1257,10 +1264,23 @@ controls_selected_modality = selected_modality_with_patient_data[
     selected_modality_with_patient_data["case_or_control"] == "Control"
 ].copy()
 
+print("After case/control separation:")
+print(f"  - Case scans: {len(cases_selected_modality):,}")
+print(f"  - Control scans: {len(controls_selected_modality):,}")
+print(
+    f"  - Other/Unknown status: {len(selected_modality_with_patient_data) - len(cases_selected_modality) - len(controls_selected_modality):,}"
+)
+
 # for cases: filter for screening scans (> 3 months = 90 days before diagnosis)
 case_screening_scans = cases_selected_modality[
     cases_selected_modality["days_to_dx"] > 90
 ].copy()
+
+print("After case screening filter (>90 days before dx):")
+print(f"  - Case screening scans: {len(case_screening_scans):,}")
+print(
+    f"  - Case scans excluded (≤90 days before dx): {len(cases_selected_modality) - len(case_screening_scans):,}"
+)
 
 # for cases: filter for scans anytime before and including diagnosis month
 # convert to year-month for comparison
@@ -1274,8 +1294,31 @@ case_before_dx_month_scans = cases_selected_modality[
     cases_selected_modality["scan_ym"] <= cases_selected_modality["diagnosis_ym"]
 ].copy()
 
+print("After case before/including dx month filter:")
+print(f"  - Case before/including dx month scans: {len(case_before_dx_month_scans):,}")
+print(
+    f"  - Case scans excluded (after dx month): {len(cases_selected_modality) - len(case_before_dx_month_scans):,}"
+)
+
 # for controls: all scans are considered (no diagnosis date filter)
 control_screening_scans = controls_selected_modality.copy()
+
+print(f"Control scans (no filtering): {len(control_screening_scans):,}")
+
+# SUMMARY OF WHERE SCANS WENT
+total_accounted = (
+    len(case_screening_scans)
+    + len(case_before_dx_month_scans)
+    + len(control_screening_scans)
+)
+print("\nSUMMARY:")
+print(f"  - Case screening scans: {len(case_screening_scans):,}")
+print(f"  - Case before/including dx month scans: {len(case_before_dx_month_scans):,}")
+print(f"  - Control scans: {len(control_screening_scans):,}")
+print(f"  - Total accounted for: {total_accounted:,}")
+print(
+    f"  - Missing from original {len(selected_modality_with_patient_data):,}: {len(selected_modality_with_patient_data) - total_accounted:,}"
+)
 
 print(
     f"case screening scans (>90 days before dx): {len(case_screening_scans):,} ({case_screening_scans['study_id'].nunique() if len(case_screening_scans) > 0 else 0:,} patients)"

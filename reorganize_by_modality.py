@@ -18,6 +18,7 @@ import logging
 import os
 import shutil
 import sys
+import warnings
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -26,6 +27,11 @@ from pydicom.dataset import FileDataset
 from pydicom.tag import Tag
 
 from metadata_utils import extract_base_modality
+
+# suppress pydicom VR UI validation warnings for non-standard UIDs
+warnings.filterwarnings("ignore", message=".*Invalid value for VR UI.*", append=True)
+# also set pydicom logging level to suppress warnings at the source
+logging.getLogger("pydicom.valuerep").setLevel(logging.ERROR)
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +136,71 @@ def load_progress_state(state_file: Path) -> Tuple[int, List[Path]]:
     processed_count = state.get("processed_count", 0)
 
     return processed_count, remaining_exams
+
+
+def find_empty_patient_directories(raw_dir: Path) -> List[Path]:
+    """Find patient ID directories that are empty after reorganization.
+
+    Returns directories that start with a number (patient IDs) and are empty
+    or contain only dotfiles (temporary files).
+    """
+    empty_dirs = []
+
+    for item in os.listdir(raw_dir):
+        item_path = raw_dir / item
+
+        # Skip non-directories
+        if not item_path.is_dir():
+            continue
+
+        # Skip modality directories
+        if item in ["US", "CT", "MR", "CR", "DX", "MG", "NM", "PT", "Other"]:
+            continue
+
+        # Only consider directories that start with a number (patient IDs)
+        if not item[0].isdigit():
+            continue
+
+        # Check if directory is empty or contains only dotfiles
+        try:
+            contents = list(item_path.iterdir())
+            if not contents:
+                # Truly empty directory
+                empty_dirs.append(item_path)
+            elif all(item.name.startswith(".") for item in contents):
+                # Directory contains only dotfiles - consider it empty
+                empty_dirs.append(item_path)
+        except (OSError, PermissionError) as e:
+            logger.warning(f"Could not check directory {item_path}: {e}")
+
+    return empty_dirs
+
+
+def cleanup_empty_patient_directories(raw_dir: Path, dry_run: bool = False) -> int:
+    """Remove empty patient ID directories.
+
+    Returns the number of directories removed (or would be removed in dry run).
+    """
+    empty_dirs = find_empty_patient_directories(raw_dir)
+
+    if not empty_dirs:
+        logger.info("No empty patient directories found")
+        return 0
+
+    logger.info(f"Found {len(empty_dirs)} empty patient directories")
+
+    for empty_dir in empty_dirs:
+        if dry_run:
+            logger.info(f"Would remove empty patient directory: {empty_dir}")
+        else:
+            try:
+                logger.info(f"Removing empty patient directory: {empty_dir}")
+                # Use shutil.rmtree to handle directories with dotfiles
+                shutil.rmtree(str(empty_dir))
+            except (OSError, PermissionError) as e:
+                logger.warning(f"Failed to remove directory {empty_dir}: {e}")
+
+    return len(empty_dirs)
 
 
 def move_exam_to_modality_directory(
@@ -284,6 +355,14 @@ def reorganize_by_modality(
             state_file.unlink()
             logger.info("Progress state file cleaned up")
 
+    # Clean up empty patient directories
+    logger.info("\n=== Cleaning up empty patient directories ===")
+    removed_count = cleanup_empty_patient_directories(raw_dir, dry_run)
+    if dry_run:
+        logger.info(f"Would remove {removed_count} empty patient directories")
+    else:
+        logger.info(f"Removed {removed_count} empty patient directories")
+
     # Print final statistics
     logger.info("\n=== Reorganization Summary ===")
     logger.info(f"Total exams processed: {stats['processed']}")
@@ -309,10 +388,10 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Dry run to see what would be moved
+  # Dry run to see what would be moved and cleaned up
   python reorganize_by_modality.py --raw /gpfs/data/huo-lab/Image/ChiMEC/ --dry-run
   
-  # Actually perform the reorganization
+  # Actually perform the reorganization and cleanup empty dirs
   python reorganize_by_modality.py --raw /gpfs/data/huo-lab/Image/ChiMEC/
   
   # Resume interrupted run

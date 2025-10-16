@@ -7,14 +7,19 @@ import shutil
 import signal
 import subprocess
 import time
+import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Tuple
 
 from tqdm import tqdm
 
-# Import the shared logic
 from fingerprint_utils import ExamFingerprint
+
+# suppress pydicom VR UI validation warnings for non-standard UIDs
+warnings.filterwarnings("ignore", message=".*Invalid value for VR UI.*", append=True)
+# also set pydicom logging level to suppress warnings at the source
+logging.getLogger("pydicom.valuerep").setLevel(logging.ERROR)
 
 # --- CONFIGURATION ---
 SRC_ROOT = Path("/Volumes/16352A")
@@ -119,6 +124,15 @@ def _read_uid_quick(exam_path: Path):
     uses pydicom with stop_before_pixels to avoid payload reads.
     """
     import pydicom
+
+    # suppress pydicom VR UI validation warnings for non-standard UIDs
+    warnings.filterwarnings(
+        "ignore", message=".*Invalid value for VR UI.*", append=True
+    )
+    # also set pydicom logging level to suppress warnings at the source
+    import logging
+
+    logging.getLogger("pydicom.valuerep").setLevel(logging.ERROR)
 
     touched = 0
     for p in exam_path.rglob("*"):
