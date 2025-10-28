@@ -14,30 +14,28 @@ micromamba config append channels conda-forge
 
 Installation recipe:
 ```bash
-# Create and activate environment
-micromamba config append channels conda-forge
-micromamba create -y --name prima python=3.11
+# create + activate
+micromamba create -y -f env.yaml
+eval "$(micromamba shell hook -s bash)"
 micromamba activate prima
 
-# Clone repository
+# install torch/vision matching cu111 wheels (from the official index)
+python -m pip install \
+  torch==1.9.0+cu111 torchvision==0.10.0+cu111 \
+  -f https://download.pytorch.org/whl/torch_stable.html  # from “previous versions”
+
+# your repo + mirai fork (zarr patch)
 git clone --recursive git@github.com:uchicago-dsi/prima.git
 cd prima
-git submodule add https://github.com/annawoodard/Mirai vendor/mirai
+git submodule add git@github.com:annawoodard/Mirai vendor/mirai
 git submodule update --init --recursive
 
-# Install DICOM compression handlers via conda (must be done first)
-# Note: pylibjpeg handles JPEG 2000 and JPEG Extended (12-bit) since gdcm 3.x is not available
-micromamba install -y -c conda-forge pydicom pylibjpeg pylibjpeg-openjpeg pylibjpeg-libjpeg
-
-# Install PyTorch and other conda dependencies
-micromamba install -y -c pytorch -c nvidia -c conda-forge \
-    pytorch torchvision pytorch-cuda=12.1 \
-    selenium firefox geckodriver ipykernel
-
-# Install package and remaining dependencies
-pip install -e .  # if developing (use 'pip install .' if not)
+# install your code + mirai
+pip install -e .
 pip install -r requirements.txt
 pip install -r requirements-dev.txt  # optional: linting + notebook extras
+pip install -e vendor/mirai
+
 ```
 
 Runtime dependencies live in `requirements.txt`; install `requirements-dev.txt` to pick up

@@ -56,6 +56,7 @@ import signal
 import sys
 import time
 import warnings
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -68,18 +69,33 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pydicom
-from pydicom import config
 import torch
 import zarr
 from einops import rearrange
 from numcodecs import Blosc
+from pydicom import config
 from pydicom.dataset import FileDataset
+from pydicom.pixel_data_handlers import gdcm_handler, numpy_handler, pillow_handler
+
+try:
+    from pydicom.pixel_data_handlers import pylibjpeg_handler
+except ImportError:
+    pylibjpeg_handler = None  # type: ignore[assignment]
 from pydicom.tag import Tag
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 # prefer pylibjpeg for JPEG 2000 (gdcm 3.x not available on conda-forge)
-config.pixel_data_handlers = ["pylibjpeg", "pillow", "gdcm", "numpy"]
+config.pixel_data_handlers = [
+    handler
+    for handler in [
+        pylibjpeg_handler,
+        pillow_handler,
+        gdcm_handler,
+        numpy_handler,
+    ]
+    if handler is not None
+]
 
 # suppress pydicom VR UI validation warnings for non-standard UIDs
 warnings.filterwarnings("ignore", message=".*Invalid value for VR UI.*", append=True)
@@ -2101,8 +2117,15 @@ def parse_args():
         action="store_true",
         help="incremental mode: only process new exams, append to existing SoT tables",
     )
+    p.add_argument(
+        "--emit-csv",
+        dest="emit_csv",
+        action="store_true",
+        default=True,
+        help="emit CSV outputs (default: True)",
+    )
+
     # optional extras
-    p.add_argument("--emit-csv", dest="emit_csv", type=Path)
     p.add_argument("--labels", dest="labels_parquet", type=Path)
     p.add_argument("--features-out", dest="features_out", type=Path)
     p.add_argument("--img-encoder-snapshot", dest="img_encoder_snapshot", type=Path)
@@ -2189,14 +2212,25 @@ def parse_args():
 
 def main() -> None:
     """Entrypoint for the CLI."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    log_format = "%(asctime)s [%(levelname)s] %(message)s"
+    log_datefmt = "%Y-%m-%d %H:%M:%S"
+    logging.basicConfig(level=logging.INFO, format=log_format, datefmt=log_datefmt)
 
     logger.info("parsing arguments...")
     cfg, args = parse_args()
+
+    if cfg is not None:
+        log_dir = cfg.out_dir / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        log_file = log_dir / f"{args.command}_{timestamp}.log"
+
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(logging.Formatter(log_format, datefmt=log_datefmt))
+        logging.getLogger().addHandler(file_handler)
+
+        logger.info(f"Log file: {log_file}")
 
     if args.command == "preprocess":
         logger.info("configuration loaded")
