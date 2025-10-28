@@ -68,6 +68,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pydicom
+from pydicom import config
 import torch
 import zarr
 from einops import rearrange
@@ -76,6 +77,9 @@ from pydicom.dataset import FileDataset
 from pydicom.tag import Tag
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+
+# prefer pylibjpeg for JPEG 2000 (gdcm 3.x not available on conda-forge)
+config.pixel_data_handlers = ["pylibjpeg", "pillow", "gdcm", "numpy"]
 
 # suppress pydicom VR UI validation warnings for non-standard UIDs
 warnings.filterwarnings("ignore", message=".*Invalid value for VR UI.*", append=True)
@@ -172,14 +176,8 @@ VIEWS_COLS = [
     "accession_number",
 ]
 
-DICOM_TAGS_COLS = [
-    "sop_instance_uid",
-    "tag_group",
-    "tag_element",
-    "tag_keyword",
-    "vr",
-    "value",
-]
+# DICOM tags are stored in wide format (one column per tag keyword)
+# No fixed column list needed - dynamically determined from data
 
 
 class PreprocessConfig:
@@ -259,8 +257,8 @@ def get_tag(
     return default
 
 
-def extract_all_tags(ds: FileDataset, sop_instance_uid: str) -> List[Dict[str, str]]:
-    """Extract all DICOM tags as rows for a table structure.
+def extract_all_tags(ds: FileDataset, sop_instance_uid: str) -> Dict[str, str]:
+    """Extract all DICOM tags as a dictionary for wide-format table.
 
     parameters
     ----------
@@ -271,14 +269,19 @@ def extract_all_tags(ds: FileDataset, sop_instance_uid: str) -> List[Dict[str, s
 
     returns
     -------
-    List[Dict[str, str]]
-        list of tag records, each with sop_instance_uid, tag_group, tag_element, tag_keyword, vr, and value
+    Dict[str, str]
+        dictionary with sop_instance_uid and all tag keywords as columns
     """
-    tag_rows = []
+    tag_dict = {"sop_instance_uid": sop_instance_uid}
+
     for tag in ds.dir():
         try:
             element = ds[tag]
             tag_keyword = element.keyword if hasattr(element, "keyword") else ""
+
+            # skip if no keyword (can't use as column name)
+            if not tag_keyword:
+                continue
 
             # convert value to string, handling special cases
             if hasattr(element, "value"):
@@ -291,21 +294,12 @@ def extract_all_tags(ds: FileDataset, sop_instance_uid: str) -> List[Dict[str, s
             else:
                 value_str = ""
 
-            tag_rows.append(
-                {
-                    "sop_instance_uid": sop_instance_uid,
-                    "tag_group": f"{element.tag.group:04X}",
-                    "tag_element": f"{element.tag.element:04X}",
-                    "tag_keyword": tag_keyword,
-                    "vr": element.VR if hasattr(element, "VR") else "",
-                    "value": value_str,
-                }
-            )
+            tag_dict[tag_keyword] = value_str
         except Exception:
             # skip problematic tags silently
             pass
 
-    return tag_rows
+    return tag_dict
 
 
 def infer_view_fields(ds: FileDataset) -> Tuple[str, str]:
@@ -758,8 +752,8 @@ def _process_exam_dir(
 
                 rows.append(row_data)
 
-                # extract all DICOM tags for this image
-                tag_rows.extend(extract_all_tags(ds, sop_uid))
+                # extract all DICOM tags for this image (wide format: one dict per image)
+                tag_rows.append(extract_all_tags(ds, sop_uid))
             except Exception as e:
                 if debug_dir:
                     logger.error(f"  ERROR: {p.name} - unexpected error: {e}")
@@ -1071,13 +1065,50 @@ def clean_checkpoints(
 
 
 def _combine_staging_files(staging_dir: Path, pattern: str) -> pd.DataFrame:
-    """Combine multiple parquet files matching a pattern."""
+    """Combine multiple parquet files matching a pattern.
+
+    For tags files with varying schemas, this ensures all chunks have the same columns.
+    """
     import glob
 
     files = sorted(glob.glob(str(staging_dir / pattern)))
     if not files:
         return pd.DataFrame()
-    dfs = [pd.read_parquet(f) for f in files]
+
+    # for tags files, collect all unique columns first to handle schema evolution
+    if "tags_chunk" in pattern:
+        # read all files and collect all columns
+        all_columns = set()
+        all_columns.add("sop_instance_uid")  # ensure this is always first
+
+        for f in files:
+            df = pd.read_parquet(f)
+            all_columns.update(df.columns)
+
+        # sort columns for consistency (sop_instance_uid first, rest alphabetical)
+        sorted_cols = ["sop_instance_uid"] + sorted(
+            [c for c in all_columns if c != "sop_instance_uid"]
+        )
+
+        # read each file and ensure it has all columns
+        dfs = []
+        for f in files:
+            df = pd.read_parquet(f)
+            # find missing columns
+            missing_cols = [col for col in sorted_cols if col not in df.columns]
+            # add all missing columns at once to avoid fragmentation
+            if missing_cols:
+                missing_df = pd.DataFrame(
+                    {col: None for col in missing_cols}, index=df.index
+                )
+                df = pd.concat([df, missing_df], axis=1)
+            # reorder columns
+            df = df[sorted_cols]
+            dfs.append(df)
+    else:
+        # for non-tags files, simple concat is fine
+        dfs = [pd.read_parquet(f) for f in files]
+
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 
@@ -1175,7 +1206,13 @@ def discover_dicoms(
                 checkpoint_data = json.load(f)
             processed_exams = set(checkpoint_data.get("processed_exams", []))
             chunk_counter = checkpoint_data.get("chunk_counter", 0)
-            exam_stats.update(checkpoint_data.get("exam_stats", exam_stats))
+            # load previous stats but keep total_exams current
+            saved_stats = checkpoint_data.get("exam_stats", {})
+            for key in exam_stats:
+                if key in saved_stats and key != "total_exams":
+                    exam_stats[key] = saved_stats[key]
+            # total_exams should always reflect the full set
+            exam_stats["total_exams"] = len(exam_dirs)
             logger.info(
                 f"resuming from checkpoint: {len(processed_exams)} exams already processed, at chunk {chunk_counter}"
             )
@@ -1379,8 +1416,9 @@ def discover_dicoms(
         logger.warning("No valid views found in any exam!")
 
     if not tags_df.empty:
+        num_tag_cols = len(tags_df.columns) - 1  # exclude sop_instance_uid
         logger.info(
-            f"\nDICOM tags: {tags_df['tag_keyword'].nunique()} unique tags across {len(tags_df)} records"
+            f"\nDICOM tags: {num_tag_cols} unique tags for {len(tags_df)} images (wide format)"
         )
 
     return views_df, tags_df
@@ -1627,15 +1665,11 @@ def preprocess(cfg: PreprocessConfig) -> None:
         # append tags
         if (sot / "dicom_tags.parquet").exists():
             existing_tags = pd.read_parquet(sot / "dicom_tags.parquet")
-            combined_tags = pd.concat(
-                [existing_tags, tags_df[DICOM_TAGS_COLS]], ignore_index=True
-            )
-            combined_tags = combined_tags.drop_duplicates(
-                subset=["sop_instance_uid", "tag_group", "tag_element"]
-            )
+            combined_tags = pd.concat([existing_tags, tags_df], ignore_index=True)
+            combined_tags = combined_tags.drop_duplicates(subset=["sop_instance_uid"])
             combined_tags.to_parquet(sot / "dicom_tags.parquet", index=False)
         else:
-            tags_df[DICOM_TAGS_COLS].to_parquet(sot / "dicom_tags.parquet", index=False)
+            tags_df.to_parquet(sot / "dicom_tags.parquet", index=False)
 
         # update cohort with all full-quad exams
         cohort = combined_exams[combined_exams["has_full_quad"]][
@@ -1649,7 +1683,7 @@ def preprocess(cfg: PreprocessConfig) -> None:
         # write new tables
         sel_df[VIEWS_COLS].to_parquet(sot / "views.parquet", index=False)
         exams[EXAMS_COLS].to_parquet(sot / "exams.parquet", index=False)
-        tags_df[DICOM_TAGS_COLS].to_parquet(sot / "dicom_tags.parquet", index=False)
+        tags_df.to_parquet(sot / "dicom_tags.parquet", index=False)
 
         # create cohort of all full-quad exams (genotype filtering done downstream)
         cohort = exams[exams["has_full_quad"]][
@@ -1672,6 +1706,7 @@ def preprocess(cfg: PreprocessConfig) -> None:
     prep_dir.mkdir(parents=True, exist_ok=True)
 
     manifest_rows: List[Dict] = []
+    failed_exams: List[Dict] = []
 
     logger.info("grouping exams for zarr writing...")
     grouped = {k: v for k, v in sel_df.groupby("exam_id")}
@@ -1692,33 +1727,56 @@ def preprocess(cfg: PreprocessConfig) -> None:
         futs = {
             ex.submit(write_exam_zarr, grp_df, prep_dir): eid for eid, grp_df in targets
         }
-        for fut in tqdm(
-            as_completed(futs), total=len(futs), desc="writing zarr", unit="exam"
-        ):
-            if shutdown_requested:
-                logger.info(
-                    "shutdown requested during zarr writing, cancelling remaining tasks..."
-                )
-                ex.shutdown(wait=False, cancel_futures=True)
-                break
+        try:
+            for fut in tqdm(
+                as_completed(futs), total=len(futs), desc="writing zarr", unit="exam"
+            ):
+                if shutdown_requested:
+                    logger.info(
+                        "shutdown requested during zarr writing, cancelling remaining tasks..."
+                    )
+                    ex.shutdown(wait=False, cancel_futures=True)
+                    raise KeyboardInterrupt("user requested shutdown")
 
-            zpath, shapes = fut.result()
-            eid = futs[fut]
-            grp_df = grouped[eid]
-            for _, r in grp_df.iterrows():
-                key = VIEWS[(r["laterality"], r["view"])]
-                manifest_rows.append(
-                    {
-                        "patient_id": r["patient_id"],
-                        "exam_id": r["exam_id"],
-                        "laterality": r["laterality"],
-                        "view": r["view"],
-                        "zarr_uri": str(zpath),
-                        "zarr_key": key,
-                        "height": shapes[key][0],
-                        "width": shapes[key][1],
-                    }
-                )
+                eid = futs[fut]
+                try:
+                    zpath, shapes = fut.result()
+                    grp_df = grouped[eid]
+                    for _, r in grp_df.iterrows():
+                        key = VIEWS[(r["laterality"], r["view"])]
+                        manifest_rows.append(
+                            {
+                                "patient_id": r["patient_id"],
+                                "exam_id": r["exam_id"],
+                                "laterality": r["laterality"],
+                                "view": r["view"],
+                                "zarr_uri": str(zpath),
+                                "zarr_key": key,
+                                "height": shapes[key][0],
+                                "width": shapes[key][1],
+                            }
+                        )
+                except Exception as e:
+                    grp_df = grouped[eid]
+                    first = grp_df.iloc[0]
+                    patient_id = first["patient_id"]
+                    error_type = type(e).__name__
+                    error_msg = str(e)
+                    failed_exams.append(
+                        {
+                            "patient_id": patient_id,
+                            "exam_id": eid,
+                            "error_type": error_type,
+                            "error_message": error_msg,
+                        }
+                    )
+                    logger.warning(
+                        f"failed to convert exam {eid} (patient {patient_id}): {error_type}: {error_msg}"
+                    )
+        except KeyboardInterrupt:
+            logger.info("cancelling zarr writing...")
+            ex.shutdown(wait=False, cancel_futures=True)
+            raise
 
     if shutdown_requested:
         logger.warning("shutdown requested, skipping manifest write")
@@ -1742,6 +1800,17 @@ def preprocess(cfg: PreprocessConfig) -> None:
     manifest.to_parquet(manifest_path, index=False)
     logger.info(f"wrote manifest to {manifest_path}")
 
+    # write failure log if any conversions failed
+    if failed_exams:
+        failures_path = out / "conversion_failures.parquet"
+        failures_df = pd.DataFrame(failed_exams)
+        failures_df.to_parquet(failures_path, index=False)
+        logger.warning(
+            f"wrote {len(failed_exams)} conversion failures to {failures_path}"
+        )
+    else:
+        logger.info("no conversion failures")
+
     # QC summary
     total_files = len(views_df)
     total_exams = views_df[["exam_id"]].nunique()[0]
@@ -1759,6 +1828,8 @@ def preprocess(cfg: PreprocessConfig) -> None:
     logger.info(f"unique exams: {total_exams}")
     logger.info(f"full-quad exams: {full_exams}")
     logger.info(f"cohort (full-quad exams): {cohort_exams}")
+    logger.info(f"successful conversions: {len(manifest_rows) // 4}")
+    logger.info(f"failed conversions: {len(failed_exams)}")
     logger.info("views by vendor/model:")
     logger.info(f"\n{vendor_counts.to_string(index=False)}")
     logger.info(f"written SoT: {sot}")

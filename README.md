@@ -14,19 +14,30 @@ micromamba config append channels conda-forge
 
 Installation recipe:
 ```bash
+# Create and activate environment
 micromamba config append channels conda-forge
 micromamba create -y --name prima python=3.11
 micromamba activate prima
+
+# Clone repository
 git clone --recursive git@github.com:uchicago-dsi/prima.git
 cd prima
 git submodule add https://github.com/annawoodard/Mirai vendor/mirai
 git submodule update --init --recursive
 
-micromamba install -y pytorch torchvision pytorch-cuda=12.1 selenium firefox geckodriver ipykernel -c pytorch -c nvidia
-pip install -e . # if developing
-# pip install . # if not developing
+# Install DICOM compression handlers via conda (must be done first)
+# Note: pylibjpeg handles JPEG 2000 and JPEG Extended (12-bit) since gdcm 3.x is not available
+micromamba install -y -c conda-forge pydicom pylibjpeg pylibjpeg-openjpeg pylibjpeg-libjpeg
+
+# Install PyTorch and other conda dependencies
+micromamba install -y -c pytorch -c nvidia -c conda-forge \
+    pytorch torchvision pytorch-cuda=12.1 \
+    selenium firefox geckodriver ipykernel
+
+# Install package and remaining dependencies
+pip install -e .  # if developing (use 'pip install .' if not)
 pip install -r requirements.txt
-pip install -r requirements-dev.txt  # linting + notebook extras when contributing
+pip install -r requirements-dev.txt  # optional: linting + notebook extras
 ```
 
 Runtime dependencies live in `requirements.txt`; install `requirements-dev.txt` to pick up

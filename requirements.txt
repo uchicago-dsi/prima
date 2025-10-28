@@ -1,3 +1,7 @@
+# DICOM handling (install via conda FIRST - see README.md):
+#   micromamba install -c conda-forge pydicom pylibjpeg pylibjpeg-openjpeg pylibjpeg-libjpeg
+# These provide JPEG 2000 and JPEG Extended (12-bit) decompression (gdcm 3.x not available)
+
 beautifulsoup4
 imageio==2.26.0
 einops
@@ -7,10 +11,8 @@ omegaconf==2.3.0
 opencv-python-headless
 opencv_python==4.7.0.72
 pandas
-pillow==9.5.0
 psutil
 pyarrow
-pydicom
 requests
 selenium
 setuptools==67.6.0
@@ -18,6 +20,3 @@ tqdm==4.65.0
 zarr>=2.15
 numcodecs>=0.11
 pillow>=10.0.0
-pylibjpeg>=2.0 
-pylibjpeg-openjpeg>=2.0
-gdcm>=3.0.10

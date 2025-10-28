@@ -23,7 +23,7 @@ from filesystem_utils import build_disk_inventory
 username = os.getenv("IBROKER_USERNAME")
 password = os.getenv("IBROKER_PASSWORD")
 
-BASE_DOWNLOAD_DIR = "/gpfs/data/huo-lab/Image/ChiMEC/"
+BASE_DOWNLOAD_DIR = "/gpfs/data/huo-lab/Image/ChiMEC/MG"
 
 # NEW: Fail fast if environment variables are not set
 if not all([username, password]):

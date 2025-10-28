@@ -1,3 +1,4 @@
 [submodule "vendor/mirai"]
 	path = vendor/mirai
 	url = git@github.com:annawoodard/Mirai.git
+	branch = prima-zarr
