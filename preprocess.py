@@ -1896,12 +1896,71 @@ def _diagnose_join(man: pd.DataFrame, lab: pd.DataFrame) -> None:
     Logs counts for manifest rows and unique exams, labels exams, join coverage,
     and whether mismatches appear to be due to patient_id vs exam_id mapping.
     """
+    logger.info("=== JOIN DIAGNOSTICS ===")
+
+    # dtypes
+    logger.info(
+        "manifest dtypes: patient_id=%s, exam_id=%s",
+        man["patient_id"].dtype,
+        man["exam_id"].dtype,
+    )
+    logger.info(
+        "labels dtypes: patient_id=%s, exam_id=%s",
+        lab["patient_id"].dtype,
+        lab["exam_id"].dtype,
+    )
+
+    # cardinality
+    logger.info(
+        "manifest: %d unique patient_ids, %d unique exam_ids",
+        man["patient_id"].nunique(),
+        man["exam_id"].nunique(),
+    )
+    logger.info(
+        "labels: %d unique patient_ids, %d unique exam_ids",
+        lab["patient_id"].nunique(),
+        lab["exam_id"].nunique(),
+    )
+
+    # sample values for visual inspection
+    logger.info("manifest sample patient_ids: %s", list(man["patient_id"].head(5)))
+    logger.info("labels sample patient_ids: %s", list(lab["patient_id"].head(5)))
+    logger.info("manifest sample exam_ids: %s", list(man["exam_id"].head(5)))
+    logger.info("labels sample exam_ids: %s", list(lab["exam_id"].head(5)))
+
+    # check for whitespace issues
+    man_pid_ws = man["patient_id"].astype(str).str.strip() != man["patient_id"].astype(
+        str
+    )
+    lab_pid_ws = lab["patient_id"].astype(str).str.strip() != lab["patient_id"].astype(
+        str
+    )
+    man_eid_ws = man["exam_id"].astype(str).str.strip() != man["exam_id"].astype(str)
+    lab_eid_ws = lab["exam_id"].astype(str).str.strip() != lab["exam_id"].astype(str)
+    if man_pid_ws.any() or lab_pid_ws.any() or man_eid_ws.any() or lab_eid_ws.any():
+        logger.warning(
+            "whitespace detected: manifest patient_id=%d, labels patient_id=%d, manifest exam_id=%d, labels exam_id=%d",
+            man_pid_ws.sum(),
+            lab_pid_ws.sum(),
+            man_eid_ws.sum(),
+            lab_eid_ws.sum(),
+        )
+
+    # paired overlap
     man_pairs = set(man[["patient_id", "exam_id"]].apply(tuple, axis=1))
     lab_pairs = set(lab[["patient_id", "exam_id"]].apply(tuple, axis=1))
     inter_pairs = man_pairs & lab_pairs
     logger.info(f"manifest views: {len(man)}; manifest exams: {len(set(man_pairs))}")
     logger.info(f"labels exams: {len(set(lab_pairs))}")
     logger.info(f"paired (patient+exam) matches: {len(inter_pairs)}")
+
+    # patient-id-only overlap
+    man_pids = set(man["patient_id"].astype(str))
+    lab_pids = set(lab["patient_id"].astype(str))
+    pid_inter = man_pids & lab_pids
+    logger.info(
+        f"patient_id-only overlap: {len(pid_inter)} of {len(man_pids)} manifest patient_ids"
+    )
 
     # exam-id-only overlap (to detect patient_id drift)
     man_eids = set(man["exam_id"].astype(str))
@@ -1940,13 +1999,26 @@ def _diagnose_join(man: pd.DataFrame, lab: pd.DataFrame) -> None:
         for eid, m_pid, l_pid in suspect[:5]:
             logger.info("  eid=%s manifest_pid=%s labels_pid=%s", eid, m_pid, l_pid)
 
+    logger.info("=== END JOIN DIAGNOSTICS ===")
+
 
 def write_mirai_csv(
-    manifest_parquet: Path, labels_parquet: Path, out_csv: Path, *, strict: bool = False
+    manifest_parquet: Path,
+    labels_csv: Path,
+    exams_parquet: Path,
+    out_csv: Path,
+    *,
+    today: Optional[date] = None,
+    strict: bool = False,
 ) -> None:
     """Create a Mirai-compatible CSV that points to Zarr URIs instead of PNGs.
 
-    The CSV schema mirrors Mirai's documented requirements:
+    Expects labels_csv to contain columns: MRN, CaseControl, datedx.
+    Uses hardcoded mapping files:
+    - /gpfs/data/huo-lab/Image/ChiMEC/study-16352a.csv to map MRN → AnonymousID (patient_id)
+    - /gpfs/data/phs/groups/Projects/Huo_projects/SPORE/CRDW_data/2025Oct23/dr_7934_pats.txt for DATE_OF_LAST_CONTACT
+
+    The output CSV schema mirrors Mirai's documented requirements:
     columns: patient_id, exam_id, laterality, view, file_path,
              years_to_cancer, years_to_last_followup, split_group
 
@@ -1957,18 +2029,165 @@ def write_mirai_csv(
     ----------
     manifest_parquet : Path
         parquet emitted by preprocess() mapping views to zarr URIs and keys
-    labels_parquet : Path
-        parquet with columns [patient_id, exam_id, years_to_cancer, years_to_last_followup, split_group]
+    labels_csv : Path
+        CSV with MRN, CaseControl, datedx columns
+    exams_parquet : Path
+        SoT parquet with exam_id, patient_id, accession_number, study_date
     out_csv : Path
         destination CSV; parent must exist
+    today : Optional[date]
+        override for 'today' when computing years_to_last_followup (not used if last_contact available)
+    strict : bool
+        raise if any manifest rows lack labels
     """
+    # hardcoded paths and column names
+    mrn_mapping_csv = Path("/gpfs/data/huo-lab/Image/ChiMEC/study-16352a.csv")
+    last_contact_file = Path(
+        "/gpfs/data/phs/groups/Projects/Huo_projects/SPORE/CRDW_data/2025Oct23/dr_7934_pats.txt"
+    )
+    mrn_col = "MRN"
+    case_col = "CaseControl"
+    dxdate_col = "datedx"
+    split_col = None
     man = pd.read_parquet(manifest_parquet)
     req_m = {"patient_id", "exam_id", "laterality", "view", "zarr_uri", "zarr_key"}
     if req_m - set(man.columns):
         miss = sorted(req_m - set(man.columns))
         raise KeyError(f"manifest missing columns: {miss}")
 
-    lab = pd.read_parquet(labels_parquet)
+    # build labels dataframe from CSV
+    logger.info("loading labels CSV…")
+    labels_df = pd.read_csv(labels_csv)
+
+    if mrn_col not in labels_df.columns:
+        raise KeyError(f"MRN column '{mrn_col}' not found in {labels_csv.name}")
+    if case_col not in labels_df.columns:
+        raise KeyError(
+            f"case/control column '{case_col}' not found in {labels_csv.name}"
+        )
+    if dxdate_col not in labels_df.columns:
+        raise KeyError(
+            f"diagnosis date column '{dxdate_col}' not found in {labels_csv.name}"
+        )
+
+    # normalize MRN to 8-digit zero-padded string
+    labels_df["MRN"] = labels_df[mrn_col].astype(str).str.strip().str.zfill(8)
+    logger.info(f"loaded {len(labels_df)} rows from labels CSV")
+
+    # load MRN → AnonymousID mapping
+    logger.info(f"loading MRN → AnonymousID mapping from {mrn_mapping_csv}…")
+    mrn_map = pd.read_csv(mrn_mapping_csv)
+    if not {"MRN", "AnonymousID"}.issubset(mrn_map.columns):
+        raise KeyError(
+            f"MRN mapping missing required columns: {mrn_map.columns.tolist()}"
+        )
+    mrn_map["MRN"] = mrn_map["MRN"].astype(str).str.strip().str.zfill(8)
+    mrn_map["AnonymousID"] = mrn_map["AnonymousID"].astype(str).str.strip()
+
+    # map labels MRN → AnonymousID
+    labels_df = labels_df.merge(mrn_map[["MRN", "AnonymousID"]], on="MRN", how="left")
+    logger.info(
+        f"mapped {labels_df['AnonymousID'].notna().sum()} / {len(labels_df)} labels rows to AnonymousID"
+    )
+
+    # load last contact dates
+    logger.info(f"loading last contact dates from {last_contact_file}…")
+    last_contact = pd.read_csv(last_contact_file, sep="|", encoding="latin-1")
+    if not {"MRN", "DATE_OF_LAST_CONTACT"}.issubset(last_contact.columns):
+        raise KeyError(
+            f"last contact file missing required columns: {last_contact.columns.tolist()}"
+        )
+    last_contact["MRN"] = last_contact["MRN"].astype(str).str.strip()
+    last_contact["last_contact_ts"] = _parse_date_col(
+        last_contact["DATE_OF_LAST_CONTACT"]
+    )
+
+    # merge last contact into labels
+    labels_df = labels_df.merge(
+        last_contact[["MRN", "last_contact_ts"]], on="MRN", how="left"
+    )
+
+    logger.info("loading SoT exams to map AnonymousID → exam_id + study_date…")
+    exams = pd.read_parquet(exams_parquet)
+    req_ex = {"exam_id", "accession_number", "study_date", "patient_id"}
+    if req_ex - set(exams.columns):
+        raise KeyError(
+            f"exams parquet missing columns: {sorted(req_ex - set(exams.columns))}"
+        )
+
+    # normalize join keys as strings
+    exams = exams.copy()
+    exams["patient_id"] = exams["patient_id"].astype(str).str.strip()
+
+    # join on AnonymousID
+    j = labels_df.merge(
+        exams[["patient_id", "exam_id", "study_date"]],
+        left_on="AnonymousID",
+        right_on="patient_id",
+        how="inner",
+    )
+    logger.info(f"matched {len(j)} exam rows via AnonymousID")
+
+    # parse dates
+    j["study_date_ts"] = _parse_date_col(j["study_date"])
+    j["dx_date_ts"] = _parse_date_col(j[dxdate_col])
+
+    # compute years_to_cancer
+    cc = j[case_col].astype(str).str.lower()
+    is_case = cc.str.contains("case", na=False)
+    is_control = cc.str.contains("control", na=False)
+
+    def _years_between(a: pd.Series, b: pd.Series) -> pd.Series:
+        delta_days = (b - a).dt.days
+        years = (delta_days / 365.25).fillna(np.nan)
+        return np.floor(np.maximum(years, 0)).astype("Int64")
+
+    ytc = pd.Series(pd.NA, index=j.index, dtype="Int64")
+    ytc_case = _years_between(j["study_date_ts"], j["dx_date_ts"])
+    ytc = ytc.where(~is_case, ytc_case)
+    ytc = ytc.where(~is_control, 100)
+
+    # years_to_last_followup: use last_contact_ts if available, else fallback to today
+    has_last_contact = j["last_contact_ts"].notna()
+    ylf = pd.Series(pd.NA, index=j.index, dtype="Int64")
+    if has_last_contact.any():
+        ylf_contact = _years_between(
+            j.loc[has_last_contact, "study_date_ts"],
+            j.loc[has_last_contact, "last_contact_ts"],
+        )
+        ylf.loc[has_last_contact] = ylf_contact
+        logger.info(
+            f"computed years_to_last_followup from DATE_OF_LAST_CONTACT for {has_last_contact.sum()} exams"
+        )
+    if (~has_last_contact).any():
+        tday = today or datetime.now().date()
+        ylf_today = _years_between(
+            j.loc[~has_last_contact, "study_date_ts"], pd.to_datetime(tday)
+        )
+        ylf.loc[~has_last_contact] = ylf_today
+        logger.info(
+            f"computed years_to_last_followup from today for {(~has_last_contact).sum()} exams (no last contact date)"
+        )
+
+    # assemble labels
+    lab = pd.DataFrame(
+        {
+            "patient_id": j["patient_id"].astype(str),
+            "exam_id": j["exam_id"].astype(str),
+            "years_to_cancer": ytc.astype("Int64"),
+            "years_to_last_followup": ylf.astype("Int64"),
+            "split_group": (
+                j[split_col].astype(str).str.lower()
+                if split_col and split_col in j.columns
+                else pd.Series(["test"] * len(j))
+            ),
+        }
+    )
+    lab = lab[(lab["exam_id"].notna()) & (lab["exam_id"].astype(str) != "nan")]
+    lab["years_to_cancer"] = lab["years_to_cancer"].fillna(100).astype(int)
+    lab["years_to_last_followup"] = lab["years_to_last_followup"].fillna(0).astype(int)
+    lab = lab.drop_duplicates(subset=["patient_id", "exam_id"]).reset_index(drop=True)
+
     req_l = {
         "patient_id",
         "exam_id",
@@ -1981,6 +2200,11 @@ def write_mirai_csv(
         raise KeyError(f"labels missing columns: {miss}")
 
     df = man.merge(lab[list(req_l)], on=["patient_id", "exam_id"], how="inner")
+    if len(df) == 0:
+        _diagnose_join(man, lab)
+        raise ValueError(
+            "merge produced 0 matches; cannot emit CSV without any paired data"
+        )
     if len(df) != len(man):
         missing_n = len(man) - len(df)
         logger.warning(
@@ -1993,8 +2217,12 @@ def write_mirai_csv(
             ) - set(df[["patient_id", "exam_id"]].apply(tuple, axis=1))
             raise ValueError(f"labels missing for {len(missing_pairs)} exam(s)")
 
-    df["file_path"] = df.apply(
-        lambda r: f"zarr://{Path(r['zarr_uri']).resolve()}#{r['zarr_key']}", axis=1
+    # vectorized string concat avoids apply() edge cases with empty DataFrames
+    df["file_path"] = (
+        "zarr://"
+        + df["zarr_uri"].apply(lambda p: str(Path(p).resolve()))
+        + "#"
+        + df["zarr_key"]
     )
     out = df[
         [
@@ -2023,152 +2251,6 @@ def _parse_date_col(series: pd.Series) -> pd.Series:
     rest = pd.to_datetime(s[ymd.isna()], errors="coerce")
     ymd.loc[ymd.isna()] = rest
     return ymd
-
-
-def build_labels_from_foo(
-    foo_csv: Path,
-    exams_parquet: Path,
-    out_parquet: Path,
-    *,
-    patient_col: str = "mammoID",
-    case_col: str = "CaseControl",
-    dxdate_col: str = "datedx",
-    split_col: Optional[str] = None,
-    today: Optional[date] = None,
-) -> Path:
-    """Create labels parquet with Mirai-required fields from a cohort CSV.
-
-    This consumes the cohort CSV (e.g., foo.csv with Case/Control and datedx),
-    treats `mammoID` as the patient identifier, joins to SoT `exams.parquet` on
-    patient_id to recover all exam_ids and exam dates for each patient, and computes
-    integer years_to_cancer (per exam) and years_to_last_followup.
-
-    Parameters
-    ----------
-    foo_csv : Path
-        Input CSV containing at least `CaseControl`, `datedx`, and an exam identifier column.
-    exams_parquet : Path
-        SoT parquet with columns including `exam_id`, `accession_number`, and `study_date`.
-    out_parquet : Path
-        Destination parquet path to write labels.
-    patient_col : str
-        Column in foo_csv that maps to `patient_id` in SoT (default: 'mammoID').
-    case_col : str
-        Column indicating case/control status (default: 'CaseControl').
-    dxdate_col : str
-        Column with diagnosis date (default: 'datedx').
-    split_col : Optional[str]
-        Optional column for split assignment (train/dev/test). If absent, defaults to 'train'.
-    today : Optional[date]
-        Override for 'today' when computing years_to_last_followup; defaults to datetime.now().date().
-    """
-    logger.info("loading foo CSV for labels…")
-    df = pd.read_csv(foo_csv)
-
-    # confirm patient identifier column exists
-    if patient_col not in df.columns:
-        raise KeyError(
-            f"Patient identifier column '{patient_col}' not found in {foo_csv.name}"
-        )
-    if case_col not in df.columns:
-        raise KeyError(f"Case/control column '{case_col}' not found in {foo_csv.name}")
-    if dxdate_col not in df.columns:
-        raise KeyError(
-            f"Diagnosis date column '{dxdate_col}' not found in {foo_csv.name}"
-        )
-
-    logger.info("loading SoT exams to map patient/accession → exam_id + study_date…")
-    exams = pd.read_parquet(exams_parquet)
-    req = {"exam_id", "accession_number", "study_date", "patient_id"}
-    missing = req - set(exams.columns)
-    if missing:
-        raise KeyError(f"exams.parquet missing required columns: {sorted(missing)}")
-
-    # normalize candidate join keys as strings
-    s_col = patient_col
-    df[s_col] = df[s_col].astype(str).str.strip()
-    exams = exams.copy()
-    exams["patient_id"] = exams["patient_id"].astype(str).str.strip()
-    exams["accession_number"] = exams["accession_number"].astype(str).str.strip()
-
-    # Strategy A: join mammoID→patient_id
-    j_pid = df.merge(
-        exams[["patient_id", "exam_id", "study_date"]],
-        left_on=s_col,
-        right_on="patient_id",
-        how="inner",
-        copy=False,
-    )
-
-    # Strategy B: join mammoID→accession_number (if values look like accessions)
-    j_acc = df.merge(
-        exams[["accession_number", "exam_id", "study_date", "patient_id"]],
-        left_on=s_col,
-        right_on="accession_number",
-        how="inner",
-        copy=False,
-    )
-
-    # choose the richer join
-    use_acc = len(j_acc) > len(j_pid)
-    j = j_acc if use_acc else j_pid
-    logger.info(
-        f"labels join mode: {'accession_number' if use_acc else 'patient_id'} "
-        f"(matched {len(j)} exam rows; pid={len(j_pid)}, acc={len(j_acc)})"
-    )
-
-    # parse dates
-    j["study_date_ts"] = _parse_date_col(j["study_date"])
-    j["dx_date_ts"] = _parse_date_col(j[dxdate_col])
-
-    # compute years_to_cancer
-    cc = j[case_col].astype(str).str.lower()
-    is_case = cc.str.contains("case", na=False)
-    is_control = cc.str.contains("control", na=False)
-
-    def _years_between(a: pd.Series, b: pd.Series) -> pd.Series:
-        delta_days = (b - a).dt.days
-        years = (delta_days / 365.25).fillna(np.nan)
-        return np.floor(np.maximum(years, 0)).astype("Int64")
-
-    ytc = pd.Series(pd.NA, index=j.index, dtype="Int64")
-    # cases with dx dates → years difference; controls → 100; others NA
-    ytc_case = _years_between(j["study_date_ts"], j["dx_date_ts"])  # may be NA
-    ytc = ytc.where(~is_case, ytc_case)
-    ytc = ytc.where(~is_control, 100)
-
-    # years_to_last_followup: today - study_date
-    tday = today or datetime.now().date()
-    ylf = _years_between(j["study_date_ts"], pd.to_datetime(tday))
-
-    # assemble labels
-    out = pd.DataFrame(
-        {
-            "patient_id": j["patient_id"].astype(str),
-            "exam_id": j["exam_id"].astype(str),
-            "years_to_cancer": ytc.astype("Int64"),
-            "years_to_last_followup": ylf.astype("Int64"),
-            "split_group": (
-                j[split_col].astype(str).str.lower()
-                if split_col and split_col in j.columns
-                else pd.Series(["train"] * len(j))
-            ),
-        }
-    )
-    # drop rows without a resolved exam_id or study_date
-    out = out[(out["exam_id"].notna()) & (out["exam_id"].astype(str) != "nan")]
-    # ensure integer dtype
-    out["years_to_cancer"] = out["years_to_cancer"].fillna(100).astype(int)
-    out["years_to_last_followup"] = out["years_to_last_followup"].fillna(0).astype(int)
-
-    # deduplicate by (patient_id, exam_id)
-    out = out.drop_duplicates(subset=["patient_id", "exam_id"]).reset_index(drop=True)
-
-    out_parquet = Path(out_parquet)
-    out_parquet.parent.mkdir(parents=True, exist_ok=True)
-    out.to_parquet(out_parquet, index=False)
-    logger.info(f"wrote labels parquet → {out_parquet}")
-    return out_parquet
 
 
 def materialize_mirai_embeddings(
@@ -2358,7 +2440,7 @@ def parse_args():
         help="Path to write Mirai CSV (defaults to out_dir/mirai_manifest.csv if --labels is provided)",
     )
 
-    # labels building from foo.csv (CaseControl + datedx)
+    # labels CSV with case/control status and diagnosis dates
     p.add_argument(
         "--labels",
         dest="labels",
@@ -2366,38 +2448,7 @@ def parse_args():
         default=Path(
             "/gpfs/data/phs/groups/Projects/Huo_projects/SPORE/annawoodard/Phenotype_ChiMEC_2025Oct4.csv"
         ),
-        help=(
-            "Cohort metadata file (CSV or Parquet). "
-            "If CSV, must contain mammoID, CaseControl, datedx and will be converted into labels.parquet; "
-            "if Parquet, must already include years_to_cancer/years_to_last_followup/split_group."
-        ),
-    )
-    p.add_argument(
-        "--labels-patient-col",
-        dest="labels_patient_col",
-        type=str,
-        default="mammoID",
-        help="Patient id column in --labels (default: mammoID)",
-    )
-    p.add_argument(
-        "--labels-case-col",
-        dest="labels_case_col",
-        type=str,
-        default="CaseControl",
-        help="Case/Control column in --labels (default: CaseControl)",
-    )
-    p.add_argument(
-        "--labels-dxdate-col",
-        dest="labels_dxdate_col",
-        type=str,
-        default="datedx",
-        help="Diagnosis date column in --labels (default: datedx)",
-    )
-    p.add_argument(
-        "--labels-split-col",
-        dest="labels_split_col",
-        type=str,
-        help="Optional split column in --labels; if absent, defaults to 'train'",
+        help="Cohort metadata CSV with MRN, CaseControl, and datedx columns",
     )
     p.add_argument(
         "--today",
@@ -2500,48 +2551,19 @@ def parse_args():
         default=Path(
             "/gpfs/data/phs/groups/Projects/Huo_projects/SPORE/annawoodard/Phenotype_ChiMEC_2025Oct4.csv"
         ),
-        help=(
-            "Cohort metadata (CSV or Parquet). CSV must contain mammoID, CaseControl, datedx."
-        ),
+        help="Cohort metadata CSV with MRN, CaseControl, datedx columns",
     )
     ec.add_argument(
         "--exams",
         dest="exams_parquet",
         type=Path,
-        help="Path to SoT exams.parquet (required when --labels is a CSV)",
+        help="Path to SoT exams.parquet",
     )
     ec.add_argument(
         "--emit-csv",
         dest="out_csv",
         type=Path,
         help="Output Mirai CSV (default: <out>/mirai_manifest.csv)",
-    )
-    ec.add_argument(
-        "--labels-patient-col",
-        dest="labels_patient_col",
-        type=str,
-        default="mammoID",
-        help="Patient id column in labels CSV (default: mammoID)",
-    )
-    ec.add_argument(
-        "--labels-case-col",
-        dest="labels_case_col",
-        type=str,
-        default="CaseControl",
-        help="Case/Control column in labels CSV (default: CaseControl)",
-    )
-    ec.add_argument(
-        "--labels-dxdate-col",
-        dest="labels_dxdate_col",
-        type=str,
-        default="datedx",
-        help="Diagnosis date column in labels CSV (default: datedx)",
-    )
-    ec.add_argument(
-        "--labels-split-col",
-        dest="labels_split_col",
-        type=str,
-        help="Optional split column in labels CSV; if absent, defaults to 'train'",
     )
     ec.add_argument(
         "--today",
@@ -2617,9 +2639,20 @@ def main() -> None:
 
         preprocess(cfg)
 
-        # Build or load labels from --labels
-        labels_path: Optional[Path] = None
-        if args.labels is not None:
+        # emit Mirai CSV if either an explicit output path is provided or labels were given
+        emit_path: Optional[Path] = args.emit_csv
+        if emit_path is None and args.labels is not None:
+            emit_path = cfg.out_dir / "mirai_manifest.csv"
+
+        if emit_path is not None:
+            logger.info("generating Mirai CSV…")
+            if args.labels is None:
+                raise ValueError("need labels CSV to write Mirai CSV; pass --labels")
+            if args.labels.suffix.lower() != ".csv":
+                raise ValueError(
+                    f"--labels must be a CSV file, got {args.labels.suffix}"
+                )
+
             # parse --today override
             today_override: Optional[date] = None
             if args.today:
@@ -2628,33 +2661,13 @@ def main() -> None:
                 except ValueError as e:
                     raise ValueError("--today must be in YYYY-MM-DD format") from e
 
-            if args.labels.suffix.lower() == ".csv":
-                logger.info("building labels from CSV passed via --labels…")
-                labels_path = build_labels_from_foo(
-                    args.labels,
-                    cfg.sot_dir / "exams.parquet",
-                    (cfg.out_dir / "labels.parquet"),
-                    patient_col=args.labels_patient_col,
-                    case_col=args.labels_case_col,
-                    dxdate_col=args.labels_dxdate_col,
-                    split_col=args.labels_split_col,
-                    today=today_override,
-                )
-            else:
-                labels_path = args.labels
-
-        # Emit Mirai CSV if either an explicit output path is provided or labels were built
-        emit_path: Optional[Path] = args.emit_csv
-        if emit_path is None and args.labels is not None:
-            emit_path = cfg.out_dir / "mirai_manifest.csv"
-
-        if emit_path is not None:
-            logger.info("generating Mirai CSV…")
-            if labels_path is None:
-                raise ValueError(
-                    "Need labels to write CSV; pass --labels (CSV or Parquet)."
-                )
-            write_mirai_csv(cfg.out_dir / "manifest.parquet", labels_path, emit_path)
+            write_mirai_csv(
+                cfg.out_dir / "manifest.parquet",
+                args.labels,
+                cfg.sot_dir / "exams.parquet",
+                emit_path,
+                today=today_override,
+            )
             logger.info(f"wrote Mirai CSV → {emit_path}")
 
         # materialize per-view embeddings if requested
@@ -2705,16 +2718,16 @@ def main() -> None:
         monitor_progress(args.checkpoint_dir, args.interval)
 
     elif args.command == "emit-csv":
-        # Only build labels (if needed) and write Mirai CSV; no recomputation of SoT/manifest
-        # Resolve default directories from --raw when unspecified
+        # Only build labels and write Mirai CSV; no recomputation of SoT/manifest
         raw_dir = args.raw_dir
         sot_dir = args.sot_dir if args.sot_dir is not None else raw_dir / "sot"
         out_dir = args.out_dir if args.out_dir is not None else raw_dir / "out"
 
-        # Determine manifest path default
         manifest_path = args.manifest_parquet or (out_dir / "manifest.parquet")
+        exams_pq = args.exams_parquet or (sot_dir / "exams.parquet")
+        out_csv = args.out_csv or (out_dir / "mirai_manifest.csv")
 
-        # Parse optional today override
+        # parse optional today override
         t_override: Optional[date] = None
         if args.today:
             try:
@@ -2722,27 +2735,16 @@ def main() -> None:
             except ValueError as e:
                 raise ValueError("--today must be in YYYY-MM-DD format") from e
 
-        # Build labels if CSV, else use provided parquet
-        labels_path: Path
-        if args.labels.suffix.lower() == ".csv":
-            exams_pq = args.exams_parquet or (sot_dir / "exams.parquet")
-            # labels.parquet will live next to manifest by default
-            labels_parquet_out = manifest_path.parent / "labels.parquet"
-            labels_path = build_labels_from_foo(
-                args.labels,
-                exams_pq,
-                labels_parquet_out,
-                patient_col=args.labels_patient_col,
-                case_col=args.labels_case_col,
-                dxdate_col=args.labels_dxdate_col,
-                split_col=args.labels_split_col,
-                today=t_override,
-            )
-        else:
-            labels_path = args.labels
+        if args.labels.suffix.lower() != ".csv":
+            raise ValueError(f"--labels must be a CSV file, got {args.labels.suffix}")
 
-        out_csv = args.out_csv or (out_dir / "mirai_manifest.csv")
-        write_mirai_csv(manifest_path, labels_path, out_csv)
+        write_mirai_csv(
+            manifest_path,
+            args.labels,
+            exams_pq,
+            out_csv,
+            today=t_override,
+        )
         logger.info(f"wrote Mirai CSV → {out_csv}")
 
     else:
