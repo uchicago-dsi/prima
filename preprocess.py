@@ -2379,6 +2379,433 @@ def ingest_mirai_predictions(prediction_csv: Path, out_parquet: Path) -> None:
     out.to_parquet(out_parquet, index=False)
 
 
+def _save_four_view_figure(
+    view_data: Dict[str, tuple],
+    debug_dir: Path,
+    patient_id: str,
+    accession_number: str,
+    exam_id: str,
+) -> None:
+    """save a combined figure with all four views of an exam.
+
+    Args:
+        view_data: dict mapping view keys (L_CC, L_MLO, R_CC, R_MLO) to (dicom_dataset, path) tuples
+        debug_dir: output directory
+        patient_id: patient identifier
+        accession_number: accession number
+        exam_id: exam identifier
+    """
+    try:
+        fig = plt.figure(figsize=(20, 10))
+
+        # canonical order
+        view_order = [("L", "CC"), ("L", "MLO"), ("R", "CC"), ("R", "MLO")]
+        view_labels = ["L CC", "L MLO", "R CC", "R MLO"]
+
+        for idx, ((lat, view), label) in enumerate(zip(view_order, view_labels), 1):
+            ax = plt.subplot(2, 4, idx)
+            view_key = f"{lat}_{view}"
+
+            if view_key in view_data:
+                ds, _ = view_data[view_key]
+                try:
+                    pixel_array = ds.pixel_array
+                    ax.imshow(pixel_array, cmap="gray")
+                    ax.set_title(label, fontsize=14, fontweight="bold")
+                except Exception as e:
+                    ax.text(
+                        0.5,
+                        0.5,
+                        f"Cannot display:\n{e}",
+                        ha="center",
+                        va="center",
+                        transform=ax.transAxes,
+                    )
+                    ax.set_title(f"{label} (error)", fontsize=14)
+            else:
+                ax.text(
+                    0.5,
+                    0.5,
+                    "Missing",
+                    ha="center",
+                    va="center",
+                    transform=ax.transAxes,
+                    fontsize=16,
+                )
+                ax.set_title(f"{label} (missing)", fontsize=14)
+
+            ax.axis("off")
+
+        # add metadata text on the right side
+        ax_text = plt.subplot(2, 4, (5, 8))
+        ax_text.axis("off")
+
+        # collect metadata from first available view
+        first_view_ds = None
+        for view_key in view_data:
+            first_view_ds = view_data[view_key][0]
+            break
+
+        if first_view_ds:
+            metadata_lines = [
+                f"Patient: {patient_id}",
+                f"Exam: {exam_id}",
+                f"Accession: {accession_number}",
+                "",
+                "Key DICOM Tags:",
+                f"  Study Date: {get_tag(first_view_ds, (0x0008, 0x0020), 'N/A')}",
+                f"  Study UID: {get_tag(first_view_ds, (0x0020, 0x000D), 'N/A')}",
+                f"  Manufacturer: {get_tag(first_view_ds, (0x0008, 0x0070), 'N/A')}",
+                f"  Modality: {get_tag(first_view_ds, (0x0008, 0x0060), 'N/A')}",
+                "",
+                "Views Present:",
+            ]
+
+            for view_key in ["L_CC", "L_MLO", "R_CC", "R_MLO"]:
+                if view_key in view_data:
+                    ds, _ = view_data[view_key]
+                    shape = (
+                        f"{ds.Rows}x{ds.Columns}" if hasattr(ds, "Rows") else "unknown"
+                    )
+                    metadata_lines.append(f"  {view_key}: {shape}")
+                else:
+                    metadata_lines.append(f"  {view_key}: MISSING")
+
+            text_content = "\n".join(metadata_lines)
+            ax_text.text(
+                0,
+                1,
+                text_content,
+                verticalalignment="top",
+                fontsize=11,
+                family="monospace",
+                transform=ax_text.transAxes,
+            )
+
+        # save figure
+        success_dir = debug_dir / "success"
+        patient_dir = success_dir / patient_id
+        accession_dir = patient_dir / accession_number
+        accession_dir.mkdir(parents=True, exist_ok=True)
+
+        out_path = accession_dir / f"COMBINED_four_views_{exam_id}.png"
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=100, bbox_inches="tight")
+        plt.close(fig)
+
+        logger.debug(f"    Saved combined 4-view figure: {out_path.name}")
+
+    except Exception as e:
+        logger.warning(
+            f"    Failed to save combined 4-view figure for exam {exam_id}: {e}"
+        )
+
+
+def generate_debug_visualizations(
+    views_parquet: Path,
+    raw_dir: Path,
+    debug_dir: Path,
+    max_exams: Optional[int] = None,
+    random_sample: bool = False,
+    patient_id: Optional[str] = None,
+    exam_id: Optional[str] = None,
+    per_view: bool = False,
+    no_gallery: bool = False,
+) -> None:
+    """generate debug visualizations from already-processed DICOMs.
+
+    Args:
+        views_parquet: path to views.parquet with dicom_path column
+        raw_dir: root directory where DICOMs are stored
+        debug_dir: output directory for debug figures
+        max_exams: limit number of exams to visualize
+        random_sample: if True, sample randomly; else take first N
+        patient_id: filter to specific patient
+        exam_id: filter to specific exam
+        per_view: if True, also generate individual per-view debug figures
+        no_gallery: if True, skip HTML gallery generation
+    """
+    logger.info(f"loading views from {views_parquet}")
+    views_df = pd.read_parquet(views_parquet)
+    logger.info(
+        f"loaded {len(views_df)} views from {views_df['exam_id'].nunique()} exams"
+    )
+
+    # filter by patient/exam if specified
+    if patient_id:
+        views_df = views_df[views_df["patient_id"] == patient_id]
+        logger.info(
+            f"filtered to patient {patient_id}: {len(views_df)} views from {views_df['exam_id'].nunique()} exams"
+        )
+
+    if exam_id:
+        views_df = views_df[views_df["exam_id"] == exam_id]
+        logger.info(f"filtered to exam {exam_id}: {len(views_df)} views")
+
+    if len(views_df) == 0:
+        logger.error("no views to visualize after filtering")
+        return
+
+    # sample exams if requested
+    if max_exams:
+        unique_exams = views_df["exam_id"].unique()
+        if len(unique_exams) > max_exams:
+            if random_sample:
+                selected_exams = (
+                    pd.Series(unique_exams).sample(n=max_exams, random_state=42).values
+                )
+                logger.info(
+                    f"randomly sampled {max_exams} exams from {len(unique_exams)}"
+                )
+            else:
+                selected_exams = unique_exams[:max_exams]
+                logger.info(f"taking first {max_exams} exams from {len(unique_exams)}")
+            views_df = views_df[views_df["exam_id"].isin(selected_exams)]
+        logger.info(
+            f"will visualize {len(views_df)} views from {views_df['exam_id'].nunique()} exams"
+        )
+
+    # create debug directory
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"debug figures will be saved to: {debug_dir}")
+
+    # process each view and track by exam
+    success_count = 0
+    error_count = 0
+    combined_figure_count = 0
+
+    # dict to track loaded views per exam: {exam_id: {view_key: (ds, path), ...}}
+    exam_view_cache = {}
+
+    for idx, row in tqdm(
+        views_df.iterrows(), total=len(views_df), desc="loading DICOMs"
+    ):
+        try:
+            # construct full path to DICOM
+            dicom_path = Path(row["dicom_path"])
+            if not dicom_path.is_absolute():
+                dicom_path = raw_dir / dicom_path
+
+            if not dicom_path.exists():
+                logger.warning(f"DICOM not found: {dicom_path}")
+                error_count += 1
+                continue
+
+            # load DICOM
+            ds = pydicom.dcmread(str(dicom_path))
+
+            # generate individual debug figure only if requested
+            if per_view:
+                view_label = f"{row['laterality']} {row['view']}"
+                _save_debug_figure(
+                    ds,
+                    dicom_path,
+                    "SUCCESS",
+                    view_label,
+                    debug_dir,
+                    patient_id=row["patient_id"],
+                    exam_id=row["exam_id"],
+                    accession_number=row.get("accession_number", "unknown"),
+                )
+            success_count += 1
+
+            # cache view for combined figure
+            exam_key = row["exam_id"]
+            if exam_key not in exam_view_cache:
+                exam_view_cache[exam_key] = {
+                    "patient_id": row["patient_id"],
+                    "accession_number": row.get("accession_number", "unknown"),
+                    "views": {},
+                }
+
+            view_key = f"{row['laterality']}_{row['view']}"
+            exam_view_cache[exam_key]["views"][view_key] = (ds, dicom_path)
+
+        except Exception as e:
+            logger.error(f"error processing {row.get('dicom_path', 'unknown')}: {e}")
+            error_count += 1
+
+    # generate combined 4-view figures for each exam
+    logger.info("generating combined 4-view figures...")
+    combined_images = []  # track for HTML gallery
+
+    for exam_key, exam_data in tqdm(exam_view_cache.items(), desc="combined figures"):
+        try:
+            _save_four_view_figure(
+                view_data=exam_data["views"],
+                debug_dir=debug_dir,
+                patient_id=exam_data["patient_id"],
+                accession_number=exam_data["accession_number"],
+                exam_id=exam_key,
+            )
+            combined_figure_count += 1
+
+            # track for gallery
+            success_dir = debug_dir / "success"
+            patient_dir = success_dir / exam_data["patient_id"]
+            accession_dir = patient_dir / exam_data["accession_number"]
+            img_path = accession_dir / f"COMBINED_four_views_{exam_key}.png"
+
+            combined_images.append(
+                {
+                    "path": img_path.relative_to(debug_dir),
+                    "patient_id": exam_data["patient_id"],
+                    "exam_id": exam_key,
+                    "accession": exam_data["accession_number"],
+                    "num_views": len(exam_data["views"]),
+                }
+            )
+
+        except Exception as e:
+            logger.error(f"error creating combined figure for exam {exam_key}: {e}")
+
+    # generate HTML gallery
+    if not no_gallery and combined_images:
+        logger.info("generating HTML gallery...")
+        gallery_path = debug_dir / "gallery.html"
+
+        html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Debug Visualization Gallery - {combined_figure_count} exams</title>
+    <style>
+        body {{
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #1e1e1e;
+            color: #d4d4d4;
+        }}
+        h1 {{
+            text-align: center;
+            color: #4ec9b0;
+            margin-bottom: 10px;
+        }}
+        .stats {{
+            text-align: center;
+            color: #9cdcfe;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }}
+        .gallery {{
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(800px, 1fr));
+            gap: 30px;
+            max-width: 2400px;
+            margin: 0 auto;
+        }}
+        .exam-card {{
+            background-color: #252526;
+            border: 1px solid #3e3e42;
+            border-radius: 8px;
+            padding: 15px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }}
+        .exam-card:hover {{
+            border-color: #4ec9b0;
+            box-shadow: 0 6px 12px rgba(78, 201, 176, 0.3);
+        }}
+        .exam-info {{
+            margin-bottom: 10px;
+            font-size: 13px;
+            color: #9cdcfe;
+        }}
+        .exam-info strong {{
+            color: #4ec9b0;
+        }}
+        .exam-card img {{
+            width: 100%;
+            border: 1px solid #3e3e42;
+            border-radius: 4px;
+            display: block;
+        }}
+        .filter-controls {{
+            text-align: center;
+            margin-bottom: 20px;
+        }}
+        .filter-controls input {{
+            padding: 8px 15px;
+            font-size: 14px;
+            border: 1px solid #3e3e42;
+            border-radius: 4px;
+            background-color: #252526;
+            color: #d4d4d4;
+            width: 300px;
+        }}
+        .filter-controls input:focus {{
+            outline: none;
+            border-color: #4ec9b0;
+        }}
+    </style>
+</head>
+<body>
+    <h1>Debug Visualization Gallery</h1>
+    <div class="stats">
+        {combined_figure_count} exams | {success_count} views loaded
+    </div>
+    
+    <div class="filter-controls">
+        <input type="text" id="searchBox" placeholder="Filter by patient ID, exam ID, or accession..." 
+               onkeyup="filterGallery()">
+    </div>
+    
+    <div class="gallery" id="gallery">
+"""
+
+        for img_info in combined_images:
+            html_content += f"""
+        <div class="exam-card" data-patient="{img_info["patient_id"]}" 
+             data-exam="{img_info["exam_id"]}" data-accession="{img_info["accession"]}">
+            <div class="exam-info">
+                <strong>Patient:</strong> {img_info["patient_id"]} | 
+                <strong>Exam:</strong> {img_info["exam_id"]} | 
+                <strong>Accession:</strong> {img_info["accession"]} | 
+                <strong>Views:</strong> {img_info["num_views"]}/4
+            </div>
+            <img src="{img_info["path"]}" alt="Exam {img_info["exam_id"]}" loading="lazy">
+        </div>
+"""
+
+        html_content += """
+    </div>
+    
+    <script>
+        function filterGallery() {
+            const searchTerm = document.getElementById('searchBox').value.toLowerCase();
+            const cards = document.getElementsByClassName('exam-card');
+            
+            for (let card of cards) {
+                const patient = card.getAttribute('data-patient').toLowerCase();
+                const exam = card.getAttribute('data-exam').toLowerCase();
+                const accession = card.getAttribute('data-accession').toLowerCase();
+                
+                if (patient.includes(searchTerm) || exam.includes(searchTerm) || accession.includes(searchTerm)) {
+                    card.style.display = 'block';
+                } else {
+                    card.style.display = 'none';
+                }
+            }
+        }
+    </script>
+</body>
+</html>
+"""
+
+        with open(gallery_path, "w") as f:
+            f.write(html_content)
+
+        logger.info(f"HTML gallery saved to: {gallery_path}")
+        logger.info(f"Open in browser: file://{gallery_path.absolute()}")
+
+    logger.info("debug visualization complete:")
+    if per_view:
+        logger.info(f"  individual view figures: {success_count}")
+    logger.info(f"  combined 4-view figures: {combined_figure_count}")
+    logger.info(f"  errors: {error_count}")
+    logger.info(f"  output directory: {debug_dir}")
+
+
 # ------------- CLI -------------
 
 
@@ -2411,7 +2838,7 @@ def parse_args():
         "--debug-dir",
         dest="debug_dir",
         type=Path,
-        default=None,
+        default="debug_viz",
         help="save debug figures for skipped DICOMs to this directory",
     )
     p.add_argument(
@@ -2570,6 +2997,61 @@ def parse_args():
         dest="today",
         type=str,
         help="Override 'today' (YYYY-MM-DD) for computing years_to_last_followup",
+    )
+
+    # debug-viz command
+    dv = subparsers.add_parser(
+        "debug-viz",
+        help="generate debug visualizations from existing views.parquet (no reprocessing)",
+    )
+    dv.add_argument(
+        "--raw",
+        dest="raw_dir",
+        type=Path,
+        default=Path("/gpfs/data/huo-lab/Image/ChiMEC/MG"),
+    )
+    dv.add_argument(
+        "--debug-dir",
+        dest="debug_dir",
+        type=Path,
+        default=Path("debug_viz"),
+        help="output directory for debug figures (default: debug_viz)",
+    )
+    dv.add_argument(
+        "--max-exams",
+        dest="max_exams",
+        type=int,
+        help="limit number of exams to visualize",
+    )
+    dv.add_argument(
+        "--random",
+        dest="random_sample",
+        action="store_true",
+        help="sample randomly instead of taking first N",
+    )
+    dv.add_argument(
+        "--patient-id",
+        dest="patient_id",
+        type=str,
+        help="filter to specific patient",
+    )
+    dv.add_argument(
+        "--exam-id",
+        dest="exam_id",
+        type=str,
+        help="filter to specific exam",
+    )
+    dv.add_argument(
+        "--per-view",
+        dest="per_view",
+        action="store_true",
+        help="also generate individual per-view debug figures (slower, more storage)",
+    )
+    dv.add_argument(
+        "--no-gallery",
+        dest="no_gallery",
+        action="store_true",
+        help="skip HTML gallery generation",
     )
 
     args = parser.parse_args()
@@ -2747,8 +3229,30 @@ def main() -> None:
         )
         logger.info(f"wrote Mirai CSV → {out_csv}")
 
+    elif args.command == "debug-viz":
+        # generate debug visualizations from existing views.parquet
+        raw_dir = args.raw_dir
+        sot_dir = raw_dir / "sot"
+        views_pq = sot_dir / "views.parquet"
+
+        if not views_pq.exists():
+            raise FileNotFoundError(f"views.parquet not found: {views_pq}")
+
+        generate_debug_visualizations(
+            views_parquet=views_pq,
+            raw_dir=raw_dir,
+            debug_dir=args.debug_dir,
+            max_exams=args.max_exams,
+            random_sample=args.random_sample,
+            patient_id=args.patient_id,
+            exam_id=args.exam_id,
+        )
+        logger.info("=== debug visualization complete ===")
+
     else:
-        print("Available commands: preprocess, checkpoint, monitor")
+        print(
+            "Available commands: preprocess, checkpoint, monitor, emit-csv, debug-viz"
+        )
         print("Use --help for more information")
 
 
