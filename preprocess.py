@@ -1890,8 +1890,59 @@ def load_view_from_manifest(
     return x
 
 
+def _diagnose_join(man: pd.DataFrame, lab: pd.DataFrame) -> None:
+    """Print diagnostics to help debug manifest↔labels mismatches.
+
+    Logs counts for manifest rows and unique exams, labels exams, join coverage,
+    and whether mismatches appear to be due to patient_id vs exam_id mapping.
+    """
+    man_pairs = set(man[["patient_id", "exam_id"]].apply(tuple, axis=1))
+    lab_pairs = set(lab[["patient_id", "exam_id"]].apply(tuple, axis=1))
+    inter_pairs = man_pairs & lab_pairs
+    logger.info(f"manifest views: {len(man)}; manifest exams: {len(set(man_pairs))}")
+    logger.info(f"labels exams: {len(set(lab_pairs))}")
+    logger.info(f"paired (patient+exam) matches: {len(inter_pairs)}")
+
+    # exam-id-only overlap (to detect patient_id drift)
+    man_eids = set(man["exam_id"].astype(str))
+    lab_eids = set(lab["exam_id"].astype(str))
+    eid_inter = man_eids & lab_eids
+    logger.info(
+        f"exam_id-only overlap: {len(eid_inter)} of {len(man_eids)} manifest exam_ids"
+    )
+
+    if inter_pairs:
+        logger.info("example matched pair: %s", next(iter(inter_pairs)))
+
+    # examples of manifest exams missing labels
+    missing_pairs = list(man_pairs - lab_pairs)
+    if missing_pairs:
+        logger.info(
+            "examples missing labels (patient_id, exam_id): %s", missing_pairs[:5]
+        )
+
+    # detect exam_ids present but with different patient_id assignments
+    suspect = []
+    if eid_inter:
+        lab_by_eid = lab.groupby("exam_id")["patient_id"].apply(
+            lambda s: set(s.astype(str))
+        )
+        man_by_eid = man.groupby("exam_id")["patient_id"].apply(
+            lambda s: set(s.astype(str))
+        )
+        for eid in list(eid_inter)[:50]:  # cap work
+            lp = lab_by_eid.get(eid, set())
+            mp = man_by_eid.get(eid, set())
+            if lp and mp and lp.isdisjoint(mp):
+                suspect.append((eid, list(mp)[:1], list(lp)[:1]))
+    if suspect:
+        logger.info("exam_ids with differing patient_id mappings (manifest vs labels):")
+        for eid, m_pid, l_pid in suspect[:5]:
+            logger.info("  eid=%s manifest_pid=%s labels_pid=%s", eid, m_pid, l_pid)
+
+
 def write_mirai_csv(
-    manifest_parquet: Path, labels_parquet: Path, out_csv: Path
+    manifest_parquet: Path, labels_parquet: Path, out_csv: Path, *, strict: bool = False
 ) -> None:
     """Create a Mirai-compatible CSV that points to Zarr URIs instead of PNGs.
 
@@ -1931,10 +1982,16 @@ def write_mirai_csv(
 
     df = man.merge(lab[list(req_l)], on=["patient_id", "exam_id"], how="inner")
     if len(df) != len(man):
-        missing = set(man[["patient_id", "exam_id"]].apply(tuple, axis=1)) - set(
-            df[["patient_id", "exam_id"]].apply(tuple, axis=1)
+        missing_n = len(man) - len(df)
+        logger.warning(
+            f"labels missing for {missing_n} view rows; emitting CSV for matched subset only"
         )
-        raise ValueError(f"labels missing for {len(missing)} exam(s)")
+        _diagnose_join(man, lab)
+        if strict:
+            missing_pairs = set(
+                man[["patient_id", "exam_id"]].apply(tuple, axis=1)
+            ) - set(df[["patient_id", "exam_id"]].apply(tuple, axis=1))
+            raise ValueError(f"labels missing for {len(missing_pairs)} exam(s)")
 
     df["file_path"] = df.apply(
         lambda r: f"zarr://{Path(r['zarr_uri']).resolve()}#{r['zarr_key']}", axis=1
@@ -2020,24 +2077,44 @@ def build_labels_from_foo(
             f"Diagnosis date column '{dxdate_col}' not found in {foo_csv.name}"
         )
 
-    logger.info("loading SoT exams to map accession→exam_id + study_date…")
+    logger.info("loading SoT exams to map patient/accession → exam_id + study_date…")
     exams = pd.read_parquet(exams_parquet)
     req = {"exam_id", "accession_number", "study_date", "patient_id"}
     missing = req - set(exams.columns)
     if missing:
         raise KeyError(f"exams.parquet missing required columns: {sorted(missing)}")
 
-    # normalize join keys as strings and rename patient id column for join
-    df = df.rename(columns={patient_col: "patient_id"})
-    df["patient_id"] = df["patient_id"].astype(str).str.strip()
+    # normalize candidate join keys as strings
+    s_col = patient_col
+    df[s_col] = df[s_col].astype(str).str.strip()
+    exams = exams.copy()
     exams["patient_id"] = exams["patient_id"].astype(str).str.strip()
+    exams["accession_number"] = exams["accession_number"].astype(str).str.strip()
 
-    # join by patient_id to attach all exams for each patient
-    j = df.merge(
+    # Strategy A: join mammoID→patient_id
+    j_pid = df.merge(
         exams[["patient_id", "exam_id", "study_date"]],
-        on="patient_id",
+        left_on=s_col,
+        right_on="patient_id",
         how="inner",
         copy=False,
+    )
+
+    # Strategy B: join mammoID→accession_number (if values look like accessions)
+    j_acc = df.merge(
+        exams[["accession_number", "exam_id", "study_date", "patient_id"]],
+        left_on=s_col,
+        right_on="accession_number",
+        how="inner",
+        copy=False,
+    )
+
+    # choose the richer join
+    use_acc = len(j_acc) > len(j_pid)
+    j = j_acc if use_acc else j_pid
+    logger.info(
+        f"labels join mode: {'accession_number' if use_acc else 'patient_id'} "
+        f"(matched {len(j)} exam rows; pid={len(j_pid)}, acc={len(j_acc)})"
     )
 
     # parse dates
