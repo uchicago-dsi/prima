@@ -56,11 +56,14 @@ import signal
 import sys
 import time
 import warnings
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import cv2
+try:
+    import cv2  # type: ignore
+except Exception:  # optional for emit-csv
+    cv2 = None
 import matplotlib
 import psutil
 
@@ -69,8 +72,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pydicom
-import torch
-import zarr
+
+try:
+    import torch  # type: ignore
+except Exception:
+    torch = None
+try:
+    import zarr  # type: ignore
+except Exception:
+    zarr = None
 from einops import rearrange
 from numcodecs import Blosc
 from pydicom import config
@@ -82,7 +92,16 @@ try:
 except ImportError:
     pylibjpeg_handler = None  # type: ignore[assignment]
 from pydicom.tag import Tag
-from torch.utils.data import DataLoader, Dataset
+
+try:
+    from torch.utils.data import DataLoader, Dataset  # type: ignore
+except Exception:
+    DataLoader = None  # type: ignore
+
+    class Dataset:  # type: ignore
+        pass
+
+
 from tqdm import tqdm
 
 # prefer pylibjpeg for JPEG 2000 (gdcm 3.x not available on conda-forge)
@@ -642,7 +661,7 @@ def _process_exam_dir(
     try:
         # collect all dicom files first
         dcm_files = []
-        for root, dirs, files in os.walk(exam_path):
+        for root, _dirs, files in os.walk(exam_path):
             for name in files:
                 if name.endswith(".dcm"):
                     dcm_files.append(Path(root) / name)
@@ -786,7 +805,7 @@ def _process_exam_dir(
                 from collections import Counter
 
                 failure_reasons = Counter()
-                for p, reason, ds in failed_files:
+                for _p, reason, _ds in failed_files:
                     failure_reasons[reason] += 1
                 logger.info("  Failure reasons:")
                 for reason, count in failure_reasons.most_common():
@@ -845,7 +864,7 @@ def _process_exam_dir(
             }
 
         # check if exam has all four required views (L-CC, L-MLO, R-CC, R-MLO)
-        view_keys = set((r["laterality"], r["view"]) for r in rows)
+        view_keys = {(r["laterality"], r["view"]) for r in rows}
         required_views = {("L", "CC"), ("L", "MLO"), ("R", "CC"), ("R", "MLO")}
         has_four_views = len(view_keys & required_views) == 4
 
@@ -891,7 +910,7 @@ def list_checkpoints(
     checkpoints = []
     for checkpoint_file in checkpoint_dir.glob("discovery_*.json"):
         try:
-            with open(checkpoint_file, "r") as f:
+            with open(checkpoint_file) as f:
                 data = json.load(f)
 
             checkpoint_info = {
@@ -1114,9 +1133,7 @@ def _combine_staging_files(staging_dir: Path, pattern: str) -> pd.DataFrame:
             missing_cols = [col for col in sorted_cols if col not in df.columns]
             # add all missing columns at once to avoid fragmentation
             if missing_cols:
-                missing_df = pd.DataFrame(
-                    {col: None for col in missing_cols}, index=df.index
-                )
+                missing_df = pd.DataFrame(dict.fromkeys(missing_cols), index=df.index)
                 df = pd.concat([df, missing_df], axis=1)
             # reorder columns
             df = df[sorted_cols]
@@ -1218,7 +1235,7 @@ def discover_dicoms(
     if resume_from_checkpoint and checkpoint_file.exists():
         logger.info(f"loading checkpoint from {checkpoint_file}")
         try:
-            with open(checkpoint_file, "r") as f:
+            with open(checkpoint_file) as f:
                 checkpoint_data = json.load(f)
             processed_exams = set(checkpoint_data.get("processed_exams", []))
             chunk_counter = checkpoint_data.get("chunk_counter", 0)
@@ -1725,7 +1742,7 @@ def preprocess(cfg: PreprocessConfig) -> None:
     failed_exams: List[Dict] = []
 
     logger.info("grouping exams for zarr writing...")
-    grouped = {k: v for k, v in sel_df.groupby("exam_id")}
+    grouped = dict(sel_df.groupby("exam_id"))
     targets = [
         (eid, grouped[eid]) for eid in cohort["exam_id"].tolist() if eid in grouped
     ]
@@ -1937,6 +1954,146 @@ def write_mirai_csv(
     out.to_csv(out_csv, index=False)
 
 
+def _parse_date_col(series: pd.Series) -> pd.Series:
+    """Parse heterogeneous date strings into pandas Timestamps.
+
+    Handles formats like 'YYYYMMDD', 'YYYY-MM-DD', and '08jan2003'. Returns NaT on failure.
+    """
+    s = series.astype(str).str.strip()
+    # try explicit YYYYMMDD first (common in DICOM StudyDate)
+    ymd = pd.to_datetime(s, format="%Y%m%d", errors="coerce")
+    # fill remaining with flexible parser (handles '08jan2003', '2003-01-08', etc.)
+    rest = pd.to_datetime(s[ymd.isna()], errors="coerce")
+    ymd.loc[ymd.isna()] = rest
+    return ymd
+
+
+def build_labels_from_foo(
+    foo_csv: Path,
+    exams_parquet: Path,
+    out_parquet: Path,
+    *,
+    patient_col: str = "mammoID",
+    case_col: str = "CaseControl",
+    dxdate_col: str = "datedx",
+    split_col: Optional[str] = None,
+    today: Optional[date] = None,
+) -> Path:
+    """Create labels parquet with Mirai-required fields from a cohort CSV.
+
+    This consumes the cohort CSV (e.g., foo.csv with Case/Control and datedx),
+    treats `mammoID` as the patient identifier, joins to SoT `exams.parquet` on
+    patient_id to recover all exam_ids and exam dates for each patient, and computes
+    integer years_to_cancer (per exam) and years_to_last_followup.
+
+    Parameters
+    ----------
+    foo_csv : Path
+        Input CSV containing at least `CaseControl`, `datedx`, and an exam identifier column.
+    exams_parquet : Path
+        SoT parquet with columns including `exam_id`, `accession_number`, and `study_date`.
+    out_parquet : Path
+        Destination parquet path to write labels.
+    patient_col : str
+        Column in foo_csv that maps to `patient_id` in SoT (default: 'mammoID').
+    case_col : str
+        Column indicating case/control status (default: 'CaseControl').
+    dxdate_col : str
+        Column with diagnosis date (default: 'datedx').
+    split_col : Optional[str]
+        Optional column for split assignment (train/dev/test). If absent, defaults to 'train'.
+    today : Optional[date]
+        Override for 'today' when computing years_to_last_followup; defaults to datetime.now().date().
+    """
+    logger.info("loading foo CSV for labels…")
+    df = pd.read_csv(foo_csv)
+
+    # confirm patient identifier column exists
+    if patient_col not in df.columns:
+        raise KeyError(
+            f"Patient identifier column '{patient_col}' not found in {foo_csv.name}"
+        )
+    if case_col not in df.columns:
+        raise KeyError(f"Case/control column '{case_col}' not found in {foo_csv.name}")
+    if dxdate_col not in df.columns:
+        raise KeyError(
+            f"Diagnosis date column '{dxdate_col}' not found in {foo_csv.name}"
+        )
+
+    logger.info("loading SoT exams to map accession→exam_id + study_date…")
+    exams = pd.read_parquet(exams_parquet)
+    req = {"exam_id", "accession_number", "study_date", "patient_id"}
+    missing = req - set(exams.columns)
+    if missing:
+        raise KeyError(f"exams.parquet missing required columns: {sorted(missing)}")
+
+    # normalize join keys as strings and rename patient id column for join
+    df = df.rename(columns={patient_col: "patient_id"})
+    df["patient_id"] = df["patient_id"].astype(str).str.strip()
+    exams["patient_id"] = exams["patient_id"].astype(str).str.strip()
+
+    # join by patient_id to attach all exams for each patient
+    j = df.merge(
+        exams[["patient_id", "exam_id", "study_date"]],
+        on="patient_id",
+        how="inner",
+        copy=False,
+    )
+
+    # parse dates
+    j["study_date_ts"] = _parse_date_col(j["study_date"])
+    j["dx_date_ts"] = _parse_date_col(j[dxdate_col])
+
+    # compute years_to_cancer
+    cc = j[case_col].astype(str).str.lower()
+    is_case = cc.str.contains("case", na=False)
+    is_control = cc.str.contains("control", na=False)
+
+    def _years_between(a: pd.Series, b: pd.Series) -> pd.Series:
+        delta_days = (b - a).dt.days
+        years = (delta_days / 365.25).fillna(np.nan)
+        return np.floor(np.maximum(years, 0)).astype("Int64")
+
+    ytc = pd.Series(pd.NA, index=j.index, dtype="Int64")
+    # cases with dx dates → years difference; controls → 100; others NA
+    ytc_case = _years_between(j["study_date_ts"], j["dx_date_ts"])  # may be NA
+    ytc = ytc.where(~is_case, ytc_case)
+    ytc = ytc.where(~is_control, 100)
+
+    # years_to_last_followup: today - study_date
+    tday = today or datetime.now().date()
+    ylf = _years_between(j["study_date_ts"], pd.to_datetime(tday))
+
+    # assemble labels
+    out = pd.DataFrame(
+        {
+            "patient_id": j["patient_id"].astype(str),
+            "exam_id": j["exam_id"].astype(str),
+            "years_to_cancer": ytc.astype("Int64"),
+            "years_to_last_followup": ylf.astype("Int64"),
+            "split_group": (
+                j[split_col].astype(str).str.lower()
+                if split_col and split_col in j.columns
+                else pd.Series(["train"] * len(j))
+            ),
+        }
+    )
+    # drop rows without a resolved exam_id or study_date
+    out = out[(out["exam_id"].notna()) & (out["exam_id"].astype(str) != "nan")]
+    # ensure integer dtype
+    out["years_to_cancer"] = out["years_to_cancer"].fillna(100).astype(int)
+    out["years_to_last_followup"] = out["years_to_last_followup"].fillna(0).astype(int)
+
+    # deduplicate by (patient_id, exam_id)
+    out = out.drop_duplicates(subset=["patient_id", "exam_id"]).reset_index(drop=True)
+
+    out_parquet = Path(out_parquet)
+    out_parquet.parent.mkdir(parents=True, exist_ok=True)
+    out.to_parquet(out_parquet, index=False)
+    logger.info(f"wrote labels parquet → {out_parquet}")
+    return out_parquet
+
+
 def materialize_mirai_embeddings(
     mirai_repo: Path,
     img_encoder_snapshot: Path,
@@ -2120,13 +2277,59 @@ def parse_args():
     p.add_argument(
         "--emit-csv",
         dest="emit_csv",
-        action="store_true",
-        default=True,
-        help="emit CSV outputs (default: True)",
+        type=Path,
+        help="Path to write Mirai CSV (defaults to out_dir/mirai_manifest.csv if --labels is provided)",
+    )
+
+    # labels building from foo.csv (CaseControl + datedx)
+    p.add_argument(
+        "--labels",
+        dest="labels",
+        type=Path,
+        default=Path(
+            "/gpfs/data/phs/groups/Projects/Huo_projects/SPORE/annawoodard/Phenotype_ChiMEC_2025Oct4.csv"
+        ),
+        help=(
+            "Cohort metadata file (CSV or Parquet). "
+            "If CSV, must contain mammoID, CaseControl, datedx and will be converted into labels.parquet; "
+            "if Parquet, must already include years_to_cancer/years_to_last_followup/split_group."
+        ),
+    )
+    p.add_argument(
+        "--labels-patient-col",
+        dest="labels_patient_col",
+        type=str,
+        default="mammoID",
+        help="Patient id column in --labels (default: mammoID)",
+    )
+    p.add_argument(
+        "--labels-case-col",
+        dest="labels_case_col",
+        type=str,
+        default="CaseControl",
+        help="Case/Control column in --labels (default: CaseControl)",
+    )
+    p.add_argument(
+        "--labels-dxdate-col",
+        dest="labels_dxdate_col",
+        type=str,
+        default="datedx",
+        help="Diagnosis date column in --labels (default: datedx)",
+    )
+    p.add_argument(
+        "--labels-split-col",
+        dest="labels_split_col",
+        type=str,
+        help="Optional split column in --labels; if absent, defaults to 'train'",
+    )
+    p.add_argument(
+        "--today",
+        dest="today",
+        type=str,
+        help="Override 'today' (YYYY-MM-DD) for computing years_to_last_followup",
     )
 
     # optional extras
-    p.add_argument("--labels", dest="labels_parquet", type=Path)
     p.add_argument("--features-out", dest="features_out", type=Path)
     p.add_argument("--img-encoder-snapshot", dest="img_encoder_snapshot", type=Path)
     p.add_argument("--mirai-repo", dest="mirai_repo", type=Path)
@@ -2182,6 +2385,75 @@ def parse_args():
     )
     monitor_parser.add_argument(
         "--interval", type=int, default=30, help="monitoring interval in seconds"
+    )
+
+    # emit-csv command: do not recompute SoT/manifest; just build labels (if CSV) and write Mirai CSV
+    ec = subparsers.add_parser(
+        "emit-csv",
+        help="Create Mirai CSV from existing manifest + labels without recomputing preprocessing",
+    )
+    ec.add_argument(
+        "--manifest",
+        dest="manifest_parquet",
+        type=Path,
+        required=True,
+        help="Path to manifest.parquet produced by preprocess()",
+    )
+    ec.add_argument(
+        "--labels",
+        dest="labels",
+        type=Path,
+        default=Path(
+            "/gpfs/data/phs/groups/Projects/Huo_projects/SPORE/annawoodard/Phenotype_ChiMEC_2025Oct4.csv"
+        ),
+        help=(
+            "Cohort metadata (CSV or Parquet). CSV must contain mammoID, CaseControl, datedx."
+        ),
+    )
+    ec.add_argument(
+        "--exams",
+        dest="exams_parquet",
+        type=Path,
+        help="Path to SoT exams.parquet (required when --labels is a CSV)",
+    )
+    ec.add_argument(
+        "--out",
+        dest="out_csv",
+        type=Path,
+        help="Output Mirai CSV (default: manifest_dir/mirai_manifest.csv)",
+    )
+    ec.add_argument(
+        "--labels-patient-col",
+        dest="labels_patient_col",
+        type=str,
+        default="mammoID",
+        help="Patient id column in labels CSV (default: mammoID)",
+    )
+    ec.add_argument(
+        "--labels-case-col",
+        dest="labels_case_col",
+        type=str,
+        default="CaseControl",
+        help="Case/Control column in labels CSV (default: CaseControl)",
+    )
+    ec.add_argument(
+        "--labels-dxdate-col",
+        dest="labels_dxdate_col",
+        type=str,
+        default="datedx",
+        help="Diagnosis date column in labels CSV (default: datedx)",
+    )
+    ec.add_argument(
+        "--labels-split-col",
+        dest="labels_split_col",
+        type=str,
+        help="Optional split column in labels CSV; if absent, defaults to 'train'",
+    )
+    ec.add_argument(
+        "--today",
+        dest="today",
+        type=str,
+        help="Override 'today' (YYYY-MM-DD) for computing years_to_last_followup",
     )
 
     args = parser.parse_args()
@@ -2251,17 +2523,45 @@ def main() -> None:
 
         preprocess(cfg)
 
-        # emit Mirai CSV if requested
-        if args.emit_csv is not None:
-            logger.info("generating Mirai CSV...")
-            if args.labels_parquet is None:
-                raise ValueError(
-                    "--emit-csv requires --labels with years_to_cancer/years_to_last_followup/split_group"
+        # Build or load labels from --labels
+        labels_path: Optional[Path] = None
+        if args.labels is not None:
+            # parse --today override
+            today_override: Optional[date] = None
+            if args.today:
+                try:
+                    today_override = datetime.strptime(args.today, "%Y-%m-%d").date()
+                except ValueError as e:
+                    raise ValueError("--today must be in YYYY-MM-DD format") from e
+
+            if args.labels.suffix.lower() == ".csv":
+                logger.info("building labels from CSV passed via --labels…")
+                labels_path = build_labels_from_foo(
+                    args.labels,
+                    cfg.sot_dir / "exams.parquet",
+                    (cfg.out_dir / "labels.parquet"),
+                    patient_col=args.labels_patient_col,
+                    case_col=args.labels_case_col,
+                    dxdate_col=args.labels_dxdate_col,
+                    split_col=args.labels_split_col,
+                    today=today_override,
                 )
-            write_mirai_csv(
-                cfg.out_dir / "manifest.parquet", args.labels_parquet, args.emit_csv
-            )
-            logger.info(f"wrote Mirai CSV → {args.emit_csv}")
+            else:
+                labels_path = args.labels
+
+        # Emit Mirai CSV if either an explicit output path is provided or labels were built
+        emit_path: Optional[Path] = args.emit_csv
+        if emit_path is None and args.labels is not None:
+            emit_path = cfg.out_dir / "mirai_manifest.csv"
+
+        if emit_path is not None:
+            logger.info("generating Mirai CSV…")
+            if labels_path is None:
+                raise ValueError(
+                    "Need labels to write CSV; pass --labels (CSV or Parquet)."
+                )
+            write_mirai_csv(cfg.out_dir / "manifest.parquet", labels_path, emit_path)
+            logger.info(f"wrote Mirai CSV → {emit_path}")
 
         # materialize per-view embeddings if requested
         if args.features_out is not None:
@@ -2309,6 +2609,36 @@ def main() -> None:
 
     elif args.command == "monitor":
         monitor_progress(args.checkpoint_dir, args.interval)
+
+    elif args.command == "emit-csv":
+        # Only build labels (if needed) and write Mirai CSV; no recomputation of SoT/manifest
+        t_override: Optional[date] = None
+        if args.today:
+            try:
+                t_override = datetime.strptime(args.today, "%Y-%m-%d").date()
+            except ValueError as e:
+                raise ValueError("--today must be in YYYY-MM-DD format") from e
+
+        labels_path: Path
+        if args.labels.suffix.lower() == ".csv":
+            if args.exams_parquet is None:
+                raise ValueError("--exams is required when --labels is a CSV")
+            labels_path = build_labels_from_foo(
+                args.labels,
+                args.exams_parquet,
+                args.manifest_parquet.parent / "labels.parquet",
+                patient_col=args.labels_patient_col,
+                case_col=args.labels_case_col,
+                dxdate_col=args.labels_dxdate_col,
+                split_col=args.labels_split_col,
+                today=t_override,
+            )
+        else:
+            labels_path = args.labels
+
+        out_csv = args.out_csv or (args.manifest_parquet.parent / "mirai_manifest.csv")
+        write_mirai_csv(args.manifest_parquet, labels_path, out_csv)
+        logger.info(f"wrote Mirai CSV → {out_csv}")
 
     else:
         print("Available commands: preprocess, checkpoint, monitor")

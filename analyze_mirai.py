@@ -38,7 +38,6 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -60,21 +59,21 @@ class Config:
     meta_csv: Path
     out_json: Path | None
     split: str | None
-    colmap: Dict[int, str] | None
+    colmap: dict[int, str] | None
     ref_split: str | None
     cindex_col: str | None
 
 
-def _parse_map(map_kv: List[str]) -> Dict[int, str]:
+def _parse_map(map_kv: list[str]) -> dict[int, str]:
     """parse --map entries like 1:pred_1year,5:pred_5yr into {1: 'pred_1year', 5: 'pred_5yr'}"""
-    m: Dict[int, str] = {}
+    m: dict[int, str] = {}
     for kv in map_kv:
         k, v = kv.split(":", 1)
         m[int(k)] = v
     return m
 
 
-def _split_patient_exam_id(series: pd.Series) -> Tuple[pd.Series, pd.Series]:
+def _split_patient_exam_id(series: pd.Series) -> tuple[pd.Series, pd.Series]:
     """split 'patient_exam_id' formatted as '<patient_id>\t<exam_id>' into two series"""
     pe = series.astype(str).str.split("\t", n=1, expand=True)
     if pe.shape[1] != 2:
@@ -82,7 +81,7 @@ def _split_patient_exam_id(series: pd.Series) -> Tuple[pd.Series, pd.Series]:
     return pe[0], pe[1]
 
 
-def _detect_pred_cols(df: pd.DataFrame) -> Dict[int, str]:
+def _detect_pred_cols(df: pd.DataFrame) -> dict[int, str]:
     """auto-detect prediction columns keyed by horizon in years
 
     looks for names containing ('risk'|'pred'|'prob') and a horizon number next to 'year'/'yr'
@@ -235,7 +234,7 @@ def _build_surv_arrays(meta: pd.DataFrame) -> np.ndarray:
     return Surv.from_arrays(event=event.astype(bool), time=time.astype(float))
 
 
-def survival_metrics(cfg: Config) -> Dict:
+def survival_metrics(cfg: Config) -> dict:
     """compute censoring-adjusted metrics: Uno's C (IPCW), time-dependent AUC, IBS
 
     uses ref_split (e.g., train) to estimate censoring via Kaplan–Meier, as required by

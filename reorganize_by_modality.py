@@ -54,7 +54,7 @@ def read_dicom(path: Path) -> FileDataset:
 
 def find_first_dicom(exam_path: Path) -> Optional[Path]:
     """Find the first DICOM file in an exam directory."""
-    for root, dirs, files in os.walk(exam_path):
+    for root, _dirs, files in os.walk(exam_path):
         for name in files:
             if name.endswith(".dcm"):
                 return Path(root) / name
@@ -129,7 +129,7 @@ def load_progress_state(state_file: Path) -> Tuple[int, List[Path]]:
 
     import json
 
-    with open(state_file, "r") as f:
+    with open(state_file) as f:
         state = json.load(f)
 
     remaining_exams = [Path(p) for p in state.get("remaining_exams", [])]
@@ -390,13 +390,13 @@ def parse_args():
 Examples:
   # Dry run to see what would be moved and cleaned up
   python reorganize_by_modality.py --raw /gpfs/data/huo-lab/Image/ChiMEC/ --dry-run
-  
+
   # Actually perform the reorganization and cleanup empty dirs
   python reorganize_by_modality.py --raw /gpfs/data/huo-lab/Image/ChiMEC/
-  
+
   # Resume interrupted run
   python reorganize_by_modality.py --raw /gpfs/data/huo-lab/Image/ChiMEC/ --resume
-  
+
   # Process only first 50 exams (for testing)
   python reorganize_by_modality.py --raw /gpfs/data/huo-lab/Image/ChiMEC/ --max-exams 50
         """,

@@ -119,7 +119,7 @@ def analyze_export_timeline(missing_exams_df: pd.DataFrame) -> None:
             print(f"\nTime since export request (n={len(valid_requested)}):")
             print("  (When THIS script requested exports via web interface)")
 
-            for i, (bin_min, bin_max) in enumerate(zip(bins[:-1], bins[1:])):
+            for _i, (bin_min, bin_max) in enumerate(zip(bins[:-1], bins[1:])):
                 if bin_max == float("inf"):
                     count = (days_since >= bin_min).sum()
                     label = f">{bin_min} days"
@@ -143,7 +143,7 @@ def analyze_export_timeline(missing_exams_df: pd.DataFrame) -> None:
             print(
                 "  (When exams were marked as exported in the system, from any source)"
             )
-            for i, (bin_min, bin_max) in enumerate(zip(bins[:-1], bins[1:])):
+            for _i, (bin_min, bin_max) in enumerate(zip(bins[:-1], bins[1:])):
                 if bin_max == float("inf"):
                     count = (days_since >= bin_min).sum()
                     label = f">{bin_min} days"
@@ -175,7 +175,7 @@ def investigate_file_system(
     dir_contents = []
     accession_found_on_disk = []
 
-    for idx, row in enhanced_df.iterrows():
+    for _idx, row in enhanced_df.iterrows():
         base_path = row["expected_base_path"]
         expected_accession = (
             str(row.get("Accession", "")).strip()
@@ -274,7 +274,7 @@ def investigate_file_system(
     if mismatch_mask.sum() > 0:
         print(f"\nAccession MISMATCH examples ({mismatch_mask.sum()} total):")
         print("  DB has accession, but no matching subdirectory found")
-        for idx, row in enhanced_df[mismatch_mask].head(3).iterrows():
+        for _idx, row in enhanced_df[mismatch_mask].head(3).iterrows():
             study_id = row.get("study_id", "unknown")
             expected = row.get("Accession", "N/A")
             contents = row.get("directory_contents", "unknown")
@@ -294,7 +294,7 @@ def investigate_file_system(
         print(
             "  but these exams might have OTHER issues (wrong modality, wrong study, etc.)"
         )
-        for idx, row in enhanced_df[accession_match].head(3).iterrows():
+        for _idx, row in enhanced_df[accession_match].head(3).iterrows():
             study_id = row.get("study_id", "unknown")
             accession = row.get("Accession", "N/A")
             total = row.get("total_files_recursive", 0)
@@ -307,7 +307,7 @@ def investigate_file_system(
     if missing_acc_mask.sum() > 0:
         print(f"\nMissing accession in DB ({missing_acc_mask.sum()} total):")
         print("  These cannot be verified because DB has no accession number")
-        for idx, row in enhanced_df[missing_acc_mask].head(3).iterrows():
+        for _idx, row in enhanced_df[missing_acc_mask].head(3).iterrows():
             study_id = row.get("study_id", "unknown")
             contents = row.get("directory_contents", "unknown")
             total = row.get("total_files_recursive", 0)

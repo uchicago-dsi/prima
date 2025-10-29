@@ -845,9 +845,11 @@ def create_comprehensive_export_analysis_plot(data, plots_dir):
                     f"recent rate: {recent_rate:.1f} exams/day",
                     transform=ax1.transAxes,
                     verticalalignment="top",
-                    bbox=dict(
-                        boxstyle="round,pad=0.3", facecolor="lightblue", alpha=0.7
-                    ),
+                    bbox={
+                        "boxstyle": "round,pad=0.3",
+                        "facecolor": "lightblue",
+                        "alpha": 0.7,
+                    },
                 )
 
     # Panel 2: Export Velocity (Daily Export Counts)
@@ -889,7 +891,11 @@ def create_comprehensive_export_analysis_plot(data, plots_dir):
             f"avg: {avg_daily:.1f}/day\nmax: {max_daily}/day",
             transform=ax2.transAxes,
             verticalalignment="top",
-            bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgreen", alpha=0.7),
+            bbox={
+                "boxstyle": "round,pad=0.3",
+                "facecolor": "lightgreen",
+                "alpha": 0.7,
+            },
         )
 
     # Panel 3: Export Distribution by Month
@@ -1885,7 +1891,7 @@ if Path(basedir).is_dir():
                 "total_on_disk": len(disk_accessions),
                 "in_database": len(disk_accessions.intersection(db_accessions)),
                 "disk_only": len(disk_only),
-                "example_disk_only": sorted(list(disk_only))[:5],  # first 5 examples
+                "example_disk_only": sorted(disk_only)[:5],  # first 5 examples
             }
 
     print(f"found {len(patients_with_disk_only):,} patients with disk-only data")

@@ -34,7 +34,7 @@ def is_patient_dir(name: str) -> bool:
 def count_dcm_files(directory: Path) -> int:
     """Count DICOM files in a directory."""
     count = 0
-    for root, dirs, files in os.walk(directory):
+    for _root, _dirs, files in os.walk(directory):
         count += sum(1 for f in files if f.endswith(".dcm"))
     return count
 
@@ -293,10 +293,10 @@ def main():
 Examples:
   # Dry run to see what would be recovered
   python3 recover_from_snapshot.py --dry-run
-  
+
   # Actually perform the recovery
   python3 recover_from_snapshot.py
-  
+
   # Use custom snapshot date
   python3 recover_from_snapshot.py --snapshot-date 2025.10.11-03.04.09
         """,

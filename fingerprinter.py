@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# coding: utf-8
 # THIS SCRIPT RUNS ON THE REMOTE (HUO-LAB) SERVER
 
 import argparse
@@ -31,7 +30,7 @@ def log_memory_usage(stage: str):
 def load_checkpoint_file(checkpoint_file: Path):
     """Load a single checkpoint file and return patient data."""
     try:
-        with open(checkpoint_file, "r") as f:
+        with open(checkpoint_file) as f:
             checkpoint_data = json.load(f)
 
         # Handle both old format (direct inventory) and new format (with metadata)
@@ -63,7 +62,7 @@ def fingerprint_all_exams_for_patient(patient_dir: Path):
             fingerprint, reason = create_exam_fingerprint(exam_path)
             if fingerprint and fingerprint.is_valid():
                 exam_name = exam_path.name
-                result = (fingerprint.study_uid, sorted(list(fingerprint.file_hashes)))
+                result = (fingerprint.study_uid, sorted(fingerprint.file_hashes))
                 patient_inventory[exam_name] = result
             else:
                 failure_reasons[reason] = failure_reasons.get(reason, 0) + 1

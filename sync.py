@@ -24,7 +24,7 @@ logging.getLogger("pydicom.valuerep").setLevel(logging.ERROR)
 # --- CONFIGURATION ---
 SRC_ROOT = Path("/Volumes/16352A")
 DST_SSH_TARGET = "annawoodard@cri-ksysappdsp3.cri.uchicago.edu"
-DST_ROOT_REMOTE = Path("/gpfs/data/huo-lab/Image/ChiMEC")
+DST_ROOT_REMOTE = Path("/gpfs/data/huo-lab/Image/ChiMEC/MG")
 
 # --- GIT-AWARE PATH CONFIGURATION ---
 # The path to your Git repository ON THE REMOTE SERVER

@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# coding: utf-8
 # SHARED LOGIC for exam fingerprinting.
 
 import hashlib
@@ -37,7 +36,7 @@ def hash_file(filepath: Path) -> str:
             for byte_block in iter(lambda: f.read(8192), b""):
                 sha256_hash.update(byte_block)
         return sha256_hash.hexdigest()
-    except (IOError, PermissionError) as e:
+    except (OSError, PermissionError) as e:
         raise e
 
 
@@ -65,7 +64,7 @@ def create_exam_fingerprint(exam_path: Path) -> Tuple[Optional[ExamFingerprint],
             p for p in all_items if p.is_file() and not p.name.startswith(".")
         ]
         list_s = time.perf_counter() - list_start
-    except (IOError, OSError) as e:
+    except OSError as e:
         return None, f"Failed to list directory contents: {e}"
 
     if not files_to_process:
@@ -92,7 +91,7 @@ def create_exam_fingerprint(exam_path: Path) -> Tuple[Optional[ExamFingerprint],
     for fpath in files_to_process:
         try:
             file_hashes.add(hash_file(fpath))
-        except (IOError, OSError) as e:
+        except OSError as e:
             return None, f"Failed to read/hash file {fpath.name}: {e}"
 
         if not study_uid:
