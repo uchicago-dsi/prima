@@ -3246,6 +3246,8 @@ def main() -> None:
             random_sample=args.random_sample,
             patient_id=args.patient_id,
             exam_id=args.exam_id,
+            per_view=args.per_view,
+            no_gallery=args.no_gallery,
         )
         logger.info("=== debug visualization complete ===")
 
