@@ -2390,14 +2390,31 @@ def parse_args():
     # emit-csv command: do not recompute SoT/manifest; just build labels (if CSV) and write Mirai CSV
     ec = subparsers.add_parser(
         "emit-csv",
-        help="Create Mirai CSV from existing manifest + labels without recomputing preprocessing",
+        help=(
+            "Create Mirai CSV from existing manifest + labels without recomputing preprocessing."
+        ),
+    )
+    ec.add_argument(
+        "--raw",
+        dest="raw_dir",
+        type=Path,
+        default=Path("/gpfs/data/huo-lab/Image/ChiMEC/MG"),
+        help="Root raw data directory (default: /gpfs/.../MG)",
+    )
+    ec.add_argument(
+        "--sot", dest="sot_dir", type=Path, help="Override SoT dir; default: <raw>/sot"
+    )
+    ec.add_argument(
+        "--out-dir",
+        dest="out_dir",
+        type=Path,
+        help="Override out dir; default: <raw>/out",
     )
     ec.add_argument(
         "--manifest",
         dest="manifest_parquet",
         type=Path,
-        required=True,
-        help="Path to manifest.parquet produced by preprocess()",
+        help="Path to manifest.parquet (default: <out>/manifest.parquet)",
     )
     ec.add_argument(
         "--labels",
@@ -2417,10 +2434,10 @@ def parse_args():
         help="Path to SoT exams.parquet (required when --labels is a CSV)",
     )
     ec.add_argument(
-        "--out",
+        "--emit-csv",
         dest="out_csv",
         type=Path,
-        help="Output Mirai CSV (default: manifest_dir/mirai_manifest.csv)",
+        help="Output Mirai CSV (default: <out>/mirai_manifest.csv)",
     )
     ec.add_argument(
         "--labels-patient-col",
@@ -2612,6 +2629,15 @@ def main() -> None:
 
     elif args.command == "emit-csv":
         # Only build labels (if needed) and write Mirai CSV; no recomputation of SoT/manifest
+        # Resolve default directories from --raw when unspecified
+        raw_dir = args.raw_dir
+        sot_dir = args.sot_dir if args.sot_dir is not None else raw_dir / "sot"
+        out_dir = args.out_dir if args.out_dir is not None else raw_dir / "out"
+
+        # Determine manifest path default
+        manifest_path = args.manifest_parquet or (out_dir / "manifest.parquet")
+
+        # Parse optional today override
         t_override: Optional[date] = None
         if args.today:
             try:
@@ -2619,14 +2645,16 @@ def main() -> None:
             except ValueError as e:
                 raise ValueError("--today must be in YYYY-MM-DD format") from e
 
+        # Build labels if CSV, else use provided parquet
         labels_path: Path
         if args.labels.suffix.lower() == ".csv":
-            if args.exams_parquet is None:
-                raise ValueError("--exams is required when --labels is a CSV")
+            exams_pq = args.exams_parquet or (sot_dir / "exams.parquet")
+            # labels.parquet will live next to manifest by default
+            labels_parquet_out = manifest_path.parent / "labels.parquet"
             labels_path = build_labels_from_foo(
                 args.labels,
-                args.exams_parquet,
-                args.manifest_parquet.parent / "labels.parquet",
+                exams_pq,
+                labels_parquet_out,
                 patient_col=args.labels_patient_col,
                 case_col=args.labels_case_col,
                 dxdate_col=args.labels_dxdate_col,
@@ -2636,8 +2664,8 @@ def main() -> None:
         else:
             labels_path = args.labels
 
-        out_csv = args.out_csv or (args.manifest_parquet.parent / "mirai_manifest.csv")
-        write_mirai_csv(args.manifest_parquet, labels_path, out_csv)
+        out_csv = args.out_csv or (out_dir / "mirai_manifest.csv")
+        write_mirai_csv(manifest_path, labels_path, out_csv)
         logger.info(f"wrote Mirai CSV → {out_csv}")
 
     else:
