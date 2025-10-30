@@ -478,7 +478,7 @@ def _save_debug_figure(
     """
     try:
         # create figure with two subplots
-        fig = plt.figure(figsize=(16, 10))
+        fig = plt.figure(figsize=(12, 8))
 
         # left: pixel data
         ax_img = plt.subplot(1, 2, 1)
@@ -601,7 +601,7 @@ def _save_debug_figure(
         out_name = f"{status}_{path.stem}.png"
         out_path = exam_dir / out_name
         plt.tight_layout()
-        plt.savefig(out_path, dpi=100, bbox_inches="tight")
+        plt.savefig(out_path, dpi=75, bbox_inches="tight", optimize=True)
         plt.close(fig)
 
         if status == "SUCCESS":
@@ -2385,7 +2385,7 @@ def _save_four_view_figure(
     patient_id: str,
     accession_number: str,
     exam_id: str,
-) -> None:
+) -> bool:
     """save a combined figure with all four views of an exam.
 
     Args:
@@ -2394,9 +2394,12 @@ def _save_four_view_figure(
         patient_id: patient identifier
         accession_number: accession number
         exam_id: exam identifier
+
+    Returns:
+        True if successfully saved, False otherwise
     """
     try:
-        fig = plt.figure(figsize=(20, 10))
+        fig = plt.figure(figsize=(16, 8))
 
         # canonical order
         view_order = [("L", "CC"), ("L", "MLO"), ("R", "CC"), ("R", "MLO")]
@@ -2490,15 +2493,17 @@ def _save_four_view_figure(
 
         out_path = accession_dir / f"COMBINED_four_views_{exam_id}.png"
         plt.tight_layout()
-        plt.savefig(out_path, dpi=100, bbox_inches="tight")
+        plt.savefig(out_path, dpi=75, bbox_inches="tight")
         plt.close(fig)
 
         logger.debug(f"    Saved combined 4-view figure: {out_path.name}")
+        return True
 
     except Exception as e:
         logger.warning(
             f"    Failed to save combined 4-view figure for exam {exam_id}: {e}"
         )
+        return False
 
 
 def generate_debug_visualizations(
@@ -2631,30 +2636,32 @@ def generate_debug_visualizations(
 
     for exam_key, exam_data in tqdm(exam_view_cache.items(), desc="combined figures"):
         try:
-            _save_four_view_figure(
+            success = _save_four_view_figure(
                 view_data=exam_data["views"],
                 debug_dir=debug_dir,
                 patient_id=exam_data["patient_id"],
                 accession_number=exam_data["accession_number"],
                 exam_id=exam_key,
             )
-            combined_figure_count += 1
 
-            # track for gallery
-            success_dir = debug_dir / "success"
-            patient_dir = success_dir / exam_data["patient_id"]
-            accession_dir = patient_dir / exam_data["accession_number"]
-            img_path = accession_dir / f"COMBINED_four_views_{exam_key}.png"
+            if success:
+                combined_figure_count += 1
 
-            combined_images.append(
-                {
-                    "path": img_path.relative_to(debug_dir),
-                    "patient_id": exam_data["patient_id"],
-                    "exam_id": exam_key,
-                    "accession": exam_data["accession_number"],
-                    "num_views": len(exam_data["views"]),
-                }
-            )
+                # track for gallery only if save was successful
+                success_dir = debug_dir / "success"
+                patient_dir = success_dir / exam_data["patient_id"]
+                accession_dir = patient_dir / exam_data["accession_number"]
+                img_path = accession_dir / f"COMBINED_four_views_{exam_key}.png"
+
+                combined_images.append(
+                    {
+                        "path": img_path.relative_to(debug_dir),
+                        "patient_id": exam_data["patient_id"],
+                        "exam_id": exam_key,
+                        "accession": exam_data["accession_number"],
+                        "num_views": len(exam_data["views"]),
+                    }
+                )
 
         except Exception as e:
             logger.error(f"error creating combined figure for exam {exam_key}: {e}")
@@ -2668,68 +2675,43 @@ def generate_debug_visualizations(
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>Debug Visualization Gallery - {combined_figure_count} exams</title>
+    <title>{combined_figure_count} exams</title>
     <style>
         body {{
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             margin: 0;
-            padding: 20px;
+            padding: 0;
             background-color: #1e1e1e;
             color: #d4d4d4;
+            overflow: hidden;
         }}
-        h1 {{
-            text-align: center;
-            color: #4ec9b0;
-            margin-bottom: 10px;
+        .container {{
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+        }}
+        .controls {{
+            background-color: #252526;
+            border-bottom: 1px solid #3e3e42;
+            padding: 10px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
         }}
         .stats {{
-            text-align: center;
             color: #9cdcfe;
-            margin-bottom: 30px;
             font-size: 14px;
-        }}
-        .gallery {{
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(800px, 1fr));
-            gap: 30px;
-            max-width: 2400px;
-            margin: 0 auto;
-        }}
-        .exam-card {{
-            background-color: #252526;
-            border: 1px solid #3e3e42;
-            border-radius: 8px;
-            padding: 15px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
-        }}
-        .exam-card:hover {{
-            border-color: #4ec9b0;
-            box-shadow: 0 6px 12px rgba(78, 201, 176, 0.3);
-        }}
-        .exam-info {{
-            margin-bottom: 10px;
-            font-size: 13px;
-            color: #9cdcfe;
-        }}
-        .exam-info strong {{
-            color: #4ec9b0;
-        }}
-        .exam-card img {{
-            width: 100%;
-            border: 1px solid #3e3e42;
-            border-radius: 4px;
-            display: block;
         }}
         .filter-controls {{
+            flex-grow: 1;
             text-align: center;
-            margin-bottom: 20px;
         }}
         .filter-controls input {{
-            padding: 8px 15px;
+            padding: 6px 12px;
             font-size: 14px;
             border: 1px solid #3e3e42;
             border-radius: 4px;
-            background-color: #252526;
+            background-color: #1e1e1e;
             color: #d4d4d4;
             width: 300px;
         }}
@@ -2737,56 +2719,170 @@ def generate_debug_visualizations(
             outline: none;
             border-color: #4ec9b0;
         }}
+        .nav-buttons {{
+            display: flex;
+            gap: 10px;
+        }}
+        .nav-buttons button {{
+            padding: 8px 20px;
+            font-size: 14px;
+            border: 1px solid #3e3e42;
+            border-radius: 4px;
+            background-color: #252526;
+            color: #d4d4d4;
+            cursor: pointer;
+            transition: all 0.2s;
+        }}
+        .nav-buttons button:hover:not(:disabled) {{
+            background-color: #4ec9b0;
+            border-color: #4ec9b0;
+            color: #1e1e1e;
+        }}
+        .nav-buttons button:disabled {{
+            opacity: 0.3;
+            cursor: not-allowed;
+        }}
+        .viewer {{
+            flex-grow: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            overflow: auto;
+        }}
+        .exam-info {{
+            margin-bottom: 15px;
+            font-size: 14px;
+            color: #9cdcfe;
+            text-align: center;
+        }}
+        .exam-info strong {{
+            color: #4ec9b0;
+        }}
+        .image-container {{
+            max-width: 100%;
+            max-height: calc(100vh - 150px);
+            display: flex;
+            justify-content: center;
+        }}
+        .image-container img {{
+            max-width: 100%;
+            max-height: 100%;
+            border: 1px solid #3e3e42;
+            border-radius: 4px;
+            object-fit: contain;
+        }}
     </style>
 </head>
 <body>
-    <h1>Debug Visualization Gallery</h1>
-    <div class="stats">
-        {combined_figure_count} exams | {success_count} views loaded
-    </div>
-    
-    <div class="filter-controls">
-        <input type="text" id="searchBox" placeholder="Filter by patient ID, exam ID, or accession..." 
-               onkeyup="filterGallery()">
-    </div>
-    
-    <div class="gallery" id="gallery">
-"""
-
-        for img_info in combined_images:
-            html_content += f"""
-        <div class="exam-card" data-patient="{img_info["patient_id"]}" 
-             data-exam="{img_info["exam_id"]}" data-accession="{img_info["accession"]}">
-            <div class="exam-info">
-                <strong>Patient:</strong> {img_info["patient_id"]} | 
-                <strong>Exam:</strong> {img_info["exam_id"]} | 
-                <strong>Accession:</strong> {img_info["accession"]} | 
-                <strong>Views:</strong> {img_info["num_views"]}/4
+    <div class="container">
+        <div class="controls">
+            <div class="stats" id="stats">
+                {combined_figure_count} exams | {success_count} views loaded
             </div>
-            <img src="{img_info["path"]}" alt="Exam {img_info["exam_id"]}" loading="lazy">
+            <div class="filter-controls">
+                <input type="text" id="searchBox" placeholder="Filter by patient ID, exam ID, or accession..." 
+                       onkeyup="filterGallery()">
+            </div>
+            <div class="nav-buttons">
+                <button id="prevBtn" onclick="navigate(-1)">← Previous</button>
+                <button id="nextBtn" onclick="navigate(1)">Next →</button>
+            </div>
         </div>
-"""
-
-        html_content += """
+        <div class="viewer" id="viewer">
+        </div>
     </div>
     
     <script>
+        const allExams = [
+"""
+
+        for i, img_info in enumerate(combined_images):
+            # convert path to posix format for web
+            path_str = str(img_info["path"]).replace("\\", "/")
+            html_content += f"""            {{
+                path: "{path_str}",
+                patient_id: "{img_info["patient_id"]}",
+                exam_id: "{img_info["exam_id"]}",
+                accession: "{img_info["accession"]}",
+                num_views: {img_info["num_views"]}
+            }}{"," if i < len(combined_images) - 1 else ""}
+"""
+
+        html_content += """
+        ];
+        
+        let filteredExams = [...allExams];
+        let currentIndex = 0;
+        
         function filterGallery() {
             const searchTerm = document.getElementById('searchBox').value.toLowerCase();
-            const cards = document.getElementsByClassName('exam-card');
             
-            for (let card of cards) {
-                const patient = card.getAttribute('data-patient').toLowerCase();
-                const exam = card.getAttribute('data-exam').toLowerCase();
-                const accession = card.getAttribute('data-accession').toLowerCase();
-                
-                if (patient.includes(searchTerm) || exam.includes(searchTerm) || accession.includes(searchTerm)) {
-                    card.style.display = 'block';
-                } else {
-                    card.style.display = 'none';
-                }
+            if (searchTerm === '') {
+                filteredExams = [...allExams];
+            } else {
+                filteredExams = allExams.filter(exam => 
+                    exam.patient_id.toLowerCase().includes(searchTerm) ||
+                    exam.exam_id.toLowerCase().includes(searchTerm) ||
+                    exam.accession.toLowerCase().includes(searchTerm)
+                );
             }
+            
+            currentIndex = 0;
+            updateView();
         }
+        
+        function navigate(direction) {
+            currentIndex += direction;
+            if (currentIndex < 0) currentIndex = 0;
+            if (currentIndex >= filteredExams.length) currentIndex = filteredExams.length - 1;
+            updateView();
+        }
+        
+        function updateView() {
+            const viewer = document.getElementById('viewer');
+            const stats = document.getElementById('stats');
+            const prevBtn = document.getElementById('prevBtn');
+            const nextBtn = document.getElementById('nextBtn');
+            
+            if (filteredExams.length === 0) {
+                viewer.innerHTML = '<div style="color: #9cdcfe;">no matching exams</div>';
+                stats.textContent = '0 exams';
+                prevBtn.disabled = true;
+                nextBtn.disabled = true;
+                return;
+            }
+            
+            const exam = filteredExams[currentIndex];
+            viewer.innerHTML = 
+                '<div class="exam-info">' +
+                    '<strong>Patient:</strong> ' + exam.patient_id + ' | ' +
+                    '<strong>Exam:</strong> ' + exam.exam_id + ' | ' +
+                    '<strong>Accession:</strong> ' + exam.accession + ' | ' +
+                    '<strong>Views:</strong> ' + exam.num_views + '/4' +
+                '</div>' +
+                '<div class="image-container">' +
+                    '<img src="' + exam.path + '" alt="Exam ' + exam.exam_id + '">' +
+                '</div>';
+            
+            stats.textContent = (currentIndex + 1) + '/' + filteredExams.length + ' | ' + allExams.length + ' total exams';
+            
+            prevBtn.disabled = currentIndex === 0;
+            nextBtn.disabled = currentIndex === filteredExams.length - 1;
+        }
+        
+        // keyboard navigation
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'ArrowLeft') {
+                navigate(-1);
+            } else if (e.key === 'ArrowRight') {
+                navigate(1);
+            }
+        });
+        
+        // initialize
+        updateView();
     </script>
 </body>
 </html>
