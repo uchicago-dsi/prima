@@ -18,28 +18,33 @@ The gallery features:
 
 QC Workflow
 -----------
-1. Run the script to generate gallery (exams marked "good" are automatically skipped)
-2. Use keyboard shortcuts or buttons to mark each exam:
-   - G or "Good" button: exam passes QC
-   - R or "Review" button: needs manual review
-   - B or "Bad" button: exam fails QC
-3. Press S or "Save QC" button to download updated qc_status.json
-4. Move the downloaded file to data/qc_status.json (or your --qc-file path)
-5. Re-run the script to continue QC on remaining exams
+1. Run script with --serve flag to generate gallery and start HTTP server
+2. Open gallery in browser (with SSH port forwarding if remote)
+3. Mark exams using keyboard (G/R/B) or buttons - auto-saves to server after each click
+4. Re-run script to continue QC on remaining exams (already-marked "good" exams skipped)
+
+Server mode (recommended for remote work):
+  python qc_gallery.py --serve --max-exams 100 --random
+  Then forward port: ssh -L 5000:localhost:5000 user@remote
+  Open: http://localhost:5000/
+
+Local mode (no server, manual file moving):
+  python qc_gallery.py --max-exams 10
+  Open qc_output/gallery.html in browser - downloads qc_status.json on each click
 
 Usage
 -----
-# start QC session with 10 random exams (uses defaults: raw=/gpfs/data/huo-lab/Image/ChiMEC/MG, views=<raw>/sot/views.parquet)
+# start QC session with HTTP server (recommended for remote work)
+python qc_gallery.py --serve --max-exams 100 --random
+
+# QC without server (downloads file on each click)
 python qc_gallery.py --max-exams 10 --random
 
-# QC specific patient with custom paths
-python qc_gallery.py --views data/views.parquet --raw /path/to/raw --output qc_output --patient 12345
-
-# include per-view debug figures
-python qc_gallery.py --per-view
+# QC specific patient with custom port
+python qc_gallery.py --serve --port 8080 --patient 12345
 
 # use custom QC file location
-python qc_gallery.py --qc-file /path/to/my_qc_status.json
+python qc_gallery.py --serve --qc-file /path/to/my_qc_status.json
 
 Dependencies
 ------------
@@ -49,8 +54,10 @@ pydicom, pandas, matplotlib, tqdm
 import argparse
 import json
 import logging
+from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from typing import Dict, Optional, Tuple
+from urllib.parse import urlparse
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -66,6 +73,139 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+
+# global variables for HTTP server
+QC_FILE_PATH = None
+OUTPUT_DIR = None
+
+
+class QCGalleryHandler(SimpleHTTPRequestHandler):
+    """HTTP request handler for serving gallery and handling QC saves."""
+
+    def do_GET(self):
+        """handle GET requests for static files and QC data."""
+        parsed_path = urlparse(self.path)
+
+        if parsed_path.path == "/load-qc":
+            # return current QC data
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+            if QC_FILE_PATH and QC_FILE_PATH.exists():
+                with open(QC_FILE_PATH) as f:
+                    qc_data = json.load(f)
+                self.wfile.write(json.dumps(qc_data).encode())
+            else:
+                self.wfile.write(b"{}")
+            return
+
+        # silently ignore favicon requests
+        if parsed_path.path == "/favicon.ico":
+            self.send_response(204)  # No Content
+            self.end_headers()
+            return
+
+        # serve static files from output directory
+        if parsed_path.path == "/" or parsed_path.path == "":
+            self.path = "/gallery.html"
+
+        return SimpleHTTPRequestHandler.do_GET(self)
+
+    def do_POST(self):
+        """handle POST requests for saving QC data."""
+        if self.path == "/save-qc":
+            content_length = int(self.headers["Content-Length"])
+            post_data = self.rfile.read(content_length)
+
+            try:
+                qc_data = json.loads(post_data.decode())
+
+                # save to file
+                if QC_FILE_PATH:
+                    QC_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                    with open(QC_FILE_PATH, "w") as f:
+                        json.dump(qc_data, f, indent=2)
+
+                    logger.info(f"saved QC data: {len(qc_data)} exams")
+
+                    self.send_response(200)
+                    self.send_header("Content-type", "application/json")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(b'{"status": "ok"}')
+                else:
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(b'{"error": "QC file path not configured"}')
+            except Exception as e:
+                logger.error(f"error saving QC data: {e}")
+                self.send_response(500)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        """override to use our logger."""
+        # skip logging favicon requests
+        if "favicon.ico" in format % args:
+            return
+        logger.info(f"HTTP: {format % args}")
+
+
+def start_qc_server(output_dir: Path, qc_file: Path, port: int = 5000) -> None:
+    """start HTTP server to serve gallery and handle QC saves.
+
+    parameters
+    ----------
+    output_dir : Path
+        directory containing gallery.html and images
+    qc_file : Path
+        path where QC data should be saved
+    port : int
+        port to listen on
+    """
+    global QC_FILE_PATH, OUTPUT_DIR
+
+    QC_FILE_PATH = qc_file.resolve()
+    OUTPUT_DIR = output_dir.resolve()
+
+    # change to output directory so SimpleHTTPRequestHandler can serve files
+    import os
+
+    original_dir = os.getcwd()
+    os.chdir(OUTPUT_DIR)
+
+    server_address = ("", port)
+    httpd = HTTPServer(server_address, QCGalleryHandler)
+
+    logger.info(f"QC file: {QC_FILE_PATH}")
+    logger.info(f"Serving from: {OUTPUT_DIR}")
+    logger.info(f"Gallery URL: http://localhost:{port}/")
+    logger.info("=" * 60)
+    logger.info("QC workflow:")
+    logger.info(f"  1. Open http://localhost:{port}/ in your browser")
+    logger.info("  2. Mark exams with G/R/B keys or buttons")
+    logger.info("  3. QC data auto-saves to server on each click")
+    logger.info("  4. Press Ctrl+C to stop server when done")
+    logger.info("=" * 60)
+
+    if not (OUTPUT_DIR / "gallery.html").exists():
+        logger.warning(f"gallery.html not found in {OUTPUT_DIR}")
+        logger.warning("Make sure you generated the gallery before starting server")
+
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        logger.info("\nShutting down server...")
+        httpd.shutdown()
+        os.chdir(original_dir)
+        logger.info("Server stopped")
 
 
 def get_tag(
@@ -258,8 +398,8 @@ def _save_four_view_figure(
         fig = plt.figure(figsize=(16, 8))
 
         # canonical order
-        view_order = [("L", "CC"), ("L", "MLO"), ("R", "CC"), ("R", "MLO")]
-        view_labels = ["L CC", "L MLO", "R CC", "R MLO"]
+        view_order = [("L", "CC"), ("R", "CC"), ("L", "MLO"), ("R", "MLO")]
+        view_labels = ["L CC", "R CC", "L MLO", "R MLO"]
 
         for idx, ((lat, view), label) in enumerate(zip(view_order, view_labels), 1):
             ax = plt.subplot(2, 4, idx)
@@ -642,18 +782,18 @@ def generate_gallery(
             color: #4ec9b0;
         }}
         .qc-controls {{
-            margin-bottom: 20px;
+            margin-bottom: 15px;
             display: flex;
-            gap: 15px;
+            gap: 10px;
             justify-content: center;
             align-items: center;
         }}
         .qc-button {{
-            padding: 10px 25px;
-            font-size: 15px;
+            padding: 6px 16px;
+            font-size: 13px;
             font-weight: bold;
             border: 2px solid #3e3e42;
-            border-radius: 6px;
+            border-radius: 4px;
             cursor: pointer;
             transition: all 0.2s;
         }}
@@ -699,21 +839,6 @@ def generate_gallery(
             border-color: #e08f8f;
             box-shadow: 0 0 10px #e06b6b;
         }}
-        .save-qc-button {{
-            padding: 10px 25px;
-            font-size: 15px;
-            font-weight: bold;
-            background-color: #264f78;
-            color: #9cdcfe;
-            border: 2px solid #3e6fa8;
-            border-radius: 6px;
-            cursor: pointer;
-            transition: all 0.2s;
-        }}
-        .save-qc-button:hover {{
-            background-color: #3e6fa8;
-            border-color: #9cdcfe;
-        }}
         .qc-status-indicator {{
             padding: 4px 12px;
             border-radius: 4px;
@@ -722,7 +847,7 @@ def generate_gallery(
         }}
         .image-container {{
             max-width: 100%;
-            max-height: calc(100vh - 250px);
+            max-height: calc(100vh - 180px);
             display: flex;
             justify-content: center;
         }}
@@ -785,39 +910,53 @@ def generate_gallery(
         // track QC decisions (exam_id -> status)
         let qcData = {{}};
         
-        // initialize QC data from existing statuses
+        // load from localStorage first (preserves work across page refreshes)
+        const savedQCData = localStorage.getItem('qc_data');
+        if (savedQCData) {{
+            try {{
+                qcData = JSON.parse(savedQCData);
+            }} catch (e) {{
+                console.error('Failed to parse saved QC data:', e);
+            }}
+        }}
+        
+        // merge with existing statuses from server
         allExams.forEach(exam => {{
-            if (exam.qc_status) {{
+            if (exam.qc_status && !qcData[exam.exam_id]) {{
                 qcData[exam.exam_id] = exam.qc_status;
             }}
         }});
+        
+        function autoSaveQCData() {{
+            // save to localStorage as backup
+            localStorage.setItem('qc_data', JSON.stringify(qcData));
+            
+            // try to save to server via POST
+            fetch('/save-qc', {{
+                method: 'POST',
+                headers: {{
+                    'Content-Type': 'application/json',
+                }},
+                body: JSON.stringify(qcData)
+            }})
+            .then(response => response.json())
+            .then(data => {{
+                console.log('QC data saved to server:', data);
+            }})
+            .catch(error => {{
+                console.error('Failed to save to server:', error);
+            }});
+        }}
         
         function setQCStatus(status) {{
             const exam = filteredExams[currentIndex];
             qcData[exam.exam_id] = status;
             exam.qc_status = status;
+            autoSaveQCData();
             updateView();
-        }}
-        
-        function saveQCData() {{
-            const jsonStr = JSON.stringify(qcData, null, 2);
-            const blob = new Blob([jsonStr], {{ type: 'application/json' }});
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = 'qc_status.json';
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
             
-            // show confirmation
-            const saveBtn = document.getElementById('saveQCBtn');
-            const originalText = saveBtn.textContent;
-            saveBtn.textContent = '✓ Saved!';
-            setTimeout(() => {{
-                saveBtn.textContent = originalText;
-            }}, 2000);
+            // auto-advance to next exam
+            navigate(1);
         }}
         
         function filterGallery() {{
@@ -877,12 +1016,11 @@ def generate_gallery(
                 '</div>' +
                 '<div class="qc-controls">' +
                     '<button class="qc-button good' + (currentStatus === 'good' ? ' active' : '') + '" ' +
-                        'onclick="setQCStatus(\\'good\\')" title="Mark as good (G key)">✓ Good</button>' +
+                        'onclick="setQCStatus(\\'good\\')" title="Mark as good">✓ Good [g]</button>' +
                     '<button class="qc-button review' + (currentStatus === 'review' ? ' active' : '') + '" ' +
-                        'onclick="setQCStatus(\\'review\\')" title="Needs review (R key)">? Review</button>' +
+                        'onclick="setQCStatus(\\'review\\')" title="Needs review">? Review [r]</button>' +
                     '<button class="qc-button bad' + (currentStatus === 'bad' ? ' active' : '') + '" ' +
-                        'onclick="setQCStatus(\\'bad\\')" title="Mark as bad (B key)">✗ Bad</button>' +
-                    '<button class="save-qc-button" id="saveQCBtn" onclick="saveQCData()" title="Download QC data (S key)">💾 Save QC</button>' +
+                        'onclick="setQCStatus(\\'bad\\')" title="Mark as bad">✗ Bad [b]</button>' +
                 '</div>' +
                 '<div class="image-container">' +
                     '<img src="' + exam.path + '" alt="Exam ' + exam.exam_id + '">' +
@@ -906,23 +1044,23 @@ def generate_gallery(
                 navigate(-1);
             }} else if (e.key === 'ArrowRight') {{
                 navigate(1);
-            }} else if (e.key === 'g' || e.key === 'G') {{
+            }} else if (e.key === 'g') {{
                 setQCStatus('good');
-            }} else if (e.key === 'r' || e.key === 'R') {{
+            }} else if (e.key === 'r') {{
                 setQCStatus('review');
-            }} else if (e.key === 'b' || e.key === 'B') {{
+            }} else if (e.key === 'b') {{
                 setQCStatus('bad');
-            }} else if (e.key === 's' || e.key === 'S') {{
-                saveQCData();
             }}
         }});
         
         // initialize
         updateView();
         
-        // show QC file path in console
-        console.log('QC file will be saved to: {qc_file_str}');
-        console.log('Keyboard shortcuts: G=Good, R=Review, B=Bad, S=Save, Arrow keys=Navigate');
+        // show instructions in console
+        console.log('QC data auto-saves to server on each button click');
+        console.log('Server saves to: {qc_file_str}');
+        console.log('Keyboard shortcuts: g=good, r=review, b=bad, Arrow keys=navigate');
+        console.log('Backup: QC data also saved to browser localStorage - safe to refresh page');
     </script>
 </body>
 </html>
@@ -941,8 +1079,17 @@ def generate_gallery(
                 f"{len([s for s in qc_data.values() if s == 'review'])} review, "
                 f"{len([s for s in qc_data.values() if s == 'bad'])} bad"
             )
+            logger.info("=" * 60)
             logger.info(
-                "Use keyboard shortcuts: G=Good, R=Review, B=Bad, S=Save QC, Arrow keys=Navigate"
+                "Without --serve: QC data saved to localStorage + downloads folder"
+            )
+            logger.info(f"Move downloaded qc_status.json to: {qc_file.resolve()}")
+            logger.info(
+                "With --serve: QC data auto-saves directly to server (recommended)"
+            )
+            logger.info("=" * 60)
+            logger.info(
+                "Keyboard shortcuts: G=Good, R=Review, B=Bad, Arrow keys=Navigate"
             )
 
     logger.info("gallery generation complete:")
@@ -960,25 +1107,27 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # start QC session with 10 random exams (uses defaults)
+  # start QC session with HTTP server (recommended for remote work)
+  python qc_gallery.py --serve --max-exams 100 --random
+  # then SSH port forward: ssh -L 5000:localhost:5000 user@host
+  # open: http://localhost:5000/
+
+  # QC without server (downloads qc_status.json on each click)
   python qc_gallery.py --max-exams 10 --random
 
-  # QC specific patient with custom paths
-  python qc_gallery.py --views data/views.parquet --raw /path/to/raw --output qc_output --patient 12345
-
-  # include per-view debug figures
-  python qc_gallery.py --per-view
+  # use custom port
+  python qc_gallery.py --serve --port 8080 --patient 12345
   
   # use custom QC file location
-  python qc_gallery.py --qc-file /path/to/my_qc_status.json
+  python qc_gallery.py --serve --qc-file /path/to/my_qc_status.json
 
-QC Workflow:
-  1. Run script to generate gallery (exams marked "good" are automatically skipped)
-  2. Mark exams using keyboard (G/R/B) or buttons
-  3. Press S to save QC data (downloads qc_status.json)
-  4. Move downloaded file to data/qc_status.json (or your --qc-file path)
-  5. Re-run script to continue QC on remaining exams
-  
+Server mode workflow:
+  1. Run with --serve, forwards port 5000 to your local machine
+  2. Open http://localhost:5000/ in browser
+  3. Mark exams with G/R/B keys - auto-saves to server after each click
+  4. Ctrl+C to stop server when done
+  5. Re-run to continue QC (already-marked "good" exams skipped)
+
 QC File Format:
   JSON file mapping exam_id to status: {"exam_id_1": "good", "exam_id_2": "review", ...}
   Valid statuses: "good", "review", "bad"
@@ -1039,6 +1188,17 @@ QC File Format:
         default=Path("data/qc_status.json"),
         help="path to QC status file (default: data/qc_status.json); exams marked 'good' will be skipped",
     )
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="start HTTP server to serve gallery and handle QC saves (recommended for remote work)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=5000,
+        help="port for HTTP server (default: 5000; use with --serve)",
+    )
 
     args = parser.parse_args()
 
@@ -1070,6 +1230,14 @@ QC File Format:
         no_gallery=args.no_gallery,
         qc_file=args.qc_file,
     )
+
+    # start HTTP server if requested
+    if args.serve:
+        logger.info("=" * 60)
+        logger.info("Starting HTTP server for QC gallery...")
+        start_qc_server(args.output, args.qc_file, args.port)
+        # server runs until Ctrl+C
+        return 0
 
     return 0
 
