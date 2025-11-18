@@ -311,39 +311,38 @@ tail -n +2 -q output_*.csv >> final_output.csv
 
 After running Mirai inference, use `analyze_mirai.py` to compute per-horizon AUC and survival metrics (Uno's C-index, time-dependent AUC, integrated Brier score).
 
-Basic usage:
+The script expects `validation_output.csv` and `mirai_manifest.csv` in the same directory. Basic usage:
 ```bash
 python analyze_mirai.py \
-  --pred /gpfs/data/huo-lab/Image/ChiMEC/MG/out/validation_output.csv \
-  --meta /path/to/mirai_manifest.csv \
-  --out /path/to/summary.json
+  --out-dir /gpfs/data/huo-lab/Image/ChiMEC/MG/out
+```
+
+This will write results to `{out_dir}/summary.json` by default. To specify a different output path:
+```bash
+python analyze_mirai.py \
+  --out-dir /gpfs/data/huo-lab/Image/ChiMEC/MG/out \
+  --out /path/to/custom_summary.json
 ```
 
 The script auto-detects prediction columns (looks for names containing 'risk', 'pred', or 'prob' with horizon numbers). To override:
 ```bash
 python analyze_mirai.py \
-  --pred validation_output.csv \
-  --meta mirai_manifest.csv \
-  --map 1:risk_1year 5:risk_5year \
-  --out summary.json
+  --out-dir /gpfs/data/huo-lab/Image/ChiMEC/MG/out \
+  --map 1:risk_1year 5:risk_5year
 ```
 
 Filter to a specific split (if your metadata has a `split_group` column):
 ```bash
 python analyze_mirai.py \
-  --pred validation_output.csv \
-  --meta mirai_manifest.csv \
-  --split test \
-  --out summary.json
+  --out-dir /gpfs/data/huo-lab/Image/ChiMEC/MG/out \
+  --split test
 ```
 
 **k-fold cross-validation for IPCW sensitivity**: When all your data is "test" (no separate training set), use k-fold CV to assess how sensitive IPCW-based metrics are to the censoring distribution estimate:
 ```bash
 python analyze_mirai.py \
-  --pred validation_output.csv \
-  --meta mirai_manifest.csv \
-  --kfold 5 \
-  --out summary.json
+  --out-dir /gpfs/data/huo-lab/Image/ChiMEC/MG/out \
+  --kfold 5
 ```
 
 This splits at the patient level (not exam level) to avoid leakage. For each fold, the training fold estimates the IPCW censoring distribution, and the test fold evaluates metrics using that estimate. Results include mean ± std across folds.

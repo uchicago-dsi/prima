@@ -20,10 +20,11 @@ Notes
 
 Usage
 -----
-python analyze_mirai_output.py \
-  --pred /prima/mirai-prep/validation_output.csv \
-  --meta /prima/mirai-prep/mirai_manifest.csv \
-  --out  /prima/mirai-prep/summary.json
+python analyze_mirai.py \
+  --out-dir /prima/mirai-prep \
+  --out /prima/mirai-prep/summary.json
+
+Expects validation_output.csv and mirai_manifest.csv in --out-dir.
 
 Requirements
 ------------
@@ -85,20 +86,36 @@ def _split_patient_exam_id(series: pd.Series) -> tuple[pd.Series, pd.Series]:
 def _detect_pred_cols(df: pd.DataFrame) -> dict[int, str]:
     """auto-detect prediction columns keyed by horizon in years
 
-    looks for names containing ('risk'|'pred'|'prob') and a horizon number next to 'year'/'yr'
+    looks for names with horizon numbers next to 'year'/'yr', optionally prefixed with 'risk'/'pred'/'prob'
+    also handles patterns like '1year', '2year', etc directly
     """
     cols = {}
     for c in df.columns:
         cl = c.lower()
-        if not any(tok in cl for tok in ("risk", "pred", "prob")):
-            continue
-        # regexes to catch '1year', 'year1', '1yr', 'yr5', 'risk_5_year', etc
-        m = re.search(r"(?:(\d+)\s*year|year\s*(\d+)|(\d+)\s*yr|yr\s*(\d+))", cl)
+        # regexes to catch '1year', '1_year', '1_year_risk', 'year1', '1yr', 'yr5', 'risk_5_year', 'pred_1year', etc
+        # [\s_] matches whitespace or underscore
+        m = re.search(
+            r"(?:(\d+)[\s_]*year|year[\s_]*(\d+)|(\d+)[\s_]*yr|yr[\s_]*(\d+))", cl
+        )
         if m:
             h = int(next(g for g in m.groups() if g))
+            # skip if it's clearly not a prediction column (e.g., 'years_to_cancer')
+            if any(
+                skip in cl for skip in ("years_to", "year_to", "followup", "follow_up")
+            ):
+                continue
             cols[h] = c
     if not cols:
-        raise KeyError("could not auto-detect prediction columns; pass --map 1:col,...")
+        # print available columns for debugging
+        numeric_cols = [
+            c
+            for c in df.columns
+            if df[c].dtype in (np.float64, np.float32, np.int64, np.int32)
+        ]
+        raise KeyError(
+            f"could not auto-detect prediction columns; pass --map 1:col,...\n"
+            f"Available numeric columns: {numeric_cols}"
+        )
     return dict(sorted(cols.items()))
 
 
@@ -139,12 +156,18 @@ def summarize(cfg: Config) -> pd.DataFrame:
     else:
         meta_eval = meta.copy()
 
+    # ensure merge keys are strings in both dataframes
+    meta_eval = meta_eval.assign(
+        patient_id=meta_eval["patient_id"].astype(str),
+        exam_id=meta_eval["exam_id"].astype(str),
+    )
+
     # join predictions to metadata (evaluation set)
+    cols_to_merge = list(req)
+    if "split_group" in meta_eval.columns:
+        cols_to_merge.append("split_group")
     df = pred.merge(
-        meta_eval[
-            list(req)
-            | ({"split_group"} if "split_group" in meta_eval.columns else set())
-        ],
+        meta_eval[cols_to_merge],
         on=["patient_id", "exam_id"],
         how="inner",
     )
@@ -188,8 +211,13 @@ def parse_args() -> Config:
     p = argparse.ArgumentParser(
         description="Summarize Mirai validation_output.csv with simple per-horizon AUC and survival metrics"
     )
-    p.add_argument("--pred", dest="pred_csv", type=Path, required=True)
-    p.add_argument("--meta", dest="meta_csv", type=Path, required=True)
+    p.add_argument(
+        "--out-dir",
+        dest="out_dir",
+        type=Path,
+        required=True,
+        help="directory containing validation_output.csv and mirai_manifest.csv",
+    )
     p.add_argument("--out", dest="out_json", type=Path)
     p.add_argument("--split", dest="split", default="test", type=str)
     p.add_argument(
@@ -212,10 +240,16 @@ def parse_args() -> Config:
     )
     args = p.parse_args()
     colmap = _parse_map(args.map_kv) if args.map_kv else None
+
+    # construct paths from output directory
+    pred_csv = args.out_dir / "validation_output.csv"
+    meta_csv = args.out_dir / "mirai_manifest.csv"
+    out_json = args.out_json or (args.out_dir / "summary.json")
+
     return Config(
-        pred_csv=args.pred_csv,
-        meta_csv=args.meta_csv,
-        out_json=args.out_json,
+        pred_csv=pred_csv,
+        meta_csv=meta_csv,
+        out_json=out_json,
         split=args.split,
         colmap=colmap,
         cindex_col=args.cindex_col,
@@ -269,6 +303,17 @@ def survival_metrics(cfg: Config) -> dict:
         ].copy()
     else:
         meta_eval = meta_all.copy()
+
+    # ensure merge keys are strings
+    meta_eval = meta_eval.assign(
+        patient_id=meta_eval["patient_id"].astype(str),
+        exam_id=meta_eval["exam_id"].astype(str),
+    )
+    meta_all = meta_all.assign(
+        patient_id=meta_all["patient_id"].astype(str),
+        exam_id=meta_all["exam_id"].astype(str),
+    )
+
     dfe = pred.merge(meta_eval[list(req)], on=["patient_id", "exam_id"], how="inner")
 
     # use all available data for IPCW censoring estimation
@@ -351,6 +396,12 @@ def kfold_survival_metrics(cfg: Config) -> dict:
         ].copy()
     else:
         meta_eval = meta_all.copy()
+
+    # ensure merge keys are strings
+    meta_eval = meta_eval.assign(
+        patient_id=meta_eval["patient_id"].astype(str),
+        exam_id=meta_eval["exam_id"].astype(str),
+    )
 
     # join predictions
     df = pred.merge(meta_eval[list(req)], on=["patient_id", "exam_id"], how="inner")
