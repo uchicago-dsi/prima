@@ -1245,8 +1245,8 @@ def compute_model_performance_metrics(
             )
 
         row = {
-            "category": category,
-            "group": label,
+            "category": category.lower(),
+            "group": label.lower(),
             "n": int(len(subset)),
         }
         for h, col_label in zip(target_horizons, horizon_labels):
@@ -1258,11 +1258,27 @@ def compute_model_performance_metrics(
             row[f"{col_label}_upper"] = upper_ci
 
         harrell_start = time.time()
-        harrell_val, harrell_lower, harrell_upper = (
-            harrell_override
-            if harrell_override is not None
-            else _compute_harrell(subset, compute_ci=True)
-        )
+        # if harrell_override provided but doesn't have CI, compute CI anyway
+        if harrell_override is not None:
+            harrell_val, harrell_lower, harrell_upper = harrell_override
+            # check if CI is missing (NaN)
+            if (
+                harrell_lower is None
+                or pd.isna(harrell_lower)
+                or harrell_upper is None
+                or pd.isna(harrell_upper)
+            ):
+                # compute CI for the override value
+                computed_harrell = _compute_harrell(subset, compute_ci=True)
+                harrell_val, harrell_lower, harrell_upper = (
+                    harrell_val,  # use override value
+                    computed_harrell[1],  # use computed CI
+                    computed_harrell[2],
+                )
+        else:
+            harrell_val, harrell_lower, harrell_upper = _compute_harrell(
+                subset, compute_ci=True
+            )
         harrell_time = time.time() - harrell_start
         if harrell_time > 1.0:  # only log if it takes more than 1 second
             print(
@@ -1321,12 +1337,12 @@ def compute_model_performance_metrics(
 
     overall_harrell = _extract_overall_harrell()
     print(
-        f"  [{_format_elapsed(time.time() - func_start)}] Adding row: All examinations"
+        f"  [{_format_elapsed(time.time() - func_start)}] Adding row: all examinations"
     )
     _add_row(
         rows,
-        "All examinations",
-        "All examinations",
+        "all examinations",
+        "all examinations",
         df_all,
         precomputed_aucs=summary_lookup if summary_lookup else None,
         harrell_override=overall_harrell,
@@ -1334,12 +1350,12 @@ def compute_model_performance_metrics(
     )
 
     print(
-        f"  [{_format_elapsed(time.time() - func_start)}] Adding row: All examinations (TTC ≥ 6 mo)"
+        f"  [{_format_elapsed(time.time() - func_start)}] Adding row: all examinations (ttc ≥ 6 mo)"
     )
     _add_row(
         rows,
-        "All examinations",
-        "All examinations (TTC ≥ 6 mo)",
+        "all examinations",
+        "all examinations (ttc ≥ 6 mo)",
         df_filtered,
         use_bootstrap=False,
     )
@@ -1347,10 +1363,12 @@ def compute_model_performance_metrics(
     # Self-reported race (filtered)
     for race_label in ("African American", "White"):
         print(
-            f"  [{_format_elapsed(time.time() - func_start)}] Adding row: Self-reported race - {race_label}"
+            f"  [{_format_elapsed(time.time() - func_start)}] Adding row: self-reported race - {race_label.lower()}"
         )
         subset = df_filtered[df_filtered["race_category"].astype(str) == race_label]
-        _add_row(rows, "Self-reported race", race_label, subset, use_bootstrap=False)
+        _add_row(
+            rows, "self-reported race", race_label.lower(), subset, use_bootstrap=False
+        )
 
     # Age groups (filtered)
     age_bins = [
@@ -1363,7 +1381,7 @@ def compute_model_performance_metrics(
     df_filtered = df_filtered.assign(_age_at_exam=age_values)
     for label, low, high in age_bins:
         print(
-            f"  [{_format_elapsed(time.time() - func_start)}] Adding row: Age group - {label}"
+            f"  [{_format_elapsed(time.time() - func_start)}] Adding row: age group - {label.lower()}"
         )
         mask = pd.Series(True, index=df_filtered.index)
         if low is not None:
@@ -1371,7 +1389,7 @@ def compute_model_performance_metrics(
         if high is not None:
             mask &= df_filtered["_age_at_exam"] < high
         subset = df_filtered[mask & df_filtered["_age_at_exam"].notna()]
-        _add_row(rows, "Age group", label, subset, use_bootstrap=False)
+        _add_row(rows, "age group", label.lower(), subset, use_bootstrap=False)
 
     # Helper for case-restricted subsets with common controls
     def _subset_cases_with_controls(
@@ -1388,7 +1406,7 @@ def compute_model_performance_metrics(
     # Receptor subtype (shared controls - use bootstrap)
     for subtype in ("HR+/HER2-", "HR+/HER2+", "HR-/HER2+", "HR-/HER2-"):
         print(
-            f"  [{_format_elapsed(time.time() - func_start)}] Adding row: Receptor subtype - {subtype}"
+            f"  [{_format_elapsed(time.time() - func_start)}] Adding row: receptor subtype - {subtype.lower()}"
         )
         subset = _subset_cases_with_controls(
             df_filtered,
@@ -1397,15 +1415,15 @@ def compute_model_performance_metrics(
         if subset is not None:
             _add_row(
                 rows,
-                "Receptor subtype (cases ≤5y; common controls)",
-                subtype,
+                "receptor subtype (cases ≤5y; common controls)",
+                subtype.lower(),
                 subset,
                 use_bootstrap=True,
             )
 
     for hr_group in ("HR+", "HR-"):
         print(
-            f"  [{_format_elapsed(time.time() - func_start)}] Adding row: Receptor subtype - {hr_group}"
+            f"  [{_format_elapsed(time.time() - func_start)}] Adding row: receptor subtype - {hr_group.lower()}"
         )
         subset = _subset_cases_with_controls(
             df_filtered, df_filtered["hr_status"].astype(str) == hr_group
@@ -1413,8 +1431,8 @@ def compute_model_performance_metrics(
         if subset is not None:
             _add_row(
                 rows,
-                "Receptor subtype (cases ≤5y; common controls)",
-                hr_group,
+                "receptor subtype (cases ≤5y; common controls)",
+                hr_group.lower(),
                 subset,
                 use_bootstrap=True,
             )
@@ -1422,7 +1440,7 @@ def compute_model_performance_metrics(
     # Tumor grade (shared controls - use bootstrap)
     for grade_group in ("Low grade", "Intermediate grade", "High grade"):
         print(
-            f"  [{_format_elapsed(time.time() - func_start)}] Adding row: Tumor grade - {grade_group}"
+            f"  [{_format_elapsed(time.time() - func_start)}] Adding row: tumor grade - {grade_group.lower()}"
         )
         subset = _subset_cases_with_controls(
             df_filtered,
@@ -1431,8 +1449,8 @@ def compute_model_performance_metrics(
         if subset is not None:
             _add_row(
                 rows,
-                "Tumor grade (cases ≤5y; common controls)",
-                grade_group,
+                "tumor grade (cases ≤5y; common controls)",
+                grade_group.lower(),
                 subset,
                 use_bootstrap=True,
             )
@@ -1759,22 +1777,6 @@ def main() -> None:
         checkpoint("Computed model performance metrics")
         print("\n=== Model Performance Metrics ===")
 
-        # format numeric columns with CI
-        def format_metric_with_ci(val, lower, upper):
-            """format metric as 'val (lower, upper)' or just 'val' if CI unavailable"""
-            if val is None or pd.isna(val):
-                return ""
-            val_str = f"{val:.4f}"
-            if (
-                lower is not None
-                and not pd.isna(lower)
-                and upper is not None
-                and not pd.isna(upper)
-            ):
-                ci_str = f" ({lower:.4f}, {upper:.4f})"
-                return val_str + ci_str
-            return val_str
-
         # extract year columns and sort by numeric value
         year_cols_list = [
             c
@@ -1797,15 +1799,25 @@ def main() -> None:
         )  # +1 for padding
         max_group_width = max(max_group_width, len("group"))
 
-        # calculate width needed for year columns (with CI format)
+        # calculate width needed for year columns (value only, CI on separate row)
         def get_year_col_width(col):
             max_width = len(col)
             for _, row in performance_df.iterrows():
                 val = row.get(col, float("nan"))
+                if val is not None and not pd.isna(val):
+                    val_str = f"{val:.2f}"
+                    max_width = max(max_width, len(val_str))
+                # also check CI width
                 lower = row.get(f"{col}_lower", float("nan"))
                 upper = row.get(f"{col}_upper", float("nan"))
-                formatted = format_metric_with_ci(val, lower, upper)
-                max_width = max(max_width, len(formatted))
+                if (
+                    lower is not None
+                    and not pd.isna(lower)
+                    and upper is not None
+                    and not pd.isna(upper)
+                ):
+                    ci_str = f"({lower:.2f}, {upper:.2f})"
+                    max_width = max(max_width, len(ci_str))
             return max_width + 1
 
         year_col_widths = {col: get_year_col_width(col) for col in year_cols_list}
@@ -1815,35 +1827,77 @@ def main() -> None:
         harrell_width = len(harrell_col)
         for _, row in performance_df.iterrows():
             val = row.get(harrell_col, float("nan"))
+            if val is not None and not pd.isna(val):
+                val_str = f"{val:.2f}"
+                harrell_width = max(harrell_width, len(val_str))
             lower = row.get(f"{harrell_col}_lower", float("nan"))
             upper = row.get(f"{harrell_col}_upper", float("nan"))
-            formatted = format_metric_with_ci(val, lower, upper)
-            harrell_width = max(harrell_width, len(formatted))
+            if (
+                lower is not None
+                and not pd.isna(lower)
+                and upper is not None
+                and not pd.isna(upper)
+            ):
+                ci_str = f"({lower:.2f}, {upper:.2f})"
+                harrell_width = max(harrell_width, len(ci_str))
         harrell_width += 1
 
+        def format_value(val):
+            """format just the value without CI"""
+            if val is None or pd.isna(val):
+                return ""
+            return f"{val:.2f}"
+
+        def format_ci(lower, upper):
+            """format CI as '(lower, upper)' or empty string"""
+            if (
+                lower is not None
+                and not pd.isna(lower)
+                and upper is not None
+                and not pd.isna(upper)
+            ):
+                return f"({lower:.2f}, {upper:.2f})"
+            return ""
+
         def format_row(row):
+            """format main row with values only"""
             category_display = str(row["category"]).ljust(max_category_width)
             group = str(row["group"]).ljust(max_group_width)
             n = str(int(row["n"])).rjust(6)
             year_vals = []
             for col in year_cols_list:
                 val = row.get(col, float("nan"))
-                lower = row.get(f"{col}_lower", float("nan"))
-                upper = row.get(f"{col}_upper", float("nan"))
-                formatted = format_metric_with_ci(val, lower, upper)
+                formatted = format_value(val)
                 year_vals.append(formatted.rjust(year_col_widths[col]))
             harrell_val = row.get(harrell_col, float("nan"))
-            harrell_lower = row.get(f"{harrell_col}_lower", float("nan"))
-            harrell_upper = row.get(f"{harrell_col}_upper", float("nan"))
-            harrell_formatted = format_metric_with_ci(
-                harrell_val, harrell_lower, harrell_upper
-            )
+            harrell_formatted = format_value(harrell_val)
             harrell = (
                 harrell_formatted.rjust(harrell_width)
                 if harrell_formatted
                 else "".rjust(harrell_width)
             )
             return f"{category_display} {group} {n} {' '.join(year_vals)} {harrell}"
+
+        def format_ci_row(row):
+            """format CI row with empty category/group/n columns"""
+            empty_category = "".ljust(max_category_width)
+            empty_group = "".ljust(max_group_width)
+            empty_n = "".rjust(6)
+            year_cis = []
+            for col in year_cols_list:
+                lower = row.get(f"{col}_lower", float("nan"))
+                upper = row.get(f"{col}_upper", float("nan"))
+                ci_str = format_ci(lower, upper)
+                year_cis.append(ci_str.rjust(year_col_widths[col]))
+            harrell_lower = row.get(f"{harrell_col}_lower", float("nan"))
+            harrell_upper = row.get(f"{harrell_col}_upper", float("nan"))
+            harrell_ci_str = format_ci(harrell_lower, harrell_upper)
+            harrell_ci = (
+                harrell_ci_str.rjust(harrell_width)
+                if harrell_ci_str
+                else "".rjust(harrell_width)
+            )
+            return f"{empty_category} {empty_group} {empty_n} {' '.join(year_cis)} {harrell_ci}"
 
         # build formatted table
         header_parts = [
@@ -1860,6 +1914,11 @@ def main() -> None:
         lines = [header, separator]
         for _, row in performance_df.iterrows():
             lines.append(format_row(row))
+            # add CI row if any CI exists
+            ci_row = format_ci_row(row)
+            # check if CI row has any non-empty content
+            if ci_row.strip():
+                lines.append(ci_row)
 
         # add notes below table
         notes = []
