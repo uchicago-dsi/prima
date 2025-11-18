@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -283,6 +284,21 @@ def _grade_category_from_row(row: pd.Series) -> str | None:
     if grade_value == 3:
         return "High grade"
     return None
+
+
+def _format_elapsed(elapsed: float) -> str:
+    """format elapsed time in seconds to human-readable string"""
+    if elapsed < 60:
+        return f"{elapsed:.2f}s"
+    elif elapsed < 3600:
+        minutes = int(elapsed // 60)
+        seconds = elapsed % 60
+        return f"{minutes}m {seconds:.2f}s"
+    else:
+        hours = int(elapsed // 3600)
+        minutes = int((elapsed % 3600) // 60)
+        seconds = elapsed % 60
+        return f"{hours}h {minutes}m {seconds:.2f}s"
 
 
 def _load_enriched_manifest(cfg: Config) -> pd.DataFrame:
@@ -835,6 +851,243 @@ def _find_optimal_threshold(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return thresholds[optimal_idx]
 
 
+def _delong_auc_ci(
+    y_true: np.ndarray, y_pred: np.ndarray, confidence: float = 0.95
+) -> tuple[float, float, float]:
+    """compute AUC with 95% CI using DeLong's non-parametric method
+
+    returns (auc, lower_bound, upper_bound)
+    """
+    from scipy import stats
+
+    if len(y_true) == 0 or not (y_true.any() and (~y_true.astype(bool)).any()):
+        return float("nan"), float("nan"), float("nan")
+
+    auc = roc_auc_score(y_true, y_pred)
+
+    # DeLong variance estimation
+    # separate cases and controls
+    case_idx = np.where(y_true == 1)[0]
+    ctrl_idx = np.where(y_true == 0)[0]
+
+    if len(case_idx) == 0 or len(ctrl_idx) == 0:
+        return auc, float("nan"), float("nan")
+
+    n_case = len(case_idx)
+    n_ctrl = len(ctrl_idx)
+
+    # compute V10 and V01 (DeLong et al. 1988) - vectorized version
+    case_scores = y_pred[case_idx]
+    ctrl_scores = y_pred[ctrl_idx]
+
+    # Vectorized computation: compare all case scores with all control scores at once
+    # Shape: (n_case, n_ctrl)
+    comparison_matrix = case_scores[:, np.newaxis] - ctrl_scores[np.newaxis, :]
+
+    # V10: for each case, compute mean indicator (ctrl < case) + 0.5 * (ctrl == case)
+    less_than = (comparison_matrix > 0).astype(float)
+    equal_to = (comparison_matrix == 0).astype(float) * 0.5
+    v10 = np.mean(less_than + equal_to, axis=1)
+
+    # V01: for each control, compute mean indicator (case > ctrl) + 0.5 * (case == ctrl)
+    # Note: (case > ctrl) is same as (ctrl < case), so we can reuse
+    v01 = np.mean(less_than.T + equal_to.T, axis=1)
+
+    # variance of AUC
+    s10 = np.var(v10, ddof=1) if len(v10) > 1 else 0.0
+    s01 = np.var(v01, ddof=1) if len(v01) > 1 else 0.0
+    var_auc = s10 / n_case + s01 / n_ctrl
+
+    if var_auc <= 0:
+        return auc, float("nan"), float("nan")
+
+    # standard error
+    se_auc = np.sqrt(var_auc)
+
+    # 95% CI using normal approximation
+    z = stats.norm.ppf((1 + confidence) / 2)
+    lower = auc - z * se_auc
+    upper = auc + z * se_auc
+
+    # clip to [0, 1]
+    lower = max(0.0, lower)
+    upper = min(1.0, upper)
+
+    return auc, lower, upper
+
+
+def _bootstrap_auc_ci(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    n_bootstrap: int = 300,
+    confidence: float = 0.95,
+    random_state: int = 42,
+) -> tuple[float, float, float]:
+    """compute AUC with 95% CI using bootstrap resampling
+
+    used for shared-control designs (receptor subtype, tumor grade)
+    returns (auc, lower_bound, upper_bound)
+    """
+    if len(y_true) == 0 or not (y_true.any() and (~y_true.astype(bool)).any()):
+        return float("nan"), float("nan"), float("nan")
+
+    bootstrap_start = time.time()
+    auc_observed = roc_auc_score(y_true, y_pred)
+    n = len(y_true)
+
+    # pre-generate all bootstrap indices for efficiency
+    rng = np.random.RandomState(random_state)
+    bootstrap_indices = rng.choice(n, size=(n_bootstrap, n), replace=True)
+
+    # helper function for single bootstrap iteration
+    def _single_bootstrap(i):
+        indices = bootstrap_indices[i]
+        y_boot = y_true[indices]
+        s_boot = y_pred[indices]
+        if y_boot.any() and (~y_boot.astype(bool)).any():
+            try:
+                return roc_auc_score(y_boot, s_boot)
+            except Exception:
+                return None
+        return None
+
+    # try parallelization with joblib, fallback to sequential
+    try:
+        from joblib import Parallel, delayed
+
+        bootstrap_aucs = Parallel(n_jobs=-1, backend="threading")(
+            delayed(_single_bootstrap)(i) for i in range(n_bootstrap)
+        )
+        bootstrap_aucs = [x for x in bootstrap_aucs if x is not None]
+    except ImportError:
+        # fallback to sequential if joblib not available
+        bootstrap_aucs = []
+        for i in range(n_bootstrap):
+            result = _single_bootstrap(i)
+            if result is not None:
+                bootstrap_aucs.append(result)
+
+    if len(bootstrap_aucs) == 0:
+        return auc_observed, float("nan"), float("nan")
+
+    # compute percentiles
+    alpha = 1 - confidence
+    lower = np.percentile(bootstrap_aucs, 100 * alpha / 2)
+    upper = np.percentile(bootstrap_aucs, 100 * (1 - alpha / 2))
+
+    bootstrap_time = time.time() - bootstrap_start
+    if bootstrap_time > 5.0:  # log if bootstrap takes more than 5 seconds
+        print(
+            f"    Bootstrap AUC CI (n={n}, iterations={n_bootstrap}): {_format_elapsed(bootstrap_time)}"
+        )
+
+    return auc_observed, lower, upper
+
+
+def _harrell_cindex_ci(
+    subset: pd.DataFrame,
+    pred_cols: dict[int, str],
+    target_horizons: list[int],
+    cfg: Config,
+    confidence: float = 0.95,
+    compute_ci: bool = True,
+) -> tuple[float, float, float]:
+    """compute Harrell C-index with 95% CI using robust variance estimation
+
+    uses bootstrap for variance estimation
+    returns (c_index, lower_bound, upper_bound)
+    if compute_ci=False, only returns point estimate (much faster)
+    """
+    if subset is None or len(subset) < 2:
+        return float("nan"), float("nan"), float("nan")
+
+    try:
+        y_surv = _build_surv_arrays(subset)
+        max_h = max(target_horizons)
+        risk_col = cfg.cindex_col or pred_cols[max_h]
+        risk = subset[risk_col].astype(float).to_numpy()
+
+        # compute observed C-index
+        c_index, *_ = concordance_index_ipcw(y_surv, y_surv, risk, tau=float(max_h))
+        c_index = float(c_index)
+
+        if not compute_ci:
+            return c_index, float("nan"), float("nan")
+
+        # bootstrap for CI (reduced iterations and optimized)
+        bootstrap_start = time.time()
+        rng = np.random.RandomState(42)
+        n = len(subset)
+        n_bootstrap = 300  # reduced from 500 for speed
+
+        # pre-generate all bootstrap indices
+        bootstrap_indices = rng.choice(n, size=(n_bootstrap, n), replace=True)
+
+        # pre-extract risk values as numpy array for faster access
+        risk_array = subset[risk_col].astype(float).to_numpy()
+
+        # pre-extract survival data columns for faster access
+        ytc_array = pd.to_numeric(subset["years_to_cancer"], errors="coerce").to_numpy()
+        ylf_array = pd.to_numeric(
+            subset["years_to_last_followup"], errors="coerce"
+        ).to_numpy()
+
+        # helper function for single bootstrap iteration
+        def _single_bootstrap_c(i):
+            indices = bootstrap_indices[i]
+            if len(indices) < 2:
+                return None
+            try:
+                # build survival arrays directly from arrays (faster than dataframe)
+                ytc_boot = ytc_array[indices]
+                ylf_boot = ylf_array[indices]
+                event_boot = np.isfinite(ytc_boot) & (ytc_boot <= ylf_boot)
+                time_boot = np.where(event_boot, ytc_boot, ylf_boot)
+                y_surv_boot = Surv.from_arrays(
+                    event=event_boot.astype(bool), time=time_boot.astype(float)
+                )
+                risk_boot = risk_array[indices]
+                c_boot, *_ = concordance_index_ipcw(
+                    y_surv_boot, y_surv_boot, risk_boot, tau=float(max_h)
+                )
+                return float(c_boot)
+            except Exception:
+                return None
+
+        # try parallelization with joblib, fallback to sequential
+        try:
+            from joblib import Parallel, delayed
+
+            bootstrap_cs = Parallel(n_jobs=-1, backend="threading")(
+                delayed(_single_bootstrap_c)(i) for i in range(n_bootstrap)
+            )
+            bootstrap_cs = [x for x in bootstrap_cs if x is not None]
+        except ImportError:
+            # fallback to sequential if joblib not available
+            bootstrap_cs = []
+            for i in range(n_bootstrap):
+                result = _single_bootstrap_c(i)
+                if result is not None:
+                    bootstrap_cs.append(result)
+
+        if len(bootstrap_cs) == 0:
+            return c_index, float("nan"), float("nan")
+
+        alpha = 1 - confidence
+        lower = np.percentile(bootstrap_cs, 100 * alpha / 2)
+        upper = np.percentile(bootstrap_cs, 100 * (1 - alpha / 2))
+
+        bootstrap_time = time.time() - bootstrap_start
+        if bootstrap_time > 5.0:  # log if bootstrap takes more than 5 seconds
+            print(
+                f"    Bootstrap Harrell C-index CI (n={n}, iterations={n_bootstrap}): {_format_elapsed(bootstrap_time)}"
+            )
+
+        return c_index, lower, upper
+    except Exception:
+        return float("nan"), float("nan"), float("nan")
+
+
 def compute_model_performance_metrics(
     cfg: Config,
     per_horizon_df: pd.DataFrame,
@@ -848,6 +1101,8 @@ def compute_model_performance_metrics(
         raise RuntimeError(
             "Omoleye-style performance table requires phenotype-enriched metadata"
         )
+
+    func_start = time.time()
 
     pred_cols = exam_data.pred_cols
     available_horizons = sorted(pred_cols.keys())
@@ -882,85 +1137,190 @@ def compute_model_performance_metrics(
         df_filtered["years_to_cancer"], errors="coerce"
     ).notna() & (pd.to_numeric(df_filtered["years_to_cancer"], errors="coerce") <= 5)
 
-    def _compute_auc_dict(subset: pd.DataFrame) -> dict[int, float]:
+    def _compute_auc_dict(
+        subset: pd.DataFrame, use_bootstrap: bool = False
+    ) -> dict[int, tuple[float, float, float]]:
+        """compute AUC with CIs for each horizon
+
+        returns dict mapping horizon -> (auc, lower_ci, upper_ci)
+        uses DeLong by default, bootstrap if use_bootstrap=True
+        """
         if subset.empty:
-            return {h: float("nan") for h in target_horizons}
+            return {
+                h: (float("nan"), float("nan"), float("nan")) for h in target_horizons
+            }
         ytc = pd.to_numeric(subset["years_to_cancer"], errors="coerce").to_numpy()
         ylf = pd.to_numeric(
             subset["years_to_last_followup"], errors="coerce"
         ).to_numpy()
-        result: dict[int, float] = {}
+        result: dict[int, tuple[float, float, float]] = {}
         for h in target_horizons:
             scores = subset[pred_cols[h]].astype(float).to_numpy()
             case = np.less_equal(ytc, h)
             ctrl = np.logical_and(np.greater(ytc, h), np.greater_equal(ylf, h))
             include = np.logical_or(case, ctrl)
             if not include.any():
-                result[h] = float("nan")
+                result[h] = (float("nan"), float("nan"), float("nan"))
                 continue
             y = case[include].astype(np.int32)
             s = scores[include]
             if y.any() and (~y.astype(bool)).any():
-                result[h] = float(roc_auc_score(y, s))
+                if use_bootstrap:
+                    auc, lower, upper = _bootstrap_auc_ci(y, s)
+                else:
+                    auc, lower, upper = _delong_auc_ci(y, s)
+                result[h] = (auc, lower, upper)
             else:
-                result[h] = float("nan")
+                result[h] = (float("nan"), float("nan"), float("nan"))
         return result
 
-    def _compute_harrell(subset: pd.DataFrame) -> float:
-        if subset is None or len(subset) < 2:
-            return float("nan")
-        try:
-            y_surv = _build_surv_arrays(subset)
-            max_h = max(target_horizons)
-            risk_col = cfg.cindex_col or pred_cols[max_h]
-            risk = subset[risk_col].astype(float).to_numpy()
-            c_index, *_ = concordance_index_ipcw(y_surv, y_surv, risk, tau=float(max_h))
-            return float(c_index)
-        except Exception:
-            return float("nan")
+    def _compute_harrell(
+        subset: pd.DataFrame, compute_ci: bool = False
+    ) -> tuple[float, float, float]:
+        """compute Harrell C-index with CI
 
-    def _extract_overall_harrell() -> float | None:
+        returns (c_index, lower_ci, upper_ci)
+        if compute_ci=False, only returns point estimate (much faster)
+        """
+        if subset is None or len(subset) < 2:
+            return (float("nan"), float("nan"), float("nan"))
+        try:
+            return _harrell_cindex_ci(
+                subset, pred_cols, target_horizons, cfg, compute_ci=compute_ci
+            )
+        except Exception:
+            return (float("nan"), float("nan"), float("nan"))
+
+    def _extract_overall_harrell() -> tuple[float, float, float] | None:
+        """extract overall Harrell C-index with CI from survival metrics"""
         if surv_metrics is None:
             return None
         uno = surv_metrics.get("uno_c")
         if isinstance(uno, dict):
-            return uno.get("mean")
-        return uno
+            mean_val = uno.get("mean")
+            std_val = uno.get("std", 0.0)
+            if mean_val is None:
+                return None
+            # approximate CI using std (for k-fold) or bootstrap if available
+            from scipy import stats
+
+            z = stats.norm.ppf(0.975)
+            lower = mean_val - z * std_val
+            upper = mean_val + z * std_val
+            return (mean_val, lower, upper)
+        if uno is None:
+            return None
+        # single value - would need bootstrap, but return without CI for now
+        return (uno, float("nan"), float("nan"))
 
     def _add_row(
         rows: list[dict],
         category: str,
         label: str,
         subset: pd.DataFrame,
-        precomputed_aucs: dict[int, float] | None = None,
-        harrell_override: float | None = None,
+        precomputed_aucs: dict[int, tuple[float, float, float]] | None = None,
+        harrell_override: tuple[float, float, float] | None = None,
+        use_bootstrap: bool = False,
     ) -> None:
+        """add a row to the performance metrics table with CIs
+
+        precomputed_aucs: dict mapping horizon -> (auc, lower_ci, upper_ci)
+        harrell_override: (c_index, lower_ci, upper_ci) or None
+        use_bootstrap: if True, use bootstrap for AUC CIs (for shared-control designs)
+        """
         if subset is None or subset.empty:
             return
-        aucs = precomputed_aucs or _compute_auc_dict(subset)
+        row_start = time.time()
+        row_label = f"{category}: {label}"
+
+        aucs = precomputed_aucs or _compute_auc_dict(
+            subset, use_bootstrap=use_bootstrap
+        )
+        auc_time = time.time() - row_start
+        if auc_time > 1.0:  # only log if it takes more than 1 second
+            print(
+                f"  [{_format_elapsed(time.time() - func_start)}] Computed AUCs for {row_label} ({_format_elapsed(auc_time)})"
+            )
+
         row = {
             "category": category,
             "group": label,
             "n": int(len(subset)),
         }
         for h, col_label in zip(target_horizons, horizon_labels):
-            row[col_label] = aucs.get(h, float("nan"))
-        row[harrell_label] = (
+            auc_val, lower_ci, upper_ci = aucs.get(
+                h, (float("nan"), float("nan"), float("nan"))
+            )
+            row[col_label] = auc_val
+            row[f"{col_label}_lower"] = lower_ci
+            row[f"{col_label}_upper"] = upper_ci
+
+        harrell_start = time.time()
+        harrell_val, harrell_lower, harrell_upper = (
             harrell_override
             if harrell_override is not None
-            else _compute_harrell(subset)
+            else _compute_harrell(subset, compute_ci=True)
         )
+        harrell_time = time.time() - harrell_start
+        if harrell_time > 1.0:  # only log if it takes more than 1 second
+            print(
+                f"  [{_format_elapsed(time.time() - func_start)}] Computed Harrell C-index for {row_label} ({_format_elapsed(harrell_time)})"
+            )
+
+        row[harrell_label] = harrell_val
+        row[f"{harrell_label}_lower"] = harrell_lower
+        row[f"{harrell_label}_upper"] = harrell_upper
         rows.append(row)
 
     rows: list[dict] = []
 
     # All examinations (unfiltered) uses per-horizon summary to keep numbers aligned
-    summary_lookup = {
-        int(r["horizon_years"]): r["auc"]
-        for _, r in per_horizon_df.iterrows()
-        if int(r["horizon_years"]) in target_horizons
-    }
+    # need to compute CIs for precomputed AUCs
+    summary_lookup: dict[int, tuple[float, float, float]] | None = None
+    if not per_horizon_df.empty:
+        summary_start = time.time()
+        print(
+            f"  [{_format_elapsed(time.time() - func_start)}] Computing summary lookup CIs..."
+        )
+        summary_lookup = {}
+        # pre-compute arrays once (don't recompute for each horizon)
+        ytc_all = pd.to_numeric(df_all["years_to_cancer"], errors="coerce").to_numpy()
+        ylf_all = pd.to_numeric(
+            df_all["years_to_last_followup"], errors="coerce"
+        ).to_numpy()
+        # pre-extract all score arrays
+        scores_dict = {
+            h: df_all[pred_cols[h]].astype(float).to_numpy() for h in target_horizons
+        }
+
+        for _, r in per_horizon_df.iterrows():
+            h = int(r["horizon_years"])
+            if h in target_horizons:
+                scores_all = scores_dict[h]
+                case_all = np.less_equal(ytc_all, h)
+                ctrl_all = np.logical_and(
+                    np.greater(ytc_all, h), np.greater_equal(ylf_all, h)
+                )
+                include_all = np.logical_or(case_all, ctrl_all)
+                if include_all.any():
+                    y_all = case_all[include_all].astype(np.int32)
+                    s_all = scores_all[include_all]
+                    if y_all.any() and (~y_all.astype(bool)).any():
+                        auc, lower, upper = _delong_auc_ci(y_all, s_all)
+                        summary_lookup[h] = (auc, lower, upper)
+                    else:
+                        summary_lookup[h] = (float("nan"), float("nan"), float("nan"))
+                else:
+                    summary_lookup[h] = (float("nan"), float("nan"), float("nan"))
+        summary_time = time.time() - summary_start
+        print(
+            f"  [{_format_elapsed(time.time() - func_start)}] Completed summary lookup ({_format_elapsed(summary_time)})"
+        )
+
     overall_harrell = _extract_overall_harrell()
+    print(
+        f"  [{_format_elapsed(time.time() - func_start)}] Adding row: All examinations"
+    )
     _add_row(
         rows,
         "All examinations",
@@ -968,19 +1328,27 @@ def compute_model_performance_metrics(
         df_all,
         precomputed_aucs=summary_lookup if summary_lookup else None,
         harrell_override=overall_harrell,
+        use_bootstrap=False,
     )
 
+    print(
+        f"  [{_format_elapsed(time.time() - func_start)}] Adding row: All examinations (TTC ≥ 6 mo)"
+    )
     _add_row(
         rows,
         "All examinations",
         "All examinations (TTC ≥ 6 mo)",
         df_filtered,
+        use_bootstrap=False,
     )
 
     # Self-reported race (filtered)
     for race_label in ("African American", "White"):
+        print(
+            f"  [{_format_elapsed(time.time() - func_start)}] Adding row: Self-reported race - {race_label}"
+        )
         subset = df_filtered[df_filtered["race_category"].astype(str) == race_label]
-        _add_row(rows, "Self-reported race", race_label, subset)
+        _add_row(rows, "Self-reported race", race_label, subset, use_bootstrap=False)
 
     # Age groups (filtered)
     age_bins = [
@@ -992,13 +1360,16 @@ def compute_model_performance_metrics(
     age_values = pd.to_numeric(df_filtered["age_at_exam"], errors="coerce")
     df_filtered = df_filtered.assign(_age_at_exam=age_values)
     for label, low, high in age_bins:
+        print(
+            f"  [{_format_elapsed(time.time() - func_start)}] Adding row: Age group - {label}"
+        )
         mask = pd.Series(True, index=df_filtered.index)
         if low is not None:
             mask &= df_filtered["_age_at_exam"] >= low
         if high is not None:
             mask &= df_filtered["_age_at_exam"] < high
         subset = df_filtered[mask & df_filtered["_age_at_exam"].notna()]
-        _add_row(rows, "Age group", label, subset)
+        _add_row(rows, "Age group", label, subset, use_bootstrap=False)
 
     # Helper for case-restricted subsets with common controls
     def _subset_cases_with_controls(
@@ -1012,8 +1383,11 @@ def compute_model_performance_metrics(
         keep_mask = (~df["_case_5y"]) | case_mask
         return df[keep_mask]
 
-    # Receptor subtype
+    # Receptor subtype (shared controls - use bootstrap)
     for subtype in ("HR+/HER2-", "HR+/HER2+", "HR-/HER2+", "HR-/HER2-"):
+        print(
+            f"  [{_format_elapsed(time.time() - func_start)}] Adding row: Receptor subtype - {subtype}"
+        )
         subset = _subset_cases_with_controls(
             df_filtered,
             df_filtered["receptor_subtype"].astype(str) == subtype,
@@ -1024,9 +1398,13 @@ def compute_model_performance_metrics(
                 "Receptor subtype (cases ≤5y; common controls)",
                 subtype,
                 subset,
+                use_bootstrap=True,
             )
 
     for hr_group in ("HR+", "HR-"):
+        print(
+            f"  [{_format_elapsed(time.time() - func_start)}] Adding row: Receptor subtype - {hr_group}"
+        )
         subset = _subset_cases_with_controls(
             df_filtered, df_filtered["hr_status"].astype(str) == hr_group
         )
@@ -1036,10 +1414,14 @@ def compute_model_performance_metrics(
                 "Receptor subtype (cases ≤5y; common controls)",
                 hr_group,
                 subset,
+                use_bootstrap=True,
             )
 
-    # Tumor grade
+    # Tumor grade (shared controls - use bootstrap)
     for grade_group in ("Low grade", "Intermediate grade", "High grade"):
+        print(
+            f"  [{_format_elapsed(time.time() - func_start)}] Adding row: Tumor grade - {grade_group}"
+        )
         subset = _subset_cases_with_controls(
             df_filtered,
             df_filtered["tumor_grade_group"].astype(str) == grade_group,
@@ -1050,12 +1432,17 @@ def compute_model_performance_metrics(
                 "Tumor grade (cases ≤5y; common controls)",
                 grade_group,
                 subset,
+                use_bootstrap=True,
             )
 
     if not rows:
         raise RuntimeError("no rows generated for performance metrics table")
 
     df_result = pd.DataFrame(rows)
+    total_time = time.time() - func_start
+    print(
+        f"  [{_format_elapsed(time.time() - func_start)}] Completed model performance metrics computation ({_format_elapsed(total_time)})"
+    )
     return df_result
 
 
@@ -1271,13 +1658,27 @@ def compute_patient_examination_characteristics(
 
 def main() -> None:
     """entrypoint"""
+    start_time = time.time()
     cfg = parse_args()
+    last_checkpoint = start_time
+
+    def checkpoint(msg: str):
+        nonlocal last_checkpoint
+        now = time.time()
+        elapsed = now - last_checkpoint
+        total = now - start_time
+        print(f"[{_format_elapsed(total)}] {msg} ({_format_elapsed(elapsed)})")
+        last_checkpoint = now
+
+    checkpoint("Starting analysis")
 
     # compute patient and examination characteristics
     try:
+        checkpoint("Loading patient/examination characteristics...")
         characteristics_df, meta_exam, meta_filtered_exam = (
             compute_patient_examination_characteristics(cfg)
         )
+        checkpoint("Computed patient/examination characteristics")
         print("\n=== Patient- and Examination-level Characteristics ===")
         print(characteristics_df.to_string(index=False))
         if cfg.out_json is not None:
@@ -1297,7 +1698,9 @@ def main() -> None:
         print(f"\n[warn] Could not compute patient examination characteristics: {e}")
         meta_exam = None
 
+    checkpoint("Computing per-horizon summary...")
     per_horizon_df, exam_data = summarize(cfg)
+    checkpoint("Computed per-horizon summary")
     print("\n=== Per-Horizon AUC ===")
     cols = ["horizon_years", "n", "cases", "controls", "excluded", "prevalence", "auc"]
     print(
@@ -1307,7 +1710,9 @@ def main() -> None:
     surv = None
     if cfg.kfold is not None:
         try:
+            checkpoint(f"Computing {cfg.kfold}-fold CV survival metrics...")
             surv = kfold_survival_metrics(cfg, exam_data)
+            checkpoint("Computed k-fold survival metrics")
             print("\n=== k-fold CV survival metrics (IPCW) ===")
             print(f"k={surv['k']}, n_folds={surv['n_folds']}")
             print("times:", ", ".join(str(int(t)) for t in surv["times"]))
@@ -1330,7 +1735,9 @@ def main() -> None:
             print("\n[warn] k-fold survival metrics unavailable:", str(e))
     else:
         try:
+            checkpoint("Computing survival metrics (IPCW)...")
             surv = survival_metrics(cfg, exam_data)
+            checkpoint("Computed survival metrics")
             print("\n=== scikit-survival (IPCW) ===")
             print("times:", ", ".join(str(int(t)) for t in surv["times"]))
             print("auc(t):", ", ".join(f"{a:.4f}" for a in surv["auc_t"]))
@@ -1343,18 +1750,37 @@ def main() -> None:
 
     # compute model performance metrics
     try:
+        checkpoint("Computing model performance metrics...")
         performance_df = compute_model_performance_metrics(
             cfg, per_horizon_df, surv, exam_data, meta_exam
         )
+        checkpoint("Computed model performance metrics")
         print("\n=== Model Performance Metrics ===")
 
-        # format numeric columns
-        def format_metric(x):
-            return f"{x:.4f}" if x is not None and not pd.isna(x) else ""
+        # format numeric columns with CI
+        def format_metric_with_ci(val, lower, upper):
+            """format metric as 'val (lower, upper)' or just 'val' if CI unavailable"""
+            if val is None or pd.isna(val):
+                return ""
+            val_str = f"{val:.4f}"
+            if (
+                lower is not None
+                and not pd.isna(lower)
+                and upper is not None
+                and not pd.isna(upper)
+            ):
+                ci_str = f" ({lower:.4f}, {upper:.4f})"
+                return val_str + ci_str
+            return val_str
 
-        # format with fixed-width columns for better alignment
         # extract year columns and sort by numeric value
-        year_cols_list = [c for c in performance_df.columns if c.startswith("Year")]
+        year_cols_list = [
+            c
+            for c in performance_df.columns
+            if c.startswith("Year")
+            and not c.endswith("_lower")
+            and not c.endswith("_upper")
+        ]
         year_cols_list.sort(
             key=lambda x: int(x.split()[-1]) if x.split()[-1].isdigit() else 0
         )
@@ -1369,16 +1795,52 @@ def main() -> None:
         )  # +1 for padding
         max_group_width = max(max_group_width, len("group"))
 
+        # calculate width needed for year columns (with CI format)
+        def get_year_col_width(col):
+            max_width = len(col)
+            for _, row in performance_df.iterrows():
+                val = row.get(col, float("nan"))
+                lower = row.get(f"{col}_lower", float("nan"))
+                upper = row.get(f"{col}_upper", float("nan"))
+                formatted = format_metric_with_ci(val, lower, upper)
+                max_width = max(max_width, len(formatted))
+            return max_width + 1
+
+        year_col_widths = {col: get_year_col_width(col) for col in year_cols_list}
+
+        # calculate width for Harrell C-index column
+        harrell_col = "Harrell C-index"
+        harrell_width = len(harrell_col)
+        for _, row in performance_df.iterrows():
+            val = row.get(harrell_col, float("nan"))
+            lower = row.get(f"{harrell_col}_lower", float("nan"))
+            upper = row.get(f"{harrell_col}_upper", float("nan"))
+            formatted = format_metric_with_ci(val, lower, upper)
+            harrell_width = max(harrell_width, len(formatted))
+        harrell_width += 1
+
         def format_row(row):
             category_display = str(row["category"]).ljust(max_category_width)
             group = str(row["group"]).ljust(max_group_width)
             n = str(int(row["n"])).rjust(6)
             year_vals = []
             for col in year_cols_list:
-                val = format_metric(row[col])
-                year_vals.append(val.rjust(8))
-            harrell = format_metric(row.get("Harrell C-index", ""))
-            harrell = harrell.rjust(15) if harrell else "".rjust(15)
+                val = row.get(col, float("nan"))
+                lower = row.get(f"{col}_lower", float("nan"))
+                upper = row.get(f"{col}_upper", float("nan"))
+                formatted = format_metric_with_ci(val, lower, upper)
+                year_vals.append(formatted.rjust(year_col_widths[col]))
+            harrell_val = row.get(harrell_col, float("nan"))
+            harrell_lower = row.get(f"{harrell_col}_lower", float("nan"))
+            harrell_upper = row.get(f"{harrell_col}_upper", float("nan"))
+            harrell_formatted = format_metric_with_ci(
+                harrell_val, harrell_lower, harrell_upper
+            )
+            harrell = (
+                harrell_formatted.rjust(harrell_width)
+                if harrell_formatted
+                else "".rjust(harrell_width)
+            )
             return f"{category_display} {group} {n} {' '.join(year_vals)} {harrell}"
 
         # build formatted table
@@ -1387,9 +1849,9 @@ def main() -> None:
             "group".ljust(max_group_width),
             "n".rjust(6),
         ]
-        year_headers = [c.rjust(8) for c in year_cols_list]
+        year_headers = [c.rjust(year_col_widths[c]) for c in year_cols_list]
         header_parts.extend(year_headers)
-        header_parts.append("Harrell C-index".rjust(15))
+        header_parts.append(harrell_col.rjust(harrell_width))
         header = " ".join(header_parts)
         separator = "-" * len(header)
 
@@ -1442,6 +1904,17 @@ def main() -> None:
             out["survival_metrics"] = surv
         cfg.out_json.parent.mkdir(parents=True, exist_ok=True)
         cfg.out_json.write_text(json.dumps(out, indent=2))
+
+    elapsed_time = time.time() - start_time
+    hours = int(elapsed_time // 3600)
+    minutes = int((elapsed_time % 3600) // 60)
+    seconds = elapsed_time % 60
+    if hours > 0:
+        print(f"\n=== Total runtime: {hours}h {minutes}m {seconds:.2f}s ===")
+    elif minutes > 0:
+        print(f"\n=== Total runtime: {minutes}m {seconds:.2f}s ===")
+    else:
+        print(f"\n=== Total runtime: {seconds:.2f}s ===")
 
 
 if __name__ == "__main__":
