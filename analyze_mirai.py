@@ -550,41 +550,74 @@ def kfold_survival_metrics(cfg: Config) -> dict:
 def reproduce_table1(cfg: Config) -> pd.DataFrame:
     """reproduce Table 1 from Omoleye et al: Patient- and Examination-level Characteristics
 
-    computes statistics from mirai_manifest.csv matching the format in the paper
+    computes statistics from mirai_manifest.csv merged with phenotype data
     """
+    # load manifest
     meta = (
         pd.read_csv(cfg.meta_csv)
         if cfg.meta_csv.suffix.lower() == ".csv"
         else pd.read_parquet(cfg.meta_csv)
     )
 
-    # ensure string types for grouping
+    # align table with the requested evaluation split to avoid counting exams twice
+    if cfg.split is not None and "split_group" in meta.columns:
+        meta = meta[
+            meta["split_group"].astype(str).str.lower() == cfg.split.lower()
+        ].copy()
+
+    # load phenotype CSV
+    phenotype_csv = Path(
+        "/gpfs/data/phs/groups/Projects/Huo_projects/SPORE/annawoodard/Phenotype_ChiMEC_2025Oct4.csv"
+    )
+    phenotype = pd.read_csv(phenotype_csv)
+    phenotype["MRN"] = phenotype["MRN"].astype(str).str.strip().str.zfill(8)
+
+    # load key file to map MRN → AnonymousID (patient_id)
+    key_file = Path("/gpfs/data/huo-lab/Image/ChiMEC/study-16352a.csv")
+    key = pd.read_csv(key_file)
+    key["MRN"] = key["MRN"].astype(str).str.strip().str.zfill(8)
+    key["AnonymousID"] = key["AnonymousID"].astype(str).str.strip()
+
+    # merge phenotype with key to get patient_id
+    phenotype = phenotype.merge(key[["MRN", "AnonymousID"]], on="MRN", how="left")
+    phenotype = phenotype.rename(columns={"AnonymousID": "patient_id"})
+
+    # merge phenotype with manifest
     meta = meta.assign(
         patient_id=meta["patient_id"].astype(str),
         exam_id=meta["exam_id"].astype(str),
     )
+    meta = meta.merge(
+        phenotype[["patient_id", "RaceEthnic", "dob"]],
+        on="patient_id",
+        how="left",
+    )
+
+    # try to get exam dates from exams parquet if available
+    exams_parquet = cfg.meta_csv.parent.parent / "sot" / "exams.parquet"
+    if exams_parquet.exists():
+        exams = pd.read_parquet(exams_parquet)
+        exams = exams.assign(
+            patient_id=exams["patient_id"].astype(str),
+            exam_id=exams["exam_id"].astype(str),
+        )
+        meta = meta.merge(
+            exams[["patient_id", "exam_id", "study_date"]],
+            on=["patient_id", "exam_id"],
+            how="left",
+        )
+        # calculate age at exam from dob and study_date
+        if "dob" in meta.columns and "study_date" in meta.columns:
+            dob_parsed = pd.to_datetime(meta["dob"], format="%d%b%Y", errors="coerce")
+            study_date_parsed = pd.to_datetime(meta["study_date"], errors="coerce")
+            age_at_exam = (study_date_parsed - dob_parsed).dt.days / 365.25
+            meta["age_at_exam"] = age_at_exam
 
     # filter to 6-month time-to-cancer filter (exclude cases with TTC < 6 months)
     ytc = pd.to_numeric(meta["years_to_cancer"], errors="coerce")
     meta_filtered = meta[ytc.isna() | (ytc >= 0.5)].copy()
 
-    # aggregate per exam (take first value for labels, they should be identical)
-    exam_cols = ["patient_id", "exam_id", "years_to_cancer", "years_to_last_followup"]
-    if "split_group" in meta.columns:
-        exam_cols.append("split_group")
-    # add any other columns that might be per-exam (age, race, etc.)
-    for col in [
-        "age",
-        "age_at_exam",
-        "race",
-        "ethnicity",
-        "breast_density",
-        "birads",
-        "birads_assessment",
-    ]:
-        if col in meta.columns:
-            exam_cols.append(col)
-
+    # aggregate per exam
     meta_exam = meta.groupby(["patient_id", "exam_id"], as_index=False).first()
     meta_filtered_exam = meta_filtered.groupby(
         ["patient_id", "exam_id"], as_index=False
@@ -617,14 +650,9 @@ def reproduce_table1(cfg: Config) -> pd.DataFrame:
     )
 
     # Age at examination
-    if "age" in meta_exam.columns or "age_at_exam" in meta_exam.columns:
-        age_col = "age" if "age" in meta_exam.columns else "age_at_exam"
-        age_filtered = pd.to_numeric(meta_filtered_exam[age_col], errors="coerce")
-        age_case_filtered = (
-            pd.to_numeric(case_filtered[age_col], errors="coerce")
-            if age_col in case_filtered.columns
-            else pd.Series(dtype=float)
-        )
+    if "age_at_exam" in meta_filtered_exam.columns:
+        age_filtered = pd.to_numeric(meta_filtered_exam["age_at_exam"], errors="coerce")
+        age_case_filtered = pd.to_numeric(case_filtered["age_at_exam"], errors="coerce")
 
         rows.append(("Age at examination (y)", "", "", ""))
         for label, low, high in [
@@ -648,25 +676,59 @@ def reproduce_table1(cfg: Config) -> pd.DataFrame:
                 pct_case = "0/0 (0.0)"
             rows.append((f"  {label}", "", pct_total, pct_case))
 
-    # Race/ethnicity
-    race_cols = [
-        c for c in meta_exam.columns if "race" in c.lower() or "ethnicity" in c.lower()
-    ]
-    if race_cols:
-        race_col = race_cols[0]
+    # Race/ethnicity - assign mutually exclusive categories
+    if "RaceEthnic" in meta_filtered_exam.columns:
         rows.append(("Self-reported race and ethnicity", "", "", ""))
-        for race_val in [
+
+        def _assign_race_category(series: pd.Series) -> pd.Series:
+            """map free-text race/ethnicity labels to mutually exclusive buckets"""
+            race_str = series.astype(str).str.lower()
+            race_norm = race_str.str.replace(r"\s+", " ", regex=True).str.strip()
+            category = pd.Series("Unknown", index=series.index, dtype=object)
+
+            non_hispanic = race_norm.str.contains(
+                r"non[\s-]?hispanic", case=False, na=False, regex=True
+            )
+            is_hispanic = (
+                race_norm.str.contains("hispanic", case=False, na=False, regex=True)
+                & ~non_hispanic
+            )
+
+            mask_black = race_norm.str.contains(
+                "black|african american", case=False, na=False, regex=True
+            )
+            mask_asian = race_norm.str.contains(
+                "asian|pacific islander", case=False, na=False, regex=True
+            )
+            mask_alaska = race_norm.str.contains(
+                "alaska native|american indian", case=False, na=False, regex=True
+            )
+            mask_white = race_norm.str.contains(
+                "white", case=False, na=False, regex=True
+            )
+
+            category[mask_black] = "African American"
+            category[mask_asian] = "Asian or Pacific Islander"
+            category[mask_alaska] = "Alaska Native"
+            category[is_hispanic] = "Hispanic"
+            category[mask_white & ~is_hispanic] = "White"
+
+            empty = race_norm.isna() | (race_norm == "")
+            category[empty] = "Unknown"
+            return category
+
+        race_category = _assign_race_category(meta_filtered_exam["RaceEthnic"])
+        race_category_case = _assign_race_category(case_filtered["RaceEthnic"])
+
+        # count by category
+        for table_label in [
             "African American",
             "White",
-            "Asian",
+            "Asian or Pacific Islander",
             "Hispanic",
             "Alaska Native",
         ]:
-            mask = (
-                meta_filtered_exam[race_col]
-                .astype(str)
-                .str.contains(race_val, case=False, na=False)
-            )
+            mask = race_category == table_label
             n_pat = meta_filtered_exam[mask]["patient_id"].nunique()
             n_exam = mask.sum()
             pct_pat = (
@@ -680,107 +742,38 @@ def reproduce_table1(cfg: Config) -> pd.DataFrame:
                 else "0/0 (0.0)"
             )
             if len(case_filtered) > 0:
-                mask_case = (
-                    case_filtered[race_col]
-                    .astype(str)
-                    .str.contains(race_val, case=False, na=False)
-                )
+                mask_case = race_category_case == table_label
                 n_case = mask_case.sum()
                 pct_case = f"{n_case}/{len(case_filtered)} ({100 * n_case / len(case_filtered):.1f})"
             else:
                 pct_case = "0/0 (0.0)"
-            rows.append((f"  {race_val}", pct_pat, pct_exam, pct_case))
+            rows.append((f"  {table_label}", pct_pat, pct_exam, pct_case))
 
-    # Breast density
-    density_cols = [
-        c
-        for c in meta_exam.columns
-        if "density" in c.lower()
-        or "birads" in c.lower()
-        and "density" in str(c).lower()
-    ]
-    if density_cols:
-        density_col = density_cols[0]
-        rows.append(("Reported mammographic breast density", "", "", ""))
-        for density_val in ["A", "B", "C", "D"]:
-            mask = (
-                meta_filtered_exam[density_col]
-                .astype(str)
-                .str.contains(density_val, na=False)
+        # handle unknown/missing
+        mask_unknown = race_category == "Unknown"
+        if mask_unknown.any():
+            n_pat = meta_filtered_exam[mask_unknown]["patient_id"].nunique()
+            n_exam = mask_unknown.sum()
+            pct_pat = (
+                f"{n_pat}/{meta_filtered_exam['patient_id'].nunique()} ({100 * n_pat / meta_filtered_exam['patient_id'].nunique():.1f})"
+                if meta_filtered_exam["patient_id"].nunique() > 0
+                else "0/0 (0.0)"
             )
-            n_exam = mask.sum()
-            if n_exam > 0:
-                pct_exam = (
-                    f"{n_exam}/{mask.sum()} ({100 * n_exam / mask.sum():.1f})"
-                    if mask.sum() > 0
-                    else "0/0 (0.0)"
-                )
-                if len(case_filtered) > 0:
-                    mask_case = (
-                        case_filtered[density_col]
-                        .astype(str)
-                        .str.contains(density_val, na=False)
-                    )
-                    n_case = mask_case.sum()
-                    pct_case = (
-                        f"{n_case}/{mask_case.sum()} ({100 * n_case / mask_case.sum():.1f})"
-                        if mask_case.sum() > 0
-                        else "0/0 (0.0)"
-                    )
-                else:
-                    pct_case = "0/0 (0.0)"
-                rows.append((f"  {density_val}", "", pct_exam, pct_case))
+            pct_exam = (
+                f"{n_exam}/{len(meta_filtered_exam)} ({100 * n_exam / len(meta_filtered_exam):.1f})"
+                if len(meta_filtered_exam) > 0
+                else "0/0 (0.0)"
+            )
+            if len(case_filtered) > 0:
+                mask_case = race_category_case == "Unknown"
+                n_case = mask_case.sum()
+                pct_case = f"{n_case}/{len(case_filtered)} ({100 * n_case / len(case_filtered):.1f})"
+            else:
+                pct_case = "0/0 (0.0)"
+            rows.append(("  Unknown or missing data", pct_pat, pct_exam, pct_case))
 
-    # BI-RADS assessment
-    birads_cols = [
-        c
-        for c in meta_exam.columns
-        if "birads" in c.lower() and "assessment" in c.lower() or c.lower() == "birads"
-    ]
-    if birads_cols:
-        birads_col = birads_cols[0]
-        rows.append(("BI-RADS assessment category", "", "", ""))
-        for birads_val in ["1", "2", "3", "0", "4", "5"]:
-            mask = (
-                meta_filtered_exam[birads_col]
-                .astype(str)
-                .str.contains(f"^{birads_val}[,\\s]", regex=True, na=False)
-            )
-            n_exam = mask.sum()
-            if n_exam > 0:
-                pct_exam = (
-                    f"{n_exam}/{mask.sum()} ({100 * n_exam / mask.sum():.1f})"
-                    if mask.sum() > 0
-                    else "0/0 (0.0)"
-                )
-                if len(case_filtered) > 0:
-                    mask_case = (
-                        case_filtered[birads_col]
-                        .astype(str)
-                        .str.contains(f"^{birads_val}[,\\s]", regex=True, na=False)
-                    )
-                    n_case = mask_case.sum()
-                    pct_case = (
-                        f"{n_case}/{mask_case.sum()} ({100 * n_case / mask_case.sum():.1f})"
-                        if mask_case.sum() > 0
-                        else "0/0 (0.0)"
-                    )
-                else:
-                    pct_case = "0/0 (0.0)"
-                label = (
-                    f"{birads_val}, negative"
-                    if birads_val == "1"
-                    else f"{birads_val}, benign findings"
-                    if birads_val == "2"
-                    else f"{birads_val}, probably benign"
-                    if birads_val == "3"
-                    else f"{birads_val}, incomplete"
-                    if birads_val == "0"
-                    else f"{birads_val} and {int(birads_val) + 1 if birads_val == '4' else '5'}, suspicious"
-                    if birads_val in ["4", "5"]
-                    else birads_val
-                )
-                rows.append((f"  {label}", "", pct_exam, pct_case))
+    # Breast density - skip for now (not in phenotype CSV)
+    # BI-RADS assessment - skip for now (not in phenotype CSV)
 
     df = pd.DataFrame(
         rows,
