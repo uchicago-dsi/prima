@@ -951,11 +951,12 @@ def _bootstrap_auc_ci(
                 return None
         return None
 
-    # try parallelization with joblib, fallback to sequential
+    # try parallelization with joblib using multiprocessing (not threading - GIL prevents speedup)
     try:
         from joblib import Parallel, delayed
 
-        bootstrap_aucs = Parallel(n_jobs=-1, backend="threading")(
+        # use multiprocessing backend for CPU-bound work
+        bootstrap_aucs = Parallel(n_jobs=-1, backend="loky", prefer="processes")(
             delayed(_single_bootstrap)(i) for i in range(n_bootstrap)
         )
         bootstrap_aucs = [x for x in bootstrap_aucs if x is not None]
@@ -1054,11 +1055,12 @@ def _harrell_cindex_ci(
             except Exception:
                 return None
 
-        # try parallelization with joblib, fallback to sequential
+        # try parallelization with joblib using multiprocessing (not threading - GIL prevents speedup)
         try:
             from joblib import Parallel, delayed
 
-            bootstrap_cs = Parallel(n_jobs=-1, backend="threading")(
+            # use multiprocessing backend for CPU-bound work
+            bootstrap_cs = Parallel(n_jobs=-1, backend="loky", prefer="processes")(
                 delayed(_single_bootstrap_c)(i) for i in range(n_bootstrap)
             )
             bootstrap_cs = [x for x in bootstrap_cs if x is not None]
