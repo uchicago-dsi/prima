@@ -940,7 +940,7 @@ def compute_model_performance_metrics(
         aucs = precomputed_aucs or _compute_auc_dict(subset)
         row = {
             "category": category,
-            "group": f"{label} (n = {len(subset):,})",
+            "group": label,
             "n": int(len(subset)),
         }
         for h, col_label in zip(target_horizons, horizon_labels):
@@ -1352,13 +1352,86 @@ def main() -> None:
         def format_metric(x):
             return f"{x:.4f}" if x is not None and not pd.isna(x) else ""
 
-        float_cols = performance_df.select_dtypes(include="float").columns
-        format_dict = {col: format_metric for col in float_cols}
-        print(performance_df.to_string(index=False, formatters=format_dict))
+        # format with fixed-width columns for better alignment
+        # extract year columns and sort by numeric value
+        year_cols_list = [c for c in performance_df.columns if c.startswith("Year")]
+        year_cols_list.sort(
+            key=lambda x: int(x.split()[-1]) if x.split()[-1].isdigit() else 0
+        )
+
+        # calculate column widths based on content
+        max_category_width = (
+            max(len(str(cat)) for cat in performance_df["category"]) + 1
+        )  # +1 for padding
+        max_category_width = max(max_category_width, len("category"))
+        max_group_width = (
+            max(len(str(group)) for group in performance_df["group"]) + 1
+        )  # +1 for padding
+        max_group_width = max(max_group_width, len("group"))
+
+        def format_row(row):
+            category_display = str(row["category"]).ljust(max_category_width)
+            group = str(row["group"]).ljust(max_group_width)
+            n = str(int(row["n"])).rjust(6)
+            year_vals = []
+            for col in year_cols_list:
+                val = format_metric(row[col])
+                year_vals.append(val.rjust(8))
+            harrell = format_metric(row.get("Harrell C-index", ""))
+            harrell = harrell.rjust(15) if harrell else "".rjust(15)
+            return f"{category_display} {group} {n} {' '.join(year_vals)} {harrell}"
+
+        # build formatted table
+        header_parts = [
+            "category".ljust(max_category_width),
+            "group".ljust(max_group_width),
+            "n".rjust(6),
+        ]
+        year_headers = [c.rjust(8) for c in year_cols_list]
+        header_parts.extend(year_headers)
+        header_parts.append("Harrell C-index".rjust(15))
+        header = " ".join(header_parts)
+        separator = "-" * len(header)
+
+        lines = [header, separator]
+        for _, row in performance_df.iterrows():
+            lines.append(format_row(row))
+
+        # add notes below table
+        notes = []
+        # explain count issue for receptor subtype and tumor grade
+        receptor_rows = performance_df[
+            performance_df["category"].str.contains("Receptor subtype", na=False)
+        ]
+        grade_rows = performance_df[
+            performance_df["category"].str.contains("Tumor grade", na=False)
+        ]
+        if len(receptor_rows) > 0 or len(grade_rows) > 0:
+            notes.append("")
+            notes.append(
+                "Note: Counts for receptor subtype and tumor grade categories sum to more than"
+            )
+            notes.append(
+                "the total because each category includes all controls plus only the cases"
+            )
+            notes.append(
+                "matching that specific subtype/grade. This allows fair comparison across"
+            )
+            notes.append("subtypes/grades using the same control set.")
+
+        formatted_table = "\n".join(lines)
+        if notes:
+            formatted_table += "\n\n" + "\n".join(notes)
+
+        print(formatted_table)
         if cfg.out_json is not None:
-            performance_path = cfg.out_json.parent / "model_performance_metrics.csv"
-            performance_df.to_csv(performance_path, index=False)
-            print(f"\nModel performance metrics saved to {performance_path}")
+            performance_csv_path = cfg.out_json.parent / "model_performance_metrics.csv"
+            performance_df.to_csv(performance_csv_path, index=False)
+            print(f"\nModel performance metrics saved to {performance_csv_path}")
+
+            performance_txt_path = cfg.out_json.parent / "model_performance_metrics.txt"
+            performance_txt_path.write_text(formatted_table)
+            print(f"Model performance metrics saved to {performance_txt_path}")
     except Exception as e:
         print(f"\n[warn] Could not compute model performance metrics: {e}")
 
