@@ -42,6 +42,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import KFold
 from sksurv.metrics import (
     brier_score,
     concordance_index_ipcw,
@@ -60,8 +61,8 @@ class Config:
     out_json: Path | None
     split: str | None
     colmap: dict[int, str] | None
-    ref_split: str | None
     cindex_col: str | None
+    kfold: int | None
 
 
 def _parse_map(map_kv: list[str]) -> dict[int, str]:
@@ -190,13 +191,7 @@ def parse_args() -> Config:
     p.add_argument("--pred", dest="pred_csv", type=Path, required=True)
     p.add_argument("--meta", dest="meta_csv", type=Path, required=True)
     p.add_argument("--out", dest="out_json", type=Path)
-    p.add_argument("--split", dest="split", type=str)
-    p.add_argument(
-        "--ref-split",
-        dest="ref_split",
-        type=str,
-        help="which split to use to estimate censoring for IPCW (e.g., train)",
-    )
+    p.add_argument("--split", dest="split", default="test", type=str)
     p.add_argument(
         "--map",
         dest="map_kv",
@@ -209,6 +204,12 @@ def parse_args() -> Config:
         type=str,
         help="column to use for Uno's C-index (default: max-horizon risk)",
     )
+    p.add_argument(
+        "--kfold",
+        dest="kfold",
+        type=int,
+        help="k-fold CV for IPCW sensitivity analysis (e.g., 5); splits at patient level",
+    )
     args = p.parse_args()
     colmap = _parse_map(args.map_kv) if args.map_kv else None
     return Config(
@@ -217,8 +218,8 @@ def parse_args() -> Config:
         out_json=args.out_json,
         split=args.split,
         colmap=colmap,
-        ref_split=args.ref_split,
         cindex_col=args.cindex_col,
+        kfold=args.kfold,
     )
 
 
@@ -237,9 +238,7 @@ def _build_surv_arrays(meta: pd.DataFrame) -> np.ndarray:
 def survival_metrics(cfg: Config) -> dict:
     """compute censoring-adjusted metrics: Uno's C (IPCW), time-dependent AUC, IBS
 
-    uses ref_split (e.g., train) to estimate censoring via Kaplan–Meier, as required by
-    sksurv's IPCW-based estimators. If ref_split is None or not present, falls back to
-    using the evaluation set itself.
+    uses all available data to estimate censoring via Kaplan–Meier for IPCW
     """
     pred = pd.read_csv(cfg.pred_csv)
     if {"patient_id", "exam_id"}.issubset(pred.columns):
@@ -272,22 +271,8 @@ def survival_metrics(cfg: Config) -> dict:
         meta_eval = meta_all.copy()
     dfe = pred.merge(meta_eval[list(req)], on=["patient_id", "exam_id"], how="inner")
 
-    # reference set for IPCW (default: 'train' if present)
-    if cfg.ref_split is not None and "split_group" in meta_all.columns:
-        meta_ref = meta_all[
-            meta_all["split_group"].astype(str).str.lower() == cfg.ref_split.lower()
-        ].copy()
-    elif (
-        "split_group" in meta_all.columns
-        and (meta_all["split_group"].astype(str).str.lower() == "train").any()
-    ):
-        meta_ref = meta_all[
-            meta_all["split_group"].astype(str).str.lower() == "train"
-        ].copy()
-    else:
-        meta_ref = meta_all.copy()
-
-    y_train = _build_surv_arrays(meta_ref)
+    # use all available data for IPCW censoring estimation
+    y_train = _build_surv_arrays(meta_all)
     y_test = _build_surv_arrays(dfe)
 
     # prediction columns / times
@@ -330,6 +315,140 @@ def survival_metrics(cfg: Config) -> dict:
     }
 
 
+def kfold_survival_metrics(cfg: Config) -> dict:
+    """k-fold CV for survival metrics to assess IPCW sensitivity
+
+    splits at patient level (not exam level) to avoid leakage. For each fold:
+    - train fold estimates IPCW censoring distribution
+    - test fold evaluates metrics using that IPCW estimate
+    """
+    pred = pd.read_csv(cfg.pred_csv)
+    if {"patient_id", "exam_id"}.issubset(pred.columns):
+        pid = pred["patient_id"].astype(str)
+        eid = pred["exam_id"].astype(str)
+    elif "patient_exam_id" in pred.columns:
+        pid, eid = _split_patient_exam_id(pred["patient_exam_id"])
+    else:
+        raise KeyError(
+            "predictions must have 'patient_exam_id' or both 'patient_id' and 'exam_id'"
+        )
+    pred = pred.assign(patient_id=pid, exam_id=eid)
+
+    meta_all = (
+        pd.read_csv(cfg.meta_csv)
+        if cfg.meta_csv.suffix.lower() == ".csv"
+        else pd.read_parquet(cfg.meta_csv)
+    )
+    req = {"patient_id", "exam_id", "years_to_cancer", "years_to_last_followup"}
+    if not req.issubset(set(meta_all.columns)):
+        missing = sorted(req - set(meta_all.columns))
+        raise KeyError(f"metadata missing columns: {missing}")
+
+    # filter to evaluation set if split specified
+    if cfg.split is not None and "split_group" in meta_all.columns:
+        meta_eval = meta_all[
+            meta_all["split_group"].astype(str).str.lower() == cfg.split.lower()
+        ].copy()
+    else:
+        meta_eval = meta_all.copy()
+
+    # join predictions
+    df = pred.merge(meta_eval[list(req)], on=["patient_id", "exam_id"], how="inner")
+
+    # get unique patients for splitting
+    patients = df["patient_id"].unique()
+    kf = KFold(n_splits=cfg.kfold, shuffle=True, random_state=42)
+
+    # detect prediction columns once
+    pred_cols = cfg.colmap or _detect_pred_cols(df)
+    times = np.array(sorted(pred_cols.keys()), dtype=float)
+
+    fold_results = []
+    for fold_idx, (train_pat_idx, test_pat_idx) in enumerate(kf.split(patients)):
+        train_patients = patients[train_pat_idx]
+        test_patients = patients[test_pat_idx]
+
+        df_train = df[df["patient_id"].isin(train_patients)].copy()
+        df_test = df[df["patient_id"].isin(test_patients)].copy()
+
+        if len(df_train) == 0 or len(df_test) == 0:
+            continue
+
+        y_train = _build_surv_arrays(df_train)
+        y_test = _build_surv_arrays(df_test)
+
+        # risk matrix for test set
+        risk = np.stack(
+            [df_test[pred_cols[h]].astype(float).to_numpy() for h in times], axis=1
+        )
+
+        # time-dependent AUC
+        auc_t, mean_auc = cumulative_dynamic_auc(y_train, y_test, risk, times)
+
+        # Uno's C-index
+        if cfg.cindex_col is not None:
+            risk_for_c = df_test[cfg.cindex_col].astype(float).to_numpy()
+        else:
+            risk_for_c = df_test[pred_cols[int(times.max())]].astype(float).to_numpy()
+        c_ipcw, n_conc, n_disc, n_trisk, n_ttime = concordance_index_ipcw(
+            y_train, y_test, risk_for_c, tau=float(times.max())
+        )
+
+        # Brier score & IBS
+        surv_prob = 1.0 - risk
+        _, bs_t = brier_score(y_train, y_test, surv_prob, times)
+        ibs = integrated_brier_score(y_train, y_test, surv_prob, times)
+
+        fold_results.append(
+            {
+                "fold": fold_idx,
+                "n_train": len(df_train),
+                "n_test": len(df_test),
+                "auc_t": auc_t.tolist(),
+                "mean_auc": float(mean_auc),
+                "uno_c": float(c_ipcw),
+                "brier_t": bs_t.tolist(),
+                "ibs": float(ibs),
+            }
+        )
+
+    # aggregate across folds
+    n_folds = len(fold_results)
+    if n_folds == 0:
+        raise ValueError("no valid folds; check data splitting")
+
+    mean_aucs = np.array([r["mean_auc"] for r in fold_results])
+    uno_cs = np.array([r["uno_c"] for r in fold_results])
+    ibss = np.array([r["ibs"] for r in fold_results])
+    auc_ts = np.array([r["auc_t"] for r in fold_results])
+
+    return {
+        "k": cfg.kfold,
+        "n_folds": n_folds,
+        "times": times.tolist(),
+        "mean_auc": {
+            "mean": float(mean_aucs.mean()),
+            "std": float(mean_aucs.std()),
+            "values": mean_aucs.tolist(),
+        },
+        "uno_c": {
+            "mean": float(uno_cs.mean()),
+            "std": float(uno_cs.std()),
+            "values": uno_cs.tolist(),
+        },
+        "ibs": {
+            "mean": float(ibss.mean()),
+            "std": float(ibss.std()),
+            "values": ibss.tolist(),
+        },
+        "auc_t": {
+            "mean": auc_ts.mean(axis=0).tolist(),
+            "std": auc_ts.std(axis=0).tolist(),
+        },
+        "folds": fold_results,
+    }
+
+
 def main() -> None:
     """entrypoint"""
     cfg = parse_args()
@@ -337,25 +456,48 @@ def main() -> None:
     cols = ["horizon_years", "n", "cases", "controls", "excluded", "prevalence", "auc"]
     print(df[cols].to_string(index=False, float_format=lambda x: f"{x:.4f}"))
 
-    try:
-        surv = survival_metrics(cfg)
-        print("\n=== scikit-survival (IPCW) ===")
-        print("times:", ", ".join(str(int(t)) for t in surv["times"]))
-        print("auc(t):", ", ".join(f"{a:.4f}" for a in surv["auc_t"]))
-        print(f"mean auc: {surv['mean_auc']:.4f}")
-        print(f"uno c (tau=max time): {surv['uno_c']:.4f}")
-        print("ibs:", f"{surv['ibs']:.4f}")
-    except Exception as e:
-        # allow quick use even if scikit-survival isn't installed or inputs are incomplete
-        print("\n[warn] survival metrics unavailable:", str(e))
+    surv = None
+    if cfg.kfold is not None:
+        try:
+            surv = kfold_survival_metrics(cfg)
+            print("\n=== k-fold CV survival metrics (IPCW) ===")
+            print(f"k={surv['k']}, n_folds={surv['n_folds']}")
+            print("times:", ", ".join(str(int(t)) for t in surv["times"]))
+            print(
+                "auc(t) mean:",
+                ", ".join(f"{a:.4f}" for a in surv["auc_t"]["mean"]),
+            )
+            print(
+                "auc(t) std:",
+                ", ".join(f"{a:.4f}" for a in surv["auc_t"]["std"]),
+            )
+            print(
+                f"mean auc: {surv['mean_auc']['mean']:.4f} ± {surv['mean_auc']['std']:.4f}"
+            )
+            print(
+                f"uno c (tau=max time): {surv['uno_c']['mean']:.4f} ± {surv['uno_c']['std']:.4f}"
+            )
+            print(f"ibs: {surv['ibs']['mean']:.4f} ± {surv['ibs']['std']:.4f}")
+        except Exception as e:
+            print("\n[warn] k-fold survival metrics unavailable:", str(e))
+    else:
+        try:
+            surv = survival_metrics(cfg)
+            print("\n=== scikit-survival (IPCW) ===")
+            print("times:", ", ".join(str(int(t)) for t in surv["times"]))
+            print("auc(t):", ", ".join(f"{a:.4f}" for a in surv["auc_t"]))
+            print(f"mean auc: {surv['mean_auc']:.4f}")
+            print(f"uno c (tau=max time): {surv['uno_c']:.4f}")
+            print("ibs:", f"{surv['ibs']:.4f}")
+        except Exception as e:
+            # allow quick use even if scikit-survival isn't installed or inputs are incomplete
+            print("\n[warn] survival metrics unavailable:", str(e))
 
     if cfg.out_json is not None:
         payload = df.to_dict(orient="records")
         out = {"per_horizon": payload}
-        try:
+        if surv is not None:
             out["survival_metrics"] = surv
-        except Exception:
-            pass
         cfg.out_json.parent.mkdir(parents=True, exist_ok=True)
         cfg.out_json.write_text(json.dumps(out, indent=2))
 

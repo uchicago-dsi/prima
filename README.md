@@ -36,6 +36,13 @@ pip install -r requirements.txt
 pip install -r requirements-dev.txt  # optional: linting + notebook extras
 pip install -e vendor/mirai
 
+# fix GLIBCXX/libstdc++ compatibility issue for lifelines/pandas
+# add conda/micromamba lib to LD_LIBRARY_PATH (required for survival analysis)
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+# add to ~/.bashrc or ~/.bash_profile to make permanent:
+# echo 'export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH' >> ~/.bashrc
+
+
 ```
 
 Runtime dependencies live in `requirements.txt`; install `requirements-dev.txt` to pick up
@@ -136,3 +143,214 @@ Over VPN, throughput was measured at ~3 MB/s (approximately 4 days per terabyte)
 ```bash
 grep '<f++++++++++' hiro2chimec-2025-08-21.log  | awk '{print $5}' | cut -d/ -f1-2 | sort -u | wc -l
 ```
+
+### running mirai
+
+**Important**: Before running mirai, ensure LD_LIBRARY_PATH is set to use conda's libstdc++:
+```bash
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+```
+
+Then run:
+
+**GPU Compatibility Check**: Ensure PyTorch is compiled for your GPU architecture:
+
+```bash
+# check your GPU compute capability (on compute node with GPU access)
+nvidia-smi --query-gpu=name,compute_cap --format=csv
+```
+
+Common GPUs and required PyTorch:
+- **A100** (compute 8.0): needs CUDA 11+ with sm_80 → use `cu118`
+- **V100** (compute 7.0): needs CUDA 10+ with sm_70 → use `cu102` or higher
+- **P100** (compute 6.0): needs CUDA 9+ with sm_60 → use `cu102` or higher
+
+Install PyTorch for your setup (A100 example with CUDA 11.8):
+```bash
+# install/reinstall PyTorch with correct CUDA version
+pip install torch==2.0.1 torchvision==0.15.2 --index-url https://download.pytorch.org/whl/cu118
+
+# verify GPU is detected and supported
+python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}')"
+```
+
+If you get `RuntimeError: CUDA error: no kernel image is available for execution on the device`, your PyTorch doesn't support your GPU. Check compiled architectures and reinstall:
+```bash
+python -c "import torch; print(f'Compiled for: {torch.cuda.get_arch_list()}')"
+# should include sm_XX matching your GPU's compute capability (e.g., sm_80 for A100)
+```
+
+For single GPU:
+```bash
+python scripts/main.py \
+  --model_name mirai_full \
+  --img_encoder_snapshot "/gpfs/data/huo-lab/Image/annawoodard/.mirai/snapshots/mgh_mammo_MIRAI_Base_May20_2019.p" \
+  --transformer_snapshot "/gpfs/data/huo-lab/Image/annawoodard/.mirai/snapshots/mgh_mammo_cancer_MIRAI_Transformer_Jan13_2020.p" \
+  --calibrator_snapshot "/gpfs/data/huo-lab/Image/annawoodard/.mirai/snapshots/calibrators/MIRAI_FULL_PRED_RF.callibrator.p" \
+  --batch_size 8 \
+  --num_workers 4 \
+  --dataset csv_mammo_risk_all_full_future \
+  --img_mean 7047.99 \
+  --img_size 1664 2048 \
+  --img_std 12005.5 \
+  --metadata_path /gpfs/data/huo-lab/Image/ChiMEC/MG/out/mirai_manifest.csv \
+  --test \
+  --prediction_save_path /gpfs/data/huo-lab/Image/ChiMEC/MG/out/validation_output.csv \
+  --cuda
+```
+
+**Performance monitoring and tuning**:
+
+Monitor GPU utilization in another terminal:
+```bash
+watch -n 1 nvidia-smi
+```
+
+If process seems hung or slow (check `nvidia-smi`):
+```bash
+# LOW GPU MEMORY (<1GB) = stuck in data loading, not GPU compute
+# Try with NO multiprocessing first:
+--num_workers 0 --batch_size 16
+
+# If that works, gradually increase:
+--num_workers 2 --batch_size 32
+--num_workers 4 --batch_size 64
+
+# add CUDA_LAUNCH_BLOCKING=1 to see exactly where it hangs
+CUDA_LAUNCH_BLOCKING=1 python scripts/main.py ... --cuda
+```
+
+Common bottlenecks:
+- **GPU memory <1GB, stuck at 0%**: data loading hang - use `--num_workers 0` to disable multiprocessing
+- **First batch very slow**: normal with large images (1664x2048) - can take 2-5 minutes per batch initially
+- **Low GPU utilization** (<50%): increase `--batch_size` 
+- **High GPU memory**: decrease `--batch_size`
+- **Network filesystem**: multiprocessing (`--num_workers`) can cause deadlocks - start with `0`
+
+For multi-GPU inference, add `--num_gpus N` and `--data_parallel`:
+```bash
+python scripts/main.py \
+  --model_name mirai_full \
+  --img_encoder_snapshot "/gpfs/data/huo-lab/Image/annawoodard/.mirai/snapshots/mgh_mammo_MIRAI_Base_May20_2019.p" \
+  --transformer_snapshot "/gpfs/data/huo-lab/Image/annawoodard/.mirai/snapshots/mgh_mammo_cancer_MIRAI_Transformer_Jan13_2020.p" \
+  --calibrator_snapshot "/gpfs/data/huo-lab/Image/annawoodard/.mirai/snapshots/calibrators/MIRAI_FULL_PRED_RF.callibrator.p" \
+  --batch_size 128 \
+  --num_workers 16 \
+  --dataset csv_mammo_risk_all_full_future \
+  --img_mean 7047.99 \
+  --img_size 1664 2048 \
+  --img_std 12005.5 \
+  --metadata_path /gpfs/data/huo-lab/Image/ChiMEC/MG/out/mirai_manifest.csv \
+  --test \
+  --prediction_save_path /gpfs/data/huo-lab/Image/ChiMEC/MG/out/validation_output.csv \
+  --cuda \
+  --num_gpus 4 \
+  --data_parallel
+```
+
+For parallel processing across multiple GPU jobs (recommended for large datasets):
+```bash
+python run_mirai_sharded.py \
+  --max_samples_per_shard 500 \
+  --metadata_path /gpfs/data/huo-lab/Image/ChiMEC/MG/out/mirai_manifest.csv \
+  --prediction_save_path /gpfs/data/huo-lab/Image/ChiMEC/MG/out/validation_output.csv \
+  --model_name mirai_full \
+  --img_encoder_snapshot "/gpfs/data/huo-lab/Image/annawoodard/.mirai/snapshots/mgh_mammo_MIRAI_Base_May20_2019.p" \
+  --transformer_snapshot "/gpfs/data/huo-lab/Image/annawoodard/.mirai/snapshots/mgh_mammo_cancer_MIRAI_Transformer_Jan13_2020.p" \
+  --calibrator_snapshot "/gpfs/data/huo-lab/Image/annawoodard/.mirai/snapshots/calibrators/Mirai_calibrator_mar12_2022.p" \
+  --batch_size 8 \
+  --num_workers 4 \
+  --dataset csv_mammo_risk_all_full_future \
+  --img_mean 7047.99 \
+  --img_size 1664 2048 \
+  --img_std 12005.5 \
+  --test \
+  --cuda \
+  --debug_max_samples 20
+```
+
+The sharded script will:
+- Split the CSV into chunks (use `--num_shards N` or `--max_samples_per_shard N`)
+- Submit one GPU job per chunk via SLURM
+- Automatically collate results when jobs complete
+- Save recovery metadata for resuming if the main process dies
+
+To recover from a crashed run:
+```bash
+python run_mirai_sharded.py --recover /path/to/mirai_shards/job_metadata.json
+```
+
+For debugging with a small sample:
+```bash
+python run_mirai_sharded.py --debug_max_samples 100 --num_shards 2 ...
+```
+
+**Checkpointing workaround** (manual alternative): Mirai doesn't save incremental results. To avoid losing work, split your metadata CSV into chunks and process separately:
+```bash
+# split manifest into chunks of 1000 patients each
+split -l 1000 -d --additional-suffix=.csv mirai_manifest.csv chunk_
+
+# process each chunk (keep header row)
+head -1 mirai_manifest.csv > chunk_00_with_header.csv
+tail -n +2 chunk_00.csv >> chunk_00_with_header.csv
+
+python scripts/main.py ... \
+  --metadata_path chunk_00_with_header.csv \
+  --prediction_save_path output_00.csv
+
+# merge results
+head -1 output_00.csv > final_output.csv
+tail -n +2 -q output_*.csv >> final_output.csv
+```
+
+**Notes**:
+- The LD_LIBRARY_PATH setting is required because pandas (a lifelines dependency) needs GLIBCXX_3.4.29, which is provided by conda/micromamba's libstdc++ but not by the system library. Setting this before Python starts ensures the correct library is used.
+- Ignore "Restarting run from scratch" message during inference - it's always printed even when only running `--test` (not training).
+
+### analyzing mirai output
+
+After running Mirai inference, use `analyze_mirai.py` to compute per-horizon AUC and survival metrics (Uno's C-index, time-dependent AUC, integrated Brier score).
+
+Basic usage:
+```bash
+python analyze_mirai.py \
+  --pred /gpfs/data/huo-lab/Image/ChiMEC/MG/out/validation_output.csv \
+  --meta /path/to/mirai_manifest.csv \
+  --out /path/to/summary.json
+```
+
+The script auto-detects prediction columns (looks for names containing 'risk', 'pred', or 'prob' with horizon numbers). To override:
+```bash
+python analyze_mirai.py \
+  --pred validation_output.csv \
+  --meta mirai_manifest.csv \
+  --map 1:risk_1year 5:risk_5year \
+  --out summary.json
+```
+
+Filter to a specific split (if your metadata has a `split_group` column):
+```bash
+python analyze_mirai.py \
+  --pred validation_output.csv \
+  --meta mirai_manifest.csv \
+  --split test \
+  --out summary.json
+```
+
+**k-fold cross-validation for IPCW sensitivity**: When all your data is "test" (no separate training set), use k-fold CV to assess how sensitive IPCW-based metrics are to the censoring distribution estimate:
+```bash
+python analyze_mirai.py \
+  --pred validation_output.csv \
+  --meta mirai_manifest.csv \
+  --kfold 5 \
+  --out summary.json
+```
+
+This splits at the patient level (not exam level) to avoid leakage. For each fold, the training fold estimates the IPCW censoring distribution, and the test fold evaluates metrics using that estimate. Results include mean ± std across folds.
+
+**Output**: The script prints:
+- Per-horizon summary: cases, controls, excluded, prevalence, AUC
+- Survival metrics: time-dependent AUC, Uno's C-index, integrated Brier score
+- With `--kfold`: aggregated statistics across folds
+
+JSON output includes detailed per-fold results when using k-fold CV.

@@ -395,14 +395,14 @@ def _save_four_view_figure(
         True if successfully saved, False otherwise
     """
     try:
-        fig = plt.figure(figsize=(16, 8))
+        fig = plt.figure(figsize=(20, 5))
 
         # canonical order
         view_order = [("L", "CC"), ("R", "CC"), ("L", "MLO"), ("R", "MLO")]
         view_labels = ["L CC", "R CC", "L MLO", "R MLO"]
 
         for idx, ((lat, view), label) in enumerate(zip(view_order, view_labels), 1):
-            ax = plt.subplot(2, 4, idx)
+            ax = plt.subplot(1, 4, idx)
             view_key = f"{lat}_{view}"
 
             if view_key in view_data:
@@ -434,52 +434,6 @@ def _save_four_view_figure(
                 ax.set_title(f"{label} (missing)", fontsize=14)
 
             ax.axis("off")
-
-        # add metadata text on the right side
-        ax_text = plt.subplot(2, 4, (5, 8))
-        ax_text.axis("off")
-
-        # collect metadata from first available view
-        first_view_ds = None
-        for view_key in view_data:
-            first_view_ds = view_data[view_key][0]
-            break
-
-        if first_view_ds:
-            metadata_lines = [
-                f"Patient: {patient_id}",
-                f"Exam: {exam_id}",
-                f"Accession: {accession_number}",
-                "",
-                "Key DICOM Tags:",
-                f"  Study Date: {get_tag(first_view_ds, (0x0008, 0x0020), 'N/A')}",
-                f"  Study UID: {get_tag(first_view_ds, (0x0020, 0x000D), 'N/A')}",
-                f"  Manufacturer: {get_tag(first_view_ds, (0x0008, 0x0070), 'N/A')}",
-                f"  Modality: {get_tag(first_view_ds, (0x0008, 0x0060), 'N/A')}",
-                "",
-                "Views Present:",
-            ]
-
-            for view_key in ["L_CC", "L_MLO", "R_CC", "R_MLO"]:
-                if view_key in view_data:
-                    ds, _ = view_data[view_key]
-                    shape = (
-                        f"{ds.Rows}x{ds.Columns}" if hasattr(ds, "Rows") else "unknown"
-                    )
-                    metadata_lines.append(f"  {view_key}: {shape}")
-                else:
-                    metadata_lines.append(f"  {view_key}: MISSING")
-
-            text_content = "\n".join(metadata_lines)
-            ax_text.text(
-                0,
-                1,
-                text_content,
-                verticalalignment="top",
-                fontsize=11,
-                family="monospace",
-                transform=ax_text.transAxes,
-            )
 
         # save figure
         success_dir = debug_dir / "success"
@@ -953,9 +907,8 @@ def generate_gallery(
             qcData[exam.exam_id] = status;
             exam.qc_status = status;
             autoSaveQCData();
-            updateView();
             
-            // auto-advance to next exam
+            // auto-advance to next exam (navigate will call updateView)
             navigate(1);
         }}
         

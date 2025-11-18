@@ -2236,6 +2236,49 @@ def write_mirai_csv(
             "split_group",
         ]
     ]
+    # Ensure numeric columns are actually numeric (not object dtype with "nan" strings)
+    out["years_to_cancer"] = (
+        pd.to_numeric(out["years_to_cancer"], errors="coerce").fillna(100).astype(int)
+    )
+    out["years_to_last_followup"] = (
+        pd.to_numeric(out["years_to_last_followup"], errors="coerce")
+        .fillna(0)
+        .astype(int)
+    )
+
+    # Validate numeric columns before writing
+    non_numeric_ytc = out[
+        ~out["years_to_cancer"].apply(lambda x: isinstance(x, (int, float, np.integer)))
+    ]
+    non_numeric_ylf = out[
+        ~out["years_to_last_followup"].apply(
+            lambda x: isinstance(x, (int, float, np.integer))
+        )
+    ]
+    if len(non_numeric_ytc) > 0:
+        logger.warning(
+            f"Found {len(non_numeric_ytc)} non-numeric values in years_to_cancer: {non_numeric_ytc['years_to_cancer'].unique()[:10]}"
+        )
+    if len(non_numeric_ylf) > 0:
+        logger.warning(
+            f"Found {len(non_numeric_ylf)} non-numeric values in years_to_last_followup: {non_numeric_ylf['years_to_last_followup'].unique()[:10]}"
+        )
+
+    # Write CSV with na_rep='' to avoid writing "nan" strings, but ensure no NaN values exist
+    # Double-check that all numeric values are actually numeric before writing
+    assert out["years_to_cancer"].dtype in [np.int64, np.int32, int], (
+        f"years_to_cancer dtype is {out['years_to_cancer'].dtype}, expected int"
+    )
+    assert out["years_to_last_followup"].dtype in [np.int64, np.int32, int], (
+        f"years_to_last_followup dtype is {out['years_to_last_followup'].dtype}, expected int"
+    )
+    assert out["years_to_cancer"].isna().sum() == 0, (
+        f"Found {out['years_to_cancer'].isna().sum()} NaN values in years_to_cancer"
+    )
+    assert out["years_to_last_followup"].isna().sum() == 0, (
+        f"Found {out['years_to_last_followup'].isna().sum()} NaN values in years_to_last_followup"
+    )
+
     out.to_csv(out_csv, index=False)
 
 
@@ -2931,13 +2974,6 @@ def parse_args():
         help="limit number of exams to process (for debugging)",
     )
     p.add_argument(
-        "--debug-dir",
-        dest="debug_dir",
-        type=Path,
-        default="debug_viz",
-        help="save debug figures for skipped DICOMs to this directory",
-    )
-    p.add_argument(
         "--chunk-size",
         dest="chunk_size",
         type=int,
@@ -3105,13 +3141,6 @@ def parse_args():
         dest="raw_dir",
         type=Path,
         default=Path("/gpfs/data/huo-lab/Image/ChiMEC/MG"),
-    )
-    dv.add_argument(
-        "--debug-dir",
-        dest="debug_dir",
-        type=Path,
-        default=Path("debug_viz"),
-        help="output directory for debug figures (default: debug_viz)",
     )
     dv.add_argument(
         "--max-exams",
