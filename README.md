@@ -353,3 +353,92 @@ This splits at the patient level (not exam level) to avoid leakage. For each fol
 - With `--kfold`: aggregated statistics across folds
 
 JSON output includes detailed per-fold results when using k-fold CV.
+
+### QC gallery
+
+Use `qc_gallery.py` to interactively review and mark mammogram exams for quality control. The tool generates combined 4-view figures (L CC, L MLO, R CC, R MLO) and provides an HTML gallery with keyboard navigation and QC marking.
+
+**Basic usage** (server mode, recommended for remote work):
+```bash
+python qc_gallery.py --serve --max-exams 100 --random
+```
+
+This will:
+1. Generate combined 4-view figures for each exam
+2. Create an interactive HTML gallery
+3. Start an HTTP server on port 5000
+
+**Accessing the gallery remotely**:
+
+If running on a remote server, set up SSH port forwarding:
+```bash
+# In a separate terminal on your local machine
+ssh -L 5000:localhost:5000 user@remote-host
+```
+
+Then open `http://localhost:5000/` in your browser.
+
+**QC workflow**:
+
+1. Mark exams using keyboard shortcuts:
+   - `G` = Good
+   - `R` = Needs review
+   - `B` = Bad
+   - Arrow keys = Navigate between exams
+
+2. QC status auto-saves to the server after each click (saved to `data/qc_status.json` by default)
+
+3. To continue QC on remaining exams, re-run the script - exams already marked "good" will be automatically skipped
+
+**Common options**:
+
+Limit number of exams and sample randomly:
+```bash
+python qc_gallery.py --serve --max-exams 50 --random
+```
+
+Use a custom port:
+```bash
+python qc_gallery.py --serve --port 8080
+```
+
+Filter to a specific patient:
+```bash
+python qc_gallery.py --serve --patient 12345
+```
+
+Use a custom QC file location:
+```bash
+python qc_gallery.py --serve --qc-file /path/to/my_qc_status.json
+```
+
+Specify custom input/output paths:
+```bash
+python qc_gallery.py \
+  --serve \
+  --views /path/to/views.parquet \
+  --raw /gpfs/data/huo-lab/Image/ChiMEC/MG \
+  --output qc_output
+```
+
+**Local mode** (without server):
+
+If you prefer not to use the server, you can generate the gallery and open it directly:
+```bash
+python qc_gallery.py --max-exams 10
+```
+
+Then open `qc_output/gallery.html` in your browser. Note: in local mode, QC data downloads as `qc_status.json` on each click - you'll need to manually move it to your desired location.
+
+**QC file format**:
+
+The QC status file is a JSON mapping exam IDs to status:
+```json
+{
+  "exam_id_1": "good",
+  "exam_id_2": "review",
+  "exam_id_3": "bad"
+}
+```
+
+Valid statuses are: `"good"`, `"review"`, `"bad"`. Exams marked as "good" are automatically skipped on subsequent runs.

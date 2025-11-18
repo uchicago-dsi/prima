@@ -1868,13 +1868,13 @@ def main() -> None:
             for col in year_cols_list:
                 val = row.get(col, float("nan"))
                 formatted = format_value(val)
-                year_vals.append(formatted.rjust(year_col_widths[col]))
+                year_vals.append(formatted.ljust(year_col_widths[col]))
             harrell_val = row.get(harrell_col, float("nan"))
             harrell_formatted = format_value(harrell_val)
             harrell = (
-                harrell_formatted.rjust(harrell_width)
+                harrell_formatted.ljust(harrell_width)
                 if harrell_formatted
-                else "".rjust(harrell_width)
+                else "".ljust(harrell_width)
             )
             return f"{category_display} {group} {n} {' '.join(year_vals)} {harrell}"
 
@@ -1888,14 +1888,14 @@ def main() -> None:
                 lower = row.get(f"{col}_lower", float("nan"))
                 upper = row.get(f"{col}_upper", float("nan"))
                 ci_str = format_ci(lower, upper)
-                year_cis.append(ci_str.rjust(year_col_widths[col]))
+                year_cis.append(ci_str.ljust(year_col_widths[col]))
             harrell_lower = row.get(f"{harrell_col}_lower", float("nan"))
             harrell_upper = row.get(f"{harrell_col}_upper", float("nan"))
             harrell_ci_str = format_ci(harrell_lower, harrell_upper)
             harrell_ci = (
-                harrell_ci_str.rjust(harrell_width)
+                harrell_ci_str.ljust(harrell_width)
                 if harrell_ci_str
-                else "".rjust(harrell_width)
+                else "".ljust(harrell_width)
             )
             return f"{empty_category} {empty_group} {empty_n} {' '.join(year_cis)} {harrell_ci}"
 
@@ -1905,9 +1905,9 @@ def main() -> None:
             "group".ljust(max_group_width),
             "n".rjust(6),
         ]
-        year_headers = [c.rjust(year_col_widths[c]) for c in year_cols_list]
+        year_headers = [c.ljust(year_col_widths[c]) for c in year_cols_list]
         header_parts.extend(year_headers)
-        header_parts.append(harrell_col.rjust(harrell_width))
+        header_parts.append(harrell_col.ljust(harrell_width))
         header = " ".join(header_parts)
         separator = "-" * len(header)
 
@@ -1955,6 +1955,116 @@ def main() -> None:
             performance_txt_path = cfg.out_json.parent / "model_performance_metrics.txt"
             performance_txt_path.write_text(formatted_table)
             print(f"Model performance metrics saved to {performance_txt_path}")
+
+            # generate HTML version with alternating row colors
+            html_lines = [
+                "<!DOCTYPE html>",
+                "<html>",
+                "<head>",
+                "<meta charset='utf-8'>",
+                "<title>Model Performance Metrics</title>",
+                "<style>",
+                "  body { font-family: monospace; margin: 20px; }",
+                "  table { border-collapse: collapse; width: auto; min-width: 100%; }",
+                "  th { background-color: #e0e0e0; padding: 8px; text-align: left; border-bottom: 2px solid #333; white-space: nowrap; }",
+                "  td { padding: 6px 8px; white-space: nowrap; }",
+                "  .row-group-0 { background-color: #ffffff; }",
+                "  .row-group-1 { background-color: #d4e4f7; }",
+                "  .ci-row { font-size: 0.9em; }",
+                "</style>",
+                "</head>",
+                "<body>",
+                "<h1>Model Performance Metrics</h1>",
+                "<table>",
+            ]
+
+            # header row
+            html_lines.append("  <tr>")
+            html_lines.append("    <th>category</th>")
+            html_lines.append("    <th>group</th>")
+            html_lines.append("    <th>n</th>")
+            for col in year_cols_list:
+                html_lines.append(f"    <th>{col}</th>")
+            html_lines.append(f"    <th>{harrell_col}</th>")
+            html_lines.append("  </tr>")
+
+            # data rows - alternate colors by category group
+            group_idx = 0
+            for _, row in performance_df.iterrows():
+                # main row - use same group class for category and its CI
+                group_class = f"row-group-{group_idx % 2}"
+                html_lines.append(f"  <tr class='{group_class}'>")
+                html_lines.append(f"    <td>{row['category']}</td>")
+                html_lines.append(f"    <td>{row['group']}</td>")
+                html_lines.append(f"    <td>{int(row['n']):,}</td>")
+                for col in year_cols_list:
+                    val = row.get(col, float("nan"))
+                    val_str = format_value(val)
+                    html_lines.append(f"    <td>{val_str}</td>")
+                harrell_val = row.get(harrell_col, float("nan"))
+                harrell_str = format_value(harrell_val)
+                html_lines.append(f"    <td>{harrell_str}</td>")
+                html_lines.append("  </tr>")
+
+                # CI row if any CI exists - use same group class
+                has_ci = False
+                for col in year_cols_list:
+                    lower = row.get(f"{col}_lower", float("nan"))
+                    upper = row.get(f"{col}_upper", float("nan"))
+                    if (
+                        lower is not None
+                        and not pd.isna(lower)
+                        and upper is not None
+                        and not pd.isna(upper)
+                    ):
+                        has_ci = True
+                        break
+                harrell_lower = row.get(f"{harrell_col}_lower", float("nan"))
+                harrell_upper = row.get(f"{harrell_col}_upper", float("nan"))
+                if (
+                    harrell_lower is not None
+                    and not pd.isna(harrell_lower)
+                    and harrell_upper is not None
+                    and not pd.isna(harrell_upper)
+                ):
+                    has_ci = True
+
+                if has_ci:
+                    html_lines.append(f"  <tr class='ci-row {group_class}'>")
+                    html_lines.append("    <td></td>")  # empty category
+                    html_lines.append("    <td></td>")  # empty group
+                    html_lines.append("    <td></td>")  # empty n
+                    for col in year_cols_list:
+                        lower = row.get(f"{col}_lower", float("nan"))
+                        upper = row.get(f"{col}_upper", float("nan"))
+                        ci_str = format_ci(lower, upper)
+                        html_lines.append(f"    <td>{ci_str}</td>")
+                    harrell_ci_str = format_ci(harrell_lower, harrell_upper)
+                    html_lines.append(f"    <td>{harrell_ci_str}</td>")
+                    html_lines.append("  </tr>")
+
+                # increment group index for next category
+                group_idx += 1
+
+            html_lines.append("</table>")
+
+            # add notes if any
+            if notes:
+                html_lines.append("<div style='margin-top: 20px;'>")
+                for note in notes:
+                    if note:
+                        html_lines.append(f"<p>{note}</p>")
+                html_lines.append("</div>")
+
+            html_lines.append("</body>")
+            html_lines.append("</html>")
+
+            html_content = "\n".join(html_lines)
+            performance_html_path = (
+                cfg.out_json.parent / "model_performance_metrics.html"
+            )
+            performance_html_path.write_text(html_content)
+            print(f"Model performance metrics saved to {performance_html_path}")
     except Exception as e:
         print(f"\n[warn] Could not compute model performance metrics: {e}")
 
