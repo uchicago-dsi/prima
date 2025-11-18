@@ -1799,25 +1799,26 @@ def main() -> None:
         )  # +1 for padding
         max_group_width = max(max_group_width, len("group"))
 
-        # calculate width needed for year columns (value only, CI on separate row)
+        # calculate width needed for year columns (value + CI on same row)
         def get_year_col_width(col):
             max_width = len(col)
             for _, row in performance_df.iterrows():
                 val = row.get(col, float("nan"))
-                if val is not None and not pd.isna(val):
-                    val_str = f"{val:.2f}"
-                    max_width = max(max_width, len(val_str))
-                # also check CI width
                 lower = row.get(f"{col}_lower", float("nan"))
                 upper = row.get(f"{col}_upper", float("nan"))
-                if (
-                    lower is not None
-                    and not pd.isna(lower)
-                    and upper is not None
-                    and not pd.isna(upper)
-                ):
-                    ci_str = f"({lower:.2f}, {upper:.2f})"
-                    max_width = max(max_width, len(ci_str))
+                val_str = f"{val:.2f}" if val is not None and not pd.isna(val) else ""
+                ci_str = (
+                    f" ({lower:.2f}, {upper:.2f})"
+                    if (
+                        lower is not None
+                        and not pd.isna(lower)
+                        and upper is not None
+                        and not pd.isna(upper)
+                    )
+                    else ""
+                )
+                combined = val_str + ci_str
+                max_width = max(max_width, len(combined))
             return max_width + 1
 
         year_col_widths = {col: get_year_col_width(col) for col in year_cols_list}
@@ -1827,77 +1828,62 @@ def main() -> None:
         harrell_width = len(harrell_col)
         for _, row in performance_df.iterrows():
             val = row.get(harrell_col, float("nan"))
-            if val is not None and not pd.isna(val):
-                val_str = f"{val:.2f}"
-                harrell_width = max(harrell_width, len(val_str))
             lower = row.get(f"{harrell_col}_lower", float("nan"))
             upper = row.get(f"{harrell_col}_upper", float("nan"))
-            if (
-                lower is not None
-                and not pd.isna(lower)
-                and upper is not None
-                and not pd.isna(upper)
-            ):
-                ci_str = f"({lower:.2f}, {upper:.2f})"
-                harrell_width = max(harrell_width, len(ci_str))
+            val_str = f"{val:.2f}" if val is not None and not pd.isna(val) else ""
+            ci_str = (
+                f" ({lower:.2f}, {upper:.2f})"
+                if (
+                    lower is not None
+                    and not pd.isna(lower)
+                    and upper is not None
+                    and not pd.isna(upper)
+                )
+                else ""
+            )
+            combined = val_str + ci_str
+            harrell_width = max(harrell_width, len(combined))
         harrell_width += 1
 
-        def format_value(val):
-            """format just the value without CI"""
-            if val is None or pd.isna(val):
-                return ""
-            return f"{val:.2f}"
-
-        def format_ci(lower, upper):
-            """format CI as '(lower, upper)' or empty string"""
-            if (
-                lower is not None
-                and not pd.isna(lower)
-                and upper is not None
-                and not pd.isna(upper)
-            ):
-                return f"({lower:.2f}, {upper:.2f})"
-            return ""
+        def format_value_with_ci(val, lower, upper):
+            """format value with CI on same row"""
+            val_str = f"{val:.2f}" if val is not None and not pd.isna(val) else ""
+            ci_str = (
+                f" ({lower:.2f}, {upper:.2f})"
+                if (
+                    lower is not None
+                    and not pd.isna(lower)
+                    and upper is not None
+                    and not pd.isna(upper)
+                )
+                else ""
+            )
+            return val_str + ci_str
 
         def format_row(row):
-            """format main row with values only"""
+            """format row with values and CIs on same line"""
             category_display = str(row["category"]).ljust(max_category_width)
             group = str(row["group"]).ljust(max_group_width)
             n = str(int(row["n"])).rjust(6)
             year_vals = []
             for col in year_cols_list:
                 val = row.get(col, float("nan"))
-                formatted = format_value(val)
+                lower = row.get(f"{col}_lower", float("nan"))
+                upper = row.get(f"{col}_upper", float("nan"))
+                formatted = format_value_with_ci(val, lower, upper)
                 year_vals.append(formatted.ljust(year_col_widths[col]))
             harrell_val = row.get(harrell_col, float("nan"))
-            harrell_formatted = format_value(harrell_val)
+            harrell_lower = row.get(f"{harrell_col}_lower", float("nan"))
+            harrell_upper = row.get(f"{harrell_col}_upper", float("nan"))
+            harrell_formatted = format_value_with_ci(
+                harrell_val, harrell_lower, harrell_upper
+            )
             harrell = (
                 harrell_formatted.ljust(harrell_width)
                 if harrell_formatted
                 else "".ljust(harrell_width)
             )
             return f"{category_display} {group} {n} {' '.join(year_vals)} {harrell}"
-
-        def format_ci_row(row):
-            """format CI row with empty category/group/n columns"""
-            empty_category = "".ljust(max_category_width)
-            empty_group = "".ljust(max_group_width)
-            empty_n = "".rjust(6)
-            year_cis = []
-            for col in year_cols_list:
-                lower = row.get(f"{col}_lower", float("nan"))
-                upper = row.get(f"{col}_upper", float("nan"))
-                ci_str = format_ci(lower, upper)
-                year_cis.append(ci_str.ljust(year_col_widths[col]))
-            harrell_lower = row.get(f"{harrell_col}_lower", float("nan"))
-            harrell_upper = row.get(f"{harrell_col}_upper", float("nan"))
-            harrell_ci_str = format_ci(harrell_lower, harrell_upper)
-            harrell_ci = (
-                harrell_ci_str.ljust(harrell_width)
-                if harrell_ci_str
-                else "".ljust(harrell_width)
-            )
-            return f"{empty_category} {empty_group} {empty_n} {' '.join(year_cis)} {harrell_ci}"
 
         # build formatted table
         header_parts = [
@@ -1914,11 +1900,6 @@ def main() -> None:
         lines = [header, separator]
         for _, row in performance_df.iterrows():
             lines.append(format_row(row))
-            # add CI row if any CI exists
-            ci_row = format_ci_row(row)
-            # check if CI row has any non-empty content
-            if ci_row.strip():
-                lines.append(ci_row)
 
         # add notes below table
         notes = []
@@ -1970,7 +1951,6 @@ def main() -> None:
                 "  td { padding: 6px 8px; white-space: nowrap; }",
                 "  .row-group-0 { background-color: #ffffff; }",
                 "  .row-group-1 { background-color: #d4e4f7; }",
-                "  .ci-row { font-size: 0.9em; }",
                 "</style>",
                 "</head>",
                 "<body>",
@@ -1991,7 +1971,7 @@ def main() -> None:
             # data rows - alternate colors by category group
             group_idx = 0
             for _, row in performance_df.iterrows():
-                # main row - use same group class for category and its CI
+                # row with values and CIs on same line
                 group_class = f"row-group-{group_idx % 2}"
                 html_lines.append(f"  <tr class='{group_class}'>")
                 html_lines.append(f"    <td>{row['category']}</td>")
@@ -1999,49 +1979,18 @@ def main() -> None:
                 html_lines.append(f"    <td>{int(row['n']):,}</td>")
                 for col in year_cols_list:
                     val = row.get(col, float("nan"))
-                    val_str = format_value(val)
-                    html_lines.append(f"    <td>{val_str}</td>")
-                harrell_val = row.get(harrell_col, float("nan"))
-                harrell_str = format_value(harrell_val)
-                html_lines.append(f"    <td>{harrell_str}</td>")
-                html_lines.append("  </tr>")
-
-                # CI row if any CI exists - use same group class
-                has_ci = False
-                for col in year_cols_list:
                     lower = row.get(f"{col}_lower", float("nan"))
                     upper = row.get(f"{col}_upper", float("nan"))
-                    if (
-                        lower is not None
-                        and not pd.isna(lower)
-                        and upper is not None
-                        and not pd.isna(upper)
-                    ):
-                        has_ci = True
-                        break
+                    val_ci_str = format_value_with_ci(val, lower, upper)
+                    html_lines.append(f"    <td>{val_ci_str}</td>")
+                harrell_val = row.get(harrell_col, float("nan"))
                 harrell_lower = row.get(f"{harrell_col}_lower", float("nan"))
                 harrell_upper = row.get(f"{harrell_col}_upper", float("nan"))
-                if (
-                    harrell_lower is not None
-                    and not pd.isna(harrell_lower)
-                    and harrell_upper is not None
-                    and not pd.isna(harrell_upper)
-                ):
-                    has_ci = True
-
-                if has_ci:
-                    html_lines.append(f"  <tr class='ci-row {group_class}'>")
-                    html_lines.append("    <td></td>")  # empty category
-                    html_lines.append("    <td></td>")  # empty group
-                    html_lines.append("    <td></td>")  # empty n
-                    for col in year_cols_list:
-                        lower = row.get(f"{col}_lower", float("nan"))
-                        upper = row.get(f"{col}_upper", float("nan"))
-                        ci_str = format_ci(lower, upper)
-                        html_lines.append(f"    <td>{ci_str}</td>")
-                    harrell_ci_str = format_ci(harrell_lower, harrell_upper)
-                    html_lines.append(f"    <td>{harrell_ci_str}</td>")
-                    html_lines.append("  </tr>")
+                harrell_str = format_value_with_ci(
+                    harrell_val, harrell_lower, harrell_upper
+                )
+                html_lines.append(f"    <td>{harrell_str}</td>")
+                html_lines.append("  </tr>")
 
                 # increment group index for next category
                 group_idx += 1
