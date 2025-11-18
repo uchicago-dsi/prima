@@ -172,16 +172,44 @@ def summarize(cfg: Config) -> pd.DataFrame:
         how="inner",
     )
 
+    # print summary statistics
+    print("=== Data Summary ===")
+    print(f"Predictions CSV rows: {len(pred):,}")
+    print(f"Metadata CSV rows (total): {len(meta):,}")
+    print(f"Metadata CSV rows (evaluation set): {len(meta_eval):,}")
+    print(f"Rows after merge: {len(df):,}")
+    print(f"Unique patients: {df['patient_id'].nunique():,}")
+    unique_exams = df[["patient_id", "exam_id"]].drop_duplicates().shape[0]
+    print(f"Unique exams: {unique_exams:,}")
+    if len(df) > unique_exams:
+        print("  (multiple rows per exam - likely multiple views)")
+        views_per_exam = df.groupby(["patient_id", "exam_id"]).size()
+        print(
+            f"  Views per exam: min={views_per_exam.min()}, max={views_per_exam.max()}, mean={views_per_exam.mean():.2f}"
+        )
+    print()
+
     # decide prediction columns
     pred_cols = cfg.colmap or _detect_pred_cols(df)
 
-    # vectorized label tensors
-    ytc = df["years_to_cancer"].astype(float).to_numpy()
-    ylf = df["years_to_last_followup"].astype(float).to_numpy()
+    # aggregate per exam: Mirai predictions are per-view but should be evaluated per-exam
+    # take mean of predictions across views for each exam
+    # labels (years_to_cancer, years_to_last_followup) should be identical across views, take first
+    agg_dict = {col: "mean" for col in pred_cols.values()}
+    agg_dict["years_to_cancer"] = "first"
+    agg_dict["years_to_last_followup"] = "first"
+    if "split_group" in df.columns:
+        agg_dict["split_group"] = "first"
+
+    df_exam = df.groupby(["patient_id", "exam_id"], as_index=False).agg(agg_dict)
+
+    # vectorized label tensors (now per exam)
+    ytc = df_exam["years_to_cancer"].astype(float).to_numpy()
+    ylf = df_exam["years_to_last_followup"].astype(float).to_numpy()
 
     rows = []
     for h, col in pred_cols.items():
-        scores = df[col].astype(float).to_numpy()
+        scores = df_exam[col].astype(float).to_numpy()
         case = ytc <= h
         ctrl = (ytc > h) & (ylf >= h)
         include = case | ctrl
@@ -316,25 +344,38 @@ def survival_metrics(cfg: Config) -> dict:
 
     dfe = pred.merge(meta_eval[list(req)], on=["patient_id", "exam_id"], how="inner")
 
+    # aggregate per exam: Mirai predictions are per-view but should be evaluated per-exam
+    pred_cols = cfg.colmap or _detect_pred_cols(dfe)
+    agg_dict = {col: "mean" for col in pred_cols.values()}
+    agg_dict["years_to_cancer"] = "first"
+    agg_dict["years_to_last_followup"] = "first"
+    dfe_exam = dfe.groupby(["patient_id", "exam_id"], as_index=False).agg(agg_dict)
+
+    # aggregate meta_all per exam for IPCW estimation
+    meta_all_exam = meta_all.groupby(["patient_id", "exam_id"], as_index=False).agg(
+        {"years_to_cancer": "first", "years_to_last_followup": "first"}
+    )
+
     # use all available data for IPCW censoring estimation
-    y_train = _build_surv_arrays(meta_all)
-    y_test = _build_surv_arrays(dfe)
+    y_train = _build_surv_arrays(meta_all_exam)
+    y_test = _build_surv_arrays(dfe_exam)
 
     # prediction columns / times
-    pred_cols = cfg.colmap or _detect_pred_cols(pd.concat([dfe, pred], axis=1))
     times = np.array(sorted(pred_cols.keys()), dtype=float)
 
     # matrix of risk estimates shape (n_test, n_times)
-    risk = np.stack([dfe[pred_cols[h]].astype(float).to_numpy() for h in times], axis=1)
+    risk = np.stack(
+        [dfe_exam[pred_cols[h]].astype(float).to_numpy() for h in times], axis=1
+    )
 
     # time-dependent AUC (Uno 2007) and weighted mean AUC (Lambert & Chevret 2014)
     auc_t, mean_auc = cumulative_dynamic_auc(y_train, y_test, risk, times)
 
     # Uno's IPCW C-index at tau = max(times); pick a single risk column
     if cfg.cindex_col is not None:
-        risk_for_c = dfe[cfg.cindex_col].astype(float).to_numpy()
+        risk_for_c = dfe_exam[cfg.cindex_col].astype(float).to_numpy()
     else:
-        risk_for_c = dfe[pred_cols[int(times.max())]].astype(float).to_numpy()
+        risk_for_c = dfe_exam[pred_cols[int(times.max())]].astype(float).to_numpy()
     c_ipcw, n_conc, n_disc, n_trisk, n_ttime = concordance_index_ipcw(
         y_train, y_test, risk_for_c, tau=float(times.max())
     )
@@ -406,12 +447,18 @@ def kfold_survival_metrics(cfg: Config) -> dict:
     # join predictions
     df = pred.merge(meta_eval[list(req)], on=["patient_id", "exam_id"], how="inner")
 
+    # aggregate per exam: Mirai predictions are per-view but should be evaluated per-exam
+    pred_cols = cfg.colmap or _detect_pred_cols(df)
+    agg_dict = {col: "mean" for col in pred_cols.values()}
+    agg_dict["years_to_cancer"] = "first"
+    agg_dict["years_to_last_followup"] = "first"
+    df_exam = df.groupby(["patient_id", "exam_id"], as_index=False).agg(agg_dict)
+
     # get unique patients for splitting
-    patients = df["patient_id"].unique()
+    patients = df_exam["patient_id"].unique()
     kf = KFold(n_splits=cfg.kfold, shuffle=True, random_state=42)
 
-    # detect prediction columns once
-    pred_cols = cfg.colmap or _detect_pred_cols(df)
+    # prediction columns / times
     times = np.array(sorted(pred_cols.keys()), dtype=float)
 
     fold_results = []
@@ -419,8 +466,8 @@ def kfold_survival_metrics(cfg: Config) -> dict:
         train_patients = patients[train_pat_idx]
         test_patients = patients[test_pat_idx]
 
-        df_train = df[df["patient_id"].isin(train_patients)].copy()
-        df_test = df[df["patient_id"].isin(test_patients)].copy()
+        df_train = df_exam[df_exam["patient_id"].isin(train_patients)].copy()
+        df_test = df_exam[df_exam["patient_id"].isin(test_patients)].copy()
 
         if len(df_train) == 0 or len(df_test) == 0:
             continue
@@ -504,6 +551,7 @@ def main() -> None:
     """entrypoint"""
     cfg = parse_args()
     df = summarize(cfg)
+    print("\n=== Per-Horizon AUC ===")
     cols = ["horizon_years", "n", "cases", "controls", "excluded", "prevalence", "auc"]
     print(df[cols].to_string(index=False, float_format=lambda x: f"{x:.4f}"))
 

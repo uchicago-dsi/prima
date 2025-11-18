@@ -20,3 +20,37 @@ Persist only the authoritative metadata (`study_uid`, hashed file lists, cache m
 
 ## Security & Data Handling
 Never commit PHI or log it to stdout. Keep cache JSON and exported logs under `data/` out of version control unless scrubbed, and double-check destructive flags before touching hospital shares. Coordinate VPN, credential rotations, and mount path changes in lab channels so automation and sync jobs stay reproducible.
+
+## analyze_mirai.py: Mirai Prediction Analysis
+
+`analyze_mirai.py` computes per-horizon AUC and survival metrics (Uno's C-index, time-dependent AUC, integrated Brier score) from Mirai's validation outputs.
+
+### Key Design: Per-Exam Aggregation
+
+**Critical**: Mirai predictions must be evaluated **per exam**, not per view. The validation output CSV contains one row per view (typically 4 views per exam: L CC, L MLO, R CC, R MLO), but Mirai's risk predictions are designed to aggregate information across all views for a single exam-level prediction.
+
+**Aggregation logic**:
+- **Predictions**: Mean across all views for each (patient_id, exam_id) pair
+- **Labels**: `years_to_cancer` and `years_to_last_followup` are identical across views for the same exam, so we take the first value
+- **AUC calculation**: Performed on exam-level aggregated predictions, not per-view
+
+This ensures that:
+1. Each exam contributes exactly one prediction to the AUC calculation
+2. The evaluation matches how Mirai is intended to be used clinically (exam-level risk assessment)
+3. Multiple views per exam don't artificially inflate sample sizes
+
+### Functions
+
+- **`summarize()`**: Computes per-horizon binary AUC (cases vs controls at each horizon). Aggregates predictions per exam before calculating metrics.
+- **`survival_metrics()`**: Computes censoring-adjusted survival metrics using all available data for IPCW censoring estimation. Also aggregates per exam.
+- **`kfold_survival_metrics()`**: K-fold cross-validation for IPCW sensitivity analysis. Splits at patient level (not exam level) to avoid leakage. Aggregates per exam within each fold.
+
+### Input Format
+
+Expects `validation_output.csv` and `mirai_manifest.csv` in the same directory (specified via `--out-dir`). The predictions CSV should have:
+- `patient_id` and `exam_id` columns (or `patient_exam_id` with tab separator)
+- Risk prediction columns auto-detected via regex (e.g., `1_year_risk`, `2_year_risk`, etc.)
+
+The metadata CSV should have:
+- `patient_id`, `exam_id`, `years_to_cancer`, `years_to_last_followup`
+- Optional: `split_group` for filtering evaluation sets
