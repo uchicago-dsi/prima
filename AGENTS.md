@@ -54,3 +54,7 @@ Expects `validation_output.csv` and `mirai_manifest.csv` in the same directory (
 The metadata CSV should have:
 - `patient_id`, `exam_id`, `years_to_cancer`, `years_to_last_followup`
 - Optional: `split_group` for filtering evaluation sets
+
+## Plotting Guidelines
+
+Never add titles to plots unless the meaning isn't obvious from the axis labels. Axis labels should be descriptive enough to convey the plot's purpose. Remove grid lines unless they significantly aid readability.

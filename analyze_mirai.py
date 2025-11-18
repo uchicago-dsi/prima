@@ -40,6 +40,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
@@ -547,7 +548,128 @@ def kfold_survival_metrics(cfg: Config) -> dict:
     }
 
 
-def reproduce_table1(cfg: Config) -> pd.DataFrame:
+def plot_exam_time_histogram(meta_exam: pd.DataFrame, out_path: Path) -> None:
+    """plot histogram of exam times (study_date) for cases vs controls"""
+    if "study_date" not in meta_exam.columns:
+        return
+
+    ytc = pd.to_numeric(meta_exam["years_to_cancer"], errors="coerce")
+    is_case = (ytc <= 5) & ytc.notna()
+    is_control = (ytc > 5) | ytc.isna()
+
+    study_dates = pd.to_datetime(meta_exam["study_date"], errors="coerce")
+    case_dates = study_dates[is_case].dropna()
+    control_dates = study_dates[is_control].dropna()
+
+    if len(case_dates) == 0 and len(control_dates) == 0:
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    date_list = []
+    if len(case_dates) > 0:
+        date_list.append(case_dates)
+    if len(control_dates) > 0:
+        date_list.append(control_dates)
+    all_dates = pd.concat(date_list)
+    bins = pd.date_range(
+        start=all_dates.min(),
+        end=all_dates.max(),
+        freq="YS",
+    )
+
+    if len(case_dates) > 0:
+        ax.hist(
+            case_dates,
+            bins=bins,
+            histtype="step",
+            linewidth=2,
+            label=f"cases (n={len(case_dates):,})",
+            color="#E64B35",
+        )
+    if len(control_dates) > 0:
+        ax.hist(
+            control_dates,
+            bins=bins,
+            histtype="step",
+            linewidth=2,
+            label=f"controls (n={len(control_dates):,})",
+            color="#4DBBD5",
+        )
+
+    ax.set_xlabel("exam date")
+    ax.set_ylabel("count")
+    ax.legend()
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def reproduce_table2(
+    cfg: Config, per_horizon_df: pd.DataFrame, surv_metrics: dict | None
+) -> pd.DataFrame:
+    """reproduce Table 2 from Omoleye et al: Model Performance Metrics
+
+    combines per-horizon AUC and survival metrics into a single table
+    """
+    rows = []
+    for _, row in per_horizon_df.iterrows():
+        h = int(row["horizon_years"])
+        rows.append(
+            {
+                "horizon_years": h,
+                "n": int(row["n"]),
+                "cases": int(row["cases"]),
+                "controls": int(row["controls"]),
+                "auc": row["auc"] if not pd.isna(row["auc"]) else None,
+            }
+        )
+
+    df = pd.DataFrame(rows).sort_values("horizon_years").reset_index(drop=True)
+
+    # add survival metrics if available
+    if surv_metrics is not None:
+        # handle k-fold vs single metrics
+        if "mean_auc" in surv_metrics and isinstance(surv_metrics["mean_auc"], dict):
+            # k-fold format
+            mean_auc_val = surv_metrics["mean_auc"].get("mean")
+            uno_c_val = (
+                surv_metrics["uno_c"].get("mean") if "uno_c" in surv_metrics else None
+            )
+            ibs_val = surv_metrics["ibs"].get("mean") if "ibs" in surv_metrics else None
+        else:
+            # single metrics format
+            mean_auc_val = surv_metrics.get("mean_auc")
+            uno_c_val = surv_metrics.get("uno_c")
+            ibs_val = surv_metrics.get("ibs")
+
+        # add mean AUC and C-index as summary rows
+        df.loc[len(df)] = {
+            "horizon_years": "mean",
+            "n": "",
+            "cases": "",
+            "controls": "",
+            "auc": mean_auc_val,
+        }
+        df.loc[len(df)] = {
+            "horizon_years": "Uno's C-index",
+            "n": "",
+            "cases": "",
+            "controls": "",
+            "auc": uno_c_val,
+        }
+        df.loc[len(df)] = {
+            "horizon_years": "IBS",
+            "n": "",
+            "cases": "",
+            "controls": "",
+            "auc": ibs_val,
+        }
+
+    return df
+
+
+def reproduce_table1(cfg: Config) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """reproduce Table 1 from Omoleye et al: Patient- and Examination-level Characteristics
 
     computes statistics from mirai_manifest.csv merged with phenotype data
@@ -594,34 +716,117 @@ def reproduce_table1(cfg: Config) -> pd.DataFrame:
     )
 
     # try to get exam dates from exams parquet if available
+    # study_date comes from DICOM tag (0x0008, 0x0020) extracted during preprocessing
+    # dates may be missing if: (1) exam not in exams.parquet, (2) DICOM missing study_date tag,
+    # or (3) patient_id/exam_id mismatch between manifest and exams.parquet
     exams_parquet = cfg.meta_csv.parent.parent / "sot" / "exams.parquet"
+    print("\n=== Date Source Debugging ===")
+    print(f"Exams in manifest before merge: {len(meta):,}")
     if exams_parquet.exists():
         exams = pd.read_parquet(exams_parquet)
         exams = exams.assign(
             patient_id=exams["patient_id"].astype(str),
             exam_id=exams["exam_id"].astype(str),
         )
+        print(f"Exams in exams.parquet: {len(exams):,}")
+        print(
+            f"Exams in exams.parquet with study_date: {exams['study_date'].notna().sum():,}"
+        )
+
+        # check for matching keys
+        meta_keys = set(zip(meta["patient_id"], meta["exam_id"]))
+        exams_keys = set(zip(exams["patient_id"], exams["exam_id"]))
+        matching_keys = meta_keys & exams_keys
+        print(f"Exams with matching (patient_id, exam_id): {len(matching_keys):,}")
+
         meta = meta.merge(
             exams[["patient_id", "exam_id", "study_date"]],
             on=["patient_id", "exam_id"],
             how="left",
         )
+        print(f"Exams in manifest after merge: {len(meta):,}")
+        print(
+            f"Exams with study_date after merge: {meta['study_date'].notna().sum():,}"
+        )
+        print(f"Exams missing study_date: {meta['study_date'].isna().sum():,}")
+
         # calculate age at exam from dob and study_date
         if "dob" in meta.columns and "study_date" in meta.columns:
             dob_parsed = pd.to_datetime(meta["dob"], format="%d%b%Y", errors="coerce")
             study_date_parsed = pd.to_datetime(meta["study_date"], errors="coerce")
             age_at_exam = (study_date_parsed - dob_parsed).dt.days / 365.25
             meta["age_at_exam"] = age_at_exam
+            print(
+                f"Exams with age_at_exam calculated: {meta['age_at_exam'].notna().sum():,}"
+            )
+    else:
+        print(f"exams.parquet not found at {exams_parquet}")
+
+    # aggregate per exam BEFORE filtering to check date coverage
+    meta_exam_before_filter = meta.groupby(
+        ["patient_id", "exam_id"], as_index=False
+    ).first()
+    print("\nBefore 6-month filter (aggregated per exam):")
+    print(f"  Unique exams: {len(meta_exam_before_filter):,}")
+    if "study_date" in meta_exam_before_filter.columns:
+        print(
+            f"  Exams with study_date: {meta_exam_before_filter['study_date'].notna().sum():,}"
+        )
+        print(
+            f"  Exams missing study_date: {meta_exam_before_filter['study_date'].isna().sum():,}"
+        )
+        # check which exams are missing dates
+        missing_dates = meta_exam_before_filter[
+            meta_exam_before_filter["study_date"].isna()
+        ]
+        if len(missing_dates) > 0:
+            print("  Sample of exams missing dates (first 5):")
+            print(missing_dates[["patient_id", "exam_id", "years_to_cancer"]].head())
 
     # filter to 6-month time-to-cancer filter (exclude cases with TTC < 6 months)
     ytc = pd.to_numeric(meta["years_to_cancer"], errors="coerce")
     meta_filtered = meta[ytc.isna() | (ytc >= 0.5)].copy()
 
+    print("\nAfter 6-month filter:")
+    print(f"  Exams in meta_filtered: {len(meta_filtered):,}")
+    if "study_date" in meta_filtered.columns:
+        print(f"  Exams with study_date: {meta_filtered['study_date'].notna().sum():,}")
+        print(
+            f"  Exams missing study_date: {meta_filtered['study_date'].isna().sum():,}"
+        )
+
     # aggregate per exam
+    # use 'first' for study_date to preserve dates (assuming all views for same exam have same date)
     meta_exam = meta.groupby(["patient_id", "exam_id"], as_index=False).first()
     meta_filtered_exam = meta_filtered.groupby(
         ["patient_id", "exam_id"], as_index=False
     ).first()
+
+    print("\nAfter aggregation per exam:")
+    print(f"  Unique exams in meta_exam: {len(meta_exam):,}")
+    print(f"  Unique exams in meta_filtered_exam: {len(meta_filtered_exam):,}")
+    if "study_date" in meta_filtered_exam.columns:
+        print(
+            f"  Exams with study_date in meta_filtered_exam: {meta_filtered_exam['study_date'].notna().sum():,}"
+        )
+        print(
+            f"  Exams missing study_date in meta_filtered_exam: {meta_filtered_exam['study_date'].isna().sum():,}"
+        )
+
+        # check if dates are being lost during aggregation
+        if "study_date" in meta_filtered.columns:
+            # count exams that have at least one row with study_date before aggregation
+            exams_with_date_before = (
+                meta_filtered.groupby(["patient_id", "exam_id"])["study_date"]
+                .apply(lambda x: x.notna().any())
+                .sum()
+            )
+            print(
+                f"  Exams with at least one row having study_date before aggregation: {exams_with_date_before:,}"
+            )
+            print(
+                f"  Exams losing study_date during aggregation: {exams_with_date_before - meta_filtered_exam['study_date'].notna().sum():,}"
+            )
 
     # identify case examinations (cancer within 5 years)
     ytc_exam = pd.to_numeric(meta_exam["years_to_cancer"], errors="coerce")
@@ -779,7 +984,7 @@ def reproduce_table1(cfg: Config) -> pd.DataFrame:
         rows,
         columns=["Characteristic", "Individuals", "Examinations", "Case Examinations*"],
     )
-    return df
+    return df, meta_exam, meta_filtered_exam
 
 
 def main() -> None:
@@ -788,15 +993,23 @@ def main() -> None:
 
     # reproduce Table 1
     try:
-        table1 = reproduce_table1(cfg)
+        table1, meta_exam, meta_filtered_exam = reproduce_table1(cfg)
         print("\n=== Table 1: Patient- and Examination-level Characteristics ===")
         print(table1.to_string(index=False))
         if cfg.out_json is not None:
-            table1_path = cfg.out_json.parent / "table1.csv"
+            table1_path = (
+                cfg.out_json.parent / "patient_examination_characteristics.csv"
+            )
             table1.to_csv(table1_path, index=False)
             print(f"\nTable 1 saved to {table1_path}")
+
+            # plot exam time histogram (using all exams, not just filtered)
+            plot_path = cfg.out_json.parent / "exam_time_histogram.png"
+            plot_exam_time_histogram(meta_exam, plot_path)
+            print(f"Exam time histogram saved to {plot_path}")
     except Exception as e:
         print(f"\n[warn] Could not reproduce Table 1: {e}")
+        meta_exam = None
 
     df = summarize(cfg)
     print("\n=== Per-Horizon AUC ===")
@@ -839,6 +1052,25 @@ def main() -> None:
         except Exception as e:
             # allow quick use even if scikit-survival isn't installed or inputs are incomplete
             print("\n[warn] survival metrics unavailable:", str(e))
+
+    # reproduce Table 2
+    try:
+        table2 = reproduce_table2(cfg, df, surv)
+        print("\n=== Table 2: Model Performance Metrics ===")
+        print(
+            table2.to_string(
+                index=False,
+                float_format=lambda x: f"{x:.4f}"
+                if x is not None and not pd.isna(x)
+                else "",
+            )
+        )
+        if cfg.out_json is not None:
+            table2_path = cfg.out_json.parent / "model_performance_metrics.csv"
+            table2.to_csv(table2_path, index=False)
+            print(f"\nTable 2 saved to {table2_path}")
+    except Exception as e:
+        print(f"\n[warn] Could not reproduce Table 2: {e}")
 
     if cfg.out_json is not None:
         payload = df.to_dict(orient="records")
