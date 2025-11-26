@@ -1112,8 +1112,8 @@ def compute_model_performance_metrics(
         h for h in available_horizons if h in OMOLEYE_TARGET_HORIZONS
     ] or available_horizons
 
-    horizon_labels = [f"Year {int(h)}" for h in target_horizons]
-    harrell_label = "Harrell C-index"
+    horizon_labels = [f"year {int(h)}" for h in target_horizons]
+    harrell_label = "harrell c-index"
 
     # enrich exam-level predictions with phenotype metadata
     meta_cols = [
@@ -1775,13 +1775,12 @@ def main() -> None:
             cfg, per_horizon_df, surv, exam_data, meta_exam
         )
         checkpoint("Computed model performance metrics")
-        print("\n=== Model Performance Metrics ===")
 
         # extract year columns and sort by numeric value
         year_cols_list = [
             c
             for c in performance_df.columns
-            if c.startswith("Year")
+            if c.startswith("year")
             and not c.endswith("_lower")
             and not c.endswith("_upper")
         ]
@@ -1823,8 +1822,8 @@ def main() -> None:
 
         year_col_widths = {col: get_year_col_width(col) for col in year_cols_list}
 
-        # calculate width for Harrell C-index column
-        harrell_col = "Harrell C-index"
+        # calculate width for harrell c-index column
+        harrell_col = "harrell c-index"
         harrell_width = len(harrell_col)
         for _, row in performance_df.iterrows():
             val = row.get(harrell_col, float("nan"))
@@ -1943,7 +1942,7 @@ def main() -> None:
                 "<html>",
                 "<head>",
                 "<meta charset='utf-8'>",
-                "<title>Model Performance Metrics</title>",
+                "<title>discriminatory performance of mirai in chimec with stratified analysis</title>",
                 "<style>",
                 "  body { font-family: monospace; margin: 20px; }",
                 "  table { border-collapse: collapse; width: auto; min-width: 100%; }",
@@ -1954,7 +1953,6 @@ def main() -> None:
                 "</style>",
                 "</head>",
                 "<body>",
-                "<h1>Model Performance Metrics</h1>",
                 "<table>",
             ]
 
