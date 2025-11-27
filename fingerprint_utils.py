@@ -7,7 +7,7 @@ import time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import FrozenSet, Optional, Tuple
 
 import pydicom
 
@@ -22,7 +22,7 @@ class ExamFingerprint:
     """A unique, content-based identifier for an exam."""
 
     study_uid: str
-    file_hashes: frozenset[str]
+    file_hashes: FrozenSet[str]
 
     def is_valid(self) -> bool:
         return bool(self.study_uid and self.file_hashes)
