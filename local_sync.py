@@ -344,7 +344,7 @@ def _is_exam_stable(exam_path: Path, threshold_sec: int) -> Tuple[bool, float]:
     import time
 
     now = time.time()
-    most_recent_age = 0.0
+    most_recent_age = float("inf")
 
     for p in exam_path.rglob("*"):
         if not p.is_file() or p.name.startswith("."):
@@ -352,7 +352,7 @@ def _is_exam_stable(exam_path: Path, threshold_sec: int) -> Tuple[bool, float]:
         try:
             st = p.stat()
             file_age = now - max(st.st_mtime, st.st_ctime)
-            most_recent_age = max(most_recent_age, file_age)
+            most_recent_age = min(most_recent_age, file_age)
         except Exception:
             # if we can't stat a file, assume it's unstable to be safe
             return False, 0.0
