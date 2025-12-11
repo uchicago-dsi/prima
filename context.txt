@@ -1,0 +1,1448 @@
+Assume all imports are defined and exist; do not re-define them!
+This is RESEARCH CODE. Avoid aggressive checks and fallbacks. If there is a bug I will debug it based on the stack trace I do not need extensive error checking. I do not want unexpected behavior or silent failures!!! If you change a function or method, give me the full function or method. If you don't change a function or method, DO NOT RETURN IT OR A STUB!!!!
+=== sync.py ===
+#!/usr/bin/env python
+# coding: utf-8
+
+import argparse
+import json
+import logging
+import shutil
+import subprocess
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+from typing import Dict
+
+from tqdm import tqdm
+
+# Import the shared logic
+from fingerprint_utils import ExamFingerprint, create_exam_fingerprint
+
+# --- CONFIGURATION ---
+SRC_ROOT = Path("/Volumes/16352A")
+DST_SSH_TARGET = "annawoodard@cri-ksysappdsp3.cri.uchicago.edu"
+DST_ROOT_REMOTE = Path("/gpfs/data/huo-lab/Image/ChiMEC")
+
+# --- GIT-AWARE PATH CONFIGURATION ---
+# The path to your Git repository ON THE REMOTE SERVER
+REMOTE_REPO_PATH = Path("/gpfs/data/huo-lab/Image/annawoodard/prima")
+
+# --- LOCAL AND REMOTE CACHE PATHS ---
+# Relative path for the cache file INSIDE the repo
+CACHE_FILE_REL_PATH = Path("data/destination_fingerprints.json")
+# Full path to the local cache file
+LOCAL_CACHE_FILE = Path(__file__).resolve().parent / CACHE_FILE_REL_PATH
+
+# Path to the delete queue on the source share
+DELETE_QUEUE_DIR = SRC_ROOT / "_synced_and_queued_for_deletion"
+PARALLEL_JOBS = 8
+REMOTE_PARALLEL_JOBS = 4  # NEW: For REMOTE processing. Start with 4, maybe try 2.
+# --- END CONFIGURATION ---
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.FileHandler("sync.log"), logging.StreamHandler()],
+)
+
+
+def run_ssh_command(command_str: str, check: bool = True):
+    """
+    Executes a complete command string on the remote server via SSH.
+    This version is designed to handle complex shell commands with redirection.
+    """
+    # Use 'bash -c' to execute the full command string.
+    # The command_str is now expected to contain the full logic, including environment setup.
+    full_ssh_command = ["ssh", DST_SSH_TARGET, "bash", "-c", command_str]
+
+    try:
+        process = subprocess.run(
+            full_ssh_command,
+            check=check,
+            capture_output=True,
+            text=True,
+        )
+        if process.stderr:
+            logging.debug(f"Remote stderr:\n{process.stderr.strip()}")
+        return process.stdout, process.stderr
+
+    except subprocess.CalledProcessError as e:
+        logging.error(
+            f"SSH command failed. Full command executed on remote: '{command_str}'"
+        )
+        logging.error(f"  Return Code: {e.returncode}")
+        logging.error(f"  --- Remote Stdout --- \n{e.stdout.strip()}")
+        logging.error(f"  --- Remote Stderr --- \n{e.stderr.strip()}")
+        raise
+
+
+def update_remote_inventory():
+    """
+    Ensures the remote fingerprinter is up-to-date, runs it on the server,
+    and downloads the resulting inventory. Progress is monitored by tailing the log file.
+    """
+    logging.info("--- Updating and Running Remote Inventory Script ---")
+
+    remote_script = REMOTE_REPO_PATH / "fingerprinter.py"
+    remote_cache = REMOTE_REPO_PATH / CACHE_FILE_REL_PATH
+    remote_log_file = REMOTE_REPO_PATH / "data/fingerprinter.log"
+
+    logging.info(f"Running 'git pull' in remote directory: {REMOTE_REPO_PATH}")
+    git_command_str = (
+        f"'set -e && "
+        f"export GIT_PAGER=cat && "
+        f"export GIT_EDITOR=true && "
+        f"cd {REMOTE_REPO_PATH} && "
+        f"git pull --ff-only'"
+    )
+    try:
+        run_ssh_command(git_command_str)
+    except subprocess.CalledProcessError:
+        logging.error(
+            "Remote 'git pull' failed. Please resolve the git status manually on the server."
+        )
+        raise
+
+    logging.info(
+        "Starting remote fingerprinting process... This will take a long time."
+    )
+    print("\n" + "=" * 70)
+    print("  MONITORING INSTRUCTIONS:")
+    print("  In a separate terminal, run the following command:")
+    print(f"  ssh {DST_SSH_TARGET} 'tail -f {remote_log_file}'")
+    print("=" * 70 + "\n")
+
+    MICROMAMBA_EXECUTABLE = "/gpfs/data/huo-lab/Image/annawoodard/bin/micromamba"
+    MAMBA_ROOT_PREFIX = "/gpfs/data/huo-lab/Image/annawoodard/micromamba"
+    init_command = f"export MAMBA_ROOT_PREFIX='{MAMBA_ROOT_PREFIX}'"
+    shell_hook_command = f'eval "$({MICROMAMBA_EXECUTABLE} shell hook -s posix)"'
+    mamba_activate_command = "micromamba activate prima"
+
+    # --- KEY CHANGE: Use the new REMOTE_PARALLEL_JOBS variable ---
+    python_command = (
+        f"python -u {remote_script} "
+        f"{DST_ROOT_REMOTE} {remote_cache} "
+        f"--parallel-jobs {REMOTE_PARALLEL_JOBS}"  # Use the new variable
+    )
+
+    full_remote_command = (
+        f"'set -e; "
+        f"{init_command}; "
+        f"{shell_hook_command}; "
+        f"{mamba_activate_command}; "
+        f"{python_command} > {remote_log_file} 2>&1'"
+    )
+
+    try:
+        run_ssh_command(full_remote_command)
+        logging.info("Remote fingerprinting completed successfully.")
+    except subprocess.CalledProcessError:
+        logging.error("Remote fingerprinting failed!")
+        logging.error(
+            f"Check the detailed log on the server for errors: {remote_log_file}"
+        )
+        raise
+
+    logging.info("Downloading remote inventory cache...")
+    LOCAL_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["scp", f"{DST_SSH_TARGET}:{remote_cache}", str(LOCAL_CACHE_FILE)], check=True
+    )
+    logging.info("Remote inventory updated successfully.")
+
+
+def load_destination_inventory() -> Dict[str, Dict[ExamFingerprint, str]]:
+    if not LOCAL_CACHE_FILE.exists():
+        logging.error(f"Local cache file not found: {LOCAL_CACHE_FILE}")
+        logging.error("Run with --update-inventory to generate it.")
+        return {}
+
+    logging.info(f"Loading destination inventory from {LOCAL_CACHE_FILE}...")
+    with open(LOCAL_CACHE_FILE, "r") as f:
+        raw_data = json.load(f)
+        inventory = {}
+        for patient_id, exams in raw_data.items():
+            inventory[patient_id] = {
+                ExamFingerprint(uid, frozenset(hashes)): name
+                for name, (uid, hashes) in exams.items()
+            }
+    logging.info("Destination inventory loaded.")
+    return inventory
+
+
+def rsync_exam_remote(src: Path, patient_id: str, exam_name: str):
+    dest_path_str = f"{DST_SSH_TARGET}:{DST_ROOT_REMOTE / patient_id / exam_name}"
+    logging.info(f"RSYNC: {src} -> {dest_path_str}")
+    run_ssh_command(["mkdir", "-p", str(DST_ROOT_REMOTE / patient_id)])
+    command = [
+        "rsync",
+        "-aH",
+        "--partial",
+        "--info=stats2,progress2",
+        f"{src}/",
+        dest_path_str,
+    ]
+    subprocess.run(command, check=True, capture_output=True, text=True)
+    logging.info(f"RSYNC successful for {src.name}")
+
+
+def main(update_inventory: bool, dry_run: bool):
+    if dry_run:
+        logging.info(
+            "--- DRY RUN MODE ENABLED: No files will be moved or transferred. ---"
+        )
+    if update_inventory:
+        update_remote_inventory()
+
+    dest_inventory = load_destination_inventory()
+    if not dest_inventory:
+        return
+
+    logging.info(f"Discovering source exams in {SRC_ROOT}...")
+    source_exams = [
+        p
+        for p_dir in SRC_ROOT.iterdir()
+        if p_dir.is_dir() and not p_dir.name.startswith("_")
+        for p in p_dir.iterdir()
+        if p.is_dir()
+    ]
+    logging.info(f"Found {len(source_exams)} source exams to process.")
+
+    if not dry_run:
+        DELETE_QUEUE_DIR.mkdir(exist_ok=True)
+
+    stats = {"renamed": 0, "transferred": 0, "skipped": 0, "failed": 0}
+
+    # --- REVERTED: Go back to parallel execution for the source filesystem ---
+    logging.info("Processing source exams in parallel...")
+
+    with ProcessPoolExecutor(max_workers=PARALLEL_JOBS) as executor:
+        futures = {
+            executor.submit(create_exam_fingerprint, path): path
+            for path in source_exams
+        }
+        for future in tqdm(
+            as_completed(futures),
+            total=len(futures),
+            desc="Processing Source Exams (Parallel)",
+        ):
+            src_path = futures[future]
+            try:
+                src_fingerprint, reason = future.result()
+
+                if not src_fingerprint or not src_fingerprint.is_valid():
+                    logging.warning(f"SKIPPED: {src_path} - Reason: {reason}")
+                    stats["skipped"] += 1
+                    continue
+
+                patient_id, new_exam_name = src_path.parent.name, src_path.name
+                match_name = dest_inventory.get(patient_id, {}).get(src_fingerprint)
+                delete_queue_path = DELETE_QUEUE_DIR / patient_id / new_exam_name
+
+                if match_name:
+                    if match_name != new_exam_name:
+                        logging.info(
+                            f"MATCH: {new_exam_name} is identical to remote {match_name}."
+                        )
+                        old_rem, new_rem = (
+                            DST_ROOT_REMOTE / patient_id / match_name,
+                            DST_ROOT_REMOTE / patient_id / new_exam_name,
+                        )
+                        if dry_run:
+                            logging.info(
+                                f"[DRY RUN] WOULD RENAME REMOTE: {old_rem} -> {new_rem}"
+                            )
+                        else:
+                            run_ssh_command(["mv", str(old_rem), str(new_rem)])
+                            logging.info("RENAME successful on remote.")
+                    else:
+                        logging.info(
+                            f"MATCH: {new_exam_name} already exists and is up to date."
+                        )
+                    stats["renamed"] += 1
+                else:
+                    logging.info(f"NEW: {new_exam_name} not found. Transferring.")
+                    if dry_run:
+                        logging.info(
+                            f"[DRY RUN] WOULD TRANSFER: {src_path} -> {DST_ROOT_REMOTE / patient_id / new_exam_name}"
+                        )
+                    else:
+                        rsync_exam_remote(src_path, patient_id, new_exam_name)
+                    stats["transferred"] += 1
+
+                if dry_run:
+                    logging.info(
+                        f"[DRY RUN] WOULD QUEUE FOR DELETE: {src_path} -> {delete_queue_path}"
+                    )
+                else:
+                    delete_queue_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(src_path), str(delete_queue_path))
+
+            except Exception as e:
+                logging.error(f"FATAL ERROR processing {src_path}", exc_info=True)
+                stats["failed"] += 1
+
+    # --- End of change ---
+
+    logging.info("--- Sync Complete ---")
+    if dry_run:
+        logging.info("--- (DRY RUN MODE) ---")
+    logging.info(f"Renamed/Matched: {stats['renamed']}")
+    logging.info(f"Transferred New: {stats['transferred']}")
+    logging.info(f"Skipped (bad source): {stats['skipped']}")
+    logging.info(f"Failed: {stats['failed']}")
+    if not dry_run:
+        logging.info(f"Processed source exams moved to: {DELETE_QUEUE_DIR}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Intelligently sync DICOM exams over SSH."
+    )
+    parser.add_argument(
+        "--update-inventory",
+        action="store_true",
+        help="Run the fingerprinter on the remote server to update "
+        "the destination inventory cache.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Simulate all operations; no files will be moved or transferred.",
+    )
+    args = parser.parse_args()
+    main(update_inventory=args.update_inventory, dry_run=args.dry_run)
+
+=== download_data.py ===
+#!/usr/bin/env python
+# coding: utf-8
+
+import argparse
+import os
+import sys
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+from tqdm.auto import tqdm
+
+from filesystem_utils import check_disk_for_downloads
+
+# Assuming scrape_ibroker.py is in the same directory or accessible
+from scrape_ibroker import login, make_driver, wait_aspnet_idle
+
+# --- Configuration ---
+CHIMEC_PATIENTS_FILE = "/gpfs/data/phs/groups/Projects/Huo_projects/SPORE/annawoodard/List_ChiMEC_priority_2025July30.csv"
+KEY_FILE = "/gpfs/data/huo-lab/Image/ChiMEC/study-16352a.csv"
+METADATA_FILE = "data/imaging_metadata.csv"
+BASE_DOWNLOAD_DIR = "/gpfs/data/huo-lab/Image/ChiMEC/"
+OUTPUT_DATABASE_FILE = "data/imaging_database_with_status.csv"
+
+USERNAME = os.getenv("IBROKER_USERNAME")
+PASSWORD = os.getenv("IBROKER_PASSWORD")
+
+
+def get_base_modality(modality):
+    if pd.isna(modality):
+        return None
+    modality_str = str(modality).upper()
+    if "MG" in modality_str:
+        return "MG"
+    if "MR" in modality_str:
+        return "MR"
+    if "CT" in modality_str:
+        return "CT"
+    if "US" in modality_str:
+        return "US"
+    if "CR" in modality_str:
+        return "CR"
+    if "DX" in modality_str:
+        return "DX"
+    if "NM" in modality_str:
+        return "NM"
+    if "PT" in modality_str:
+        return "PT"
+    return modality_str.split("/")[0]
+
+
+def load_and_merge_data():
+    print("--- Phase 1: Loading and Merging Data ---")
+    try:
+        patients = pd.read_csv(CHIMEC_PATIENTS_FILE)
+        print(f"Loaded {len(patients):,} rows from patient info file.")
+        key = pd.read_csv(KEY_FILE)
+        print(f"Loaded {len(key):,} rows from study_id-MRN key file.")
+        metadata = pd.read_csv(METADATA_FILE)
+        print(f"Loaded {len(metadata):,} exam records from raw metadata file.")
+
+        # A small fix: The Accession number is often what we care about, not the old exam_id
+        # Let's rename exam_id to Accession if Accession is missing.
+        if "exam_id" in metadata.columns and "Accession" in metadata.columns:
+            metadata["Accession"] = metadata["Accession"].fillna(metadata["exam_id"])
+
+        metadata["base_modality"] = metadata["Modality"].apply(get_base_modality)
+        print("  - Added 'base_modality' column.")
+    except FileNotFoundError as e:
+        print(f"ERROR: Input file not found - {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print("\nStep 1.1: Merging metadata with key file...")
+    db = pd.merge(metadata, key, left_on="study_id", right_on="AnonymousID", how="left")
+    db["MRN"] = pd.to_numeric(db["MRN"], errors="coerce")
+
+    print("\nStep 1.2: Merging result with patient info file...")
+    patients["_in_patient_file"] = True
+    db = pd.merge(
+        db, patients.drop(columns=["status"], errors="ignore"), on="MRN", how="left"
+    )
+
+    print("\nStep 1.3: Cleaning dates and deriving Case/Control status...")
+    db["Study DateTime"] = pd.to_datetime(db["Study DateTime"], errors="coerce")
+    db["DatedxIndex"] = pd.to_datetime(
+        db["DatedxIndex"], errors="coerce", dayfirst=True
+    )
+
+    conditions = [db["DatedxIndex"].notna(), db["_in_patient_file"]]
+    choices = ["Case", "Control"]
+    db["case_control_status"] = np.select(conditions, choices, default="Unknown")
+    print("  - Derived Case/Control status based on DatedxIndex:")
+    print(db["case_control_status"].value_counts().to_string())
+
+    db.drop(columns=["_in_patient_file"], inplace=True)
+    db.dropna(subset=["study_id", "Study DateTime", "StudyDescription"], inplace=True)
+
+    # This column will be populated by check_disk_for_downloads
+    db["is_exported"] = db["Accession"].notna()
+    print(
+        f"Marked {db['is_exported'].sum():,} exams as 'is_exported' based on having an Accession number."
+    )
+
+    print(f"\nMaster database created with {len(db):,} total exam records.")
+    return db
+
+
+def identify_download_targets(
+    df: pd.DataFrame, filter_by_genotyping: bool, modality: str
+):
+    print("\n--- Phase 3: Identifying Target Exams for Download ---")
+    df["rejection_reason"] = ""
+    print(f"Initial pool: {len(df):,} exams")
+
+    modality_mask = df["base_modality"] == modality
+    df.loc[~modality_mask, "rejection_reason"] = f"Wrong modality (not {modality})"
+    targets = df[modality_mask].copy()
+    print(f"  - Kept {len(targets):,} exams after filtering for modality '{modality}'.")
+
+    # NEW: Check against the on-disk status first
+    mask_on_disk = targets["is_on_disk"]
+    targets.loc[mask_on_disk, "rejection_reason"] = "Already on disk"
+    targets = targets[~mask_on_disk]
+    print(f"  - Rejected {mask_on_disk.sum():,} because they are already on disk.")
+
+    # We still check if it's exported, but now it's a secondary check.
+    # An exam could be exported but the sync failed, so it's not on disk.
+    has_accession_mask = targets["is_exported"] == True
+    targets.loc[has_accession_mask, "rejection_reason"] = (
+        "Already exported (but not found on disk - possible sync issue)"
+    )
+    targets = targets[~has_accession_mask]
+    print(
+        f"  - Rejected {has_accession_mask.sum():,} exams already in iBroker's 'Exported' list (but not on disk)."
+    )
+
+    if filter_by_genotyping:
+        mask_no_chip = targets["chip"].isna()
+        targets.loc[mask_no_chip, "rejection_reason"] = "No genotyping data"
+        targets = targets[~mask_no_chip]
+        print(f"  - Rejected {mask_no_chip.sum():,} due to missing genotyping data.")
+
+    case_mask = targets["case_control_status"] == "Case"
+    bad_case_date_mask = case_mask & (
+        targets["Study DateTime"] > targets["DatedxIndex"]
+    )
+    targets.loc[bad_case_date_mask, "rejection_reason"] = "Exam is after diagnosis date"
+    targets = targets[~bad_case_date_mask]
+    print(
+        f"  - Rejected {bad_case_date_mask.sum():,} 'Case' exams that occurred after diagnosis."
+    )
+
+    print(f"  = {len(targets):,} final potential target exams identified.")
+    return targets.sort_values(by=["study_id", "Study DateTime"])
+
+
+def execute_downloads(targets_df: pd.DataFrame, batch_size: int):
+    """Verifies exam availability live and requests exports."""
+    if targets_df.empty:
+        return {}, 0, 0
+
+    print(
+        f"\n--- Phase 4: Executing Downloads (target: {batch_size} successful exports) ---"
+    )
+    driver = None
+    outcomes = {}
+    already_exported_counter = 0
+    successfully_exported_counter = 0
+
+    # Process patient by patient from the sorted target list
+    unique_patients = targets_df["study_id"].unique()
+
+    try:
+        driver = make_driver()
+        login(driver, USERNAME, PASSWORD)
+
+        for study_id in tqdm(unique_patients, desc="Processing Patients"):
+            if successfully_exported_counter >= batch_size:
+                print(f"\nReached target of {batch_size} successful exports. Stopping.")
+                break
+
+            patient_exams = targets_df[targets_df["study_id"] == study_id]
+            print(
+                f"\nProcessing patient {study_id} (has {len(patient_exams)} target exams)..."
+            )
+
+            try:
+                driver.find_element(by="name", value="tbxAssignedID").clear()
+                driver.find_element(by="name", value="tbxAssignedID").send_keys(
+                    str(int(study_id))
+                )
+                driver.find_element(by="name", value="btnFetch").click()
+                wait_aspnet_idle(driver)
+            except Exception as e:
+                print(f"ERROR navigating for study_id {study_id}. Skipping. Error: {e}")
+                for index, _ in patient_exams.iterrows():
+                    outcomes[index] = "Navigation Error"
+                continue
+
+            available_on_page = {}
+            page_rows = driver.find_elements(
+                by="xpath",
+                value="//table[@id='TabContainer1_tabPanel1_gv1']//tr[position()>1]",
+            )
+            for row in page_rows:
+                try:
+                    cells = row.find_elements(by="tag name", value="td")
+                    row_date = pd.to_datetime(cells[2].text).date()
+                    row_desc = cells[3].text.strip()
+                    checkbox = row.find_element(
+                        by="xpath", value=".//input[@type='checkbox']"
+                    )
+                    available_on_page[(row_date, row_desc)] = checkbox
+                except Exception:
+                    pass
+
+            requested_this_patient = False
+            for index, target_exam in patient_exams.iterrows():
+                if successfully_exported_counter >= batch_size:
+                    outcomes[index] = "Skipped - Batch full"
+                    continue
+
+                target_key = (
+                    target_exam["Study DateTime"].date(),
+                    target_exam["StudyDescription"],
+                )
+
+                if target_key in available_on_page:
+                    print(
+                        f"  - Found available exam from {target_key[0]}. Selecting checkbox."
+                    )
+                    available_on_page[target_key].click()
+                    outcomes[index] = "Request Submitted"
+                    successfully_exported_counter += 1
+                    requested_this_patient = True
+                else:
+                    print(
+                        f"  - INFO: Exam from {target_key[0]} is no longer available (already exported)."
+                    )
+                    outcomes[index] = "Already Exported"
+                    already_exported_counter += 1
+
+            if requested_this_patient:
+                print("  Submitting export request for selected exams...")
+                driver.find_element(by="name", value="btnExport").click()
+                wait_aspnet_idle(driver)
+                print("  Export request submitted.")
+    finally:
+        if driver:
+            print("Closing webdriver session.")
+            driver.quit()
+
+    return outcomes, already_exported_counter, successfully_exported_counter
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Identify and download ChiMEC imaging exams."
+    )
+    parser.add_argument(
+        "--no-genotyping-filter",
+        action="store_true",
+        help="Include patients without genotyping data.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=50,
+        help="Max number of exams to request in one run.",
+    )
+    parser.add_argument(
+        "--modality",
+        type=str,
+        default="MG",
+        help="Base modality to filter for (e.g., MG, MR, CT).",
+    )
+    args = parser.parse_args()
+
+    if not all([USERNAME, PASSWORD]):
+        print(
+            "ERROR: IBROKER_USERNAME and IBROKER_PASSWORD must be set.", file=sys.stderr
+        )
+        sys.exit(1)
+
+    db = load_and_merge_data()
+    db = check_disk_for_downloads(db, BASE_DOWNLOAD_DIR)
+
+    targets = identify_download_targets(
+        db,
+        filter_by_genotyping=not args.no_genotyping_filter,
+        modality=args.modality.upper(),
+    )
+
+    db["is_target"] = False
+    db.loc[targets.index, "is_target"] = True
+    db["download_attempt_outcome"] = pd.NA
+    db["export_requested_on"] = pd.NaT
+
+    if targets.empty:
+        print("\nNo new exams to download based on the current criteria.")
+    else:
+        print("\n--- Summary of Exams to Download ---")
+        print(f"Total potential targets: {len(targets)}")
+        print(f"Unique patients to process: {targets['study_id'].nunique()}")
+
+        proceed = (
+            input(
+                f"\nProceed with attempting to export up to {args.batch_size} exams? (y/n): "
+            )
+            .lower()
+            .strip()
+        )
+        if proceed == "y":
+            outcomes, already_exported_count, successfully_exported_count = (
+                execute_downloads(targets, args.batch_size)
+            )
+
+            if outcomes:
+                for index, outcome in outcomes.items():
+                    db.loc[index, "download_attempt_outcome"] = outcome
+                    if outcome == "Request Submitted":
+                        db.loc[index, "export_requested_on"] = datetime.now()
+
+            print("\n--- Run Summary ---")
+            print(
+                f"Successfully submitted export requests for: {successfully_exported_count} exams."
+            )
+            print(
+                f"Discovered to be already exported:        {already_exported_count} exams."
+            )
+            print(f"Total exams processed:                    {len(outcomes)} exams.")
+        else:
+            print("Download cancelled by user.")
+
+    final_cols = [
+        "study_id",
+        "MRN",
+        "case_control_status",
+        "chip",
+        "base_modality",
+        "Study DateTime",
+        "DatedxIndex",
+        "StudyDescription",
+        "Accession",
+        "is_exported",  # New name: True if it has an Accession
+        "is_on_disk",  # New column: True if found on filesystem
+        "is_target",
+        "download_attempt_outcome",
+        "export_requested_on",
+        "rejection_reason",
+        "Modality",
+    ]
+    db_final = db[[col for col in final_cols if col in db.columns]].copy()
+
+    db_final.to_csv(OUTPUT_DATABASE_FILE, index=False, date_format="%Y-%m-%d %H:%M:%S")
+    print(
+        f"\nProcess complete. A full snapshot of this run has been saved to '{OUTPUT_DATABASE_FILE}'"
+    )
+
+
+if __name__ == "__main__":
+    main()
+
+=== filesystem_utils.py ===
+#!/usr/bin/env python3
+"""
+Shared filesystem utilities for ChiMEC imaging data management.
+Contains functions for scanning and inventorying downloaded imaging data.
+"""
+
+import os
+from pathlib import Path
+from typing import Dict, Set
+
+import pandas as pd
+from tqdm.auto import tqdm
+
+
+def build_disk_inventory(basedir: str) -> Dict[str, Set[str]]:
+    """
+    performs a one-time, efficient scan of the download directory to build an in-memory
+    inventory of all existing exams and provides a detailed summary.
+
+    handles various naming conventions (e.g., ACCESSION, ACCESSION-DATE, ACCESSION.tar.xz).
+
+    Parameters
+    ----------
+    basedir : str
+        the root directory where patient data is stored.
+
+    Returns
+    -------
+    Dict[str, Set[str]]
+        a dictionary mapping {patient_id: {set_of_accession_numbers}}.
+    """
+    print("--- pre-scanning all patient directories to build file inventory ---")
+    inventory = {}
+    total_exam_count = 0
+
+    if not Path(basedir).is_dir():
+        print(f"WARNING: base download directory not found: {basedir}")
+        print("inventory will be empty.")
+        return inventory
+
+    try:
+        patient_dirs = [d for d in os.scandir(basedir) if d.is_dir()]
+    except PermissionError:
+        print(f"WARNING: permission denied to read directory: {basedir}")
+        return inventory
+
+    for entry in tqdm(patient_dirs, desc="building file inventory"):
+        patient_id = entry.name
+        found_accessions = set()
+        try:
+            # scan for subdirectories and files (accession numbers)
+            for item in os.scandir(entry.path):
+                accession_number = None
+
+                if item.is_dir():
+                    # directory format: "2O42657" or "2O42657-2015-12-08"
+                    # extract accession number (part before first dash)
+                    accession_number = item.name.split("-")[0]
+                elif item.is_file() and item.name.endswith(".tar.xz"):
+                    # compressed file format: "2O42660.tar.xz"
+                    # extract accession number (part before .tar.xz)
+                    accession_number = item.name.replace(".tar.xz", "")
+
+                if accession_number:
+                    found_accessions.add(accession_number)
+
+            if found_accessions:
+                inventory[patient_id] = found_accessions
+                total_exam_count += len(found_accessions)
+        except (FileNotFoundError, PermissionError):
+            continue
+
+    # detailed summary print statements
+    patient_count = len(inventory)
+    print("\n--- inventory summary ---")
+    print(f"  - scanned {len(patient_dirs):,} total directories.")
+    print(f"  - found downloaded data for {patient_count:,} unique patients.")
+    print(f"  - inventoried a total of {total_exam_count:,} unique exams on disk.")
+    print("-------------------------\n")
+    return inventory
+
+
+def update_metadata_with_disk_status(
+    metadata_df: pd.DataFrame, basedir: str
+) -> pd.DataFrame:
+    """
+    update metadata with current filesystem status by scanning disk inventory
+
+    Parameters
+    ----------
+    metadata_df : pd.DataFrame
+        the metadata dataframe to update
+    basedir : str
+        the base directory where patient data is stored
+
+    Returns
+    -------
+    pd.DataFrame
+        updated metadata with corrected is_on_disk column
+    """
+    print("\n=== UPDATING METADATA WITH CURRENT DISK STATUS ===")
+
+    # build current disk inventory
+    disk_inventory = build_disk_inventory(basedir)
+
+    # create corrected is_on_disk column
+    metadata_df["is_on_disk_corrected"] = False
+
+    # filter for rows that can be checked (have Accession and study_id)
+    checkable_mask = metadata_df["Accession"].notna() & metadata_df["study_id"].notna()
+    checkable_df = metadata_df[checkable_mask].copy()
+
+    if checkable_df.empty:
+        print(
+            "no exams with accession numbers found in metadata. cannot check filesystem."
+        )
+        return metadata_df
+
+    def check_row_on_disk(row):
+        """check if a specific exam row is found on disk"""
+        try:
+            patient_id_str = str(int(row["study_id"]))
+            accession_str = str(row["Accession"])
+            patient_inventory = disk_inventory.get(patient_id_str, set())
+            return accession_str in patient_inventory
+        except (ValueError, TypeError):
+            return False
+
+    print("matching metadata against current file inventory...")
+    # apply check to rows that can be checked
+    on_disk_mask = checkable_df.apply(check_row_on_disk, axis=1)
+
+    # update the corrected column for matching rows
+    metadata_df.loc[on_disk_mask[on_disk_mask].index, "is_on_disk_corrected"] = True
+
+    # summary of changes
+    total_checkable = len(checkable_df)
+    found_on_disk = on_disk_mask.sum()
+
+    print(f"  - checked {total_checkable:,} exams with accession numbers")
+    print(f"  - found {found_on_disk:,} exams currently on disk")
+
+    if "is_on_disk" in metadata_df.columns:
+        # compare with existing is_on_disk column
+        old_on_disk = metadata_df["is_on_disk"].sum()
+        print(f"  - previous is_on_disk count: {old_on_disk:,}")
+        print(f"  - updated is_on_disk count: {found_on_disk:,}")
+        print(f"  - difference: {found_on_disk - old_on_disk:+,}")
+
+    print("updated metadata with current disk status")
+    return metadata_df
+
+
+def check_disk_for_downloads(df: pd.DataFrame, basedir: str) -> pd.DataFrame:
+    """
+    audits the filesystem to find which exams have been downloaded.
+    handles various naming conventions (e.g., ACCESSION, ACCESSION-DATE, ACCESSION.tar.xz).
+
+    this is an alias for update_metadata_with_disk_status for backward compatibility
+    with download_data.py
+    """
+    print(f"\n--- Phase 2: Auditing Filesystem for Downloads in {basedir} ---")
+
+    # initialize the new column with False
+    df["is_on_disk"] = False
+
+    # filter for rows that *could* be checked (have an Accession and study_id)
+    checkable_df = df.dropna(subset=["Accession", "study_id"]).copy()
+    if checkable_df.empty:
+        print(
+            "No exams with Accession Numbers found in metadata. Cannot check filesystem."
+        )
+        return df
+
+    # build inventory using shared function
+    inventory = build_disk_inventory(basedir)
+
+    # logic to check against the inventory
+    def check_row(row):
+        # ensure study_id is a clean string without decimals for dict lookup
+        patient_id = str(int(row["study_id"]))
+        accession = str(row["Accession"])
+
+        # check if we have any inventory for this patient, and if the accession is in their set
+        if patient_id in inventory and accession in inventory[patient_id]:
+            return True
+        return False
+
+    print("Matching metadata against file inventory...")
+    # apply the check only to the relevant subset of the DataFrame
+    on_disk_mask = checkable_df.apply(check_row, axis=1)
+
+    # update the original DataFrame using the index from our checkable subset
+    df.loc[on_disk_mask[on_disk_mask].index, "is_on_disk"] = True
+
+    print(
+        f"  - Marked {df['is_on_disk'].sum():,} exams in the database as 'is_on_disk'."
+    )
+    return df
+
+=== fingerprint_utils.py ===
+#!/usr/bin/env python
+# coding: utf-8
+# SHARED LOGIC for exam fingerprinting.
+
+import hashlib
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, Tuple
+
+import pydicom
+
+
+@dataclass(frozen=True)
+class ExamFingerprint:
+    """A unique, content-based identifier for an exam."""
+
+    study_uid: str
+    file_hashes: frozenset[str]
+
+    def is_valid(self) -> bool:
+        return bool(self.study_uid and self.file_hashes)
+
+
+def hash_file(filepath: Path) -> str:
+    """Calculates the SHA256 hash of a file."""
+    sha256_hash = hashlib.sha256()
+    try:
+        with open(filepath, "rb") as f:
+            for byte_block in iter(lambda: f.read(8192), b""):
+                sha256_hash.update(byte_block)
+        return sha256_hash.hexdigest()
+    except (IOError, PermissionError) as e:
+        raise e
+
+
+def create_exam_fingerprint(exam_path: Path) -> Tuple[Optional[ExamFingerprint], str]:
+    """
+    Generates a fingerprint for an exam directory. This version searches RECURSIVELY
+    for files to handle nested directory structures. It also retains retries for
+    flaky network filesystems.
+
+    Returns a tuple: (ExamFingerprint | None, reason_string).
+    """
+    if not exam_path.is_dir():
+        return None, "Path is not a directory."
+
+    study_uid = None
+    file_hashes = set()
+
+    files_to_process = []
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            # --- KEY CHANGE HERE ---
+            # Use rglob('*') to find ALL files in ALL subdirectories.
+            # This will correctly find the DICOM files in the nested folder.
+            all_items = exam_path.rglob("*")
+            files_to_process = [
+                p for p in all_items if p.is_file() and not p.name.startswith(".")
+            ]
+            # --- End of Key Change ---
+
+            if files_to_process:
+                break
+
+            # If still no files, it might be a true empty dir or a glitch. Retry.
+            time.sleep(1 + attempt)
+        except (IOError, OSError) as e:
+            if attempt < max_retries - 1:
+                time.sleep(1 + attempt)
+                continue
+            else:
+                return (
+                    None,
+                    f"Failed to list directory contents after {max_retries} attempts: {e}",
+                )
+
+    if not files_to_process:
+        return (
+            None,
+            "No valid files found (directory appears to be empty or only contains dotfiles).",
+        )
+
+    try:
+        for fpath in files_to_process:
+            try:
+                file_hashes.add(hash_file(fpath))
+            except (IOError, OSError) as e:
+                return None, f"Failed to read/hash file {fpath.name}: {e}"
+
+            if not study_uid:
+                try:
+                    dcm = pydicom.dcmread(fpath, stop_before_pixels=True)
+                    study_uid = str(dcm.StudyInstanceUID)
+                except pydicom.errors.InvalidDicomError:
+                    continue
+
+        if not study_uid:
+            return (
+                None,
+                f"Processed {len(file_hashes)} file(s), but none contained a valid DICOM StudyInstanceUID.",
+            )
+
+        fingerprint = ExamFingerprint(
+            study_uid=study_uid, file_hashes=frozenset(file_hashes)
+        )
+        return fingerprint, "Success"
+
+    except PermissionError as e:
+        return None, f"Permission denied while accessing files: {e}"
+    except Exception as e:
+        return None, f"An unexpected error occurred: {e}"
+
+=== fingerprinter.py ===
+#!/usr/bin/env python
+# coding: utf-8
+# THIS SCRIPT RUNS ON THE REMOTE (HUO-LAB) SERVER
+
+import argparse
+import json
+import logging
+import sys
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+
+import psutil
+from tqdm import tqdm
+
+# Import the shared logic
+from fingerprint_utils import create_exam_fingerprint
+
+# --- NEW: Checkpoint Configuration ---
+CHECKPOINT_DIR = Path("data/fingerprint_checkpoints")
+
+
+def log_memory_usage(stage: str):
+    """Log current memory usage for debugging."""
+    process = psutil.Process()
+    memory_info = process.memory_info()
+    memory_mb = memory_info.rss / 1024 / 1024
+    logging.info(f"[{stage}] Memory usage: {memory_mb:.1f} MB")
+
+
+def load_checkpoint_file(checkpoint_file: Path):
+    """Load a single checkpoint file and return patient data."""
+    try:
+        with open(checkpoint_file, "r") as f:
+            checkpoint_data = json.load(f)
+
+        # Handle both old format (direct inventory) and new format (with metadata)
+        if isinstance(checkpoint_data, dict) and "inventory" in checkpoint_data:
+            # New format with metadata
+            patient_data = checkpoint_data["inventory"]
+        else:
+            # Old format - direct inventory
+            patient_data = checkpoint_data
+
+        return checkpoint_file.stem, patient_data
+    except Exception as e:
+        logging.error(f"Failed to load checkpoint {checkpoint_file}: {e}")
+        return None, None
+
+
+def fingerprint_all_exams_for_patient(patient_dir: Path):
+    """
+    Worker function to process all exams for a single patient.
+    This is a better unit of work for checkpointing.
+    """
+    patient_id = patient_dir.name
+    patient_inventory = {}
+    failure_reasons = {}
+
+    exam_dirs = [d for d in patient_dir.iterdir() if d.is_dir()]
+    for exam_path in exam_dirs:
+        try:
+            fingerprint, reason = create_exam_fingerprint(exam_path)
+            if fingerprint and fingerprint.is_valid():
+                exam_name = exam_path.name
+                result = (fingerprint.study_uid, sorted(list(fingerprint.file_hashes)))
+                patient_inventory[exam_name] = result
+            else:
+                failure_reasons[reason] = failure_reasons.get(reason, 0) + 1
+        except Exception as e:
+            reason = f"Worker exception on {exam_path.name}: {e}"
+            failure_reasons[reason] = failure_reasons.get(reason, 0) + 1
+
+    return patient_id, patient_inventory, failure_reasons
+
+
+def consolidate_checkpoints(final_output_file: Path, parallel_jobs: int = 4):
+    """Reads all patient checkpoint files and combines them into one final inventory using parallel processing."""
+    start_time = time.time()
+    logging.info(f"Consolidating checkpoints from {CHECKPOINT_DIR}...")
+    log_memory_usage("consolidation_start")
+
+    checkpoint_files = list(CHECKPOINT_DIR.glob("*.json"))
+    logging.info(f"Found {len(checkpoint_files)} checkpoint files to consolidate")
+
+    # Check if checkpoint files are accessible
+    accessible_files = []
+    for checkpoint_file in checkpoint_files[:10]:  # Check first 10 files
+        try:
+            if checkpoint_file.stat().st_size > 0:
+                accessible_files.append(checkpoint_file)
+        except Exception as e:
+            logging.warning(f"Cannot access {checkpoint_file}: {e}")
+
+    logging.info(
+        f"Sample check: {len(accessible_files)}/{min(10, len(checkpoint_files))} files are accessible"
+    )
+
+    if not checkpoint_files:
+        logging.warning("No checkpoint files found!")
+        return {}
+
+    # Try batch processing first (most reliable), then parallel, then sequential
+    try:
+        logging.info("Attempting batch consolidation (most reliable)...")
+        full_inventory = _consolidate_batch(checkpoint_files, batch_size=50)
+        logging.info("Batch consolidation completed successfully")
+    except Exception as e:
+        logging.warning(
+            f"Batch consolidation failed: {e}. Trying parallel processing..."
+        )
+        try:
+            full_inventory = _consolidate_parallel(checkpoint_files, parallel_jobs)
+            logging.info("Parallel consolidation completed successfully")
+        except Exception as e2:
+            logging.warning(
+                f"Parallel consolidation failed: {e2}. Falling back to sequential processing."
+            )
+            full_inventory = _consolidate_sequential(checkpoint_files)
+
+    log_memory_usage("before_json_write")
+
+    # Write the consolidated inventory
+    write_start = time.time()
+    logging.info(f"Writing final inventory to {final_output_file}...")
+    final_output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Use streaming JSON write for large files
+    with open(final_output_file, "w") as f:
+        json.dump(full_inventory, f, indent=None, separators=(",", ":"))
+
+    write_time = time.time() - write_start
+    total_time = time.time() - start_time
+
+    logging.info(f"Final inventory written successfully in {write_time:.1f} seconds")
+    logging.info(f"Total consolidation time: {total_time:.1f} seconds")
+    log_memory_usage("consolidation_complete")
+
+    return full_inventory
+
+
+def _consolidate_parallel(checkpoint_files, parallel_jobs):
+    """Parallel consolidation implementation."""
+    full_inventory = {}
+    failed_files = []
+
+    logging.info(
+        f"Starting parallel consolidation with {len(checkpoint_files)} files using {parallel_jobs} workers"
+    )
+    start_time = time.time()
+
+    with ProcessPoolExecutor(max_workers=parallel_jobs) as executor:
+        # Submit all checkpoint files for parallel loading
+        future_to_file = {
+            executor.submit(load_checkpoint_file, checkpoint_file): checkpoint_file
+            for checkpoint_file in checkpoint_files
+        }
+
+        logging.info(f"Submitted {len(future_to_file)} tasks to executor")
+
+        # Process results as they complete
+        with tqdm(total=len(checkpoint_files), desc="Loading checkpoints") as pbar:
+            last_heartbeat = time.time()
+            for future in as_completed(
+                future_to_file, timeout=300
+            ):  # 5 minute timeout per future
+                checkpoint_file = future_to_file[future]
+                try:
+                    patient_id, patient_data = future.result()
+                    if patient_id is not None and patient_data is not None:
+                        full_inventory[patient_id] = patient_data
+                    else:
+                        failed_files.append(checkpoint_file)
+                except Exception as e:
+                    logging.error(f"Failed to process {checkpoint_file}: {e}")
+                    failed_files.append(checkpoint_file)
+
+                pbar.update(1)
+
+                # Heartbeat every 30 seconds
+                current_time = time.time()
+                if current_time - last_heartbeat > 30:
+                    elapsed = current_time - start_time
+                    logging.info(
+                        f"HEARTBEAT: Processed {pbar.n}/{len(checkpoint_files)} files in {elapsed:.1f}s"
+                    )
+                    last_heartbeat = current_time
+
+                # Log progress every 100 files
+                if pbar.n % 100 == 0:
+                    log_memory_usage(f"loaded_{pbar.n}_files")
+
+    if failed_files:
+        logging.warning(f"Failed to load {len(failed_files)} checkpoint files")
+
+    return full_inventory
+
+
+def _consolidate_sequential(checkpoint_files):
+    """Sequential consolidation implementation as fallback."""
+    full_inventory = {}
+    failed_files = []
+
+    logging.info(
+        f"Starting sequential consolidation with {len(checkpoint_files)} files"
+    )
+    start_time = time.time()
+    last_heartbeat = start_time
+
+    for i, checkpoint_file in enumerate(
+        tqdm(checkpoint_files, desc="Loading checkpoints (sequential)")
+    ):
+        try:
+            patient_id, patient_data = load_checkpoint_file(checkpoint_file)
+            if patient_id is not None and patient_data is not None:
+                full_inventory[patient_id] = patient_data
+            else:
+                failed_files.append(checkpoint_file)
+        except Exception as e:
+            logging.error(f"Failed to process {checkpoint_file}: {e}")
+            failed_files.append(checkpoint_file)
+
+        # Heartbeat every 30 seconds
+        current_time = time.time()
+        if current_time - last_heartbeat > 30:
+            elapsed = current_time - start_time
+            logging.info(
+                f"HEARTBEAT: Processed {i + 1}/{len(checkpoint_files)} files in {elapsed:.1f}s"
+            )
+            last_heartbeat = current_time
+
+    if failed_files:
+        logging.warning(f"Failed to load {len(failed_files)} checkpoint files")
+
+    return full_inventory
+
+
+def _consolidate_batch(checkpoint_files, batch_size=100):
+    """Batch consolidation implementation - processes files in small batches."""
+    full_inventory = {}
+    failed_files = []
+
+    logging.info(
+        f"Starting batch consolidation with {len(checkpoint_files)} files in batches of {batch_size}"
+    )
+    start_time = time.time()
+
+    for i in range(0, len(checkpoint_files), batch_size):
+        batch = checkpoint_files[i : i + batch_size]
+        batch_start = time.time()
+
+        logging.info(
+            f"Processing batch {i // batch_size + 1}/{(len(checkpoint_files) + batch_size - 1) // batch_size} ({len(batch)} files)"
+        )
+
+        for checkpoint_file in batch:
+            try:
+                patient_id, patient_data = load_checkpoint_file(checkpoint_file)
+                if patient_id is not None and patient_data is not None:
+                    full_inventory[patient_id] = patient_data
+                else:
+                    failed_files.append(checkpoint_file)
+            except Exception as e:
+                logging.error(f"Failed to process {checkpoint_file}: {e}")
+                failed_files.append(checkpoint_file)
+
+        batch_time = time.time() - batch_start
+        elapsed = time.time() - start_time
+        logging.info(f"Batch completed in {batch_time:.1f}s (total: {elapsed:.1f}s)")
+        log_memory_usage(f"batch_{i // batch_size + 1}_complete")
+
+    if failed_files:
+        logging.warning(f"Failed to load {len(failed_files)} checkpoint files")
+
+    return full_inventory
+
+
+def main(root_dir: Path, output_file: Path, parallel_jobs: int):
+    start_time = time.time()
+    logging.info(f"Starting remote fingerprinting of {root_dir}")
+    log_memory_usage("main_start")
+
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    all_patient_dirs = [d for d in root_dir.iterdir() if d.is_dir()]
+
+    completed_patient_ids = {p.stem for p in CHECKPOINT_DIR.glob("*.json")}
+    patients_to_process = [
+        p for p in all_patient_dirs if p.name not in completed_patient_ids
+    ]
+
+    logging.info(f"Found {len(all_patient_dirs)} total patients in source directory.")
+    logging.info(f"Found {len(completed_patient_ids)} already completed checkpoints.")
+
+    if patients_to_process:
+        logging.info(f"Patients to process: {[p.name for p in patients_to_process]}")
+        logging.info(f"Sample completed patients: {list(completed_patient_ids)[:10]}")
+
+    if not patients_to_process:
+        logging.info("All patients already fingerprinted. Proceeding to consolidation.")
+    else:
+        logging.info(
+            f"Resuming... {len(patients_to_process)} patients remaining to be processed."
+        )
+
+        # Process patients in batches to reduce main process overhead.
+        # Chunk size is a multiple of parallel jobs to keep all workers busy.
+        chunk_size = parallel_jobs * 20  # e.g., 8 jobs * 20 = 160 patients per batch
+        chunk_size = 1
+        overall_failure_reasons = {}
+
+        logging.info(
+            f"Using {parallel_jobs} parallel workers with chunk size {chunk_size}"
+        )
+        log_memory_usage("before_processing")
+
+        with ProcessPoolExecutor(max_workers=parallel_jobs) as executor:
+            # Wrap the main loop in a tqdm bar that tracks patients, not chunks
+            with tqdm(
+                total=len(patients_to_process), desc="Fingerprinting Patients"
+            ) as pbar:
+                for i in range(0, len(patients_to_process), chunk_size):
+                    chunk = patients_to_process[i : i + chunk_size]
+                    chunk_start_time = time.time()
+
+                    logging.info(
+                        f"Processing chunk {i // chunk_size + 1}/{(len(patients_to_process) + chunk_size - 1) // chunk_size} "
+                        f"({len(chunk)} patients)"
+                    )
+
+                    futures = {
+                        executor.submit(fingerprint_all_exams_for_patient, path): path
+                        for path in chunk
+                    }
+
+                    for future in as_completed(futures):
+                        try:
+                            patient_id, patient_inventory, failure_reasons = (
+                                future.result()
+                            )
+
+                            # Always save a checkpoint, even if patient_inventory is empty
+                            # This prevents the same patients from being reprocessed
+                            checkpoint_data = {
+                                "inventory": patient_inventory,
+                                "failure_reasons": failure_reasons,
+                                "processed_at": time.time(),
+                            }
+
+                            with open(CHECKPOINT_DIR / f"{patient_id}.json", "w") as f:
+                                json.dump(checkpoint_data, f)
+
+                            logging.info(
+                                f"Saved checkpoint for patient {patient_id} "
+                                f"({len(patient_inventory)} exams, {sum(failure_reasons.values())} failures)"
+                            )
+
+                            for reason, count in failure_reasons.items():
+                                overall_failure_reasons[reason] = (
+                                    overall_failure_reasons.get(reason, 0) + count
+                                )
+
+                        except Exception as e:
+                            path = futures[future]
+                            logging.error(
+                                f"A master process future failed for patient {path.name}: {e}"
+                            )
+
+                        # Update the single, overarching progress bar
+                        pbar.update(1)
+
+                    chunk_time = time.time() - chunk_start_time
+                    logging.info(f"Chunk completed in {chunk_time:.1f} seconds")
+                    log_memory_usage(f"chunk_{i // chunk_size + 1}_complete")
+
+    # Consolidation and summary
+    processing_time = time.time() - start_time
+    logging.info(f"Patient processing completed in {processing_time:.1f} seconds")
+    log_memory_usage("before_consolidation")
+
+    consolidation_start = time.time()
+    logging.info("Starting consolidation phase...")
+
+    # Add a timeout mechanism for consolidation
+    import signal
+
+    def timeout_handler(signum, frame):
+        raise TimeoutError("Consolidation timed out after 30 minutes")
+
+    # Set a 30-minute timeout for consolidation
+    signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(1800)  # 30 minutes
+
+    try:
+        full_inventory = consolidate_checkpoints(output_file, parallel_jobs)
+        signal.alarm(0)  # Cancel the alarm
+    except TimeoutError:
+        logging.error("Consolidation timed out after 30 minutes!")
+        logging.error(
+            "This suggests the parallel processing is hanging. Check system resources."
+        )
+        return
+    except Exception as e:
+        signal.alarm(0)  # Cancel the alarm
+        logging.error(f"Consolidation failed: {e}")
+        return
+
+    consolidation_time = time.time() - consolidation_start
+
+    total_exams_fingerprinted = sum(len(v) for v in full_inventory.values())
+    total_time = time.time() - start_time
+
+    logging.info("\n" + "=" * 50)
+    logging.info("--- Fingerprinting Run Complete ---")
+    logging.info(f"Total patients in final inventory: {len(full_inventory):,}")
+    logging.info(f"Total exams in final inventory:  {total_exams_fingerprinted:,}")
+    logging.info(f"Processing time: {processing_time:.1f} seconds")
+    logging.info(f"Consolidation time: {consolidation_time:.1f} seconds")
+    logging.info(f"Total runtime: {total_time:.1f} seconds")
+    # Note: Failure summary is now only for the current run, not accumulated.
+    if "overall_failure_reasons" in locals() and overall_failure_reasons:
+        logging.info("--- Failure Summary During Run ---")
+        for reason, count in sorted(
+            overall_failure_reasons.items(), key=lambda item: item[1], reverse=True
+        ):
+            logging.info(f"  - [{count:,}]: {reason}")
+    logging.info("=" * 50 + "\n")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Scans and fingerprints a DICOM directory structure with checkpointing."
+    )
+    parser.add_argument("root_dir", type=Path, help="The root directory to scan.")
+    parser.add_argument(
+        "output_file", type=Path, help="The final JSON file to write the inventory to."
+    )
+    parser.add_argument(
+        "-p",
+        "--parallel-jobs",
+        type=int,
+        default=8,
+        help="Number of parallel processes.",
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        stream=sys.stderr,
+    )
+    main(args.root_dir, args.output_file, args.parallel_jobs)
+
