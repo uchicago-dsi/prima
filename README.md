@@ -75,7 +75,23 @@ Goal: one-way, resumable, safe copy of files. Files are deleted from HIRO after 
 - Finder mounts the share under `/Volumes/16352a` (the exact name may vary if you remount multiple times). This mounted path is the source for rsync.
 
 ---
-### 2. Install a modern rsync on macOS
+### 2. Mount the HIRO share on Linux
+
+To mount the HIRO share on a Linux system:
+
+```bash
+sudo mount -t cifs //cifs01uchadccd.uchad.uchospitals.edu/radiology/HIRO /mnt/uchad_samba -o credentials=/home/annawoodard/creds
+```
+
+This mounts the share at `/mnt/uchad_samba`. Ensure the credentials file exists and contains your UCHAD username and password in the format:
+```
+username=your_username
+password=your_password
+domain=UCHAD
+```
+
+---
+### 3. Install a modern rsync on macOS
 
 The Apple-provided rsync is outdated. Use **Homebrew** to install a modern version.
 
@@ -86,7 +102,7 @@ brew install rsync
 This installs modern rsync as `/opt/homebrew/bin/rsync` (Apple Silicon) or `/usr/local/bin/rsync` (Intel).
 
 ---
-### 3. Set source and destination paths
+### 4. Set source and destination paths
 
 ```bash
 SRC="/Volumes/16352a/"  # mounted HIRO subdir; note trailing slash
@@ -94,7 +110,7 @@ DST="annawoodard@cri-ksysappdsp3.cri.uchicago.edu:/gpfs/data/huo-lab/Image/ChiME
 ```
 
 ---
-### 4. Dry run (safe preview)
+### 5. Dry run (safe preview)
 
 This command performs a dry run, showing what will be copied without actually moving any files.
 
@@ -110,7 +126,7 @@ This command performs a dry run, showing what will be copied without actually mo
 Check that the file mapping is correct (`/Volumes/16352a/...` → `/gpfs/.../ChiMEC/...`).
 
 ---
-### 5. Real transfer (resumable, safe delete-on-success)
+### 6. Real transfer (resumable, safe delete-on-success)
 
 This command performs the actual data transfer and can be stopped and restarted as needed.
 
@@ -129,7 +145,7 @@ caffeinate -dims /opt/homebrew/bin/rsync \
 - `--log-file`: records all transfers to a log file
 
 ---
-### 6. Cleanup (optional)
+### 7. Cleanup (optional)
 
 Directories on HIRO will remain after the files are moved. They can be pruned manually later if desired, but this is not required.
 
