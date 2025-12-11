@@ -1186,6 +1186,7 @@ def run_single_sync(
             dest_inventory,
             dry_run,
             immediate_delete,
+            max_exams=max_exams_this_run,
         )
     )
     phase1_time = monotonic() - phase1_start
