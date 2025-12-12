@@ -1256,6 +1256,46 @@ selected_modality_with_patient_data["DatedxIndex"] = pd.to_datetime(
     selected_modality_with_patient_data["DatedxIndex"], format="%d/%m/%Y"
 )
 
+# find and print 20 earliest exams
+print("\n" + "=" * 100)
+print("=" * 100)
+print(f"20 EARLIEST {SELECTED_MODALITY} EXAMS")
+print("=" * 100)
+print("=" * 100 + "\n")
+
+earliest_exams = (
+    selected_modality_with_patient_data.sort_values("Study DateTime").head(20).copy()
+)
+
+# select relevant columns for display
+display_cols = [
+    "study_id",
+    "Accession",
+    "Study DateTime",
+    "StudyDescription",
+    "Modality",
+    "case_or_control",
+    "DatedxIndex",
+    "is_on_disk",
+    "is_exported",
+]
+# only include columns that exist
+display_cols = [col for col in display_cols if col in earliest_exams.columns]
+
+for idx, (_, row) in enumerate(earliest_exams.iterrows(), 1):
+    print(f"\n--- Exam #{idx} ---")
+    for col in display_cols:
+        value = row[col]
+        if pd.isna(value):
+            value = "N/A"
+        elif isinstance(value, pd.Timestamp):
+            value = value.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"  {col:20s}: {value}")
+    print()
+
+print("=" * 100)
+print("=" * 100 + "\n")
+
 # calculate time difference in days (positive = scan before diagnosis)
 selected_modality_with_patient_data["days_to_dx"] = (
     selected_modality_with_patient_data["DatedxIndex"]

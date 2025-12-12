@@ -6769,3 +6769,1414 @@ PermissionError: [Errno 13] Permission denied: '1.2.840.113681.2772715798.164251
 2025-11-26 19:31:36,009 [INFO] Sync completed successfully. Waiting 120 seconds before restart...
 2025-11-26 19:32:59,817 [INFO] Received signal 2. Shutting down gracefully...
 2025-11-26 19:33:00,099 [INFO] Shutdown requested during restart delay. Exiting.
+2025-12-12 10:35:27,796 [INFO] === STARTING SYNC ===
+2025-12-12 10:35:27,796 [INFO] === STARTING SYNC ===
+2025-12-12 10:35:27,796 [INFO] Step 1: Loading destination inventory...
+2025-12-12 10:35:27,797 [INFO] Loading destination inventory from /gpfs/data/huo-lab/Image/annawoodard/prima/data/destination_fingerprints.json...
+2025-12-12 10:35:27,798 [INFO] Cache file size: 620.8 MB
+2025-12-12 10:35:27,798 [INFO] Parsing JSON...
+2025-12-12 10:35:32,585 [INFO] JSON parsed in 4.8s
+2025-12-12 10:35:32,586 [INFO] Building inventory structure...
+2025-12-12 10:35:35,268 [INFO] Inventory structure built in 2.7s
+2025-12-12 10:35:35,268 [INFO] Destination inventory loaded in 7.5s total
+2025-12-12 10:35:35,385 [INFO] Destination inventory summary: 3,770 patients, 34,793 exams
+2025-12-12 10:35:35,386 [INFO] Inventory loading took 7.6s
+2025-12-12 10:35:35,386 [INFO] Step 2: Scanning source directory...
+2025-12-12 10:35:35,386 [INFO] Scanning top-level in /mnt/uchad_samba/16352A for patient directories...
+2025-12-12 10:35:35,393 [INFO] Found 87 top-level directories
+2025-12-12 10:35:35,393 [INFO] Source directory scan took 0.0s
+2025-12-12 10:35:35,394 [INFO] Found 86 patient roots; 69 known in cache, 17 unknown. Sample unknown: [37375170, 37921947, 39159703, 39438423, 39438872, 40753861, 40865286, 40981768, 41110277, 41314463...]
+2025-12-12 10:35:35,397 [INFO] [UNKNOWN] patient 41110277: EMPTY; subdirs=0 files=0; age=1351.5h; sample_subdirs=[]
+2025-12-12 10:35:35,400 [INFO] [UNKNOWN] patient 39159703: EMPTY; subdirs=0 files=0; age=1354.6h; sample_subdirs=[]
+2025-12-12 10:35:35,404 [INFO] [UNKNOWN] patient 39438872: EMPTY; subdirs=0 files=0; age=1354.6h; sample_subdirs=[]
+2025-12-12 10:35:35,407 [INFO] [UNKNOWN] patient 40753861: HAS DATA; subdirs=1 files=0; age=1347.8h; sample_subdirs=[2O45612-2022-01-18]
+2025-12-12 10:35:35,411 [INFO] [UNKNOWN] patient 39438423: EMPTY; subdirs=0 files=0; age=1354.6h; sample_subdirs=[]
+2025-12-12 10:35:35,414 [INFO] [UNKNOWN] patient 40865286: HAS DATA; subdirs=1 files=0; age=1349.4h; sample_subdirs=[2O45616-2025-04-14]
+2025-12-12 10:35:35,418 [INFO] [UNKNOWN] patient 37375170: EMPTY; subdirs=0 files=0; age=1354.3h; sample_subdirs=[]
+2025-12-12 10:35:35,421 [INFO] [UNKNOWN] patient 37921947: EMPTY; subdirs=0 files=0; age=1353.8h; sample_subdirs=[]
+2025-12-12 10:35:35,425 [INFO] [UNKNOWN] patient 40981768: HAS DATA; subdirs=1 files=0; age=1348.2h; sample_subdirs=[2O45640-2015-11-13]
+2025-12-12 10:35:35,428 [INFO] [UNKNOWN] patient 41314463: HAS DATA; subdirs=1 files=0; age=1348.2h; sample_subdirs=[2O45670-2015-10-27]
+2025-12-12 10:35:35,432 [INFO] [UNKNOWN] patient 40480293: HAS DATA; subdirs=1 files=0; age=1347.5h; sample_subdirs=[2O45554-2023-02-15]
+2025-12-12 10:35:35,436 [INFO] [UNKNOWN] patient 40351621: EMPTY; subdirs=0 files=0; age=1349.0h; sample_subdirs=[]
+2025-12-12 10:35:35,439 [INFO] [UNKNOWN] patient 39194148: EMPTY; subdirs=0 files=0; age=1354.5h; sample_subdirs=[]
+2025-12-12 10:35:35,443 [INFO] [UNKNOWN] patient 40476482: EMPTY; subdirs=0 files=0; age=1350.0h; sample_subdirs=[]
+2025-12-12 10:35:35,446 [INFO] [UNKNOWN] patient 37724161: EMPTY; subdirs=0 files=0; age=1354.5h; sample_subdirs=[]
+2025-12-12 10:35:35,450 [INFO] [UNKNOWN] patient 37904958: EMPTY; subdirs=0 files=0; age=1354.7h; sample_subdirs=[]
+2025-12-12 10:35:35,453 [INFO] [UNKNOWN] patient 37697994: EMPTY; subdirs=0 files=0; age=1354.7h; sample_subdirs=[]
+2025-12-12 10:35:35,453 [INFO] Step 3: Pruning empty patient directories...
+2025-12-12 10:35:35,456 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/38371408: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/38371408'
+2025-12-12 10:35:35,460 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/37699168: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/37699168'
+2025-12-12 10:35:35,464 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/38066645: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/38066645'
+2025-12-12 10:35:35,474 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/37873340: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/37873340'
+2025-12-12 10:35:35,488 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/41110277: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/41110277'
+2025-12-12 10:35:35,491 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/39159703: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/39159703'
+2025-12-12 10:35:35,495 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/38469235: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/38469235'
+2025-12-12 10:35:35,498 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/37678195: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/37678195'
+2025-12-12 10:35:35,502 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/39677840: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/39677840'
+2025-12-12 10:35:35,508 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/37052391: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/37052391'
+2025-12-12 10:35:35,512 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/38631533: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/38631533'
+2025-12-12 10:35:35,516 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/37984843: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/37984843'
+2025-12-12 10:35:35,519 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/38656380: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/38656380'
+2025-12-12 10:35:35,527 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/37981422: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/37981422'
+2025-12-12 10:35:35,541 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/39438872: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/39438872'
+2025-12-12 10:35:35,555 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/37054464: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/37054464'
+2025-12-12 10:35:35,561 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/39438423: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/39438423'
+2025-12-12 10:35:35,565 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/41079414: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/41079414'
+2025-12-12 10:35:35,578 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/37375170: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/37375170'
+2025-12-12 10:35:35,582 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/38671334: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/38671334'
+2025-12-12 10:35:35,588 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/37210512: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/37210512'
+2025-12-12 10:35:35,599 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/37921947: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/37921947'
+2025-12-12 10:35:35,612 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/38379072: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/38379072'
+2025-12-12 10:35:35,636 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/37066123: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/37066123'
+2025-12-12 10:35:35,639 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/40939461: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/40939461'
+2025-12-12 10:35:35,642 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/40351621: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/40351621'
+2025-12-12 10:35:35,646 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/40040318: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/40040318'
+2025-12-12 10:35:35,649 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/39194148: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/39194148'
+2025-12-12 10:35:35,652 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/39811603: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/39811603'
+2025-12-12 10:35:35,665 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/37736877: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/37736877'
+2025-12-12 10:35:35,669 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/38979805: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/38979805'
+2025-12-12 10:35:35,672 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/39207002: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/39207002'
+2025-12-12 10:35:35,679 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/39165887: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/39165887'
+2025-12-12 10:35:35,689 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/37096588: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/37096588'
+2025-12-12 10:35:35,693 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/40476482: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/40476482'
+2025-12-12 10:35:35,700 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/38834515: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/38834515'
+2025-12-12 10:35:35,707 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/38300786: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/38300786'
+2025-12-12 10:35:35,710 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/39053734: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/39053734'
+2025-12-12 10:35:35,714 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/37724161: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/37724161'
+2025-12-12 10:35:35,718 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/39532914: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/39532914'
+2025-12-12 10:35:35,725 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/37124181: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/37124181'
+2025-12-12 10:35:35,728 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/40156903: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/40156903'
+2025-12-12 10:35:35,742 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/37904958: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/37904958'
+2025-12-12 10:35:35,748 [WARNING] [PRUNE] failed to remove /mnt/uchad_samba/16352A/37697994: [Errno 13] Permission denied: '/mnt/uchad_samba/16352A/37697994'
+2025-12-12 10:35:35,749 [INFO] [PRUNE SUMMARY] checked 86 patient roots: pruned 0, recent-empty 0, nonempty 42
+2025-12-12 10:35:35,749 [INFO] Pruning took 0.3s
+2025-12-12 10:35:35,749 [INFO] Step 4: Rebuilding patient directory list...
+2025-12-12 10:35:35,754 [INFO] Rebuild took 0.0s, found 86 patient directories
+2025-12-12 10:35:35,754 [INFO] Step 5: Collecting all exam directories...
+2025-12-12 10:35:36,019 [INFO] Exam collection took 0.3s
+2025-12-12 10:35:36,020 [INFO] Found 151 source exams to process.
+2025-12-12 10:35:36,020 [INFO] === PHASE 1: UID FASTPATH PROCESSING ===
+2025-12-12 10:35:36,020 [INFO] Processing 151 exams for UID matches first (fast, no file transfers)
+2025-12-12 10:35:36,020 [INFO] Starting UID fastpath phase...
+2025-12-12 10:35:36,020 [INFO] Processing 151 exams in UID fastpath phase...
+2025-12-12 10:35:36,125 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O07350, will transfer
+2025-12-12 10:35:36,125 [WARNING] Local source path: /mnt/uchad_samba/16352A/40686376/2O45595-2008-08-25 | patient=40686376 exam=2O45595-2008-08-25 uid=2.16.840.1.114151.603919394675652426411887536338957026020100629
+2025-12-12 10:35:36,143 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376 contents (first 20 of 22 entries):
+2025-12-12 10:35:36,143 [ERROR]     40755 annawoodard annawoodard 2O45583-2017-01-25
+2025-12-12 10:35:36,144 [ERROR]     40755 annawoodard cri-huo_lab 2O07356
+2025-12-12 10:35:36,144 [ERROR]     40755 annawoodard cri-huo_lab 2O07363
+2025-12-12 10:35:36,144 [ERROR]     40755 annawoodard cri-huo_lab 2O07351
+2025-12-12 10:35:36,144 [ERROR]     40755 annawoodard cri-huo_lab 2O07358
+2025-12-12 10:35:36,144 [ERROR]     40755 annawoodard cri-huo_lab 2O07362
+2025-12-12 10:35:36,144 [ERROR]     40755 annawoodard cri-huo_lab 2O07354
+2025-12-12 10:35:36,144 [ERROR]     40755 annawoodard cri-huo_lab 2O45585-2016-01-13
+2025-12-12 10:35:36,144 [ERROR]     40755 annawoodard cri-huo_lab 2O45594-2010-12-15
+2025-12-12 10:35:36,144 [ERROR]     40755 annawoodard annawoodard 2O45584-2016-01-13
+2025-12-12 10:35:36,144 [ERROR]     40755 annawoodard cri-huo_lab 2O45592-2013-03-13
+2025-12-12 10:35:36,144 [ERROR]     40755 annawoodard cri-huo_lab 2O07361
+2025-12-12 10:35:36,144 [ERROR]     40755 annawoodard cri-huo_lab 2O45591-2013-04-17
+2025-12-12 10:35:36,144 [ERROR]     40755 annawoodard cri-huo_lab 2O45589-2015-12-14
+2025-12-12 10:35:36,145 [ERROR]     40775 annawoodard annawoodard 2O45582-2018-03-13
+2025-12-12 10:35:36,145 [ERROR]     40755 annawoodard cri-huo_lab 2O45590-2015-10-14
+2025-12-12 10:35:36,145 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2008-08-25
+2025-12-12 10:35:36,145 [ERROR]     40755 annawoodard cri-huo_lab 2O45593-2011-12-12
+2025-12-12 10:35:36,145 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2009-12-15
+2025-12-12 10:35:36,145 [ERROR]     40755 annawoodard cri-huo_lab 2O45588-2015-12-16
+2025-12-12 10:35:36,350 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O07343, will transfer
+2025-12-12 10:35:36,350 [WARNING] Local source path: /mnt/uchad_samba/16352A/40686376/2O45593-2011-12-12 | patient=40686376 exam=2O45593-2011-12-12 uid=2.16.840.1.114151.4.231.40887.4241.6179814
+2025-12-12 10:35:36,357 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376 contents (first 20 of 22 entries):
+2025-12-12 10:35:36,358 [ERROR]     40755 annawoodard annawoodard 2O45583-2017-01-25
+2025-12-12 10:35:36,358 [ERROR]     40755 annawoodard cri-huo_lab 2O07356
+2025-12-12 10:35:36,358 [ERROR]     40755 annawoodard cri-huo_lab 2O07363
+2025-12-12 10:35:36,358 [ERROR]     40755 annawoodard cri-huo_lab 2O07351
+2025-12-12 10:35:36,358 [ERROR]     40755 annawoodard cri-huo_lab 2O07358
+2025-12-12 10:35:36,358 [ERROR]     40755 annawoodard cri-huo_lab 2O07362
+2025-12-12 10:35:36,358 [ERROR]     40755 annawoodard cri-huo_lab 2O07354
+2025-12-12 10:35:36,358 [ERROR]     40755 annawoodard cri-huo_lab 2O45585-2016-01-13
+2025-12-12 10:35:36,358 [ERROR]     40755 annawoodard cri-huo_lab 2O45594-2010-12-15
+2025-12-12 10:35:36,358 [ERROR]     40755 annawoodard annawoodard 2O45584-2016-01-13
+2025-12-12 10:35:36,358 [ERROR]     40755 annawoodard cri-huo_lab 2O45592-2013-03-13
+2025-12-12 10:35:36,358 [ERROR]     40755 annawoodard cri-huo_lab 2O07361
+2025-12-12 10:35:36,358 [ERROR]     40755 annawoodard cri-huo_lab 2O45591-2013-04-17
+2025-12-12 10:35:36,359 [ERROR]     40755 annawoodard cri-huo_lab 2O45589-2015-12-14
+2025-12-12 10:35:36,359 [ERROR]     40775 annawoodard annawoodard 2O45582-2018-03-13
+2025-12-12 10:35:36,359 [ERROR]     40755 annawoodard cri-huo_lab 2O45590-2015-10-14
+2025-12-12 10:35:36,359 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2008-08-25
+2025-12-12 10:35:36,359 [ERROR]     40755 annawoodard cri-huo_lab 2O45593-2011-12-12
+2025-12-12 10:35:36,359 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2009-12-15
+2025-12-12 10:35:36,359 [ERROR]     40755 annawoodard cri-huo_lab 2O45588-2015-12-16
+2025-12-12 10:35:36,563 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O07349, will transfer
+2025-12-12 10:35:36,564 [WARNING] Local source path: /mnt/uchad_samba/16352A/40686376/2O45588-2015-12-16 | patient=40686376 exam=2O45588-2015-12-16 uid=2.16.840.1.114151.4.231.42352.5339.9080476
+2025-12-12 10:35:36,567 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376 contents (first 20 of 22 entries):
+2025-12-12 10:35:36,568 [ERROR]     40755 annawoodard annawoodard 2O45583-2017-01-25
+2025-12-12 10:35:36,568 [ERROR]     40755 annawoodard cri-huo_lab 2O07356
+2025-12-12 10:35:36,568 [ERROR]     40755 annawoodard cri-huo_lab 2O07363
+2025-12-12 10:35:36,568 [ERROR]     40755 annawoodard cri-huo_lab 2O07351
+2025-12-12 10:35:36,568 [ERROR]     40755 annawoodard cri-huo_lab 2O07358
+2025-12-12 10:35:36,568 [ERROR]     40755 annawoodard cri-huo_lab 2O07362
+2025-12-12 10:35:36,569 [ERROR]     40755 annawoodard cri-huo_lab 2O07354
+2025-12-12 10:35:36,569 [ERROR]     40755 annawoodard cri-huo_lab 2O45585-2016-01-13
+2025-12-12 10:35:36,569 [ERROR]     40755 annawoodard cri-huo_lab 2O45594-2010-12-15
+2025-12-12 10:35:36,569 [ERROR]     40755 annawoodard annawoodard 2O45584-2016-01-13
+2025-12-12 10:35:36,569 [ERROR]     40755 annawoodard cri-huo_lab 2O45592-2013-03-13
+2025-12-12 10:35:36,569 [ERROR]     40755 annawoodard cri-huo_lab 2O07361
+2025-12-12 10:35:36,570 [ERROR]     40755 annawoodard cri-huo_lab 2O45591-2013-04-17
+2025-12-12 10:35:36,570 [ERROR]     40755 annawoodard cri-huo_lab 2O45589-2015-12-14
+2025-12-12 10:35:36,570 [ERROR]     40775 annawoodard annawoodard 2O45582-2018-03-13
+2025-12-12 10:35:36,570 [ERROR]     40755 annawoodard cri-huo_lab 2O45590-2015-10-14
+2025-12-12 10:35:36,570 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2008-08-25
+2025-12-12 10:35:36,570 [ERROR]     40755 annawoodard cri-huo_lab 2O45593-2011-12-12
+2025-12-12 10:35:36,571 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2009-12-15
+2025-12-12 10:35:36,571 [ERROR]     40755 annawoodard cri-huo_lab 2O45588-2015-12-16
+2025-12-12 10:35:37,041 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O07345, will transfer
+2025-12-12 10:35:37,041 [WARNING] Local source path: /mnt/uchad_samba/16352A/40686376/2O45586-2015-12-16 | patient=40686376 exam=2O45586-2015-12-16 uid=2.16.840.1.114151.4.231.42352.5337.9080474
+2025-12-12 10:35:37,045 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376 contents (first 20 of 22 entries):
+2025-12-12 10:35:37,045 [ERROR]     40755 annawoodard annawoodard 2O45583-2017-01-25
+2025-12-12 10:35:37,045 [ERROR]     40755 annawoodard cri-huo_lab 2O07356
+2025-12-12 10:35:37,045 [ERROR]     40755 annawoodard cri-huo_lab 2O07363
+2025-12-12 10:35:37,045 [ERROR]     40755 annawoodard cri-huo_lab 2O07351
+2025-12-12 10:35:37,045 [ERROR]     40755 annawoodard cri-huo_lab 2O07358
+2025-12-12 10:35:37,046 [ERROR]     40755 annawoodard cri-huo_lab 2O07362
+2025-12-12 10:35:37,046 [ERROR]     40755 annawoodard cri-huo_lab 2O07354
+2025-12-12 10:35:37,046 [ERROR]     40755 annawoodard cri-huo_lab 2O45585-2016-01-13
+2025-12-12 10:35:37,046 [ERROR]     40755 annawoodard cri-huo_lab 2O45594-2010-12-15
+2025-12-12 10:35:37,046 [ERROR]     40755 annawoodard annawoodard 2O45584-2016-01-13
+2025-12-12 10:35:37,046 [ERROR]     40755 annawoodard cri-huo_lab 2O45592-2013-03-13
+2025-12-12 10:35:37,046 [ERROR]     40755 annawoodard cri-huo_lab 2O07361
+2025-12-12 10:35:37,046 [ERROR]     40755 annawoodard cri-huo_lab 2O45591-2013-04-17
+2025-12-12 10:35:37,046 [ERROR]     40755 annawoodard cri-huo_lab 2O45589-2015-12-14
+2025-12-12 10:35:37,047 [ERROR]     40775 annawoodard annawoodard 2O45582-2018-03-13
+2025-12-12 10:35:37,047 [ERROR]     40755 annawoodard cri-huo_lab 2O45590-2015-10-14
+2025-12-12 10:35:37,047 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2008-08-25
+2025-12-12 10:35:37,047 [ERROR]     40755 annawoodard cri-huo_lab 2O45593-2011-12-12
+2025-12-12 10:35:37,047 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2009-12-15
+2025-12-12 10:35:37,047 [ERROR]     40755 annawoodard cri-huo_lab 2O45588-2015-12-16
+2025-12-12 10:35:37,201 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O07342, will transfer
+2025-12-12 10:35:37,201 [WARNING] Local source path: /mnt/uchad_samba/16352A/40686376/2O45594-2010-12-15 | patient=40686376 exam=2O45594-2010-12-15 uid=2.16.840.1.114151.4.231.40525.3672.5540180
+2025-12-12 10:35:37,203 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376 contents (first 20 of 22 entries):
+2025-12-12 10:35:37,204 [ERROR]     40755 annawoodard annawoodard 2O45583-2017-01-25
+2025-12-12 10:35:37,204 [ERROR]     40755 annawoodard cri-huo_lab 2O07356
+2025-12-12 10:35:37,204 [ERROR]     40755 annawoodard cri-huo_lab 2O07363
+2025-12-12 10:35:37,204 [ERROR]     40755 annawoodard cri-huo_lab 2O07351
+2025-12-12 10:35:37,204 [ERROR]     40755 annawoodard cri-huo_lab 2O07358
+2025-12-12 10:35:37,204 [ERROR]     40755 annawoodard cri-huo_lab 2O07362
+2025-12-12 10:35:37,204 [ERROR]     40755 annawoodard cri-huo_lab 2O07354
+2025-12-12 10:35:37,204 [ERROR]     40755 annawoodard cri-huo_lab 2O45585-2016-01-13
+2025-12-12 10:35:37,204 [ERROR]     40755 annawoodard cri-huo_lab 2O45594-2010-12-15
+2025-12-12 10:35:37,204 [ERROR]     40755 annawoodard annawoodard 2O45584-2016-01-13
+2025-12-12 10:35:37,204 [ERROR]     40755 annawoodard cri-huo_lab 2O45592-2013-03-13
+2025-12-12 10:35:37,204 [ERROR]     40755 annawoodard cri-huo_lab 2O07361
+2025-12-12 10:35:37,205 [ERROR]     40755 annawoodard cri-huo_lab 2O45591-2013-04-17
+2025-12-12 10:35:37,205 [ERROR]     40755 annawoodard cri-huo_lab 2O45589-2015-12-14
+2025-12-12 10:35:37,205 [ERROR]     40775 annawoodard annawoodard 2O45582-2018-03-13
+2025-12-12 10:35:37,205 [ERROR]     40755 annawoodard cri-huo_lab 2O45590-2015-10-14
+2025-12-12 10:35:37,205 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2008-08-25
+2025-12-12 10:35:37,205 [ERROR]     40755 annawoodard cri-huo_lab 2O45593-2011-12-12
+2025-12-12 10:35:37,205 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2009-12-15
+2025-12-12 10:35:37,205 [ERROR]     40755 annawoodard cri-huo_lab 2O45588-2015-12-16
+2025-12-12 10:35:37,459 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O07353, will transfer
+2025-12-12 10:35:37,459 [WARNING] Local source path: /mnt/uchad_samba/16352A/40686376/2O45585-2016-01-13 | patient=40686376 exam=2O45585-2016-01-13 uid=2.16.840.1.114151.4.231.42380.3145.9135318
+2025-12-12 10:35:37,463 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376 contents (first 20 of 22 entries):
+2025-12-12 10:35:37,463 [ERROR]     40755 annawoodard annawoodard 2O45583-2017-01-25
+2025-12-12 10:35:37,463 [ERROR]     40755 annawoodard cri-huo_lab 2O07356
+2025-12-12 10:35:37,464 [ERROR]     40755 annawoodard cri-huo_lab 2O07363
+2025-12-12 10:35:37,464 [ERROR]     40755 annawoodard cri-huo_lab 2O07351
+2025-12-12 10:35:37,464 [ERROR]     40755 annawoodard cri-huo_lab 2O07358
+2025-12-12 10:35:37,464 [ERROR]     40755 annawoodard cri-huo_lab 2O07362
+2025-12-12 10:35:37,464 [ERROR]     40755 annawoodard cri-huo_lab 2O07354
+2025-12-12 10:35:37,464 [ERROR]     40755 annawoodard cri-huo_lab 2O45585-2016-01-13
+2025-12-12 10:35:37,464 [ERROR]     40755 annawoodard cri-huo_lab 2O45594-2010-12-15
+2025-12-12 10:35:37,464 [ERROR]     40755 annawoodard annawoodard 2O45584-2016-01-13
+2025-12-12 10:35:37,464 [ERROR]     40755 annawoodard cri-huo_lab 2O45592-2013-03-13
+2025-12-12 10:35:37,464 [ERROR]     40755 annawoodard cri-huo_lab 2O07361
+2025-12-12 10:35:37,464 [ERROR]     40755 annawoodard cri-huo_lab 2O45591-2013-04-17
+2025-12-12 10:35:37,464 [ERROR]     40755 annawoodard cri-huo_lab 2O45589-2015-12-14
+2025-12-12 10:35:37,464 [ERROR]     40775 annawoodard annawoodard 2O45582-2018-03-13
+2025-12-12 10:35:37,465 [ERROR]     40755 annawoodard cri-huo_lab 2O45590-2015-10-14
+2025-12-12 10:35:37,465 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2008-08-25
+2025-12-12 10:35:37,465 [ERROR]     40755 annawoodard cri-huo_lab 2O45593-2011-12-12
+2025-12-12 10:35:37,465 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2009-12-15
+2025-12-12 10:35:37,465 [ERROR]     40755 annawoodard cri-huo_lab 2O45588-2015-12-16
+2025-12-12 10:35:37,622 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O07347, will transfer
+2025-12-12 10:35:37,622 [WARNING] Local source path: /mnt/uchad_samba/16352A/40686376/2O45591-2013-04-17 | patient=40686376 exam=2O45591-2013-04-17 uid=2.16.840.1.114151.4.231.41379.6265.7062293
+2025-12-12 10:35:37,625 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376 contents (first 20 of 22 entries):
+2025-12-12 10:35:37,625 [ERROR]     40755 annawoodard annawoodard 2O45583-2017-01-25
+2025-12-12 10:35:37,625 [ERROR]     40755 annawoodard cri-huo_lab 2O07356
+2025-12-12 10:35:37,625 [ERROR]     40755 annawoodard cri-huo_lab 2O07363
+2025-12-12 10:35:37,626 [ERROR]     40755 annawoodard cri-huo_lab 2O07351
+2025-12-12 10:35:37,626 [ERROR]     40755 annawoodard cri-huo_lab 2O07358
+2025-12-12 10:35:37,626 [ERROR]     40755 annawoodard cri-huo_lab 2O07362
+2025-12-12 10:35:37,626 [ERROR]     40755 annawoodard cri-huo_lab 2O07354
+2025-12-12 10:35:37,626 [ERROR]     40755 annawoodard cri-huo_lab 2O45585-2016-01-13
+2025-12-12 10:35:37,626 [ERROR]     40755 annawoodard cri-huo_lab 2O45594-2010-12-15
+2025-12-12 10:35:37,626 [ERROR]     40755 annawoodard annawoodard 2O45584-2016-01-13
+2025-12-12 10:35:37,626 [ERROR]     40755 annawoodard cri-huo_lab 2O45592-2013-03-13
+2025-12-12 10:35:37,626 [ERROR]     40755 annawoodard cri-huo_lab 2O07361
+2025-12-12 10:35:37,626 [ERROR]     40755 annawoodard cri-huo_lab 2O45591-2013-04-17
+2025-12-12 10:35:37,626 [ERROR]     40755 annawoodard cri-huo_lab 2O45589-2015-12-14
+2025-12-12 10:35:37,626 [ERROR]     40775 annawoodard annawoodard 2O45582-2018-03-13
+2025-12-12 10:35:37,627 [ERROR]     40755 annawoodard cri-huo_lab 2O45590-2015-10-14
+2025-12-12 10:35:37,627 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2008-08-25
+2025-12-12 10:35:37,627 [ERROR]     40755 annawoodard cri-huo_lab 2O45593-2011-12-12
+2025-12-12 10:35:37,627 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2009-12-15
+2025-12-12 10:35:37,627 [ERROR]     40755 annawoodard cri-huo_lab 2O45588-2015-12-16
+2025-12-12 10:35:37,842 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O07346, will transfer
+2025-12-12 10:35:37,843 [WARNING] Local source path: /mnt/uchad_samba/16352A/40686376/2O45590-2015-10-14 | patient=40686376 exam=2O45590-2015-10-14 uid=2.16.840.1.114151.4.231.42289.4307.8935608
+2025-12-12 10:35:37,845 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376 contents (first 20 of 22 entries):
+2025-12-12 10:35:37,846 [ERROR]     40755 annawoodard annawoodard 2O45583-2017-01-25
+2025-12-12 10:35:37,846 [ERROR]     40755 annawoodard cri-huo_lab 2O07356
+2025-12-12 10:35:37,846 [ERROR]     40755 annawoodard cri-huo_lab 2O07363
+2025-12-12 10:35:37,846 [ERROR]     40755 annawoodard cri-huo_lab 2O07351
+2025-12-12 10:35:37,846 [ERROR]     40755 annawoodard cri-huo_lab 2O07358
+2025-12-12 10:35:37,846 [ERROR]     40755 annawoodard cri-huo_lab 2O07362
+2025-12-12 10:35:37,846 [ERROR]     40755 annawoodard cri-huo_lab 2O07354
+2025-12-12 10:35:37,846 [ERROR]     40755 annawoodard cri-huo_lab 2O45585-2016-01-13
+2025-12-12 10:35:37,846 [ERROR]     40755 annawoodard cri-huo_lab 2O45594-2010-12-15
+2025-12-12 10:35:37,846 [ERROR]     40755 annawoodard annawoodard 2O45584-2016-01-13
+2025-12-12 10:35:37,846 [ERROR]     40755 annawoodard cri-huo_lab 2O45592-2013-03-13
+2025-12-12 10:35:37,846 [ERROR]     40755 annawoodard cri-huo_lab 2O07361
+2025-12-12 10:35:37,847 [ERROR]     40755 annawoodard cri-huo_lab 2O45591-2013-04-17
+2025-12-12 10:35:37,847 [ERROR]     40755 annawoodard cri-huo_lab 2O45589-2015-12-14
+2025-12-12 10:35:37,847 [ERROR]     40775 annawoodard annawoodard 2O45582-2018-03-13
+2025-12-12 10:35:37,847 [ERROR]     40755 annawoodard cri-huo_lab 2O45590-2015-10-14
+2025-12-12 10:35:37,847 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2008-08-25
+2025-12-12 10:35:37,847 [ERROR]     40755 annawoodard cri-huo_lab 2O45593-2011-12-12
+2025-12-12 10:35:37,847 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2009-12-15
+2025-12-12 10:35:37,847 [ERROR]     40755 annawoodard cri-huo_lab 2O45588-2015-12-16
+2025-12-12 10:35:38,020 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O07348, will transfer
+2025-12-12 10:35:38,020 [WARNING] Local source path: /mnt/uchad_samba/16352A/40686376/2O45589-2015-12-14 | patient=40686376 exam=2O45589-2015-12-14 uid=2.16.840.1.114151.4.231.42350.6081.9074569
+2025-12-12 10:35:38,023 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376 contents (first 20 of 22 entries):
+2025-12-12 10:35:38,023 [ERROR]     40755 annawoodard annawoodard 2O45583-2017-01-25
+2025-12-12 10:35:38,023 [ERROR]     40755 annawoodard cri-huo_lab 2O07356
+2025-12-12 10:35:38,024 [ERROR]     40755 annawoodard cri-huo_lab 2O07363
+2025-12-12 10:35:38,024 [ERROR]     40755 annawoodard cri-huo_lab 2O07351
+2025-12-12 10:35:38,024 [ERROR]     40755 annawoodard cri-huo_lab 2O07358
+2025-12-12 10:35:38,024 [ERROR]     40755 annawoodard cri-huo_lab 2O07362
+2025-12-12 10:35:38,024 [ERROR]     40755 annawoodard cri-huo_lab 2O07354
+2025-12-12 10:35:38,024 [ERROR]     40755 annawoodard cri-huo_lab 2O45585-2016-01-13
+2025-12-12 10:35:38,024 [ERROR]     40755 annawoodard cri-huo_lab 2O45594-2010-12-15
+2025-12-12 10:35:38,024 [ERROR]     40755 annawoodard annawoodard 2O45584-2016-01-13
+2025-12-12 10:35:38,024 [ERROR]     40755 annawoodard cri-huo_lab 2O45592-2013-03-13
+2025-12-12 10:35:38,024 [ERROR]     40755 annawoodard cri-huo_lab 2O07361
+2025-12-12 10:35:38,024 [ERROR]     40755 annawoodard cri-huo_lab 2O45591-2013-04-17
+2025-12-12 10:35:38,024 [ERROR]     40755 annawoodard cri-huo_lab 2O45589-2015-12-14
+2025-12-12 10:35:38,024 [ERROR]     40775 annawoodard annawoodard 2O45582-2018-03-13
+2025-12-12 10:35:38,024 [ERROR]     40755 annawoodard cri-huo_lab 2O45590-2015-10-14
+2025-12-12 10:35:38,024 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2008-08-25
+2025-12-12 10:35:38,024 [ERROR]     40755 annawoodard cri-huo_lab 2O45593-2011-12-12
+2025-12-12 10:35:38,025 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2009-12-15
+2025-12-12 10:35:38,025 [ERROR]     40755 annawoodard cri-huo_lab 2O45588-2015-12-16
+2025-12-12 10:35:38,244 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O07344, will transfer
+2025-12-12 10:35:38,244 [WARNING] Local source path: /mnt/uchad_samba/16352A/40686376/2O45592-2013-03-13 | patient=40686376 exam=2O45592-2013-03-13 uid=2.16.840.1.114151.4.231.41344.3808.6994527
+2025-12-12 10:35:38,247 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376 contents (first 20 of 22 entries):
+2025-12-12 10:35:38,247 [ERROR]     40755 annawoodard annawoodard 2O45583-2017-01-25
+2025-12-12 10:35:38,247 [ERROR]     40755 annawoodard cri-huo_lab 2O07356
+2025-12-12 10:35:38,248 [ERROR]     40755 annawoodard cri-huo_lab 2O07363
+2025-12-12 10:35:38,248 [ERROR]     40755 annawoodard cri-huo_lab 2O07351
+2025-12-12 10:35:38,248 [ERROR]     40755 annawoodard cri-huo_lab 2O07358
+2025-12-12 10:35:38,248 [ERROR]     40755 annawoodard cri-huo_lab 2O07362
+2025-12-12 10:35:38,248 [ERROR]     40755 annawoodard cri-huo_lab 2O07354
+2025-12-12 10:35:38,248 [ERROR]     40755 annawoodard cri-huo_lab 2O45585-2016-01-13
+2025-12-12 10:35:38,248 [ERROR]     40755 annawoodard cri-huo_lab 2O45594-2010-12-15
+2025-12-12 10:35:38,248 [ERROR]     40755 annawoodard annawoodard 2O45584-2016-01-13
+2025-12-12 10:35:38,248 [ERROR]     40755 annawoodard cri-huo_lab 2O45592-2013-03-13
+2025-12-12 10:35:38,248 [ERROR]     40755 annawoodard cri-huo_lab 2O07361
+2025-12-12 10:35:38,248 [ERROR]     40755 annawoodard cri-huo_lab 2O45591-2013-04-17
+2025-12-12 10:35:38,248 [ERROR]     40755 annawoodard cri-huo_lab 2O45589-2015-12-14
+2025-12-12 10:35:38,248 [ERROR]     40775 annawoodard annawoodard 2O45582-2018-03-13
+2025-12-12 10:35:38,248 [ERROR]     40755 annawoodard cri-huo_lab 2O45590-2015-10-14
+2025-12-12 10:35:38,249 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2008-08-25
+2025-12-12 10:35:38,249 [ERROR]     40755 annawoodard cri-huo_lab 2O45593-2011-12-12
+2025-12-12 10:35:38,249 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2009-12-15
+2025-12-12 10:35:38,249 [ERROR]     40755 annawoodard cri-huo_lab 2O45588-2015-12-16
+2025-12-12 10:35:38,574 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40896104/2O07413, will transfer
+2025-12-12 10:35:38,574 [WARNING] Local source path: /mnt/uchad_samba/16352A/40896104/2O45631-2016-09-07 | patient=40896104 exam=2O45631-2016-09-07 uid=2.16.840.1.114151.4.231.42618.4005.9671804
+2025-12-12 10:35:38,581 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40896104 contents:
+2025-12-12 10:35:38,582 [ERROR]     40755 annawoodard cri-huo_lab 2O45627-2018-06-19
+2025-12-12 10:35:38,582 [ERROR]     40755 annawoodard cri-huo_lab 2O45628-2017-06-13
+2025-12-12 10:35:38,582 [ERROR]     40755 annawoodard cri-huo_lab 2O45630-2016-11-08
+2025-12-12 10:35:38,582 [ERROR]     40755 annawoodard annawoodard 2O45629-2016-11-09
+2025-12-12 10:35:38,582 [ERROR]     40755 annawoodard cri-huo_lab 2O45631-2016-09-07
+2025-12-12 10:35:38,777 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40896104/2O07412, will transfer
+2025-12-12 10:35:38,778 [WARNING] Local source path: /mnt/uchad_samba/16352A/40896104/2O45630-2016-11-08 | patient=40896104 exam=2O45630-2016-11-08 uid=2.16.840.1.114151.4.231.42680.3279.9814875
+2025-12-12 10:35:38,780 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40896104 contents:
+2025-12-12 10:35:38,780 [ERROR]     40755 annawoodard cri-huo_lab 2O45627-2018-06-19
+2025-12-12 10:35:38,780 [ERROR]     40755 annawoodard cri-huo_lab 2O45628-2017-06-13
+2025-12-12 10:35:38,780 [ERROR]     40755 annawoodard cri-huo_lab 2O45630-2016-11-08
+2025-12-12 10:35:38,780 [ERROR]     40755 annawoodard annawoodard 2O45629-2016-11-09
+2025-12-12 10:35:38,781 [ERROR]     40755 annawoodard cri-huo_lab 2O45631-2016-09-07
+2025-12-12 10:35:39,096 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40700609/2O18030, will transfer
+2025-12-12 10:35:39,096 [WARNING] Local source path: /mnt/uchad_samba/16352A/40700609/2O45601-2010-05-24 | patient=40700609 exam=2O45601-2010-05-24 uid=2.16.840.1.114151.4.231.40320.5549.5207640
+2025-12-12 10:35:39,105 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40700609 contents:
+2025-12-12 10:35:39,105 [ERROR]     40755 annawoodard cri-huo_lab 2O45597-2016-06-29
+2025-12-12 10:35:39,105 [ERROR]     40755 annawoodard cri-huo_lab 2O18041
+2025-12-12 10:35:39,105 [ERROR]     40755 annawoodard cri-huo_lab 2O18036
+2025-12-12 10:35:39,105 [ERROR]     40755 annawoodard cri-huo_lab 2O45602-2009-04-14
+2025-12-12 10:35:39,105 [ERROR]     40755 annawoodard cri-huo_lab 2O45596-2016-07-07
+2025-12-12 10:35:39,105 [ERROR]     40755 annawoodard cri-huo_lab 2O18039
+2025-12-12 10:35:39,105 [ERROR]     40755 annawoodard cri-huo_lab 2O45600-2011-09-08
+2025-12-12 10:35:39,105 [ERROR]     40755 annawoodard cri-huo_lab 2O18040
+2025-12-12 10:35:39,105 [ERROR]     40755 annawoodard cri-huo_lab 2O18028
+2025-12-12 10:35:39,106 [ERROR]     40755 annawoodard cri-huo_lab 2O45599-2012-12-14
+2025-12-12 10:35:39,106 [ERROR]     40755 annawoodard cri-huo_lab 2O18027
+2025-12-12 10:35:39,106 [ERROR]     40755 annawoodard cri-huo_lab 2O45598-2014-12-09
+2025-12-12 10:35:39,106 [ERROR]     40755 annawoodard cri-huo_lab 2O18038
+2025-12-12 10:35:39,106 [ERROR]     40755 annawoodard cri-huo_lab 2O45601-2010-05-24
+2025-12-12 10:35:39,106 [ERROR]     40755 annawoodard cri-huo_lab 2O18037
+2025-12-12 10:35:41,128 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40700609/2O18034, will transfer
+2025-12-12 10:35:41,129 [WARNING] Local source path: /mnt/uchad_samba/16352A/40700609/2O45597-2016-06-29 | patient=40700609 exam=2O45597-2016-06-29 uid=2.16.840.1.114151.4.231.42548.4429.9518712
+2025-12-12 10:35:41,133 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40700609 contents:
+2025-12-12 10:35:41,133 [ERROR]     40755 annawoodard cri-huo_lab 2O45597-2016-06-29
+2025-12-12 10:35:41,133 [ERROR]     40755 annawoodard cri-huo_lab 2O18041
+2025-12-12 10:35:41,133 [ERROR]     40755 annawoodard cri-huo_lab 2O18036
+2025-12-12 10:35:41,133 [ERROR]     40755 annawoodard cri-huo_lab 2O45602-2009-04-14
+2025-12-12 10:35:41,133 [ERROR]     40755 annawoodard cri-huo_lab 2O45596-2016-07-07
+2025-12-12 10:35:41,133 [ERROR]     40755 annawoodard cri-huo_lab 2O18039
+2025-12-12 10:35:41,133 [ERROR]     40755 annawoodard cri-huo_lab 2O45600-2011-09-08
+2025-12-12 10:35:41,133 [ERROR]     40755 annawoodard cri-huo_lab 2O18040
+2025-12-12 10:35:41,133 [ERROR]     40755 annawoodard cri-huo_lab 2O18028
+2025-12-12 10:35:41,134 [ERROR]     40755 annawoodard cri-huo_lab 2O45599-2012-12-14
+2025-12-12 10:35:41,134 [ERROR]     40755 annawoodard cri-huo_lab 2O18027
+2025-12-12 10:35:41,134 [ERROR]     40755 annawoodard cri-huo_lab 2O45598-2014-12-09
+2025-12-12 10:35:41,134 [ERROR]     40755 annawoodard cri-huo_lab 2O18038
+2025-12-12 10:35:41,134 [ERROR]     40755 annawoodard cri-huo_lab 2O45601-2010-05-24
+2025-12-12 10:35:41,134 [ERROR]     40755 annawoodard cri-huo_lab 2O18037
+2025-12-12 10:35:41,285 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40700609/2O18033, will transfer
+2025-12-12 10:35:41,286 [WARNING] Local source path: /mnt/uchad_samba/16352A/40700609/2O45598-2014-12-09 | patient=40700609 exam=2O45598-2014-12-09 uid=2.16.840.1.114151.4.231.41980.5262.8252854
+2025-12-12 10:35:41,288 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40700609 contents:
+2025-12-12 10:35:41,288 [ERROR]     40755 annawoodard cri-huo_lab 2O45597-2016-06-29
+2025-12-12 10:35:41,288 [ERROR]     40755 annawoodard cri-huo_lab 2O18041
+2025-12-12 10:35:41,288 [ERROR]     40755 annawoodard cri-huo_lab 2O18036
+2025-12-12 10:35:41,288 [ERROR]     40755 annawoodard cri-huo_lab 2O45602-2009-04-14
+2025-12-12 10:35:41,288 [ERROR]     40755 annawoodard cri-huo_lab 2O45596-2016-07-07
+2025-12-12 10:35:41,288 [ERROR]     40755 annawoodard cri-huo_lab 2O18039
+2025-12-12 10:35:41,288 [ERROR]     40755 annawoodard cri-huo_lab 2O45600-2011-09-08
+2025-12-12 10:35:41,289 [ERROR]     40755 annawoodard cri-huo_lab 2O18040
+2025-12-12 10:35:41,289 [ERROR]     40755 annawoodard cri-huo_lab 2O18028
+2025-12-12 10:35:41,289 [ERROR]     40755 annawoodard cri-huo_lab 2O45599-2012-12-14
+2025-12-12 10:35:41,289 [ERROR]     40755 annawoodard cri-huo_lab 2O18027
+2025-12-12 10:35:41,289 [ERROR]     40755 annawoodard cri-huo_lab 2O45598-2014-12-09
+2025-12-12 10:35:41,289 [ERROR]     40755 annawoodard cri-huo_lab 2O18038
+2025-12-12 10:35:41,289 [ERROR]     40755 annawoodard cri-huo_lab 2O45601-2010-05-24
+2025-12-12 10:35:41,289 [ERROR]     40755 annawoodard cri-huo_lab 2O18037
+2025-12-12 10:35:41,516 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40700609/2O18031, will transfer
+2025-12-12 10:35:41,516 [WARNING] Local source path: /mnt/uchad_samba/16352A/40700609/2O45599-2012-12-14 | patient=40700609 exam=2O45599-2012-12-14 uid=2.16.840.1.114151.4.231.41255.4807.6829830
+2025-12-12 10:35:41,521 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40700609 contents:
+2025-12-12 10:35:41,521 [ERROR]     40755 annawoodard cri-huo_lab 2O45597-2016-06-29
+2025-12-12 10:35:41,521 [ERROR]     40755 annawoodard cri-huo_lab 2O18041
+2025-12-12 10:35:41,521 [ERROR]     40755 annawoodard cri-huo_lab 2O18036
+2025-12-12 10:35:41,521 [ERROR]     40755 annawoodard cri-huo_lab 2O45602-2009-04-14
+2025-12-12 10:35:41,521 [ERROR]     40755 annawoodard cri-huo_lab 2O45596-2016-07-07
+2025-12-12 10:35:41,521 [ERROR]     40755 annawoodard cri-huo_lab 2O18039
+2025-12-12 10:35:41,521 [ERROR]     40755 annawoodard cri-huo_lab 2O45600-2011-09-08
+2025-12-12 10:35:41,521 [ERROR]     40755 annawoodard cri-huo_lab 2O18040
+2025-12-12 10:35:41,521 [ERROR]     40755 annawoodard cri-huo_lab 2O18028
+2025-12-12 10:35:41,521 [ERROR]     40755 annawoodard cri-huo_lab 2O45599-2012-12-14
+2025-12-12 10:35:41,521 [ERROR]     40755 annawoodard cri-huo_lab 2O18027
+2025-12-12 10:35:41,521 [ERROR]     40755 annawoodard cri-huo_lab 2O45598-2014-12-09
+2025-12-12 10:35:41,521 [ERROR]     40755 annawoodard cri-huo_lab 2O18038
+2025-12-12 10:35:41,521 [ERROR]     40755 annawoodard cri-huo_lab 2O45601-2010-05-24
+2025-12-12 10:35:41,522 [ERROR]     40755 annawoodard cri-huo_lab 2O18037
+2025-12-12 10:35:41,703 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40700609/2O18032, will transfer
+2025-12-12 10:35:41,703 [WARNING] Local source path: /mnt/uchad_samba/16352A/40700609/2O45600-2011-09-08 | patient=40700609 exam=2O45600-2011-09-08 uid=2.16.840.1.114151.4.231.40792.4814.6007105
+2025-12-12 10:35:41,707 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40700609 contents:
+2025-12-12 10:35:41,707 [ERROR]     40755 annawoodard cri-huo_lab 2O45597-2016-06-29
+2025-12-12 10:35:41,707 [ERROR]     40755 annawoodard cri-huo_lab 2O18041
+2025-12-12 10:35:41,707 [ERROR]     40755 annawoodard cri-huo_lab 2O18036
+2025-12-12 10:35:41,707 [ERROR]     40755 annawoodard cri-huo_lab 2O45602-2009-04-14
+2025-12-12 10:35:41,708 [ERROR]     40755 annawoodard cri-huo_lab 2O45596-2016-07-07
+2025-12-12 10:35:41,708 [ERROR]     40755 annawoodard cri-huo_lab 2O18039
+2025-12-12 10:35:41,708 [ERROR]     40755 annawoodard cri-huo_lab 2O45600-2011-09-08
+2025-12-12 10:35:41,708 [ERROR]     40755 annawoodard cri-huo_lab 2O18040
+2025-12-12 10:35:41,708 [ERROR]     40755 annawoodard cri-huo_lab 2O18028
+2025-12-12 10:35:41,708 [ERROR]     40755 annawoodard cri-huo_lab 2O45599-2012-12-14
+2025-12-12 10:35:41,708 [ERROR]     40755 annawoodard cri-huo_lab 2O18027
+2025-12-12 10:35:41,708 [ERROR]     40755 annawoodard cri-huo_lab 2O45598-2014-12-09
+2025-12-12 10:35:41,708 [ERROR]     40755 annawoodard cri-huo_lab 2O18038
+2025-12-12 10:35:41,708 [ERROR]     40755 annawoodard cri-huo_lab 2O45601-2010-05-24
+2025-12-12 10:35:41,708 [ERROR]     40755 annawoodard cri-huo_lab 2O18037
+2025-12-12 10:35:41,877 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40700609/2O18035, will transfer
+2025-12-12 10:35:41,877 [WARNING] Local source path: /mnt/uchad_samba/16352A/40700609/2O45596-2016-07-07 | patient=40700609 exam=2O45596-2016-07-07 uid=2.16.840.1.114151.4.231.42556.5904.9535796
+2025-12-12 10:35:41,880 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40700609 contents:
+2025-12-12 10:35:41,880 [ERROR]     40755 annawoodard cri-huo_lab 2O45597-2016-06-29
+2025-12-12 10:35:41,880 [ERROR]     40755 annawoodard cri-huo_lab 2O18041
+2025-12-12 10:35:41,880 [ERROR]     40755 annawoodard cri-huo_lab 2O18036
+2025-12-12 10:35:41,880 [ERROR]     40755 annawoodard cri-huo_lab 2O45602-2009-04-14
+2025-12-12 10:35:41,880 [ERROR]     40755 annawoodard cri-huo_lab 2O45596-2016-07-07
+2025-12-12 10:35:41,880 [ERROR]     40755 annawoodard cri-huo_lab 2O18039
+2025-12-12 10:35:41,881 [ERROR]     40755 annawoodard cri-huo_lab 2O45600-2011-09-08
+2025-12-12 10:35:41,881 [ERROR]     40755 annawoodard cri-huo_lab 2O18040
+2025-12-12 10:35:41,881 [ERROR]     40755 annawoodard cri-huo_lab 2O18028
+2025-12-12 10:35:41,881 [ERROR]     40755 annawoodard cri-huo_lab 2O45599-2012-12-14
+2025-12-12 10:35:41,881 [ERROR]     40755 annawoodard cri-huo_lab 2O18027
+2025-12-12 10:35:41,881 [ERROR]     40755 annawoodard cri-huo_lab 2O45598-2014-12-09
+2025-12-12 10:35:41,881 [ERROR]     40755 annawoodard cri-huo_lab 2O18038
+2025-12-12 10:35:41,881 [ERROR]     40755 annawoodard cri-huo_lab 2O45601-2010-05-24
+2025-12-12 10:35:41,881 [ERROR]     40755 annawoodard cri-huo_lab 2O18037
+2025-12-12 10:35:42,122 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:35:42,159 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40997454/2O07420, will transfer
+2025-12-12 10:35:42,159 [WARNING] Local source path: /mnt/uchad_samba/16352A/40997454/2O45654-2011-08-18 | patient=40997454 exam=2O45654-2011-08-18 uid=2.16.840.1.114151.4.231.40771.3587.5965939
+2025-12-12 10:35:42,171 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40997454 contents (first 20 of 21 entries):
+2025-12-12 10:35:42,171 [ERROR]     40755 annawoodard cri-huo_lab 2O45648-2017-10-13
+2025-12-12 10:35:42,172 [ERROR]     40755 annawoodard cri-huo_lab 2O45647-2018-10-19
+2025-12-12 10:35:42,172 [ERROR]     40755 annawoodard cri-huo_lab 2O45651-2014-09-15
+2025-12-12 10:35:42,172 [ERROR]     40755 annawoodard cri-huo_lab 2O45655-2009-07-30
+2025-12-12 10:35:42,172 [ERROR]     40755 annawoodard cri-huo_lab 2O07418
+2025-12-12 10:35:42,172 [ERROR]     40775 annawoodard annawoodard 2O45646-2019-11-01
+2025-12-12 10:35:42,172 [ERROR]     40755 annawoodard annawoodard 2O45644-2021-11-12
+2025-12-12 10:35:42,172 [ERROR]     40775 annawoodard annawoodard 2O45643-2022-12-07
+2025-12-12 10:35:42,172 [ERROR]     40755 annawoodard cri-huo_lab 2O07425
+2025-12-12 10:35:42,172 [ERROR]     40755 annawoodard cri-huo_lab 2O45654-2011-08-18
+2025-12-12 10:35:42,172 [ERROR]     40755 annawoodard cri-huo_lab 2O45652-2013-09-13
+2025-12-12 10:35:42,172 [ERROR]     40755 annawoodard cri-huo_lab 2O45653-2012-08-28
+2025-12-12 10:35:42,172 [ERROR]     40755 annawoodard cri-huo_lab 2O07424
+2025-12-12 10:35:42,172 [ERROR]     40755 annawoodard cri-huo_lab 2O45650-2015-09-17
+2025-12-12 10:35:42,172 [ERROR]     40775 annawoodard annawoodard 2O45641-2024-12-13
+2025-12-12 10:35:42,172 [ERROR]     40755 annawoodard cri-huo_lab 2O45656-2008-07-24
+2025-12-12 10:35:42,172 [ERROR]     40775 annawoodard annawoodard 2O45645-2020-11-06
+2025-12-12 10:35:42,172 [ERROR]     40755 annawoodard cri-huo_lab 2O45649-2016-10-07
+2025-12-12 10:35:42,173 [ERROR]     40755 annawoodard annawoodard 2O45642-2023-12-08
+2025-12-12 10:35:42,173 [ERROR]     40755 annawoodard cri-huo_lab 2O07416
+2025-12-12 10:35:42,362 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40997454/2O07428, will transfer
+2025-12-12 10:35:42,362 [WARNING] Local source path: /mnt/uchad_samba/16352A/40997454/2O45651-2014-09-15 | patient=40997454 exam=2O45651-2014-09-15 uid=2.16.840.1.114151.4.231.41895.3784.8070798
+2025-12-12 10:35:42,365 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40997454 contents (first 20 of 21 entries):
+2025-12-12 10:35:42,366 [ERROR]     40755 annawoodard cri-huo_lab 2O45648-2017-10-13
+2025-12-12 10:35:42,366 [ERROR]     40755 annawoodard cri-huo_lab 2O45647-2018-10-19
+2025-12-12 10:35:42,366 [ERROR]     40755 annawoodard cri-huo_lab 2O45651-2014-09-15
+2025-12-12 10:35:42,366 [ERROR]     40755 annawoodard cri-huo_lab 2O45655-2009-07-30
+2025-12-12 10:35:42,366 [ERROR]     40755 annawoodard cri-huo_lab 2O07418
+2025-12-12 10:35:42,366 [ERROR]     40775 annawoodard annawoodard 2O45646-2019-11-01
+2025-12-12 10:35:42,366 [ERROR]     40755 annawoodard annawoodard 2O45644-2021-11-12
+2025-12-12 10:35:42,366 [ERROR]     40775 annawoodard annawoodard 2O45643-2022-12-07
+2025-12-12 10:35:42,366 [ERROR]     40755 annawoodard cri-huo_lab 2O07425
+2025-12-12 10:35:42,366 [ERROR]     40755 annawoodard cri-huo_lab 2O45654-2011-08-18
+2025-12-12 10:35:42,366 [ERROR]     40755 annawoodard cri-huo_lab 2O45652-2013-09-13
+2025-12-12 10:35:42,367 [ERROR]     40755 annawoodard cri-huo_lab 2O45653-2012-08-28
+2025-12-12 10:35:42,367 [ERROR]     40755 annawoodard cri-huo_lab 2O07424
+2025-12-12 10:35:42,367 [ERROR]     40755 annawoodard cri-huo_lab 2O45650-2015-09-17
+2025-12-12 10:35:42,367 [ERROR]     40775 annawoodard annawoodard 2O45641-2024-12-13
+2025-12-12 10:35:42,367 [ERROR]     40755 annawoodard cri-huo_lab 2O45656-2008-07-24
+2025-12-12 10:35:42,367 [ERROR]     40775 annawoodard annawoodard 2O45645-2020-11-06
+2025-12-12 10:35:42,367 [ERROR]     40755 annawoodard cri-huo_lab 2O45649-2016-10-07
+2025-12-12 10:35:42,367 [ERROR]     40755 annawoodard annawoodard 2O45642-2023-12-08
+2025-12-12 10:35:42,367 [ERROR]     40755 annawoodard cri-huo_lab 2O07416
+2025-12-12 10:35:43,085 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40997454/2O07417, will transfer
+2025-12-12 10:35:43,085 [WARNING] Local source path: /mnt/uchad_samba/16352A/40997454/2O45655-2009-07-30 | patient=40997454 exam=2O45655-2009-07-30 uid=2.16.840.1.114151.4.231.40022.3686.4743943
+2025-12-12 10:35:43,088 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40997454 contents (first 20 of 21 entries):
+2025-12-12 10:35:43,088 [ERROR]     40755 annawoodard cri-huo_lab 2O45648-2017-10-13
+2025-12-12 10:35:43,088 [ERROR]     40755 annawoodard cri-huo_lab 2O45647-2018-10-19
+2025-12-12 10:35:43,088 [ERROR]     40755 annawoodard cri-huo_lab 2O45651-2014-09-15
+2025-12-12 10:35:43,088 [ERROR]     40755 annawoodard cri-huo_lab 2O45655-2009-07-30
+2025-12-12 10:35:43,088 [ERROR]     40755 annawoodard cri-huo_lab 2O07418
+2025-12-12 10:35:43,088 [ERROR]     40775 annawoodard annawoodard 2O45646-2019-11-01
+2025-12-12 10:35:43,089 [ERROR]     40755 annawoodard annawoodard 2O45644-2021-11-12
+2025-12-12 10:35:43,089 [ERROR]     40775 annawoodard annawoodard 2O45643-2022-12-07
+2025-12-12 10:35:43,089 [ERROR]     40755 annawoodard cri-huo_lab 2O07425
+2025-12-12 10:35:43,089 [ERROR]     40755 annawoodard cri-huo_lab 2O45654-2011-08-18
+2025-12-12 10:35:43,089 [ERROR]     40755 annawoodard cri-huo_lab 2O45652-2013-09-13
+2025-12-12 10:35:43,089 [ERROR]     40755 annawoodard cri-huo_lab 2O45653-2012-08-28
+2025-12-12 10:35:43,089 [ERROR]     40755 annawoodard cri-huo_lab 2O07424
+2025-12-12 10:35:43,089 [ERROR]     40755 annawoodard cri-huo_lab 2O45650-2015-09-17
+2025-12-12 10:35:43,089 [ERROR]     40775 annawoodard annawoodard 2O45641-2024-12-13
+2025-12-12 10:35:43,089 [ERROR]     40755 annawoodard cri-huo_lab 2O45656-2008-07-24
+2025-12-12 10:35:43,089 [ERROR]     40775 annawoodard annawoodard 2O45645-2020-11-06
+2025-12-12 10:35:43,089 [ERROR]     40755 annawoodard cri-huo_lab 2O45649-2016-10-07
+2025-12-12 10:35:43,089 [ERROR]     40755 annawoodard annawoodard 2O45642-2023-12-08
+2025-12-12 10:35:43,090 [ERROR]     40755 annawoodard cri-huo_lab 2O07416
+2025-12-12 10:35:43,392 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40997454/2O07429, will transfer
+2025-12-12 10:35:43,392 [WARNING] Local source path: /mnt/uchad_samba/16352A/40997454/2O45649-2016-10-07 | patient=40997454 exam=2O45649-2016-10-07 uid=2.16.840.1.114151.4.231.42648.3526.9742218
+2025-12-12 10:35:43,396 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40997454 contents (first 20 of 21 entries):
+2025-12-12 10:35:43,397 [ERROR]     40755 annawoodard cri-huo_lab 2O45648-2017-10-13
+2025-12-12 10:35:43,397 [ERROR]     40755 annawoodard cri-huo_lab 2O45647-2018-10-19
+2025-12-12 10:35:43,397 [ERROR]     40755 annawoodard cri-huo_lab 2O45651-2014-09-15
+2025-12-12 10:35:43,397 [ERROR]     40755 annawoodard cri-huo_lab 2O45655-2009-07-30
+2025-12-12 10:35:43,397 [ERROR]     40755 annawoodard cri-huo_lab 2O07418
+2025-12-12 10:35:43,397 [ERROR]     40775 annawoodard annawoodard 2O45646-2019-11-01
+2025-12-12 10:35:43,397 [ERROR]     40755 annawoodard annawoodard 2O45644-2021-11-12
+2025-12-12 10:35:43,397 [ERROR]     40775 annawoodard annawoodard 2O45643-2022-12-07
+2025-12-12 10:35:43,397 [ERROR]     40755 annawoodard cri-huo_lab 2O07425
+2025-12-12 10:35:43,397 [ERROR]     40755 annawoodard cri-huo_lab 2O45654-2011-08-18
+2025-12-12 10:35:43,397 [ERROR]     40755 annawoodard cri-huo_lab 2O45652-2013-09-13
+2025-12-12 10:35:43,398 [ERROR]     40755 annawoodard cri-huo_lab 2O45653-2012-08-28
+2025-12-12 10:35:43,398 [ERROR]     40755 annawoodard cri-huo_lab 2O07424
+2025-12-12 10:35:43,398 [ERROR]     40755 annawoodard cri-huo_lab 2O45650-2015-09-17
+2025-12-12 10:35:43,398 [ERROR]     40775 annawoodard annawoodard 2O45641-2024-12-13
+2025-12-12 10:35:43,398 [ERROR]     40755 annawoodard cri-huo_lab 2O45656-2008-07-24
+2025-12-12 10:35:43,398 [ERROR]     40775 annawoodard annawoodard 2O45645-2020-11-06
+2025-12-12 10:35:43,398 [ERROR]     40755 annawoodard cri-huo_lab 2O45649-2016-10-07
+2025-12-12 10:35:43,398 [ERROR]     40755 annawoodard annawoodard 2O45642-2023-12-08
+2025-12-12 10:35:43,398 [ERROR]     40755 annawoodard cri-huo_lab 2O07416
+2025-12-12 10:35:43,594 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40997454/2O07427, will transfer
+2025-12-12 10:35:43,595 [WARNING] Local source path: /mnt/uchad_samba/16352A/40997454/2O45650-2015-09-17 | patient=40997454 exam=2O45650-2015-09-17 uid=2.16.840.1.114151.4.231.42262.3824.8873786
+2025-12-12 10:35:43,597 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40997454 contents (first 20 of 21 entries):
+2025-12-12 10:35:43,598 [ERROR]     40755 annawoodard cri-huo_lab 2O45648-2017-10-13
+2025-12-12 10:35:43,598 [ERROR]     40755 annawoodard cri-huo_lab 2O45647-2018-10-19
+2025-12-12 10:35:43,598 [ERROR]     40755 annawoodard cri-huo_lab 2O45651-2014-09-15
+2025-12-12 10:35:43,598 [ERROR]     40755 annawoodard cri-huo_lab 2O45655-2009-07-30
+2025-12-12 10:35:43,598 [ERROR]     40755 annawoodard cri-huo_lab 2O07418
+2025-12-12 10:35:43,598 [ERROR]     40775 annawoodard annawoodard 2O45646-2019-11-01
+2025-12-12 10:35:43,598 [ERROR]     40755 annawoodard annawoodard 2O45644-2021-11-12
+2025-12-12 10:35:43,598 [ERROR]     40775 annawoodard annawoodard 2O45643-2022-12-07
+2025-12-12 10:35:43,598 [ERROR]     40755 annawoodard cri-huo_lab 2O07425
+2025-12-12 10:35:43,598 [ERROR]     40755 annawoodard cri-huo_lab 2O45654-2011-08-18
+2025-12-12 10:35:43,598 [ERROR]     40755 annawoodard cri-huo_lab 2O45652-2013-09-13
+2025-12-12 10:35:43,599 [ERROR]     40755 annawoodard cri-huo_lab 2O45653-2012-08-28
+2025-12-12 10:35:43,599 [ERROR]     40755 annawoodard cri-huo_lab 2O07424
+2025-12-12 10:35:43,599 [ERROR]     40755 annawoodard cri-huo_lab 2O45650-2015-09-17
+2025-12-12 10:35:43,599 [ERROR]     40775 annawoodard annawoodard 2O45641-2024-12-13
+2025-12-12 10:35:43,599 [ERROR]     40755 annawoodard cri-huo_lab 2O45656-2008-07-24
+2025-12-12 10:35:43,599 [ERROR]     40775 annawoodard annawoodard 2O45645-2020-11-06
+2025-12-12 10:35:43,599 [ERROR]     40755 annawoodard cri-huo_lab 2O45649-2016-10-07
+2025-12-12 10:35:43,599 [ERROR]     40755 annawoodard annawoodard 2O45642-2023-12-08
+2025-12-12 10:35:43,599 [ERROR]     40755 annawoodard cri-huo_lab 2O07416
+2025-12-12 10:35:43,730 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40997454/2O07421, will transfer
+2025-12-12 10:35:43,730 [WARNING] Local source path: /mnt/uchad_samba/16352A/40997454/2O45653-2012-08-28 | patient=40997454 exam=2O45653-2012-08-28 uid=2.16.840.1.114151.4.231.41147.3566.6639641
+2025-12-12 10:35:43,735 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40997454 contents (first 20 of 21 entries):
+2025-12-12 10:35:43,735 [ERROR]     40755 annawoodard cri-huo_lab 2O45648-2017-10-13
+2025-12-12 10:35:43,735 [ERROR]     40755 annawoodard cri-huo_lab 2O45647-2018-10-19
+2025-12-12 10:35:43,735 [ERROR]     40755 annawoodard cri-huo_lab 2O45651-2014-09-15
+2025-12-12 10:35:43,735 [ERROR]     40755 annawoodard cri-huo_lab 2O45655-2009-07-30
+2025-12-12 10:35:43,735 [ERROR]     40755 annawoodard cri-huo_lab 2O07418
+2025-12-12 10:35:43,735 [ERROR]     40775 annawoodard annawoodard 2O45646-2019-11-01
+2025-12-12 10:35:43,735 [ERROR]     40755 annawoodard annawoodard 2O45644-2021-11-12
+2025-12-12 10:35:43,736 [ERROR]     40775 annawoodard annawoodard 2O45643-2022-12-07
+2025-12-12 10:35:43,736 [ERROR]     40755 annawoodard cri-huo_lab 2O07425
+2025-12-12 10:35:43,736 [ERROR]     40755 annawoodard cri-huo_lab 2O45654-2011-08-18
+2025-12-12 10:35:43,736 [ERROR]     40755 annawoodard cri-huo_lab 2O45652-2013-09-13
+2025-12-12 10:35:43,736 [ERROR]     40755 annawoodard cri-huo_lab 2O45653-2012-08-28
+2025-12-12 10:35:43,736 [ERROR]     40755 annawoodard cri-huo_lab 2O07424
+2025-12-12 10:35:43,736 [ERROR]     40755 annawoodard cri-huo_lab 2O45650-2015-09-17
+2025-12-12 10:35:43,736 [ERROR]     40775 annawoodard annawoodard 2O45641-2024-12-13
+2025-12-12 10:35:43,736 [ERROR]     40755 annawoodard cri-huo_lab 2O45656-2008-07-24
+2025-12-12 10:35:43,736 [ERROR]     40775 annawoodard annawoodard 2O45645-2020-11-06
+2025-12-12 10:35:43,736 [ERROR]     40755 annawoodard cri-huo_lab 2O45649-2016-10-07
+2025-12-12 10:35:43,736 [ERROR]     40755 annawoodard annawoodard 2O45642-2023-12-08
+2025-12-12 10:35:43,737 [ERROR]     40755 annawoodard cri-huo_lab 2O07416
+2025-12-12 10:35:44,148 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40997454/2O07426, will transfer
+2025-12-12 10:35:44,148 [WARNING] Local source path: /mnt/uchad_samba/16352A/40997454/2O45647-2018-10-19 | patient=40997454 exam=2O45647-2018-10-19 uid=2.16.840.1.114151.604755036482654440953114275909180063250181019
+2025-12-12 10:35:44,151 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40997454 contents (first 20 of 21 entries):
+2025-12-12 10:35:44,151 [ERROR]     40755 annawoodard cri-huo_lab 2O45648-2017-10-13
+2025-12-12 10:35:44,151 [ERROR]     40755 annawoodard cri-huo_lab 2O45647-2018-10-19
+2025-12-12 10:35:44,151 [ERROR]     40755 annawoodard cri-huo_lab 2O45651-2014-09-15
+2025-12-12 10:35:44,152 [ERROR]     40755 annawoodard cri-huo_lab 2O45655-2009-07-30
+2025-12-12 10:35:44,152 [ERROR]     40755 annawoodard cri-huo_lab 2O07418
+2025-12-12 10:35:44,152 [ERROR]     40775 annawoodard annawoodard 2O45646-2019-11-01
+2025-12-12 10:35:44,152 [ERROR]     40755 annawoodard annawoodard 2O45644-2021-11-12
+2025-12-12 10:35:44,152 [ERROR]     40775 annawoodard annawoodard 2O45643-2022-12-07
+2025-12-12 10:35:44,152 [ERROR]     40755 annawoodard cri-huo_lab 2O07425
+2025-12-12 10:35:44,152 [ERROR]     40755 annawoodard cri-huo_lab 2O45654-2011-08-18
+2025-12-12 10:35:44,152 [ERROR]     40755 annawoodard cri-huo_lab 2O45652-2013-09-13
+2025-12-12 10:35:44,152 [ERROR]     40755 annawoodard cri-huo_lab 2O45653-2012-08-28
+2025-12-12 10:35:44,152 [ERROR]     40755 annawoodard cri-huo_lab 2O07424
+2025-12-12 10:35:44,152 [ERROR]     40755 annawoodard cri-huo_lab 2O45650-2015-09-17
+2025-12-12 10:35:44,152 [ERROR]     40775 annawoodard annawoodard 2O45641-2024-12-13
+2025-12-12 10:35:44,152 [ERROR]     40755 annawoodard cri-huo_lab 2O45656-2008-07-24
+2025-12-12 10:35:44,153 [ERROR]     40775 annawoodard annawoodard 2O45645-2020-11-06
+2025-12-12 10:35:44,153 [ERROR]     40755 annawoodard cri-huo_lab 2O45649-2016-10-07
+2025-12-12 10:35:44,153 [ERROR]     40755 annawoodard annawoodard 2O45642-2023-12-08
+2025-12-12 10:35:44,153 [ERROR]     40755 annawoodard cri-huo_lab 2O07416
+2025-12-12 10:35:44,360 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40997454/2O07422, will transfer
+2025-12-12 10:35:44,360 [WARNING] Local source path: /mnt/uchad_samba/16352A/40997454/2O45652-2013-09-13 | patient=40997454 exam=2O45652-2013-09-13 uid=2.16.840.1.114151.4.231.41528.3471.7344796
+2025-12-12 10:35:44,363 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40997454 contents (first 20 of 21 entries):
+2025-12-12 10:35:44,363 [ERROR]     40755 annawoodard cri-huo_lab 2O45648-2017-10-13
+2025-12-12 10:35:44,363 [ERROR]     40755 annawoodard cri-huo_lab 2O45647-2018-10-19
+2025-12-12 10:35:44,363 [ERROR]     40755 annawoodard cri-huo_lab 2O45651-2014-09-15
+2025-12-12 10:35:44,363 [ERROR]     40755 annawoodard cri-huo_lab 2O45655-2009-07-30
+2025-12-12 10:35:44,363 [ERROR]     40755 annawoodard cri-huo_lab 2O07418
+2025-12-12 10:35:44,363 [ERROR]     40775 annawoodard annawoodard 2O45646-2019-11-01
+2025-12-12 10:35:44,363 [ERROR]     40755 annawoodard annawoodard 2O45644-2021-11-12
+2025-12-12 10:35:44,364 [ERROR]     40775 annawoodard annawoodard 2O45643-2022-12-07
+2025-12-12 10:35:44,364 [ERROR]     40755 annawoodard cri-huo_lab 2O07425
+2025-12-12 10:35:44,364 [ERROR]     40755 annawoodard cri-huo_lab 2O45654-2011-08-18
+2025-12-12 10:35:44,364 [ERROR]     40755 annawoodard cri-huo_lab 2O45652-2013-09-13
+2025-12-12 10:35:44,364 [ERROR]     40755 annawoodard cri-huo_lab 2O45653-2012-08-28
+2025-12-12 10:35:44,364 [ERROR]     40755 annawoodard cri-huo_lab 2O07424
+2025-12-12 10:35:44,364 [ERROR]     40755 annawoodard cri-huo_lab 2O45650-2015-09-17
+2025-12-12 10:35:44,364 [ERROR]     40775 annawoodard annawoodard 2O45641-2024-12-13
+2025-12-12 10:35:44,364 [ERROR]     40755 annawoodard cri-huo_lab 2O45656-2008-07-24
+2025-12-12 10:35:44,364 [ERROR]     40775 annawoodard annawoodard 2O45645-2020-11-06
+2025-12-12 10:35:44,364 [ERROR]     40755 annawoodard cri-huo_lab 2O45649-2016-10-07
+2025-12-12 10:35:44,364 [ERROR]     40755 annawoodard annawoodard 2O45642-2023-12-08
+2025-12-12 10:35:44,364 [ERROR]     40755 annawoodard cri-huo_lab 2O07416
+2025-12-12 10:35:44,738 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40514837/2O07334, will transfer
+2025-12-12 10:35:44,739 [WARNING] Local source path: /mnt/uchad_samba/16352A/40514837/2O45577-2013-01-08 | patient=40514837 exam=2O45577-2013-01-08 uid=2.16.840.1.114151.4.231.41280.5961.6871381
+2025-12-12 10:35:44,747 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40514837 contents:
+2025-12-12 10:35:44,748 [ERROR]     40755 annawoodard cri-huo_lab 2O45577-2013-01-08
+2025-12-12 10:35:44,748 [ERROR]     40755 annawoodard cri-huo_lab 2O45579-2010-07-09
+2025-12-12 10:35:44,748 [ERROR]     40755 annawoodard cri-huo_lab 2O45578-2011-12-20
+2025-12-12 10:35:44,748 [ERROR]     40775 annawoodard annawoodard 2O45571-2020-02-25
+2025-12-12 10:35:44,748 [ERROR]     40755 annawoodard cri-huo_lab 2O45580-2009-07-10
+2025-12-12 10:35:44,748 [ERROR]     40775 annawoodard annawoodard 2O45567-2024-03-27
+2025-12-12 10:35:44,748 [ERROR]     40755 annawoodard cri-huo_lab 2O45574-2016-12-12
+2025-12-12 10:35:44,748 [ERROR]     40755 annawoodard cri-huo_lab 2O07327
+2025-12-12 10:35:44,748 [ERROR]     40775 annawoodard annawoodard 2O45566-2025-03-28
+2025-12-12 10:35:44,748 [ERROR]     40775 annawoodard annawoodard 2O45568-2023-03-22
+2025-12-12 10:35:44,748 [ERROR]     40755 annawoodard annawoodard 2O45572-2019-02-11
+2025-12-12 10:35:44,748 [ERROR]     40775 annawoodard annawoodard 2O45569-2022-03-24
+2025-12-12 10:35:44,748 [ERROR]     40755 annawoodard cri-huo_lab 2O45575-2015-12-10
+2025-12-12 10:35:44,748 [ERROR]     40755 annawoodard cri-huo_lab 2O07328
+2025-12-12 10:35:44,749 [ERROR]     40755 annawoodard cri-huo_lab 2O45576-2014-04-29
+2025-12-12 10:35:44,749 [ERROR]     40775 annawoodard annawoodard 2O45570-2021-03-23
+2025-12-12 10:35:44,749 [ERROR]     40755 annawoodard cri-huo_lab 2O45573-2018-01-22
+2025-12-12 10:35:44,982 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40514837/2O07332, will transfer
+2025-12-12 10:35:44,982 [WARNING] Local source path: /mnt/uchad_samba/16352A/40514837/2O45575-2015-12-10 | patient=40514837 exam=2O45575-2015-12-10 uid=2.16.840.1.114151.4.231.42346.3627.9065143
+2025-12-12 10:35:44,984 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40514837 contents:
+2025-12-12 10:35:44,985 [ERROR]     40755 annawoodard cri-huo_lab 2O45577-2013-01-08
+2025-12-12 10:35:44,985 [ERROR]     40755 annawoodard cri-huo_lab 2O45579-2010-07-09
+2025-12-12 10:35:44,985 [ERROR]     40755 annawoodard cri-huo_lab 2O45578-2011-12-20
+2025-12-12 10:35:44,985 [ERROR]     40775 annawoodard annawoodard 2O45571-2020-02-25
+2025-12-12 10:35:44,985 [ERROR]     40755 annawoodard cri-huo_lab 2O45580-2009-07-10
+2025-12-12 10:35:44,985 [ERROR]     40775 annawoodard annawoodard 2O45567-2024-03-27
+2025-12-12 10:35:44,985 [ERROR]     40755 annawoodard cri-huo_lab 2O45574-2016-12-12
+2025-12-12 10:35:44,985 [ERROR]     40755 annawoodard cri-huo_lab 2O07327
+2025-12-12 10:35:44,985 [ERROR]     40775 annawoodard annawoodard 2O45566-2025-03-28
+2025-12-12 10:35:44,985 [ERROR]     40775 annawoodard annawoodard 2O45568-2023-03-22
+2025-12-12 10:35:44,985 [ERROR]     40755 annawoodard annawoodard 2O45572-2019-02-11
+2025-12-12 10:35:44,985 [ERROR]     40775 annawoodard annawoodard 2O45569-2022-03-24
+2025-12-12 10:35:44,985 [ERROR]     40755 annawoodard cri-huo_lab 2O45575-2015-12-10
+2025-12-12 10:35:44,985 [ERROR]     40755 annawoodard cri-huo_lab 2O07328
+2025-12-12 10:35:44,986 [ERROR]     40755 annawoodard cri-huo_lab 2O45576-2014-04-29
+2025-12-12 10:35:44,986 [ERROR]     40775 annawoodard annawoodard 2O45570-2021-03-23
+2025-12-12 10:35:44,986 [ERROR]     40755 annawoodard cri-huo_lab 2O45573-2018-01-22
+2025-12-12 10:35:45,044 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:35:45,097 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40514837/2O07329, will transfer
+2025-12-12 10:35:45,097 [WARNING] Local source path: /mnt/uchad_samba/16352A/40514837/2O45580-2009-07-10 | patient=40514837 exam=2O45580-2009-07-10 uid=2.16.840.1.114151.4.231.40002.5124.4713174
+2025-12-12 10:35:45,099 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40514837 contents:
+2025-12-12 10:35:45,099 [ERROR]     40755 annawoodard cri-huo_lab 2O45577-2013-01-08
+2025-12-12 10:35:45,099 [ERROR]     40755 annawoodard cri-huo_lab 2O45579-2010-07-09
+2025-12-12 10:35:45,099 [ERROR]     40755 annawoodard cri-huo_lab 2O45578-2011-12-20
+2025-12-12 10:35:45,100 [ERROR]     40775 annawoodard annawoodard 2O45571-2020-02-25
+2025-12-12 10:35:45,100 [ERROR]     40755 annawoodard cri-huo_lab 2O45580-2009-07-10
+2025-12-12 10:35:45,100 [ERROR]     40775 annawoodard annawoodard 2O45567-2024-03-27
+2025-12-12 10:35:45,100 [ERROR]     40755 annawoodard cri-huo_lab 2O45574-2016-12-12
+2025-12-12 10:35:45,100 [ERROR]     40755 annawoodard cri-huo_lab 2O07327
+2025-12-12 10:35:45,100 [ERROR]     40775 annawoodard annawoodard 2O45566-2025-03-28
+2025-12-12 10:35:45,100 [ERROR]     40775 annawoodard annawoodard 2O45568-2023-03-22
+2025-12-12 10:35:45,100 [ERROR]     40755 annawoodard annawoodard 2O45572-2019-02-11
+2025-12-12 10:35:45,100 [ERROR]     40775 annawoodard annawoodard 2O45569-2022-03-24
+2025-12-12 10:35:45,100 [ERROR]     40755 annawoodard cri-huo_lab 2O45575-2015-12-10
+2025-12-12 10:35:45,100 [ERROR]     40755 annawoodard cri-huo_lab 2O07328
+2025-12-12 10:35:45,100 [ERROR]     40755 annawoodard cri-huo_lab 2O45576-2014-04-29
+2025-12-12 10:35:45,100 [ERROR]     40775 annawoodard annawoodard 2O45570-2021-03-23
+2025-12-12 10:35:45,101 [ERROR]     40755 annawoodard cri-huo_lab 2O45573-2018-01-22
+2025-12-12 10:35:45,261 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40514837/2O07330, will transfer
+2025-12-12 10:35:45,261 [WARNING] Local source path: /mnt/uchad_samba/16352A/40514837/2O45579-2010-07-09 | patient=40514837 exam=2O45579-2010-07-09 uid=2.16.840.1.114151.4.231.40366.3093.5280095
+2025-12-12 10:35:45,263 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40514837 contents:
+2025-12-12 10:35:45,263 [ERROR]     40755 annawoodard cri-huo_lab 2O45577-2013-01-08
+2025-12-12 10:35:45,263 [ERROR]     40755 annawoodard cri-huo_lab 2O45579-2010-07-09
+2025-12-12 10:35:45,264 [ERROR]     40755 annawoodard cri-huo_lab 2O45578-2011-12-20
+2025-12-12 10:35:45,264 [ERROR]     40775 annawoodard annawoodard 2O45571-2020-02-25
+2025-12-12 10:35:45,264 [ERROR]     40755 annawoodard cri-huo_lab 2O45580-2009-07-10
+2025-12-12 10:35:45,264 [ERROR]     40775 annawoodard annawoodard 2O45567-2024-03-27
+2025-12-12 10:35:45,264 [ERROR]     40755 annawoodard cri-huo_lab 2O45574-2016-12-12
+2025-12-12 10:35:45,264 [ERROR]     40755 annawoodard cri-huo_lab 2O07327
+2025-12-12 10:35:45,264 [ERROR]     40775 annawoodard annawoodard 2O45566-2025-03-28
+2025-12-12 10:35:45,264 [ERROR]     40775 annawoodard annawoodard 2O45568-2023-03-22
+2025-12-12 10:35:45,264 [ERROR]     40755 annawoodard annawoodard 2O45572-2019-02-11
+2025-12-12 10:35:45,264 [ERROR]     40775 annawoodard annawoodard 2O45569-2022-03-24
+2025-12-12 10:35:45,264 [ERROR]     40755 annawoodard cri-huo_lab 2O45575-2015-12-10
+2025-12-12 10:35:45,264 [ERROR]     40755 annawoodard cri-huo_lab 2O07328
+2025-12-12 10:35:45,264 [ERROR]     40755 annawoodard cri-huo_lab 2O45576-2014-04-29
+2025-12-12 10:35:45,264 [ERROR]     40775 annawoodard annawoodard 2O45570-2021-03-23
+2025-12-12 10:35:45,264 [ERROR]     40755 annawoodard cri-huo_lab 2O45573-2018-01-22
+2025-12-12 10:35:47,011 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:35:47,020 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40514837/2O07335, will transfer
+2025-12-12 10:35:47,020 [WARNING] Local source path: /mnt/uchad_samba/16352A/40514837/2O45574-2016-12-12 | patient=40514837 exam=2O45574-2016-12-12 uid=2.16.840.1.114151.4.231.42714.3405.9891711
+2025-12-12 10:35:47,022 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40514837 contents:
+2025-12-12 10:35:47,022 [ERROR]     40755 annawoodard cri-huo_lab 2O45577-2013-01-08
+2025-12-12 10:35:47,022 [ERROR]     40755 annawoodard cri-huo_lab 2O45579-2010-07-09
+2025-12-12 10:35:47,022 [ERROR]     40755 annawoodard cri-huo_lab 2O45578-2011-12-20
+2025-12-12 10:35:47,022 [ERROR]     40775 annawoodard annawoodard 2O45571-2020-02-25
+2025-12-12 10:35:47,022 [ERROR]     40755 annawoodard cri-huo_lab 2O45580-2009-07-10
+2025-12-12 10:35:47,023 [ERROR]     40775 annawoodard annawoodard 2O45567-2024-03-27
+2025-12-12 10:35:47,023 [ERROR]     40755 annawoodard cri-huo_lab 2O45574-2016-12-12
+2025-12-12 10:35:47,023 [ERROR]     40755 annawoodard cri-huo_lab 2O07327
+2025-12-12 10:35:47,023 [ERROR]     40775 annawoodard annawoodard 2O45566-2025-03-28
+2025-12-12 10:35:47,023 [ERROR]     40775 annawoodard annawoodard 2O45568-2023-03-22
+2025-12-12 10:35:47,023 [ERROR]     40755 annawoodard annawoodard 2O45572-2019-02-11
+2025-12-12 10:35:47,023 [ERROR]     40775 annawoodard annawoodard 2O45569-2022-03-24
+2025-12-12 10:35:47,023 [ERROR]     40755 annawoodard cri-huo_lab 2O45575-2015-12-10
+2025-12-12 10:35:47,023 [ERROR]     40755 annawoodard cri-huo_lab 2O07328
+2025-12-12 10:35:47,023 [ERROR]     40755 annawoodard cri-huo_lab 2O45576-2014-04-29
+2025-12-12 10:35:47,023 [ERROR]     40775 annawoodard annawoodard 2O45570-2021-03-23
+2025-12-12 10:35:47,023 [ERROR]     40755 annawoodard cri-huo_lab 2O45573-2018-01-22
+2025-12-12 10:35:47,023 [INFO]   UID fastpath progress: 38/151 exams processed (25.2%)
+2025-12-12 10:35:47,178 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40514837/2O07333, will transfer
+2025-12-12 10:35:47,178 [WARNING] Local source path: /mnt/uchad_samba/16352A/40514837/2O45578-2011-12-20 | patient=40514837 exam=2O45578-2011-12-20 uid=2.16.840.1.114151.4.231.40895.5563.6196821
+2025-12-12 10:35:47,181 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40514837 contents:
+2025-12-12 10:35:47,181 [ERROR]     40755 annawoodard cri-huo_lab 2O45577-2013-01-08
+2025-12-12 10:35:47,182 [ERROR]     40755 annawoodard cri-huo_lab 2O45579-2010-07-09
+2025-12-12 10:35:47,182 [ERROR]     40755 annawoodard cri-huo_lab 2O45578-2011-12-20
+2025-12-12 10:35:47,182 [ERROR]     40775 annawoodard annawoodard 2O45571-2020-02-25
+2025-12-12 10:35:47,182 [ERROR]     40755 annawoodard cri-huo_lab 2O45580-2009-07-10
+2025-12-12 10:35:47,182 [ERROR]     40775 annawoodard annawoodard 2O45567-2024-03-27
+2025-12-12 10:35:47,182 [ERROR]     40755 annawoodard cri-huo_lab 2O45574-2016-12-12
+2025-12-12 10:35:47,182 [ERROR]     40755 annawoodard cri-huo_lab 2O07327
+2025-12-12 10:35:47,182 [ERROR]     40775 annawoodard annawoodard 2O45566-2025-03-28
+2025-12-12 10:35:47,182 [ERROR]     40775 annawoodard annawoodard 2O45568-2023-03-22
+2025-12-12 10:35:47,182 [ERROR]     40755 annawoodard annawoodard 2O45572-2019-02-11
+2025-12-12 10:35:47,182 [ERROR]     40775 annawoodard annawoodard 2O45569-2022-03-24
+2025-12-12 10:35:47,182 [ERROR]     40755 annawoodard cri-huo_lab 2O45575-2015-12-10
+2025-12-12 10:35:47,182 [ERROR]     40755 annawoodard cri-huo_lab 2O07328
+2025-12-12 10:35:47,182 [ERROR]     40755 annawoodard cri-huo_lab 2O45576-2014-04-29
+2025-12-12 10:35:47,182 [ERROR]     40775 annawoodard annawoodard 2O45570-2021-03-23
+2025-12-12 10:35:47,182 [ERROR]     40755 annawoodard cri-huo_lab 2O45573-2018-01-22
+2025-12-12 10:35:47,388 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40514837/2O07331, will transfer
+2025-12-12 10:35:47,389 [WARNING] Local source path: /mnt/uchad_samba/16352A/40514837/2O45576-2014-04-29 | patient=40514837 exam=2O45576-2014-04-29 uid=2.16.840.1.114151.4.231.41756.5107.7788839
+2025-12-12 10:35:47,391 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40514837 contents:
+2025-12-12 10:35:47,391 [ERROR]     40755 annawoodard cri-huo_lab 2O45577-2013-01-08
+2025-12-12 10:35:47,391 [ERROR]     40755 annawoodard cri-huo_lab 2O45579-2010-07-09
+2025-12-12 10:35:47,391 [ERROR]     40755 annawoodard cri-huo_lab 2O45578-2011-12-20
+2025-12-12 10:35:47,391 [ERROR]     40775 annawoodard annawoodard 2O45571-2020-02-25
+2025-12-12 10:35:47,392 [ERROR]     40755 annawoodard cri-huo_lab 2O45580-2009-07-10
+2025-12-12 10:35:47,392 [ERROR]     40775 annawoodard annawoodard 2O45567-2024-03-27
+2025-12-12 10:35:47,392 [ERROR]     40755 annawoodard cri-huo_lab 2O45574-2016-12-12
+2025-12-12 10:35:47,392 [ERROR]     40755 annawoodard cri-huo_lab 2O07327
+2025-12-12 10:35:47,392 [ERROR]     40775 annawoodard annawoodard 2O45566-2025-03-28
+2025-12-12 10:35:47,392 [ERROR]     40775 annawoodard annawoodard 2O45568-2023-03-22
+2025-12-12 10:35:47,392 [ERROR]     40755 annawoodard annawoodard 2O45572-2019-02-11
+2025-12-12 10:35:47,392 [ERROR]     40775 annawoodard annawoodard 2O45569-2022-03-24
+2025-12-12 10:35:47,392 [ERROR]     40755 annawoodard cri-huo_lab 2O45575-2015-12-10
+2025-12-12 10:35:47,392 [ERROR]     40755 annawoodard cri-huo_lab 2O07328
+2025-12-12 10:35:47,392 [ERROR]     40755 annawoodard cri-huo_lab 2O45576-2014-04-29
+2025-12-12 10:35:47,392 [ERROR]     40775 annawoodard annawoodard 2O45570-2021-03-23
+2025-12-12 10:35:47,392 [ERROR]     40755 annawoodard cri-huo_lab 2O45573-2018-01-22
+2025-12-12 10:35:47,494 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/39424901/2O39677, will transfer
+2025-12-12 10:35:47,494 [WARNING] Local source path: /mnt/uchad_samba/16352A/39424901/2O45434-2011-01-12 | patient=39424901 exam=2O45434-2011-01-12 uid=1.2.826.0.1.3680043.8.829.1.1.1.1.7912
+2025-12-12 10:35:47,496 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/39424901 contents:
+2025-12-12 10:35:47,496 [ERROR]     40775 annawoodard annawoodard 2O45435-2011-01-12
+2025-12-12 10:35:47,497 [ERROR]     40755 annawoodard annawoodard 2O39676
+2025-12-12 10:35:47,799 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40054723/2O22712, will transfer
+2025-12-12 10:35:47,799 [WARNING] Local source path: /mnt/uchad_samba/16352A/40054723/2O45523-2018-03-19 | patient=40054723 exam=2O45523-2018-03-19 uid=2.16.840.1.114151.602060359390634096343501631807873613330180319
+2025-12-12 10:35:47,808 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40054723 contents:
+2025-12-12 10:35:47,808 [ERROR]     40755 annawoodard cri-huo_lab 2O22708
+2025-12-12 10:35:47,808 [ERROR]     40755 annawoodard cri-huo_lab 2O22710
+2025-12-12 10:35:47,808 [ERROR]     40755 annawoodard cri-huo_lab 2O22707
+2025-12-12 10:35:47,808 [ERROR]     40755 annawoodard cri-huo_lab 2O45524-2013-12-03
+2025-12-12 10:35:47,808 [ERROR]     40755 annawoodard cri-huo_lab 2O45525-2012-04-12
+2025-12-12 10:35:47,808 [ERROR]     40755 annawoodard cri-huo_lab 2O22709
+2025-12-12 10:35:47,809 [ERROR]     40755 annawoodard annawoodard 2O22711
+2025-12-12 10:35:47,809 [ERROR]     40755 annawoodard annawoodard 2O22713
+2025-12-12 10:35:47,809 [ERROR]     40755 annawoodard cri-huo_lab 2O45523-2018-03-19
+2025-12-12 10:35:47,957 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40054723/2O22705, will transfer
+2025-12-12 10:35:47,957 [WARNING] Local source path: /mnt/uchad_samba/16352A/40054723/2O45525-2012-04-12 | patient=40054723 exam=2O45525-2012-04-12 uid=2.16.840.1.114151.4.231.41009.3170.6410634
+2025-12-12 10:35:47,958 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40054723 contents:
+2025-12-12 10:35:47,959 [ERROR]     40755 annawoodard cri-huo_lab 2O22708
+2025-12-12 10:35:47,959 [ERROR]     40755 annawoodard cri-huo_lab 2O22710
+2025-12-12 10:35:47,959 [ERROR]     40755 annawoodard cri-huo_lab 2O22707
+2025-12-12 10:35:47,959 [ERROR]     40755 annawoodard cri-huo_lab 2O45524-2013-12-03
+2025-12-12 10:35:47,959 [ERROR]     40755 annawoodard cri-huo_lab 2O45525-2012-04-12
+2025-12-12 10:35:47,959 [ERROR]     40755 annawoodard cri-huo_lab 2O22709
+2025-12-12 10:35:47,959 [ERROR]     40755 annawoodard annawoodard 2O22711
+2025-12-12 10:35:47,959 [ERROR]     40755 annawoodard annawoodard 2O22713
+2025-12-12 10:35:47,959 [ERROR]     40755 annawoodard cri-huo_lab 2O45523-2018-03-19
+2025-12-12 10:35:48,109 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:35:48,113 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40666920/2O17658, will transfer
+2025-12-12 10:35:48,114 [WARNING] Local source path: /mnt/uchad_samba/16352A/40666920/2O45581-2009-06-08 | patient=40666920 exam=2O45581-2009-06-08 uid=2.16.840.1.114151.4.231.39970.4802.4661377
+2025-12-12 10:35:48,122 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40666920 contents:
+2025-12-12 10:35:48,122 [ERROR]     40755 annawoodard cri-huo_lab 2O45581-2009-06-08
+2025-12-12 10:35:48,122 [ERROR]     40755 annawoodard cri-huo_lab 2O17665
+2025-12-12 10:35:48,122 [ERROR]     40755 annawoodard cri-huo_lab 2O17663
+2025-12-12 10:35:48,122 [ERROR]     40755 annawoodard cri-huo_lab 2O17661
+2025-12-12 10:35:48,122 [ERROR]     40755 annawoodard cri-huo_lab 2O17668
+2025-12-12 10:35:48,122 [ERROR]     40755 annawoodard cri-huo_lab 2O17666
+2025-12-12 10:35:48,122 [ERROR]     40755 annawoodard cri-huo_lab 2O17664
+2025-12-12 10:35:48,122 [ERROR]     40755 annawoodard cri-huo_lab 2O17662
+2025-12-12 10:35:48,122 [ERROR]     40755 annawoodard cri-huo_lab 2O17667
+2025-12-12 10:35:48,122 [ERROR]     40755 annawoodard cri-huo_lab 2O17659
+2025-12-12 10:35:48,123 [ERROR]     40755 annawoodard cri-huo_lab 2O17660
+2025-12-12 10:35:48,234 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/37024739/2O06836, will transfer
+2025-12-12 10:35:48,234 [WARNING] Local source path: /mnt/uchad_samba/16352A/37024739/2O45145-2016-12-30 | patient=37024739 exam=2O45145-2016-12-30 uid=2.16.840.1.114151.4.231.42732.3517.9933377
+2025-12-12 10:35:48,243 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/37024739 contents:
+2025-12-12 10:35:48,243 [ERROR]     40755 annawoodard cri-huo_lab 2O45155-2008-12-10
+2025-12-12 10:35:48,244 [ERROR]     40755 annawoodard cri-huo_lab 2O45144-2016-12-30
+2025-12-12 10:35:48,244 [ERROR]     40755 annawoodard cri-huo_lab 2O45151-2013-03-05
+2025-12-12 10:35:48,244 [ERROR]     40755 annawoodard cri-huo_lab 2O45147-2016-12-22
+2025-12-12 10:35:48,244 [ERROR]     40755 annawoodard cri-huo_lab 2O45143-2017-02-22
+2025-12-12 10:35:48,244 [ERROR]     40755 annawoodard cri-huo_lab 2O45146-2016-12-30
+2025-12-12 10:35:48,244 [ERROR]     40755 annawoodard cri-huo_lab 2O45149-2015-11-18
+2025-12-12 10:35:48,244 [ERROR]     40755 annawoodard cri-huo_lab 2O45154-2010-01-11
+2025-12-12 10:35:48,244 [ERROR]     40755 annawoodard cri-huo_lab 2O45148-2015-12-02
+2025-12-12 10:35:48,244 [ERROR]     40775 annawoodard annawoodard 2O45139-2019-01-17
+2025-12-12 10:35:48,244 [ERROR]     40755 annawoodard cri-huo_lab 2O45153-2011-01-14
+2025-12-12 10:35:48,244 [ERROR]     40755 annawoodard cri-huo_lab 2O06824
+2025-12-12 10:35:48,244 [ERROR]     40775 annawoodard annawoodard 2O45142-2017-02-22
+2025-12-12 10:35:48,244 [ERROR]     40755 annawoodard cri-huo_lab 2O45141-2018-01-02
+2025-12-12 10:35:48,244 [ERROR]     40755 annawoodard cri-huo_lab 2O45150-2014-08-04
+2025-12-12 10:35:48,244 [ERROR]     40755 annawoodard cri-huo_lab 2O45152-2012-01-24
+2025-12-12 10:35:48,244 [ERROR]     40775 annawoodard annawoodard 2O45140-2018-11-06
+2025-12-12 10:35:48,402 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40387624/2O25529, will transfer
+2025-12-12 10:35:48,402 [WARNING] Local source path: /mnt/uchad_samba/16352A/40387624/2O45533-2011-08-12 | patient=40387624 exam=2O45533-2011-08-12 uid=2.16.840.1.114151.4.231.40765.4395.5956249
+2025-12-12 10:35:48,415 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40387624 contents (first 20 of 21 entries):
+2025-12-12 10:35:48,415 [ERROR]     40755 annawoodard cri-huo_lab 2O25528
+2025-12-12 10:35:48,415 [ERROR]     40755 annawoodard cri-huo_lab 2O25525
+2025-12-12 10:35:48,415 [ERROR]     40755 annawoodard cri-huo_lab 2O25542
+2025-12-12 10:35:48,415 [ERROR]     40755 annawoodard cri-huo_lab 2O25522
+2025-12-12 10:35:48,415 [ERROR]     40755 annawoodard cri-huo_lab 2O25538
+2025-12-12 10:35:48,415 [ERROR]     40755 annawoodard cri-huo_lab 2O45532-2011-08-24
+2025-12-12 10:35:48,416 [ERROR]     40755 annawoodard cri-huo_lab 2O45536-2004-02-12
+2025-12-12 10:35:48,416 [ERROR]     40755 annawoodard cri-huo_lab 2O25540
+2025-12-12 10:35:48,416 [ERROR]     40755 annawoodard cri-huo_lab 2O25539
+2025-12-12 10:35:48,416 [ERROR]     40755 annawoodard cri-huo_lab 2O25533
+2025-12-12 10:35:48,416 [ERROR]     40755 annawoodard cri-huo_lab 2O45533-2011-08-12
+2025-12-12 10:35:48,416 [ERROR]     40755 annawoodard cri-huo_lab 2O25541
+2025-12-12 10:35:48,416 [ERROR]     40755 annawoodard cri-huo_lab 2O25530
+2025-12-12 10:35:48,416 [ERROR]     40755 annawoodard cri-huo_lab 2O45535-2009-07-02
+2025-12-12 10:35:48,416 [ERROR]     40755 annawoodard cri-huo_lab 2O25534
+2025-12-12 10:35:48,416 [ERROR]     40755 annawoodard cri-huo_lab 2O25523
+2025-12-12 10:35:48,416 [ERROR]     40755 annawoodard cri-huo_lab 2O25531
+2025-12-12 10:35:48,416 [ERROR]     40755 annawoodard cri-huo_lab 2O25535
+2025-12-12 10:35:48,416 [ERROR]     40755 annawoodard cri-huo_lab 2O25524
+2025-12-12 10:35:48,417 [ERROR]     40755 annawoodard cri-huo_lab 2O45534-2010-08-12
+2025-12-12 10:35:48,569 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40387624/2O25537, will transfer
+2025-12-12 10:35:48,569 [WARNING] Local source path: /mnt/uchad_samba/16352A/40387624/2O45534-2010-08-12 | patient=40387624 exam=2O45534-2010-08-12 uid=2.16.840.1.114151.4.231.40400.4560.5335605
+2025-12-12 10:35:48,571 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40387624 contents (first 20 of 21 entries):
+2025-12-12 10:35:48,572 [ERROR]     40755 annawoodard cri-huo_lab 2O25528
+2025-12-12 10:35:48,572 [ERROR]     40755 annawoodard cri-huo_lab 2O25525
+2025-12-12 10:35:48,572 [ERROR]     40755 annawoodard cri-huo_lab 2O25542
+2025-12-12 10:35:48,572 [ERROR]     40755 annawoodard cri-huo_lab 2O25522
+2025-12-12 10:35:48,572 [ERROR]     40755 annawoodard cri-huo_lab 2O25538
+2025-12-12 10:35:48,572 [ERROR]     40755 annawoodard cri-huo_lab 2O45532-2011-08-24
+2025-12-12 10:35:48,572 [ERROR]     40755 annawoodard cri-huo_lab 2O45536-2004-02-12
+2025-12-12 10:35:48,572 [ERROR]     40755 annawoodard cri-huo_lab 2O25540
+2025-12-12 10:35:48,572 [ERROR]     40755 annawoodard cri-huo_lab 2O25539
+2025-12-12 10:35:48,572 [ERROR]     40755 annawoodard cri-huo_lab 2O25533
+2025-12-12 10:35:48,572 [ERROR]     40755 annawoodard cri-huo_lab 2O45533-2011-08-12
+2025-12-12 10:35:48,572 [ERROR]     40755 annawoodard cri-huo_lab 2O25541
+2025-12-12 10:35:48,572 [ERROR]     40755 annawoodard cri-huo_lab 2O25530
+2025-12-12 10:35:48,572 [ERROR]     40755 annawoodard cri-huo_lab 2O45535-2009-07-02
+2025-12-12 10:35:48,572 [ERROR]     40755 annawoodard cri-huo_lab 2O25534
+2025-12-12 10:35:48,572 [ERROR]     40755 annawoodard cri-huo_lab 2O25523
+2025-12-12 10:35:48,572 [ERROR]     40755 annawoodard cri-huo_lab 2O25531
+2025-12-12 10:35:48,573 [ERROR]     40755 annawoodard cri-huo_lab 2O25535
+2025-12-12 10:35:48,573 [ERROR]     40755 annawoodard cri-huo_lab 2O25524
+2025-12-12 10:35:48,573 [ERROR]     40755 annawoodard cri-huo_lab 2O45534-2010-08-12
+2025-12-12 10:35:48,687 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40387624/2O25536, will transfer
+2025-12-12 10:35:48,687 [WARNING] Local source path: /mnt/uchad_samba/16352A/40387624/2O45535-2009-07-02 | patient=40387624 exam=2O45535-2009-07-02 uid=2.16.840.1.114151.4.231.39994.5374.4701341
+2025-12-12 10:35:48,689 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40387624 contents (first 20 of 21 entries):
+2025-12-12 10:35:48,689 [ERROR]     40755 annawoodard cri-huo_lab 2O25528
+2025-12-12 10:35:48,689 [ERROR]     40755 annawoodard cri-huo_lab 2O25525
+2025-12-12 10:35:48,689 [ERROR]     40755 annawoodard cri-huo_lab 2O25542
+2025-12-12 10:35:48,690 [ERROR]     40755 annawoodard cri-huo_lab 2O25522
+2025-12-12 10:35:48,690 [ERROR]     40755 annawoodard cri-huo_lab 2O25538
+2025-12-12 10:35:48,690 [ERROR]     40755 annawoodard cri-huo_lab 2O45532-2011-08-24
+2025-12-12 10:35:48,690 [ERROR]     40755 annawoodard cri-huo_lab 2O45536-2004-02-12
+2025-12-12 10:35:48,690 [ERROR]     40755 annawoodard cri-huo_lab 2O25540
+2025-12-12 10:35:48,690 [ERROR]     40755 annawoodard cri-huo_lab 2O25539
+2025-12-12 10:35:48,690 [ERROR]     40755 annawoodard cri-huo_lab 2O25533
+2025-12-12 10:35:48,690 [ERROR]     40755 annawoodard cri-huo_lab 2O45533-2011-08-12
+2025-12-12 10:35:48,690 [ERROR]     40755 annawoodard cri-huo_lab 2O25541
+2025-12-12 10:35:48,690 [ERROR]     40755 annawoodard cri-huo_lab 2O25530
+2025-12-12 10:35:48,690 [ERROR]     40755 annawoodard cri-huo_lab 2O45535-2009-07-02
+2025-12-12 10:35:48,690 [ERROR]     40755 annawoodard cri-huo_lab 2O25534
+2025-12-12 10:35:48,690 [ERROR]     40755 annawoodard cri-huo_lab 2O25523
+2025-12-12 10:35:48,690 [ERROR]     40755 annawoodard cri-huo_lab 2O25531
+2025-12-12 10:35:48,690 [ERROR]     40755 annawoodard cri-huo_lab 2O25535
+2025-12-12 10:35:48,690 [ERROR]     40755 annawoodard cri-huo_lab 2O25524
+2025-12-12 10:35:48,690 [ERROR]     40755 annawoodard cri-huo_lab 2O45534-2010-08-12
+2025-12-12 10:35:48,725 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:35:48,840 [WARNING] UID match but destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40387624/2O25527, will transfer
+2025-12-12 10:35:48,840 [WARNING] Local source path: /mnt/uchad_samba/16352A/40387624/2O45532-2011-08-24 | patient=40387624 exam=2O45532-2011-08-24 uid=2.16.840.1.114151.4.231.40777.5636.5977143
+2025-12-12 10:35:48,842 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40387624 contents (first 20 of 21 entries):
+2025-12-12 10:35:48,842 [ERROR]     40755 annawoodard cri-huo_lab 2O25528
+2025-12-12 10:35:48,842 [ERROR]     40755 annawoodard cri-huo_lab 2O25525
+2025-12-12 10:35:48,842 [ERROR]     40755 annawoodard cri-huo_lab 2O25542
+2025-12-12 10:35:48,843 [ERROR]     40755 annawoodard cri-huo_lab 2O25522
+2025-12-12 10:35:48,843 [ERROR]     40755 annawoodard cri-huo_lab 2O25538
+2025-12-12 10:35:48,843 [ERROR]     40755 annawoodard cri-huo_lab 2O45532-2011-08-24
+2025-12-12 10:35:48,843 [ERROR]     40755 annawoodard cri-huo_lab 2O45536-2004-02-12
+2025-12-12 10:35:48,843 [ERROR]     40755 annawoodard cri-huo_lab 2O25540
+2025-12-12 10:35:48,843 [ERROR]     40755 annawoodard cri-huo_lab 2O25539
+2025-12-12 10:35:48,843 [ERROR]     40755 annawoodard cri-huo_lab 2O25533
+2025-12-12 10:35:48,843 [ERROR]     40755 annawoodard cri-huo_lab 2O45533-2011-08-12
+2025-12-12 10:35:48,843 [ERROR]     40755 annawoodard cri-huo_lab 2O25541
+2025-12-12 10:35:48,843 [ERROR]     40755 annawoodard cri-huo_lab 2O25530
+2025-12-12 10:35:48,843 [ERROR]     40755 annawoodard cri-huo_lab 2O45535-2009-07-02
+2025-12-12 10:35:48,843 [ERROR]     40755 annawoodard cri-huo_lab 2O25534
+2025-12-12 10:35:48,843 [ERROR]     40755 annawoodard cri-huo_lab 2O25523
+2025-12-12 10:35:48,843 [ERROR]     40755 annawoodard cri-huo_lab 2O25531
+2025-12-12 10:35:48,843 [ERROR]     40755 annawoodard cri-huo_lab 2O25535
+2025-12-12 10:35:48,843 [ERROR]     40755 annawoodard cri-huo_lab 2O25524
+2025-12-12 10:35:48,843 [ERROR]     40755 annawoodard cri-huo_lab 2O45534-2010-08-12
+2025-12-12 10:35:49,210 [INFO] Phase 1 complete in 13.2s:
+2025-12-12 10:35:49,211 [INFO]   - UID fastpath hits: 0
+2025-12-12 10:35:49,211 [INFO]   - Remote renamed: 0
+2025-12-12 10:35:49,211 [INFO]   - Skipped (unstable): 0
+2025-12-12 10:35:49,211 [INFO]   - Failed: 0
+2025-12-12 10:35:49,211 [INFO]   - Remaining for transfer: 50
+2025-12-12 10:35:49,211 [INFO]   - Exams touched this run: 50
+2025-12-12 10:35:49,211 [INFO] Deferred 101 exams from earlier stage for later processing.
+2025-12-12 10:35:49,211 [INFO] === PHASE 2: TRANSFER PROCESSING ===
+2025-12-12 10:35:49,211 [INFO] Processing 50 exams requiring hash matching or transfer
+2025-12-12 10:35:49,213 [INFO] [USAGE mount] /mnt/uchad_samba/16352A: used 10706.9 GB / total 13194.1 GB (free 2487.3 GB)
+2025-12-12 10:35:49,273 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:35:51,338 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:35:52,094 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:35:52,902 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:35:53,587 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:35:53,843 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:35:54,378 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:35:54,378 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:35:56,172 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:35:56,645 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:35:58,494 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:35:59,493 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:35:59,493 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:36:00,335 [ERROR] Destination verify failed (UID fastpath) for patient=40686376 exam=2O45595-2008-08-25 uid=2.16.840.1.114151.603919394675652426411887536338957026020100629
+2025-12-12 10:36:00,335 [ERROR] Local source path: /mnt/uchad_samba/16352A/40686376/2O45595-2008-08-25
+2025-12-12 10:36:00,336 [ERROR] Expected destination: /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O07350
+2025-12-12 10:36:00,338 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376 contents (first 20 of 22 entries):
+2025-12-12 10:36:00,338 [ERROR]     40755 annawoodard annawoodard 2O45583-2017-01-25
+2025-12-12 10:36:00,338 [ERROR]     40755 annawoodard cri-huo_lab 2O07356
+2025-12-12 10:36:00,338 [ERROR]     40755 annawoodard cri-huo_lab 2O07363
+2025-12-12 10:36:00,338 [ERROR]     40755 annawoodard cri-huo_lab 2O07351
+2025-12-12 10:36:00,338 [ERROR]     40755 annawoodard cri-huo_lab 2O07358
+2025-12-12 10:36:00,338 [ERROR]     40755 annawoodard cri-huo_lab 2O07362
+2025-12-12 10:36:00,338 [ERROR]     40755 annawoodard cri-huo_lab 2O07354
+2025-12-12 10:36:00,338 [ERROR]     40755 annawoodard cri-huo_lab 2O45585-2016-01-13
+2025-12-12 10:36:00,338 [ERROR]     40755 annawoodard cri-huo_lab 2O45594-2010-12-15
+2025-12-12 10:36:00,338 [ERROR]     40755 annawoodard annawoodard 2O45584-2016-01-13
+2025-12-12 10:36:00,338 [ERROR]     40755 annawoodard cri-huo_lab 2O45592-2013-03-13
+2025-12-12 10:36:00,338 [ERROR]     40755 annawoodard cri-huo_lab 2O07361
+2025-12-12 10:36:00,338 [ERROR]     40755 annawoodard cri-huo_lab 2O45591-2013-04-17
+2025-12-12 10:36:00,339 [ERROR]     40755 annawoodard cri-huo_lab 2O45589-2015-12-14
+2025-12-12 10:36:00,339 [ERROR]     40775 annawoodard annawoodard 2O45582-2018-03-13
+2025-12-12 10:36:00,339 [ERROR]     40755 annawoodard cri-huo_lab 2O45590-2015-10-14
+2025-12-12 10:36:00,339 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2008-08-25
+2025-12-12 10:36:00,339 [ERROR]     40755 annawoodard cri-huo_lab 2O45593-2011-12-12
+2025-12-12 10:36:00,339 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2009-12-15
+2025-12-12 10:36:00,339 [ERROR]     40755 annawoodard cri-huo_lab 2O45588-2015-12-16
+2025-12-12 10:36:00,339 [ERROR] FATAL ERROR processing /mnt/uchad_samba/16352A/40686376/2O45595-2008-08-25
+Traceback (most recent call last):
+  File "local_sync.py", line 1044, in process_single_exam
+    return process_single_exam_internal(
+  File "local_sync.py", line 759, in process_single_exam_internal
+    raise RuntimeError(
+RuntimeError: destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O07350: directory does not exist
+2025-12-12 10:36:05,362 [ERROR] Destination verify failed (UID fastpath) for patient=40686376 exam=2O45593-2011-12-12 uid=2.16.840.1.114151.4.231.40887.4241.6179814
+2025-12-12 10:36:05,362 [ERROR] Local source path: /mnt/uchad_samba/16352A/40686376/2O45593-2011-12-12
+2025-12-12 10:36:05,363 [ERROR] Expected destination: /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O07343
+2025-12-12 10:36:05,368 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376 contents (first 20 of 22 entries):
+2025-12-12 10:36:05,368 [ERROR]     40755 annawoodard annawoodard 2O45583-2017-01-25
+2025-12-12 10:36:05,368 [ERROR]     40755 annawoodard cri-huo_lab 2O07356
+2025-12-12 10:36:05,368 [ERROR]     40755 annawoodard cri-huo_lab 2O07363
+2025-12-12 10:36:05,368 [ERROR]     40755 annawoodard cri-huo_lab 2O07351
+2025-12-12 10:36:05,368 [ERROR]     40755 annawoodard cri-huo_lab 2O07358
+2025-12-12 10:36:05,368 [ERROR]     40755 annawoodard cri-huo_lab 2O07362
+2025-12-12 10:36:05,368 [ERROR]     40755 annawoodard cri-huo_lab 2O07354
+2025-12-12 10:36:05,368 [ERROR]     40755 annawoodard cri-huo_lab 2O45585-2016-01-13
+2025-12-12 10:36:05,369 [ERROR]     40755 annawoodard cri-huo_lab 2O45594-2010-12-15
+2025-12-12 10:36:05,369 [ERROR]     40755 annawoodard annawoodard 2O45584-2016-01-13
+2025-12-12 10:36:05,369 [ERROR]     40755 annawoodard cri-huo_lab 2O45592-2013-03-13
+2025-12-12 10:36:05,369 [ERROR]     40755 annawoodard cri-huo_lab 2O07361
+2025-12-12 10:36:05,369 [ERROR]     40755 annawoodard cri-huo_lab 2O45591-2013-04-17
+2025-12-12 10:36:05,369 [ERROR]     40755 annawoodard cri-huo_lab 2O45589-2015-12-14
+2025-12-12 10:36:05,369 [ERROR]     40775 annawoodard annawoodard 2O45582-2018-03-13
+2025-12-12 10:36:05,369 [ERROR]     40755 annawoodard cri-huo_lab 2O45590-2015-10-14
+2025-12-12 10:36:05,369 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2008-08-25
+2025-12-12 10:36:05,369 [ERROR]     40755 annawoodard cri-huo_lab 2O45593-2011-12-12
+2025-12-12 10:36:05,370 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2009-12-15
+2025-12-12 10:36:05,370 [ERROR]     40755 annawoodard cri-huo_lab 2O45588-2015-12-16
+2025-12-12 10:36:05,370 [ERROR] FATAL ERROR processing /mnt/uchad_samba/16352A/40686376/2O45593-2011-12-12
+Traceback (most recent call last):
+  File "local_sync.py", line 1044, in process_single_exam
+    return process_single_exam_internal(
+  File "local_sync.py", line 759, in process_single_exam_internal
+    raise RuntimeError(
+RuntimeError: destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O07343: directory does not exist
+2025-12-12 10:36:10,072 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:36:10,144 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:36:11,253 [ERROR] Destination verify failed (UID fastpath) for patient=40686376 exam=2O45588-2015-12-16 uid=2.16.840.1.114151.4.231.42352.5339.9080476
+2025-12-12 10:36:11,253 [ERROR] Local source path: /mnt/uchad_samba/16352A/40686376/2O45588-2015-12-16
+2025-12-12 10:36:11,253 [ERROR] Expected destination: /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O07349
+2025-12-12 10:36:11,259 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376 contents (first 20 of 22 entries):
+2025-12-12 10:36:11,259 [ERROR]     40755 annawoodard annawoodard 2O45583-2017-01-25
+2025-12-12 10:36:11,259 [ERROR]     40755 annawoodard cri-huo_lab 2O07356
+2025-12-12 10:36:11,259 [ERROR]     40755 annawoodard cri-huo_lab 2O07363
+2025-12-12 10:36:11,259 [ERROR]     40755 annawoodard cri-huo_lab 2O07351
+2025-12-12 10:36:11,259 [ERROR]     40755 annawoodard cri-huo_lab 2O07358
+2025-12-12 10:36:11,259 [ERROR]     40755 annawoodard cri-huo_lab 2O07362
+2025-12-12 10:36:11,260 [ERROR]     40755 annawoodard cri-huo_lab 2O07354
+2025-12-12 10:36:11,260 [ERROR]     40755 annawoodard cri-huo_lab 2O45585-2016-01-13
+2025-12-12 10:36:11,260 [ERROR]     40755 annawoodard cri-huo_lab 2O45594-2010-12-15
+2025-12-12 10:36:11,260 [ERROR]     40755 annawoodard annawoodard 2O45584-2016-01-13
+2025-12-12 10:36:11,260 [ERROR]     40755 annawoodard cri-huo_lab 2O45592-2013-03-13
+2025-12-12 10:36:11,260 [ERROR]     40755 annawoodard cri-huo_lab 2O07361
+2025-12-12 10:36:11,260 [ERROR]     40755 annawoodard cri-huo_lab 2O45591-2013-04-17
+2025-12-12 10:36:11,260 [ERROR]     40755 annawoodard cri-huo_lab 2O45589-2015-12-14
+2025-12-12 10:36:11,260 [ERROR]     40775 annawoodard annawoodard 2O45582-2018-03-13
+2025-12-12 10:36:11,260 [ERROR]     40755 annawoodard cri-huo_lab 2O45590-2015-10-14
+2025-12-12 10:36:11,260 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2008-08-25
+2025-12-12 10:36:11,260 [ERROR]     40755 annawoodard cri-huo_lab 2O45593-2011-12-12
+2025-12-12 10:36:11,260 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2009-12-15
+2025-12-12 10:36:11,260 [ERROR]     40755 annawoodard cri-huo_lab 2O45588-2015-12-16
+2025-12-12 10:36:11,260 [ERROR] FATAL ERROR processing /mnt/uchad_samba/16352A/40686376/2O45588-2015-12-16
+Traceback (most recent call last):
+  File "local_sync.py", line 1044, in process_single_exam
+    return process_single_exam_internal(
+  File "local_sync.py", line 759, in process_single_exam_internal
+    raise RuntimeError(
+RuntimeError: destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O07349: directory does not exist
+2025-12-12 10:36:11,555 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:36:11,636 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:36:12,353 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:36:12,353 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:36:14,266 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:36:15,741 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:36:15,923 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:36:15,923 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:36:17,144 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:36:17,179 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:36:17,627 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:36:17,629 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:36:18,131 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:36:18,166 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:36:18,294 [INFO] NEW: 2O45583-2017-01-25 not found at destination. Copying.
+2025-12-12 10:36:18,294 [INFO] COPY: /mnt/uchad_samba/16352A/40686376/2O45583-2017-01-25 -> /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O45583-2017-01-25
+2025-12-12 10:36:18,583 [INFO] [COPY]               0   0%    0.00kB/s    0:00:00 (xfr#0, to-chk=17/35)
+2025-12-12 10:36:18,583 [INFO] [COPY]               0   0%    0.00kB/s    0:00:00 (xfr#0, to-chk=16/35)
+2025-12-12 10:36:18,583 [INFO] [COPY]               0   0%    0.00kB/s    0:00:00 (xfr#0, to-chk=15/35)
+2025-12-12 10:36:18,583 [INFO] [COPY]               0   0%    0.00kB/s    0:00:00 (xfr#0, to-chk=14/35)
+2025-12-12 10:36:18,583 [INFO] [COPY]               0   0%    0.00kB/s    0:00:00 (xfr#0, to-chk=13/35)
+2025-12-12 10:36:18,583 [INFO] [COPY]               0   0%    0.00kB/s    0:00:00 (xfr#0, to-chk=12/35)
+2025-12-12 10:36:18,583 [INFO] [COPY]               0   0%    0.00kB/s    0:00:00 (xfr#0, to-chk=11/35)
+2025-12-12 10:36:18,583 [INFO] [COPY]               0   0%    0.00kB/s    0:00:00 (xfr#0, to-chk=10/35)
+2025-12-12 10:36:18,583 [INFO] [COPY]               0   0%    0.00kB/s    0:00:00 (xfr#0, to-chk=9/35)
+2025-12-12 10:36:18,583 [INFO] [COPY]               0   0%    0.00kB/s    0:00:00 (xfr#0, to-chk=8/35)
+2025-12-12 10:36:18,583 [INFO] [COPY]               0   0%    0.00kB/s    0:00:00 (xfr#0, to-chk=7/35)
+2025-12-12 10:36:18,583 [INFO] [COPY]               0   0%    0.00kB/s    0:00:00 (xfr#0, to-chk=6/35)
+2025-12-12 10:36:18,583 [INFO] [COPY]               0   0%    0.00kB/s    0:00:00 (xfr#0, to-chk=5/35)
+2025-12-12 10:36:18,584 [INFO] [COPY]               0   0%    0.00kB/s    0:00:00 (xfr#0, to-chk=4/35)
+2025-12-12 10:36:18,584 [INFO] [COPY]               0   0%    0.00kB/s    0:00:00 (xfr#0, to-chk=3/35)
+2025-12-12 10:36:18,584 [INFO] [COPY]               0   0%    0.00kB/s    0:00:00 (xfr#0, to-chk=2/35)
+2025-12-12 10:36:18,584 [INFO] [COPY]               0   0%    0.00kB/s    0:00:00 (xfr#0, to-chk=1/35)
+2025-12-12 10:36:18,600 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:36:18,600 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:36:19,000 [INFO] [COPY]               0   0%    0.00kB/s    0:00:00 (xfr#0, to-chk=0/35)rsync error: received SIGINT, SIGTERM, or SIGHUP (code 20) at rsync.c(713) [sender=3.2.5]
+2025-12-12 10:36:19,000 [INFO] [COPY] rsync error: received SIGUSR1 (code 19) at main.c(1598) [generator=3.2.5]
+2025-12-12 10:36:19,101 [ERROR] FATAL ERROR processing /mnt/uchad_samba/16352A/40686376/2O45583-2017-01-25
+Traceback (most recent call last):
+  File "local_sync.py", line 1044, in process_single_exam
+    return process_single_exam_internal(
+  File "local_sync.py", line 860, in process_single_exam_internal
+    logical_bytes, _ = copy_exam_local(src_path, patient_id, exam_name)
+  File "local_sync.py", line 598, in copy_exam_local
+    raise subprocess.CalledProcessError(proc.returncode, command)
+subprocess.CalledProcessError: Command '['rsync', '-aH', '--info=stats2,progress2', '--stats', '/mnt/uchad_samba/16352A/40686376/2O45583-2017-01-25/', '/gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O45583-2017-01-25']' returned non-zero exit status 20.
+2025-12-12 10:36:19,141 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:36:19,741 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:36:20,186 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:36:20,187 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:36:20,761 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:36:21,276 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:36:22,892 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:36:23,886 [INFO] Received signal 2. Shutting down gracefully...
+2025-12-12 10:36:25,917 [INFO] NEW: 2O45587-2015-12-16 not found at destination. Copying.
+2025-12-12 10:36:25,917 [INFO] COPY: /mnt/uchad_samba/16352A/40686376/2O45587-2015-12-16 -> /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O45587-2015-12-16
+2025-12-12 10:36:26,032 [INFO] [COPY]               0   0%    0.00kB/s    0:00:00 (xfr#0, to-chk=2/5)
+2025-12-12 10:36:26,033 [INFO] [COPY]               0   0%    0.00kB/s    0:00:00 (xfr#0, to-chk=1/5)
+2025-12-12 10:36:26,073 [INFO] [COPY]               0   0%    0.00kB/s    0:00:00 (xfr#0, to-chk=0/5)
+2025-12-12 10:36:26,073 [INFO] [COPY] Number of files: 5 (reg: 2, dir: 3)
+2025-12-12 10:36:26,073 [INFO] [COPY] Number of created files: 0
+2025-12-12 10:36:26,073 [INFO] [COPY] Number of deleted files: 0
+2025-12-12 10:36:26,073 [INFO] [COPY] Number of regular files transferred: 0
+2025-12-12 10:36:26,073 [INFO] [COPY] Total file size: 8,394,908 bytes
+2025-12-12 10:36:26,073 [INFO] [COPY] Total transferred file size: 0 bytes
+2025-12-12 10:36:26,074 [INFO] [COPY] sent 269 bytes  received 14 bytes  566.00 bytes/sec
+2025-12-12 10:36:26,074 [INFO] COPY successful for 2O45587-2015-12-16 [logical 0.0 MB in 0.1s, 0.00 MB/s]
+2025-12-12 10:36:26,083 [ERROR] FATAL ERROR processing /mnt/uchad_samba/16352A/40686376/2O45587-2015-12-16
+Traceback (most recent call last):
+  File "local_sync.py", line 1044, in process_single_exam
+    return process_single_exam_internal(
+  File "local_sync.py", line 869, in process_single_exam_internal
+    shutil.rmtree(str(src_path))
+  File "/gpfs/data/huo-lab/Image/annawoodard/micromamba/envs/prima/lib/python3.8/shutil.py", line 718, in rmtree
+    _rmtree_safe_fd(fd, path, onerror)
+  File "/gpfs/data/huo-lab/Image/annawoodard/micromamba/envs/prima/lib/python3.8/shutil.py", line 655, in _rmtree_safe_fd
+    _rmtree_safe_fd(dirfd, fullname, onerror)
+  File "/gpfs/data/huo-lab/Image/annawoodard/micromamba/envs/prima/lib/python3.8/shutil.py", line 675, in _rmtree_safe_fd
+    onerror(os.unlink, fullname, sys.exc_info())
+  File "/gpfs/data/huo-lab/Image/annawoodard/micromamba/envs/prima/lib/python3.8/shutil.py", line 673, in _rmtree_safe_fd
+    os.unlink(entry.name, dir_fd=topfd)
+PermissionError: [Errno 13] Permission denied: '1.2.840.114257.1.20151216.1134825.1.1.1.dcm'
+2025-12-12 10:36:31,493 [ERROR] Destination verify failed (UID fastpath) for patient=40686376 exam=2O45586-2015-12-16 uid=2.16.840.1.114151.4.231.42352.5337.9080474
+2025-12-12 10:36:31,493 [ERROR] Local source path: /mnt/uchad_samba/16352A/40686376/2O45586-2015-12-16
+2025-12-12 10:36:31,493 [ERROR] Expected destination: /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O07345
+2025-12-12 10:36:31,497 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376 contents (first 20 of 22 entries):
+2025-12-12 10:36:31,497 [ERROR]     40755 annawoodard annawoodard 2O45583-2017-01-25
+2025-12-12 10:36:31,497 [ERROR]     40755 annawoodard cri-huo_lab 2O07356
+2025-12-12 10:36:31,497 [ERROR]     40755 annawoodard cri-huo_lab 2O07363
+2025-12-12 10:36:31,497 [ERROR]     40755 annawoodard cri-huo_lab 2O07351
+2025-12-12 10:36:31,497 [ERROR]     40755 annawoodard cri-huo_lab 2O07358
+2025-12-12 10:36:31,497 [ERROR]     40755 annawoodard cri-huo_lab 2O07362
+2025-12-12 10:36:31,497 [ERROR]     40755 annawoodard cri-huo_lab 2O07354
+2025-12-12 10:36:31,498 [ERROR]     40755 annawoodard cri-huo_lab 2O45585-2016-01-13
+2025-12-12 10:36:31,498 [ERROR]     40755 annawoodard cri-huo_lab 2O45594-2010-12-15
+2025-12-12 10:36:31,498 [ERROR]     40755 annawoodard annawoodard 2O45584-2016-01-13
+2025-12-12 10:36:31,498 [ERROR]     40755 annawoodard cri-huo_lab 2O45592-2013-03-13
+2025-12-12 10:36:31,498 [ERROR]     40755 annawoodard cri-huo_lab 2O07361
+2025-12-12 10:36:31,498 [ERROR]     40755 annawoodard cri-huo_lab 2O45591-2013-04-17
+2025-12-12 10:36:31,498 [ERROR]     40755 annawoodard cri-huo_lab 2O45589-2015-12-14
+2025-12-12 10:36:31,498 [ERROR]     40775 annawoodard annawoodard 2O45582-2018-03-13
+2025-12-12 10:36:31,498 [ERROR]     40755 annawoodard cri-huo_lab 2O45590-2015-10-14
+2025-12-12 10:36:31,498 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2008-08-25
+2025-12-12 10:36:31,498 [ERROR]     40755 annawoodard cri-huo_lab 2O45593-2011-12-12
+2025-12-12 10:36:31,498 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2009-12-15
+2025-12-12 10:36:31,499 [ERROR]     40755 annawoodard cri-huo_lab 2O45588-2015-12-16
+2025-12-12 10:36:31,499 [ERROR] FATAL ERROR processing /mnt/uchad_samba/16352A/40686376/2O45586-2015-12-16
+Traceback (most recent call last):
+  File "local_sync.py", line 1044, in process_single_exam
+    return process_single_exam_internal(
+  File "local_sync.py", line 759, in process_single_exam_internal
+    raise RuntimeError(
+RuntimeError: destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O07345: directory does not exist
+2025-12-12 10:36:37,620 [ERROR] Destination verify failed (UID fastpath) for patient=40686376 exam=2O45594-2010-12-15 uid=2.16.840.1.114151.4.231.40525.3672.5540180
+2025-12-12 10:36:37,620 [ERROR] Local source path: /mnt/uchad_samba/16352A/40686376/2O45594-2010-12-15
+2025-12-12 10:36:37,621 [ERROR] Expected destination: /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O07342
+2025-12-12 10:36:37,626 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376 contents (first 20 of 22 entries):
+2025-12-12 10:36:37,626 [ERROR]     40755 annawoodard annawoodard 2O45583-2017-01-25
+2025-12-12 10:36:37,626 [ERROR]     40755 annawoodard cri-huo_lab 2O07356
+2025-12-12 10:36:37,626 [ERROR]     40755 annawoodard cri-huo_lab 2O07363
+2025-12-12 10:36:37,626 [ERROR]     40755 annawoodard cri-huo_lab 2O07351
+2025-12-12 10:36:37,627 [ERROR]     40755 annawoodard cri-huo_lab 2O07358
+2025-12-12 10:36:37,627 [ERROR]     40755 annawoodard cri-huo_lab 2O07362
+2025-12-12 10:36:37,627 [ERROR]     40755 annawoodard cri-huo_lab 2O07354
+2025-12-12 10:36:37,627 [ERROR]     40755 annawoodard cri-huo_lab 2O45585-2016-01-13
+2025-12-12 10:36:37,627 [ERROR]     40755 annawoodard cri-huo_lab 2O45594-2010-12-15
+2025-12-12 10:36:37,627 [ERROR]     40755 annawoodard annawoodard 2O45584-2016-01-13
+2025-12-12 10:36:37,627 [ERROR]     40755 annawoodard cri-huo_lab 2O45592-2013-03-13
+2025-12-12 10:36:37,628 [ERROR]     40755 annawoodard cri-huo_lab 2O07361
+2025-12-12 10:36:37,628 [ERROR]     40755 annawoodard cri-huo_lab 2O45591-2013-04-17
+2025-12-12 10:36:37,628 [ERROR]     40755 annawoodard cri-huo_lab 2O45589-2015-12-14
+2025-12-12 10:36:37,628 [ERROR]     40775 annawoodard annawoodard 2O45582-2018-03-13
+2025-12-12 10:36:37,628 [ERROR]     40755 annawoodard cri-huo_lab 2O45590-2015-10-14
+2025-12-12 10:36:37,628 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2008-08-25
+2025-12-12 10:36:37,628 [ERROR]     40755 annawoodard cri-huo_lab 2O45593-2011-12-12
+2025-12-12 10:36:37,629 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2009-12-15
+2025-12-12 10:36:37,629 [ERROR]     40755 annawoodard cri-huo_lab 2O45588-2015-12-16
+2025-12-12 10:36:37,629 [ERROR] FATAL ERROR processing /mnt/uchad_samba/16352A/40686376/2O45594-2010-12-15
+Traceback (most recent call last):
+  File "local_sync.py", line 1044, in process_single_exam
+    return process_single_exam_internal(
+  File "local_sync.py", line 759, in process_single_exam_internal
+    raise RuntimeError(
+RuntimeError: destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O07342: directory does not exist
+2025-12-12 10:36:42,867 [ERROR] Destination verify failed (UID fastpath) for patient=40686376 exam=2O45585-2016-01-13 uid=2.16.840.1.114151.4.231.42380.3145.9135318
+2025-12-12 10:36:42,867 [ERROR] Local source path: /mnt/uchad_samba/16352A/40686376/2O45585-2016-01-13
+2025-12-12 10:36:42,867 [ERROR] Expected destination: /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O07353
+2025-12-12 10:36:42,872 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376 contents (first 20 of 22 entries):
+2025-12-12 10:36:42,873 [ERROR]     40755 annawoodard annawoodard 2O45583-2017-01-25
+2025-12-12 10:36:42,873 [ERROR]     40755 annawoodard cri-huo_lab 2O07356
+2025-12-12 10:36:42,873 [ERROR]     40755 annawoodard cri-huo_lab 2O07363
+2025-12-12 10:36:42,873 [ERROR]     40755 annawoodard cri-huo_lab 2O07351
+2025-12-12 10:36:42,873 [ERROR]     40755 annawoodard cri-huo_lab 2O07358
+2025-12-12 10:36:42,873 [ERROR]     40755 annawoodard cri-huo_lab 2O07362
+2025-12-12 10:36:42,874 [ERROR]     40755 annawoodard cri-huo_lab 2O07354
+2025-12-12 10:36:42,874 [ERROR]     40755 annawoodard cri-huo_lab 2O45585-2016-01-13
+2025-12-12 10:36:42,874 [ERROR]     40755 annawoodard cri-huo_lab 2O45594-2010-12-15
+2025-12-12 10:36:42,874 [ERROR]     40755 annawoodard annawoodard 2O45584-2016-01-13
+2025-12-12 10:36:42,874 [ERROR]     40755 annawoodard cri-huo_lab 2O45592-2013-03-13
+2025-12-12 10:36:42,874 [ERROR]     40755 annawoodard cri-huo_lab 2O07361
+2025-12-12 10:36:42,874 [ERROR]     40755 annawoodard cri-huo_lab 2O45591-2013-04-17
+2025-12-12 10:36:42,874 [ERROR]     40755 annawoodard cri-huo_lab 2O45589-2015-12-14
+2025-12-12 10:36:42,875 [ERROR]     40775 annawoodard annawoodard 2O45582-2018-03-13
+2025-12-12 10:36:42,875 [ERROR]     40755 annawoodard cri-huo_lab 2O45590-2015-10-14
+2025-12-12 10:36:42,875 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2008-08-25
+2025-12-12 10:36:42,875 [ERROR]     40755 annawoodard cri-huo_lab 2O45593-2011-12-12
+2025-12-12 10:36:42,875 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2009-12-15
+2025-12-12 10:36:42,875 [ERROR]     40755 annawoodard cri-huo_lab 2O45588-2015-12-16
+2025-12-12 10:36:42,875 [ERROR] FATAL ERROR processing /mnt/uchad_samba/16352A/40686376/2O45585-2016-01-13
+Traceback (most recent call last):
+  File "local_sync.py", line 1044, in process_single_exam
+    return process_single_exam_internal(
+  File "local_sync.py", line 759, in process_single_exam_internal
+    raise RuntimeError(
+RuntimeError: destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O07353: directory does not exist
+2025-12-12 10:36:48,896 [ERROR] Destination verify failed (UID fastpath) for patient=40686376 exam=2O45591-2013-04-17 uid=2.16.840.1.114151.4.231.41379.6265.7062293
+2025-12-12 10:36:48,897 [ERROR] Local source path: /mnt/uchad_samba/16352A/40686376/2O45591-2013-04-17
+2025-12-12 10:36:48,897 [ERROR] Expected destination: /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O07347
+2025-12-12 10:36:48,899 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376 contents (first 20 of 22 entries):
+2025-12-12 10:36:48,899 [ERROR]     40755 annawoodard annawoodard 2O45583-2017-01-25
+2025-12-12 10:36:48,899 [ERROR]     40755 annawoodard cri-huo_lab 2O07356
+2025-12-12 10:36:48,899 [ERROR]     40755 annawoodard cri-huo_lab 2O07363
+2025-12-12 10:36:48,899 [ERROR]     40755 annawoodard cri-huo_lab 2O07351
+2025-12-12 10:36:48,899 [ERROR]     40755 annawoodard cri-huo_lab 2O07358
+2025-12-12 10:36:48,899 [ERROR]     40755 annawoodard cri-huo_lab 2O07362
+2025-12-12 10:36:48,899 [ERROR]     40755 annawoodard cri-huo_lab 2O07354
+2025-12-12 10:36:48,899 [ERROR]     40755 annawoodard cri-huo_lab 2O45585-2016-01-13
+2025-12-12 10:36:48,899 [ERROR]     40755 annawoodard cri-huo_lab 2O45594-2010-12-15
+2025-12-12 10:36:48,899 [ERROR]     40755 annawoodard annawoodard 2O45584-2016-01-13
+2025-12-12 10:36:48,899 [ERROR]     40755 annawoodard cri-huo_lab 2O45592-2013-03-13
+2025-12-12 10:36:48,899 [ERROR]     40755 annawoodard cri-huo_lab 2O07361
+2025-12-12 10:36:48,899 [ERROR]     40755 annawoodard cri-huo_lab 2O45591-2013-04-17
+2025-12-12 10:36:48,899 [ERROR]     40755 annawoodard cri-huo_lab 2O45589-2015-12-14
+2025-12-12 10:36:48,899 [ERROR]     40775 annawoodard annawoodard 2O45582-2018-03-13
+2025-12-12 10:36:48,900 [ERROR]     40755 annawoodard cri-huo_lab 2O45590-2015-10-14
+2025-12-12 10:36:48,900 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2008-08-25
+2025-12-12 10:36:48,900 [ERROR]     40755 annawoodard cri-huo_lab 2O45593-2011-12-12
+2025-12-12 10:36:48,900 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2009-12-15
+2025-12-12 10:36:48,900 [ERROR]     40755 annawoodard cri-huo_lab 2O45588-2015-12-16
+2025-12-12 10:36:48,900 [ERROR] FATAL ERROR processing /mnt/uchad_samba/16352A/40686376/2O45591-2013-04-17
+Traceback (most recent call last):
+  File "local_sync.py", line 1044, in process_single_exam
+    return process_single_exam_internal(
+  File "local_sync.py", line 759, in process_single_exam_internal
+    raise RuntimeError(
+RuntimeError: destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O07347: directory does not exist
+2025-12-12 10:36:54,087 [ERROR] Destination verify failed (UID fastpath) for patient=40686376 exam=2O45590-2015-10-14 uid=2.16.840.1.114151.4.231.42289.4307.8935608
+2025-12-12 10:36:54,087 [ERROR] Local source path: /mnt/uchad_samba/16352A/40686376/2O45590-2015-10-14
+2025-12-12 10:36:54,087 [ERROR] Expected destination: /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O07346
+2025-12-12 10:36:54,090 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376 contents (first 20 of 22 entries):
+2025-12-12 10:36:54,090 [ERROR]     40755 annawoodard annawoodard 2O45583-2017-01-25
+2025-12-12 10:36:54,090 [ERROR]     40755 annawoodard cri-huo_lab 2O07356
+2025-12-12 10:36:54,090 [ERROR]     40755 annawoodard cri-huo_lab 2O07363
+2025-12-12 10:36:54,090 [ERROR]     40755 annawoodard cri-huo_lab 2O07351
+2025-12-12 10:36:54,090 [ERROR]     40755 annawoodard cri-huo_lab 2O07358
+2025-12-12 10:36:54,090 [ERROR]     40755 annawoodard cri-huo_lab 2O07362
+2025-12-12 10:36:54,090 [ERROR]     40755 annawoodard cri-huo_lab 2O07354
+2025-12-12 10:36:54,090 [ERROR]     40755 annawoodard cri-huo_lab 2O45585-2016-01-13
+2025-12-12 10:36:54,090 [ERROR]     40755 annawoodard cri-huo_lab 2O45594-2010-12-15
+2025-12-12 10:36:54,090 [ERROR]     40755 annawoodard annawoodard 2O45584-2016-01-13
+2025-12-12 10:36:54,090 [ERROR]     40755 annawoodard cri-huo_lab 2O45592-2013-03-13
+2025-12-12 10:36:54,090 [ERROR]     40755 annawoodard cri-huo_lab 2O07361
+2025-12-12 10:36:54,090 [ERROR]     40755 annawoodard cri-huo_lab 2O45591-2013-04-17
+2025-12-12 10:36:54,090 [ERROR]     40755 annawoodard cri-huo_lab 2O45589-2015-12-14
+2025-12-12 10:36:54,090 [ERROR]     40775 annawoodard annawoodard 2O45582-2018-03-13
+2025-12-12 10:36:54,090 [ERROR]     40755 annawoodard cri-huo_lab 2O45590-2015-10-14
+2025-12-12 10:36:54,090 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2008-08-25
+2025-12-12 10:36:54,090 [ERROR]     40755 annawoodard cri-huo_lab 2O45593-2011-12-12
+2025-12-12 10:36:54,090 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2009-12-15
+2025-12-12 10:36:54,090 [ERROR]     40755 annawoodard cri-huo_lab 2O45588-2015-12-16
+2025-12-12 10:36:54,091 [ERROR] FATAL ERROR processing /mnt/uchad_samba/16352A/40686376/2O45590-2015-10-14
+Traceback (most recent call last):
+  File "local_sync.py", line 1044, in process_single_exam
+    return process_single_exam_internal(
+  File "local_sync.py", line 759, in process_single_exam_internal
+    raise RuntimeError(
+RuntimeError: destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O07346: directory does not exist
+2025-12-12 10:36:54,123 [INFO] [HEARTBEAT] processed 10/151 | 0 transferred (logical 0.0 MB) | avg throughput 0.00 MB/s | 0 destination-renamed | early_hash 0, full_hash 0 | rate 554.87 exams/hr | share 10706.9/13194.1 GB used (free 2487.3 GB)
+2025-12-12 10:37:00,129 [ERROR] Destination verify failed (UID fastpath) for patient=40686376 exam=2O45589-2015-12-14 uid=2.16.840.1.114151.4.231.42350.6081.9074569
+2025-12-12 10:37:00,129 [ERROR] Local source path: /mnt/uchad_samba/16352A/40686376/2O45589-2015-12-14
+2025-12-12 10:37:00,129 [ERROR] Expected destination: /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O07348
+2025-12-12 10:37:00,140 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376 contents (first 20 of 22 entries):
+2025-12-12 10:37:00,140 [ERROR]     40755 annawoodard annawoodard 2O45583-2017-01-25
+2025-12-12 10:37:00,140 [ERROR]     40755 annawoodard cri-huo_lab 2O07356
+2025-12-12 10:37:00,140 [ERROR]     40755 annawoodard cri-huo_lab 2O07363
+2025-12-12 10:37:00,140 [ERROR]     40755 annawoodard cri-huo_lab 2O07351
+2025-12-12 10:37:00,140 [ERROR]     40755 annawoodard cri-huo_lab 2O07358
+2025-12-12 10:37:00,140 [ERROR]     40755 annawoodard cri-huo_lab 2O07362
+2025-12-12 10:37:00,140 [ERROR]     40755 annawoodard cri-huo_lab 2O07354
+2025-12-12 10:37:00,140 [ERROR]     40755 annawoodard cri-huo_lab 2O45585-2016-01-13
+2025-12-12 10:37:00,141 [ERROR]     40755 annawoodard cri-huo_lab 2O45594-2010-12-15
+2025-12-12 10:37:00,141 [ERROR]     40755 annawoodard annawoodard 2O45584-2016-01-13
+2025-12-12 10:37:00,141 [ERROR]     40755 annawoodard cri-huo_lab 2O45592-2013-03-13
+2025-12-12 10:37:00,141 [ERROR]     40755 annawoodard cri-huo_lab 2O07361
+2025-12-12 10:37:00,141 [ERROR]     40755 annawoodard cri-huo_lab 2O45591-2013-04-17
+2025-12-12 10:37:00,141 [ERROR]     40755 annawoodard cri-huo_lab 2O45589-2015-12-14
+2025-12-12 10:37:00,141 [ERROR]     40775 annawoodard annawoodard 2O45582-2018-03-13
+2025-12-12 10:37:00,141 [ERROR]     40755 annawoodard cri-huo_lab 2O45590-2015-10-14
+2025-12-12 10:37:00,141 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2008-08-25
+2025-12-12 10:37:00,141 [ERROR]     40755 annawoodard cri-huo_lab 2O45593-2011-12-12
+2025-12-12 10:37:00,141 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2009-12-15
+2025-12-12 10:37:00,141 [ERROR]     40755 annawoodard cri-huo_lab 2O45588-2015-12-16
+2025-12-12 10:37:00,141 [ERROR] FATAL ERROR processing /mnt/uchad_samba/16352A/40686376/2O45589-2015-12-14
+Traceback (most recent call last):
+  File "local_sync.py", line 1044, in process_single_exam
+    return process_single_exam_internal(
+  File "local_sync.py", line 759, in process_single_exam_internal
+    raise RuntimeError(
+RuntimeError: destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O07348: directory does not exist
+2025-12-12 10:37:05,300 [ERROR] Destination verify failed (UID fastpath) for patient=40686376 exam=2O45592-2013-03-13 uid=2.16.840.1.114151.4.231.41344.3808.6994527
+2025-12-12 10:37:05,300 [ERROR] Local source path: /mnt/uchad_samba/16352A/40686376/2O45592-2013-03-13
+2025-12-12 10:37:05,300 [ERROR] Expected destination: /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O07344
+2025-12-12 10:37:05,303 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376 contents (first 20 of 22 entries):
+2025-12-12 10:37:05,303 [ERROR]     40755 annawoodard annawoodard 2O45583-2017-01-25
+2025-12-12 10:37:05,303 [ERROR]     40755 annawoodard cri-huo_lab 2O07356
+2025-12-12 10:37:05,303 [ERROR]     40755 annawoodard cri-huo_lab 2O07363
+2025-12-12 10:37:05,303 [ERROR]     40755 annawoodard cri-huo_lab 2O07351
+2025-12-12 10:37:05,303 [ERROR]     40755 annawoodard cri-huo_lab 2O07358
+2025-12-12 10:37:05,303 [ERROR]     40755 annawoodard cri-huo_lab 2O07362
+2025-12-12 10:37:05,303 [ERROR]     40755 annawoodard cri-huo_lab 2O07354
+2025-12-12 10:37:05,303 [ERROR]     40755 annawoodard cri-huo_lab 2O45585-2016-01-13
+2025-12-12 10:37:05,303 [ERROR]     40755 annawoodard cri-huo_lab 2O45594-2010-12-15
+2025-12-12 10:37:05,303 [ERROR]     40755 annawoodard annawoodard 2O45584-2016-01-13
+2025-12-12 10:37:05,303 [ERROR]     40755 annawoodard cri-huo_lab 2O45592-2013-03-13
+2025-12-12 10:37:05,303 [ERROR]     40755 annawoodard cri-huo_lab 2O07361
+2025-12-12 10:37:05,303 [ERROR]     40755 annawoodard cri-huo_lab 2O45591-2013-04-17
+2025-12-12 10:37:05,303 [ERROR]     40755 annawoodard cri-huo_lab 2O45589-2015-12-14
+2025-12-12 10:37:05,304 [ERROR]     40775 annawoodard annawoodard 2O45582-2018-03-13
+2025-12-12 10:37:05,304 [ERROR]     40755 annawoodard cri-huo_lab 2O45590-2015-10-14
+2025-12-12 10:37:05,304 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2008-08-25
+2025-12-12 10:37:05,304 [ERROR]     40755 annawoodard cri-huo_lab 2O45593-2011-12-12
+2025-12-12 10:37:05,304 [ERROR]     40755 annawoodard cri-huo_lab 2O45595-2009-12-15
+2025-12-12 10:37:05,304 [ERROR]     40755 annawoodard cri-huo_lab 2O45588-2015-12-16
+2025-12-12 10:37:05,304 [ERROR] FATAL ERROR processing /mnt/uchad_samba/16352A/40686376/2O45592-2013-03-13
+Traceback (most recent call last):
+  File "local_sync.py", line 1044, in process_single_exam
+    return process_single_exam_internal(
+  File "local_sync.py", line 759, in process_single_exam_internal
+    raise RuntimeError(
+RuntimeError: destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O07344: directory does not exist
+2025-12-12 10:37:11,853 [INFO] NEW: 2O45584-2016-01-13 not found at destination. Copying.
+2025-12-12 10:37:11,853 [INFO] COPY: /mnt/uchad_samba/16352A/40686376/2O45584-2016-01-13 -> /gpfs/data/huo-lab/Image/ChiMEC/MG/40686376/2O45584-2016-01-13
+2025-12-12 10:37:11,998 [INFO] [COPY]               0   0%    0.00kB/s    0:00:00 (xfr#0, to-chk=5/11)
+2025-12-12 10:37:11,998 [INFO] [COPY]               0   0%    0.00kB/s    0:00:00 (xfr#0, to-chk=4/11)
+2025-12-12 10:37:11,998 [INFO] [COPY]               0   0%    0.00kB/s    0:00:00 (xfr#0, to-chk=3/11)
+2025-12-12 10:37:11,998 [INFO] [COPY]               0   0%    0.00kB/s    0:00:00 (xfr#0, to-chk=2/11)
+2025-12-12 10:37:11,998 [INFO] [COPY]               0   0%    0.00kB/s    0:00:00 (xfr#0, to-chk=1/11)
+2025-12-12 10:37:12,038 [INFO] [COPY]               0   0%    0.00kB/s    0:00:00 (xfr#0, to-chk=0/11)
+2025-12-12 10:37:12,038 [INFO] [COPY] Number of files: 11 (reg: 5, dir: 6)
+2025-12-12 10:37:12,038 [INFO] [COPY] Number of created files: 0
+2025-12-12 10:37:12,038 [INFO] [COPY] Number of deleted files: 0
+2025-12-12 10:37:12,039 [INFO] [COPY] Number of regular files transferred: 0
+2025-12-12 10:37:12,039 [INFO] [COPY] Total file size: 62,930,354 bytes
+2025-12-12 10:37:12,039 [INFO] [COPY] Total transferred file size: 0 bytes
+2025-12-12 10:37:12,039 [INFO] [COPY] sent 564 bytes  received 17 bytes  1,162.00 bytes/sec
+2025-12-12 10:37:12,039 [INFO] COPY successful for 2O45584-2016-01-13 [logical 0.0 MB in 0.1s, 0.00 MB/s]
+2025-12-12 10:37:12,046 [ERROR] FATAL ERROR processing /mnt/uchad_samba/16352A/40686376/2O45584-2016-01-13
+Traceback (most recent call last):
+  File "local_sync.py", line 1044, in process_single_exam
+    return process_single_exam_internal(
+  File "local_sync.py", line 869, in process_single_exam_internal
+    shutil.rmtree(str(src_path))
+  File "/gpfs/data/huo-lab/Image/annawoodard/micromamba/envs/prima/lib/python3.8/shutil.py", line 718, in rmtree
+    _rmtree_safe_fd(fd, path, onerror)
+  File "/gpfs/data/huo-lab/Image/annawoodard/micromamba/envs/prima/lib/python3.8/shutil.py", line 655, in _rmtree_safe_fd
+    _rmtree_safe_fd(dirfd, fullname, onerror)
+  File "/gpfs/data/huo-lab/Image/annawoodard/micromamba/envs/prima/lib/python3.8/shutil.py", line 675, in _rmtree_safe_fd
+    onerror(os.unlink, fullname, sys.exc_info())
+  File "/gpfs/data/huo-lab/Image/annawoodard/micromamba/envs/prima/lib/python3.8/shutil.py", line 673, in _rmtree_safe_fd
+    os.unlink(entry.name, dir_fd=topfd)
+PermissionError: [Errno 13] Permission denied: '1.2.840.114257.1.20160113.1114844.1.1.1.dcm'
+2025-12-12 10:37:18,518 [ERROR] Destination verify failed (UID fastpath) for patient=40896104 exam=2O45631-2016-09-07 uid=2.16.840.1.114151.4.231.42618.4005.9671804
+2025-12-12 10:37:18,518 [ERROR] Local source path: /mnt/uchad_samba/16352A/40896104/2O45631-2016-09-07
+2025-12-12 10:37:18,518 [ERROR] Expected destination: /gpfs/data/huo-lab/Image/ChiMEC/MG/40896104/2O07413
+2025-12-12 10:37:18,520 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40896104 contents:
+2025-12-12 10:37:18,520 [ERROR]     40755 annawoodard cri-huo_lab 2O45627-2018-06-19
+2025-12-12 10:37:18,520 [ERROR]     40755 annawoodard cri-huo_lab 2O45628-2017-06-13
+2025-12-12 10:37:18,520 [ERROR]     40755 annawoodard cri-huo_lab 2O45630-2016-11-08
+2025-12-12 10:37:18,520 [ERROR]     40755 annawoodard annawoodard 2O45629-2016-11-09
+2025-12-12 10:37:18,520 [ERROR]     40755 annawoodard cri-huo_lab 2O45631-2016-09-07
+2025-12-12 10:37:18,520 [ERROR] FATAL ERROR processing /mnt/uchad_samba/16352A/40896104/2O45631-2016-09-07
+Traceback (most recent call last):
+  File "local_sync.py", line 1044, in process_single_exam
+    return process_single_exam_internal(
+  File "local_sync.py", line 759, in process_single_exam_internal
+    raise RuntimeError(
+RuntimeError: destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40896104/2O07413: directory does not exist
+2025-12-12 10:37:23,726 [ERROR] Destination verify failed (UID fastpath) for patient=40896104 exam=2O45630-2016-11-08 uid=2.16.840.1.114151.4.231.42680.3279.9814875
+2025-12-12 10:37:23,726 [ERROR] Local source path: /mnt/uchad_samba/16352A/40896104/2O45630-2016-11-08
+2025-12-12 10:37:23,726 [ERROR] Expected destination: /gpfs/data/huo-lab/Image/ChiMEC/MG/40896104/2O07412
+2025-12-12 10:37:23,727 [ERROR] Destination directory /gpfs/data/huo-lab/Image/ChiMEC/MG/40896104 contents:
+2025-12-12 10:37:23,727 [ERROR]     40755 annawoodard cri-huo_lab 2O45627-2018-06-19
+2025-12-12 10:37:23,727 [ERROR]     40755 annawoodard cri-huo_lab 2O45628-2017-06-13
+2025-12-12 10:37:23,727 [ERROR]     40755 annawoodard cri-huo_lab 2O45630-2016-11-08
+2025-12-12 10:37:23,727 [ERROR]     40755 annawoodard annawoodard 2O45629-2016-11-09
+2025-12-12 10:37:23,727 [ERROR]     40755 annawoodard cri-huo_lab 2O45631-2016-09-07
+2025-12-12 10:37:23,727 [ERROR] FATAL ERROR processing /mnt/uchad_samba/16352A/40896104/2O45630-2016-11-08
+Traceback (most recent call last):
+  File "local_sync.py", line 1044, in process_single_exam
+    return process_single_exam_internal(
+  File "local_sync.py", line 759, in process_single_exam_internal
+    raise RuntimeError(
+RuntimeError: destination verify failed for /gpfs/data/huo-lab/Image/ChiMEC/MG/40896104/2O07412: directory does not exist

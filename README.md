@@ -370,6 +370,33 @@ This splits at the patient level (not exam level) to avoid leakage. For each fol
 
 JSON output includes detailed per-fold results when using k-fold CV.
 
+### analyze_metadata.py
+
+Use `analyze_metadata.py` to analyze imaging metadata and generate summary plots for a specified modality. The script performs ChiMEC patient data analysis, generates distribution plots, and tracks download status.
+
+**Basic usage**:
+```bash
+python analyze_metadata.py --modality MG
+```
+
+This analyzes mammography (MG) data and generates plots in the `plots/` directory, including:
+- Download status by category
+- Scans per patient distributions
+- Modality distributions
+- Time-to-diagnosis analysis
+- Cases vs controls comparisons
+
+**Available modalities**: CR, DX, MG, US, CT, MR, NM, PT, XA, RF, ES, XC, PX, RG
+
+**Dump screening patients**:
+```bash
+python analyze_metadata.py --modality MG --dump-screening-patients
+```
+
+This generates a CSV of patients with screening scans at least 3 months before diagnosis, useful for identifying screening cohorts.
+
+The script creates both "all" and "genotyped" versions of all plots, comparing the full dataset against the genotyped subset.
+
 ### QC gallery
 
 Use `qc_gallery.py` to interactively review and mark mammogram exams for quality control. The tool generates combined 4-view figures (L CC, L MLO, R CC, R MLO) and provides an HTML gallery with keyboard navigation and QC marking.
