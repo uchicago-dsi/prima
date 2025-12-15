@@ -80,7 +80,8 @@ Goal: one-way, resumable, safe copy of files. Files are deleted from HIRO after 
 To mount the HIRO share on a Linux system:
 
 ```bash
-sudo mount -t cifs //cifs01uchadccd.uchad.uchospitals.edu/radiology/HIRO /mnt/uchad_samba -o credentials=/home/annawoodard/creds
+sudo mount -t cifs //cifs01uchadccd.uchad.uchospitals.edu/radiology/HIRO /mnt/uchad_samba \
+  -o credentials=/home/annawoodard/creds,vers=3.0,noperm,uid=$(id -u),gid=$(id -g),file_mode=0660,dir_mode=0770
 ```
 
 This mounts the share at `/mnt/uchad_samba`. Ensure the credentials file exists and contains your UCHAD username and password in the format:
@@ -90,6 +91,12 @@ password=your_password
 domain=UCHAD
 ```
 
+This requires special access granted from the admins, e.g.:
+```
+# cat /etc/sudoers.d/annawoodard.conf
+annawoodard ALL=(root) NOPASSWD: /usr/sbin/mount.cifs
+annawoodard ALL=(root) NOPASSWD: /usr/sbin/umount
+```
 ---
 ### 3. Install a modern rsync on macOS
 

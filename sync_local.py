@@ -662,6 +662,13 @@ def run_single_sync(dry_run: bool, immediate_delete: bool):
         f"[FINAL USAGE] {SRC_ROOT}: used {used_gb:.1f} GB / total {total_gb:.1f} GB (free {free_gb:.1f} GB)"
     )
 
+    # clean up empty patient directories
+    logging.info("Cleaning up empty patient directories...")
+    empty_removed = _cleanup_empty_patient_dirs(dry_run)
+    if empty_removed > 0:
+        action = "would remove" if dry_run else "removed"
+        logging.info(f"  - Empty patient directories {action}: {empty_removed}")
+
 
 def run_with_auto_restart(dry_run: bool, immediate_delete: bool):
     """run sync with automatic restart functionality"""
