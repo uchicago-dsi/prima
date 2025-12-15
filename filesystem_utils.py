@@ -196,10 +196,10 @@ def check_disk_for_downloads(df: pd.DataFrame, basedir: str) -> pd.DataFrame:
     on_disk_count = df["is_on_disk"].sum()
     print(f"  - Marked {on_disk_count:,} exams in the database as 'is_on_disk'.")
 
-    # show how many of the on-disk exams have accession numbers
-    on_disk_with_accession = df[df["is_on_disk"]]["Accession"].notna().sum()
-    print(
-        f"  - Exams on disk with Accession numbers: {on_disk_with_accession:,}/{on_disk_count:,} ({on_disk_with_accession / on_disk_count * 100:.1f}%)"
-    )
+    if on_disk_count > 0:
+        on_disk_with_accession = df[df["is_on_disk"]]["Accession"].notna().sum()
+        print(
+            f"  - Exams on disk with Accession numbers: {on_disk_with_accession:,}/{on_disk_count:,} ({on_disk_with_accession / on_disk_count * 100:.1f}%)"
+        )
 
     return df

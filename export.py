@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+from __future__ import annotations
 
 import argparse
 import os
@@ -583,7 +584,7 @@ def load_and_merge_data():
         db.loc[db["is_exported"], "base_modality"].fillna("<missing>").value_counts()
     )
     print(
-        "  - Export flags (by base_modality incl. <missing>):\n"
+        "  - Studies already exported (have Accession) by modality:\n"
         + (modality_counts.to_string() if not modality_counts.empty else "<none>")
     )
 
