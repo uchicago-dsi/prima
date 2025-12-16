@@ -23,9 +23,6 @@ from filesystem_utils import build_disk_inventory
 username = os.getenv("IBROKER_USERNAME")
 password = os.getenv("IBROKER_PASSWORD")
 
-BASE_DOWNLOAD_DIR = "/gpfs/data/huo-lab/Image/ChiMEC/MG"
-
-# NEW: Fail fast if environment variables are not set
 if not all([username, password]):
     print(
         "ERROR: IBROKER_USERNAME and IBROKER_PASSWORD environment variables must be set.",
@@ -33,6 +30,7 @@ if not all([username, password]):
     )
     sys.exit(1)
 
+BASE_DOWNLOAD_DIR = "/gpfs/data/huo-lab/Image/ChiMEC/MG"
 study_id_file = "/gpfs/data/huo-lab/Image/ChiMEC/study-16352a.csv"
 output_file = "data/imaging_metadata.csv"
 BASE = "http://cw2radiis03.uchad.uchospitals.edu"
@@ -190,9 +188,9 @@ def parse_results_table_html(table_html: str) -> pd.DataFrame:
             columns=["Modality", "Study DateTime", "StudyDescription", "exam_id"]
         )
 
-    modality = [r.xpath("normalize-space(td[2])") for r in rows]
-    dt_str = [r.xpath("normalize-space(td[3])") for r in rows]
-    desc = [r.xpath("normalize-space(td[4])") for r in rows]
+    modality = [str(r.xpath("normalize-space(td[2])")) for r in rows]
+    dt_str = [str(r.xpath("normalize-space(td[3])")) for r in rows]
+    desc = [str(r.xpath("normalize-space(td[4])")) for r in rows]
     dt = pd.to_datetime(pd.Series(dt_str, dtype="string"), errors="coerce")
 
     titles = np.array([r.get("title") or "" for r in rows], dtype=str)
@@ -277,11 +275,11 @@ def parse_all_tables_from_page(page_html: str) -> pd.DataFrame:
         if len(trs) > 1 and "no record" not in root.text_content().lower():
             rows = trs[1:]
             # Columns: StudyDT, StudyDescription, Status, Accession, Exported On
-            dt_str = [r.xpath("normalize-space(td[1])") for r in rows]
-            desc = [r.xpath("normalize-space(td[2])") for r in rows]
-            status = [r.xpath("normalize-space(td[3])") for r in rows]
-            accession = [r.xpath("normalize-space(td[4])") for r in rows]
-            exported_on_str = [r.xpath("normalize-space(td[5])") for r in rows]
+            dt_str = [str(r.xpath("normalize-space(td[1])")) for r in rows]
+            desc = [str(r.xpath("normalize-space(td[2])")) for r in rows]
+            status = [str(r.xpath("normalize-space(td[3])")) for r in rows]
+            accession = [str(r.xpath("normalize-space(td[4])")) for r in rows]
+            exported_on_str = [str(r.xpath("normalize-space(td[5])")) for r in rows]
 
             df_exported = pd.DataFrame(
                 {
@@ -309,9 +307,9 @@ def parse_all_tables_from_page(page_html: str) -> pd.DataFrame:
         trs = root.xpath(".//tr")
         if len(trs) > 1 and "no record" not in root.text_content().lower():
             rows = trs[1:]
-            modality = [r.xpath("normalize-space(td[2])") for r in rows]
-            dt_str = [r.xpath("normalize-space(td[3])") for r in rows]
-            desc = [r.xpath("normalize-space(td[4])") for r in rows]
+            modality = [str(r.xpath("normalize-space(td[2])")) for r in rows]
+            dt_str = [str(r.xpath("normalize-space(td[3])")) for r in rows]
+            desc = [str(r.xpath("normalize-space(td[4])")) for r in rows]
 
             df_available = pd.DataFrame(
                 {
