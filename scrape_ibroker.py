@@ -275,6 +275,7 @@ def parse_all_tables_from_page(page_html: str) -> pd.DataFrame:
         if len(trs) > 1 and "no record" not in root.text_content().lower():
             rows = trs[1:]
             # Columns: StudyDT, StudyDescription, Status, Accession, Exported On
+            # explicit str() to convert lxml._ElementUnicodeResult to plain str
             dt_str = [str(r.xpath("normalize-space(td[1])")) for r in rows]
             desc = [str(r.xpath("normalize-space(td[2])")) for r in rows]
             status = [str(r.xpath("normalize-space(td[3])")) for r in rows]
@@ -284,13 +285,13 @@ def parse_all_tables_from_page(page_html: str) -> pd.DataFrame:
             df_exported = pd.DataFrame(
                 {
                     "Study DateTime": pd.to_datetime(
-                        pd.Series(dt_str), errors="coerce"
+                        pd.Series(dt_str, dtype="string"), errors="coerce"
                     ),
                     "StudyDescription": desc,
                     "Status": status,
                     "Accession": accession,
                     "Exported On": pd.to_datetime(
-                        pd.Series(exported_on_str), errors="coerce"
+                        pd.Series(exported_on_str, dtype="string"), errors="coerce"
                     ),
                 }
             )
@@ -315,7 +316,7 @@ def parse_all_tables_from_page(page_html: str) -> pd.DataFrame:
                 {
                     "Modality": modality,
                     "Study DateTime": pd.to_datetime(
-                        pd.Series(dt_str), errors="coerce"
+                        pd.Series(dt_str, dtype="string"), errors="coerce"
                     ),
                     "StudyDescription": desc,
                 }
@@ -374,6 +375,59 @@ def parse_all_tables_from_page(page_html: str) -> pd.DataFrame:
     return combined.reset_index(drop=True)
 
 
+ALL_COLUMNS = [
+    "Modality",
+    "Study DateTime",
+    "StudyDescription",
+    "Status",
+    "Accession",
+    "Exported On",
+    "study_id",
+    "is_on_disk",
+    "scrape_error",
+]
+
+
+def process_study_id(
+    study_id: str,
+    session: requests.Session,
+    state: dict,
+    disk_inventory: dict,
+) -> tuple[pd.DataFrame, dict]:
+    """process a single study_id and return (df, updated_state)"""
+    page_html, state = post_fetch_grid(session, state, str(study_id))
+    df = parse_all_tables_from_page(page_html)
+
+    if df.empty:
+        df = pd.DataFrame(columns=ALL_COLUMNS)
+
+    df["StudyDescription"] = df["StudyDescription"].astype("string")
+    df["Modality"] = df.get("Modality", pd.Series(dtype="string"))
+    df["Modality"] = df["Modality"].astype("string")
+    missing_modalities = df["Modality"].isna() | (df["Modality"] == "")
+    if missing_modalities.any():
+        df.loc[missing_modalities, "Modality"] = df.loc[
+            missing_modalities, "StudyDescription"
+        ].map(infer_modality_from_description)
+
+    df["study_id"] = study_id
+    df = df.reindex(columns=ALL_COLUMNS)
+
+    # vectorized disk check
+    patient_inventory = disk_inventory.get(str(int(study_id)), set())
+    df["is_on_disk"] = df["Accession"].notna() & df["Accession"].isin(patient_inventory)
+
+    return df, state
+
+
+def make_error_row(study_id, error_msg: str) -> pd.DataFrame:
+    """create a single-row dataframe indicating a scrape failure"""
+    row = {col: pd.NA for col in ALL_COLUMNS}
+    row["study_id"] = study_id
+    row["scrape_error"] = error_msg
+    return pd.DataFrame([row])
+
+
 def main():
     driver = None
     try:
@@ -419,67 +473,32 @@ def main():
             )
             study_ids_to_process = study_ids
 
-        all_columns = [
-            "Modality",
-            "Study DateTime",
-            "StudyDescription",
-            "Status",
-            "Accession",
-            "Exported On",
-            "study_id",
-            "is_on_disk",
-        ]
+        if not study_ids_to_process:
+            print("No IDs to process. Exiting.")
+            return
+
+        # write header if needed
+        if not output_exists or os.path.getsize(output_file) == 0:
+            pd.DataFrame(columns=ALL_COLUMNS).to_csv(output_file, index=False)
 
         with open(output_file, "a", newline="") as f:
-            if not output_exists or os.path.getsize(output_file) == 0:
-                pd.DataFrame(columns=all_columns).to_csv(f, index=False, header=True)
-
             for study_id in tqdm(study_ids_to_process, desc="Scraping Study IDs"):
                 try:
-                    page_html, state = post_fetch_grid(session, state, str(study_id))
-                    df = parse_all_tables_from_page(page_html)
-
-                    if df.empty:
-                        df = pd.DataFrame(columns=all_columns)
-
-                    df["StudyDescription"] = df["StudyDescription"].astype("string")
-                    df["Modality"] = df.get("Modality", pd.Series(dtype="string"))
-                    df["Modality"] = df["Modality"].astype("string")
-                    missing_modalities = df["Modality"].isna() | (df["Modality"] == "")
-                    if missing_modalities.any():
-                        df.loc[missing_modalities, "Modality"] = df.loc[
-                            missing_modalities, "StudyDescription"
-                        ].map(infer_modality_from_description)
-
-                    df["study_id"] = study_id
-                    df = df.reindex(columns=all_columns)
-
-                    def check_row_on_disk(row):
-                        accession_val = row.get("Accession")
-                        if pd.notna(accession_val):
-                            patient_id_str = str(int(row["study_id"]))
-                            accession_str = str(accession_val)
-                            patient_inventory = disk_inventory.get(
-                                patient_id_str, set()
-                            )
-                            if accession_str in patient_inventory:
-                                return True
-                        return False
-
-                    df["is_on_disk"] = False
-                    on_disk_mask = df.apply(check_row_on_disk, axis=1)
-                    df.loc[on_disk_mask, "is_on_disk"] = True
-
+                    df, state = process_study_id(
+                        study_id, session, state, disk_inventory
+                    )
                     df.to_csv(f, index=False, header=False)
                     f.flush()
-
-                except (requests.exceptions.RequestException, ValueError) as e:
-                    print(
-                        f"\nWARNING: Failed to process study_id {study_id}. Error: {e}"
-                    )
-                    print("Re-initializing session state and continuing to next ID...")
-                    page_html, state = http_get_root(session)
-                    continue
+                except Exception as e:
+                    print(f"\nFailed on {study_id}: {e}. Re-initializing...")
+                    error_df = make_error_row(study_id, str(e))
+                    error_df.to_csv(f, index=False, header=False)
+                    f.flush()
+                    try:
+                        page_html, state = http_get_root(session)
+                        page_html, state = post_link_event(session, state, "lbAll")
+                    except Exception:
+                        pass
 
         print("Scraping complete.")
 
