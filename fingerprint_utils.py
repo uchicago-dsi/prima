@@ -23,9 +23,21 @@ class ExamFingerprint:
 
     study_uid: str
     file_hashes: FrozenSet[str]
+    study_date: Optional[str] = None  # DICOM tag (0008,0020) format: YYYYMMDD
+    study_time: Optional[str] = None  # DICOM tag (0008,0030) format: HHMMSS.ffffff
 
     def is_valid(self) -> bool:
         return bool(self.study_uid and self.file_hashes)
+
+    def get_study_datetime_str(self) -> Optional[str]:
+        """return combined date+time string for matching, or just date if time unavailable"""
+        if not self.study_date:
+            return None
+        if self.study_time:
+            # normalize time to just HHMMSS (drop fractional seconds for matching)
+            time_part = self.study_time.split(".")[0][:6]
+            return f"{self.study_date}_{time_part}"
+        return self.study_date
 
 
 def hash_file(filepath: Path) -> str:
@@ -84,9 +96,11 @@ def create_exam_fingerprint(exam_path: Path) -> Tuple[Optional[ExamFingerprint],
         pass
 
     study_uid = None
+    study_date = None
+    study_time = None
     file_hashes = set()
 
-    # hash + uid discovery
+    # hash + uid/date discovery
     hash_start = time.perf_counter()
     for fpath in files_to_process:
         try:
@@ -98,6 +112,11 @@ def create_exam_fingerprint(exam_path: Path) -> Tuple[Optional[ExamFingerprint],
             try:
                 dcm = pydicom.dcmread(fpath, stop_before_pixels=True)
                 study_uid = str(dcm.StudyInstanceUID)
+                # also extract StudyDate and StudyTime for reconciliation
+                if hasattr(dcm, "StudyDate") and dcm.StudyDate:
+                    study_date = str(dcm.StudyDate)
+                if hasattr(dcm, "StudyTime") and dcm.StudyTime:
+                    study_time = str(dcm.StudyTime)
             except pydicom.errors.InvalidDicomError:
                 continue
     hash_s = time.perf_counter() - hash_start
@@ -114,7 +133,10 @@ def create_exam_fingerprint(exam_path: Path) -> Tuple[Optional[ExamFingerprint],
         )
 
     fingerprint = ExamFingerprint(
-        study_uid=study_uid, file_hashes=frozenset(file_hashes)
+        study_uid=study_uid,
+        file_hashes=frozenset(file_hashes),
+        study_date=study_date,
+        study_time=study_time,
     )
     total_s = time.perf_counter() - t0
     logging.info(

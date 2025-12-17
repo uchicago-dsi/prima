@@ -62,7 +62,13 @@ def fingerprint_all_exams_for_patient(patient_dir: Path):
             fingerprint, reason = create_exam_fingerprint(exam_path)
             if fingerprint and fingerprint.is_valid():
                 exam_name = exam_path.name
-                result = (fingerprint.study_uid, sorted(fingerprint.file_hashes))
+                # store: (study_uid, file_hashes, study_date, study_time)
+                result = (
+                    fingerprint.study_uid,
+                    sorted(fingerprint.file_hashes),
+                    fingerprint.study_date,
+                    fingerprint.study_time,
+                )
                 patient_inventory[exam_name] = result
             else:
                 failure_reasons[reason] = failure_reasons.get(reason, 0) + 1

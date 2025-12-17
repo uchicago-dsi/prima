@@ -18,6 +18,9 @@ Use short imperative commit subjects (`add exported info to plotting`, `fastpath
 ## Configuration & Cache Discipline
 Persist only the authoritative metadata (`study_uid`, hashed file lists, cache manifests`) to JSON. Update producers and consumers together when adding keys; drop legacy aliases instead of keeping passive support. For new preprocessing parameters or remote paths, update the defining constants, rebuild caches end-to-end, and verify outputs via `sync.log` or plot diffs.
 
+## No Backward Compatibility
+**Do not add backward compatibility shims.** This is research code—simplicity is more valuable than compatibility. When data formats change (e.g., fingerprint cache schema), delete old caches and regenerate rather than adding conditional logic to handle multiple formats. The added complexity of backward compatibility is not worth it; we can always nuke and rerun.
+
 ## Security & Data Handling
 Never commit PHI or log it to stdout. Keep cache JSON and exported logs under `data/` out of version control unless scrubbed, and double-check destructive flags before touching hospital shares. Coordinate VPN, credential rotations, and mount path changes in lab channels so automation and sync jobs stay reproducible.
 

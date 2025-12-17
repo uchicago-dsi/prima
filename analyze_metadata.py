@@ -530,20 +530,26 @@ def create_is_on_disk_plot(
 
     # count on disk vs not on disk for each category
     case_screening_on_disk = (
-        case_screening["is_on_disk"].sum() if len(case_screening) > 0 else 0
+        case_screening["is_on_disk"].fillna(False).sum()
+        if len(case_screening) > 0
+        else 0
     )
     case_screening_not_on_disk = (
         len(case_screening) - case_screening_on_disk if len(case_screening) > 0 else 0
     )
 
     case_before_dx_on_disk = (
-        case_before_dx["is_on_disk"].sum() if len(case_before_dx) > 0 else 0
+        case_before_dx["is_on_disk"].fillna(False).sum()
+        if len(case_before_dx) > 0
+        else 0
     )
     case_before_dx_not_on_disk = (
         len(case_before_dx) - case_before_dx_on_disk if len(case_before_dx) > 0 else 0
     )
 
-    controls_on_disk = controls["is_on_disk"].sum() if len(controls) > 0 else 0
+    controls_on_disk = (
+        controls["is_on_disk"].fillna(False).sum() if len(controls) > 0 else 0
+    )
     controls_not_on_disk = len(controls) - controls_on_disk if len(controls) > 0 else 0
 
     on_disk_counts = [case_screening_on_disk, case_before_dx_on_disk, controls_on_disk]
@@ -624,20 +630,26 @@ def create_comprehensive_download_status_plot(
 
     # count on disk vs not on disk for each category
     case_screening_on_disk = (
-        case_screening["is_on_disk"].sum() if len(case_screening) > 0 else 0
+        case_screening["is_on_disk"].fillna(False).sum()
+        if len(case_screening) > 0
+        else 0
     )
     case_screening_not_on_disk = (
         len(case_screening) - case_screening_on_disk if len(case_screening) > 0 else 0
     )
 
     case_before_dx_on_disk = (
-        case_before_dx["is_on_disk"].sum() if len(case_before_dx) > 0 else 0
+        case_before_dx["is_on_disk"].fillna(False).sum()
+        if len(case_before_dx) > 0
+        else 0
     )
     case_before_dx_not_on_disk = (
         len(case_before_dx) - case_before_dx_on_disk if len(case_before_dx) > 0 else 0
     )
 
-    controls_on_disk = controls["is_on_disk"].sum() if len(controls) > 0 else 0
+    controls_on_disk = (
+        controls["is_on_disk"].fillna(False).sum() if len(controls) > 0 else 0
+    )
     controls_not_on_disk = len(controls) - controls_on_disk if len(controls) > 0 else 0
 
     on_disk_counts = [case_screening_on_disk, case_before_dx_on_disk, controls_on_disk]
@@ -690,7 +702,7 @@ def create_comprehensive_download_status_plot(
                 )
 
     # Panel 2: Modality breakdown of downloaded exams
-    downloaded_data = all_metadata[all_metadata["is_on_disk"]].copy()
+    downloaded_data = all_metadata[all_metadata["is_on_disk"].fillna(False)].copy()
     if len(downloaded_data) > 0:
         modality_counts = downloaded_data["base_modality"].value_counts()
         ax2.bar(
@@ -733,9 +745,9 @@ def create_comprehensive_download_status_plot(
     )
     if len(all_data_combined) > 0:
         modality_total = all_data_combined["base_modality"].value_counts()
-        modality_downloaded = all_data_combined[all_data_combined["is_on_disk"]][
-            "base_modality"
-        ].value_counts()
+        modality_downloaded = all_data_combined[
+            all_data_combined["is_on_disk"].fillna(False)
+        ]["base_modality"].value_counts()
 
         # calculate download rates
         download_rates = []
@@ -767,7 +779,7 @@ def create_comprehensive_download_status_plot(
     # Panel 4: Export vs Download status
     exported_data = all_metadata[all_metadata["Exported On"].notna()].copy()
     if len(exported_data) > 0:
-        exported_on_disk = (exported_data["is_on_disk"]).sum()
+        exported_on_disk = exported_data["is_on_disk"].fillna(False).sum()
         exported_not_on_disk = len(exported_data) - exported_on_disk
 
         labels = ["exported & on disk", "exported & not on disk"]
@@ -928,7 +940,7 @@ def create_comprehensive_export_analysis_plot(data, plots_dir):
 
     # Panel 4: Export Success Rate Analysis (exported vs downloaded)
     if "is_on_disk" in exported_data.columns:
-        exported_on_disk = exported_data["is_on_disk"].sum()
+        exported_on_disk = exported_data["is_on_disk"].fillna(False).sum()
         exported_not_on_disk = len(exported_data) - exported_on_disk
 
         labels = ["exported & downloaded", "exported & not downloaded"]
@@ -993,7 +1005,9 @@ def create_comprehensive_export_analysis_plot(data, plots_dir):
             print(f"estimated days to complete at current rate: {days_remaining:.1f}")
 
     if "is_on_disk" in exported_data.columns:
-        success_rate = (exported_data["is_on_disk"].sum() / len(exported_data)) * 100
+        success_rate = (
+            exported_data["is_on_disk"].fillna(False).sum() / len(exported_data)
+        ) * 100
         print(f"export-to-download success rate: {success_rate:.1f}%")
 
 
@@ -1771,14 +1785,91 @@ create_comprehensive_download_status_plot(
 create_comprehensive_export_analysis_plot(metadata_with_patient_data, plots_dir)
 
 # count and report exams with exported_on date but not on disk
-print("\n=== EXPORTED BUT NOT ON DISK ANALYSIS ===")
+print("\n=== EXPORT STATUS ANALYSIS ===")
+
+# show Status column breakdown by on_disk status
+if "Status" in metadata.columns and "is_on_disk" in metadata.columns:
+    print("Status breakdown (from iBroker 'Exported' table):")
+    print()
+
+    # get unique status values (excluding NaN)
+    status_values = metadata["Status"].dropna().unique()
+
+    is_on_disk = metadata["is_on_disk"].fillna(False)
+
+    print(f"{'Status':<25} {'on disk':>12} {'not on disk':>12} {'total':>12}")
+    print("-" * 65)
+
+    for status in sorted(status_values):
+        mask = metadata["Status"] == status
+        on_disk = (mask & is_on_disk).sum()
+        not_on_disk = (mask & ~is_on_disk).sum()
+        total = mask.sum()
+        print(f"{status:<25} {on_disk:>12,} {not_on_disk:>12,} {total:>12,}")
+
+    # also show records with no Status (from Available table, not yet exported)
+    no_status = metadata["Status"].isna()
+    on_disk_no_status = (no_status & is_on_disk).sum()
+    not_on_disk_no_status = (no_status & ~is_on_disk).sum()
+    total_no_status = no_status.sum()
+    print(
+        f"{'(no status/available)':<25} {on_disk_no_status:>12,} {not_on_disk_no_status:>12,} {total_no_status:>12,}"
+    )
+    print("-" * 65)
+
+    # totals
+    total_on_disk = is_on_disk.sum()
+    total_not_on_disk = (~is_on_disk).sum()
+    print(
+        f"{'TOTAL':<25} {total_on_disk:>12,} {total_not_on_disk:>12,} {len(metadata):>12,}"
+    )
+    print()
+
+    # show sample of records with Status but not on disk
+    pending = metadata[metadata["Status"].notna() & ~is_on_disk]
+    if len(pending) > 0:
+        print(f"sample of {len(pending):,} records with Status but not on disk:")
+        display_cols = [
+            "study_id",
+            "Accession",
+            "Status",
+            "Exported On",
+            "StudyDescription",
+        ]
+        display_cols = [c for c in display_cols if c in pending.columns]
+        print(pending[display_cols].head(20).to_string())
+        print()
+
+    # specifically show records with "Completed" status but not on disk
+    completed_mask = metadata["Status"].str.lower().str.contains("completed", na=False)
+    completed_not_on_disk = metadata[completed_mask & ~is_on_disk]
+    if len(completed_not_on_disk) > 0:
+        print(
+            f"\n=== {len(completed_not_on_disk):,} RECORDS WITH 'COMPLETED' STATUS BUT NOT ON DISK ==="
+        )
+        display_cols = [
+            "study_id",
+            "Accession",
+            "Status",
+            "Exported On",
+            "StudyDescription",
+        ]
+        display_cols = [c for c in display_cols if c in completed_not_on_disk.columns]
+        print(completed_not_on_disk[display_cols].to_string())
+        print()
+else:
+    if "Status" not in metadata.columns:
+        print("Status column not found in metadata")
+    if "is_on_disk" not in metadata.columns:
+        print("is_on_disk column not found in metadata")
+
 if (
     "Exported On" in metadata_with_patient_data.columns
     and "is_on_disk" in metadata_with_patient_data.columns
 ):
     exported_not_on_disk = metadata_with_patient_data[
         (metadata_with_patient_data["Exported On"].notna())
-        & (~metadata_with_patient_data["is_on_disk"])
+        & (~metadata_with_patient_data["is_on_disk"].fillna(False))
     ]
     print(
         f"exams with 'Exported On' date but not on disk: {len(exported_not_on_disk):,}"
@@ -1887,10 +1978,10 @@ if args.dump_screening_patients:
 print("\n=== DISK-ONLY DATA ANALYSIS ===")
 print("Finding patients with downloaded exams not in database...")
 
-# build filesystem inventory
+# build filesystem inventory using shared function
 basedir = "/gpfs/data/huo-lab/Image/ChiMEC/"
 if Path(basedir).is_dir():
-    from tqdm.auto import tqdm
+    from filesystem_utils import build_disk_inventory
 
     # get database accessions
     db_accessions = set()
@@ -1901,37 +1992,19 @@ if Path(basedir).is_dir():
 
     print(f"database contains {len(db_accessions):,} accessions")
 
-    # build inventory of disk accessions by patient
-    import os
+    # use shared inventory function (handles modality subdirs)
+    disk_inventory = build_disk_inventory(basedir)
 
-    patient_dirs = [d for d in os.scandir(basedir) if d.is_dir()]
+    # find patients with accessions on disk but not in database
     patients_with_disk_only = {}
-
-    for entry in tqdm(
-        patient_dirs[:500], desc="checking first 500 patients for disk-only data"
-    ):  # limit to avoid long runtime
-        patient_id = entry.name
-        disk_accessions = set()
-        try:
-            for item in os.scandir(entry.path):
-                accession_number = None
-                if item.is_dir():
-                    accession_number = item.name.split("-")[0]
-                elif item.is_file() and item.name.endswith(".tar.xz"):
-                    accession_number = item.name.replace(".tar.xz", "")
-                if accession_number:
-                    disk_accessions.add(accession_number)
-        except (OSError, PermissionError):
-            continue
-
-        # find accessions on disk but not in database
+    for patient_id, disk_accessions in disk_inventory.items():
         disk_only = disk_accessions - db_accessions
         if disk_only:
             patients_with_disk_only[patient_id] = {
                 "total_on_disk": len(disk_accessions),
                 "in_database": len(disk_accessions.intersection(db_accessions)),
                 "disk_only": len(disk_only),
-                "example_disk_only": sorted(disk_only)[:5],  # first 5 examples
+                "example_disk_only": sorted(disk_only)[:5],
             }
 
     print(f"found {len(patients_with_disk_only):,} patients with disk-only data")

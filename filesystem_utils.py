@@ -12,10 +12,32 @@ import pandas as pd
 from tqdm.auto import tqdm
 
 
+KNOWN_MODALITY_CODES = {
+    "CR",
+    "CT",
+    "DX",
+    "ES",
+    "MG",
+    "MR",
+    "NM",
+    "PT",
+    "PX",
+    "RF",
+    "RG",
+    "US",
+    "XA",
+    "XC",
+}
+
+
 def build_disk_inventory(basedir: str) -> Dict[str, Set[str]]:
     """
     performs a one-time, efficient scan of the download directory to build an in-memory
     inventory of all existing exams and provides a detailed summary.
+
+    handles two directory structures:
+    - flat: basedir/{patient_id}/{accession}/
+    - modality-grouped: basedir/{modality}/{patient_id}/{accession}/
 
     handles various naming conventions (e.g., ACCESSION, ACCESSION-DATE, ACCESSION.tar.xz).
 
@@ -39,12 +61,39 @@ def build_disk_inventory(basedir: str) -> Dict[str, Set[str]]:
         return inventory
 
     try:
-        patient_dirs = [d for d in os.scandir(basedir) if d.is_dir()]
+        top_level_dirs = [d for d in os.scandir(basedir) if d.is_dir()]
     except PermissionError:
         print(f"WARNING: permission denied to read directory: {basedir}")
         return inventory
 
-    for entry in tqdm(patient_dirs, desc="building file inventory"):
+    # check if top-level contains modality subdirs or patient dirs directly
+    modality_dirs = [d for d in top_level_dirs if d.name in KNOWN_MODALITY_CODES]
+    patient_dirs_at_root = [
+        d for d in top_level_dirs if d.name not in KNOWN_MODALITY_CODES
+    ]
+
+    # collect all patient directories to scan
+    all_patient_dirs = []
+
+    if modality_dirs:
+        print(
+            f"  - detected modality subdirectories: {[d.name for d in modality_dirs]}"
+        )
+        for mod_dir in modality_dirs:
+            try:
+                patient_dirs_in_mod = [
+                    d for d in os.scandir(mod_dir.path) if d.is_dir()
+                ]
+                all_patient_dirs.extend(patient_dirs_in_mod)
+            except PermissionError:
+                continue
+
+    # also include any patient dirs at root level (handles mixed structure)
+    all_patient_dirs.extend(patient_dirs_at_root)
+
+    print(f"  - found {len(all_patient_dirs):,} patient directories to scan")
+
+    for entry in tqdm(all_patient_dirs, desc="building file inventory"):
         patient_id = entry.name
         found_accessions = set()
         try:
@@ -65,7 +114,11 @@ def build_disk_inventory(basedir: str) -> Dict[str, Set[str]]:
                     found_accessions.add(accession_number)
 
             if found_accessions:
-                inventory[patient_id] = found_accessions
+                # merge with existing inventory for this patient (may appear in multiple modalities)
+                if patient_id in inventory:
+                    inventory[patient_id].update(found_accessions)
+                else:
+                    inventory[patient_id] = found_accessions
                 total_exam_count += len(found_accessions)
         except (FileNotFoundError, PermissionError):
             continue
@@ -73,7 +126,7 @@ def build_disk_inventory(basedir: str) -> Dict[str, Set[str]]:
     # detailed summary print statements
     patient_count = len(inventory)
     print("\n--- inventory summary ---")
-    print(f"  - scanned {len(patient_dirs):,} total directories.")
+    print(f"  - scanned {len(all_patient_dirs):,} patient directories.")
     print(f"  - found downloaded data for {patient_count:,} unique patients.")
     print(f"  - inventoried a total of {total_exam_count:,} unique exams on disk.")
     print("-------------------------\n")
