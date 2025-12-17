@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 from __future__ import annotations
 
+import fcntl
 import os
 import sys
 import traceback
@@ -482,23 +483,28 @@ def main():
             pd.DataFrame(columns=ALL_COLUMNS).to_csv(output_file, index=False)
 
         with open(output_file, "a", newline="") as f:
-            for study_id in tqdm(study_ids_to_process, desc="Scraping Study IDs"):
-                try:
-                    df, state = process_study_id(
-                        study_id, session, state, disk_inventory
-                    )
-                    df.to_csv(f, index=False, header=False)
-                    f.flush()
-                except Exception as e:
-                    print(f"\nFailed on {study_id}: {e}. Re-initializing...")
-                    error_df = make_error_row(study_id, str(e))
-                    error_df.to_csv(f, index=False, header=False)
-                    f.flush()
+            # acquire exclusive lock to prevent concurrent writes from other scripts
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                for study_id in tqdm(study_ids_to_process, desc="Scraping Study IDs"):
                     try:
-                        page_html, state = http_get_root(session)
-                        page_html, state = post_link_event(session, state, "lbAll")
-                    except Exception:
-                        pass
+                        df, state = process_study_id(
+                            study_id, session, state, disk_inventory
+                        )
+                        df.to_csv(f, index=False, header=False)
+                        f.flush()
+                    except Exception as e:
+                        print(f"\nFailed on {study_id}: {e}. Re-initializing...")
+                        error_df = make_error_row(study_id, str(e))
+                        error_df.to_csv(f, index=False, header=False)
+                        f.flush()
+                        try:
+                            page_html, state = http_get_root(session)
+                            page_html, state = post_link_event(session, state, "lbAll")
+                        except Exception:
+                            pass
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
         print("Scraping complete.")
 

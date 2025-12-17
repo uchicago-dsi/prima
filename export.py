@@ -22,17 +22,15 @@ from scrape_ibroker import login, make_driver, wait_aspnet_idle
 CHIMEC_PATIENTS_FILE = "/gpfs/data/phs/groups/Projects/Huo_projects/SPORE/annawoodard/List_ChiMEC_priority_2025July30.csv"
 KEY_FILE = "/gpfs/data/huo-lab/Image/ChiMEC/study-16352a.csv"
 METADATA_FILE = "data/imaging_metadata.csv"
+EXPORT_STATE_FILE = "data/export_state.csv"
 BASE_DOWNLOAD_DIR = "/gpfs/data/huo-lab/Image/ChiMEC/"
-METADATA_EXTRA_COLUMNS = [
+
+MERGE_KEY_COLUMNS = ["study_id", "Study DateTime", "StudyDescription"]
+EXPORT_STATE_COLUMNS = MERGE_KEY_COLUMNS + [
     "is_exported",
     "download_attempt_outcome",
     "export_requested_on",
 ]
-
-
-METADATA_BASE_COLUMNS: list[str] = []
-
-MERGE_KEY_COLUMNS = ["study_id", "Study DateTime", "StudyDescription"]
 
 USERNAME = os.getenv("IBROKER_USERNAME")
 PASSWORD = os.getenv("IBROKER_PASSWORD")
@@ -417,47 +415,33 @@ def _atomic_write_csv(df: pd.DataFrame, path: str | Path, **kwargs) -> None:
 
 
 def save_current_state(db: pd.DataFrame):
-    """Persist export state back into the metadata file atomically."""
+    """Persist export state to a separate file (not the scraper's metadata file).
 
-    if not METADATA_BASE_COLUMNS:
-        raise RuntimeError(
-            "Metadata columns are unknown; load_and_merge_data must run before saving."
-        )
+    Writes only the merge keys and export-specific columns to EXPORT_STATE_FILE.
+    This avoids conflicts with scrape_ibroker.py which owns METADATA_FILE.
+    """
+    available_cols = [c for c in EXPORT_STATE_COLUMNS if c in db.columns]
+    export_state = db[available_cols].copy()
 
-    working = db.copy()
-    for column in METADATA_EXTRA_COLUMNS:
-        if column not in working.columns:
-            working[column] = pd.NA
+    # only keep rows that have meaningful export state
+    has_state = (
+        export_state["is_exported"].fillna(False)
+        | export_state["download_attempt_outcome"].notna()
+        | export_state["export_requested_on"].notna()
+    )
+    export_state = export_state[has_state]
 
-    persist_columns: list[str] = []
-    seen = set()
-    for column in METADATA_BASE_COLUMNS + METADATA_EXTRA_COLUMNS:
-        if column in working.columns and column not in seen:
-            persist_columns.append(column)
-            seen.add(column)
-
-    metadata_subset = working[persist_columns].copy()
-
-    key_cols = [col for col in MERGE_KEY_COLUMNS if col in metadata_subset.columns]
+    key_cols = [c for c in MERGE_KEY_COLUMNS if c in export_state.columns]
     if key_cols:
-        before = len(metadata_subset)
-        metadata_subset = (
-            metadata_subset.sort_values(key_cols)
+        export_state = (
+            export_state.sort_values(key_cols)
             .drop_duplicates(subset=key_cols, keep="last")
             .reset_index(drop=True)
         )
-        if len(metadata_subset) != before:
-            print(
-                "  - save_current_state: collapsed "
-                f"{before:,} rows to {len(metadata_subset):,}"
-            )
-
-    if "is_target" in metadata_subset.columns:
-        metadata_subset = metadata_subset.drop(columns=["is_target"])
 
     _atomic_write_csv(
-        metadata_subset,
-        METADATA_FILE,
+        export_state,
+        EXPORT_STATE_FILE,
         index=False,
         date_format="%Y-%m-%d %H:%M:%S",
     )
@@ -473,9 +457,6 @@ def load_and_merge_data():
         metadata = pd.read_csv(METADATA_FILE)
         print(f"Loaded {len(metadata):,} exam records from raw metadata file.")
 
-        global METADATA_BASE_COLUMNS
-        METADATA_BASE_COLUMNS = list(metadata.columns)
-
         # A small fix: The Accession number is often what we care about, not the old exam_id
         # Let's rename exam_id to Accession if Accession is missing.
         if "exam_id" in metadata.columns and "Accession" in metadata.columns:
@@ -489,6 +470,7 @@ def load_and_merge_data():
                 metadata["Exported On"], errors="coerce"
             )
 
+        # initialize export state columns from scraper metadata where available
         if "is_exported" not in metadata.columns:
             metadata["is_exported"] = False
 
@@ -508,18 +490,48 @@ def load_and_merge_data():
             metadata.loc[exported_on_mask, "is_exported"] = True
 
         metadata["is_exported"] = metadata["is_exported"].fillna(False).astype(bool)
-
-        if "download_attempt_outcome" not in metadata.columns:
-            metadata["download_attempt_outcome"] = pd.NA
+        metadata["download_attempt_outcome"] = pd.NA
         metadata["download_attempt_outcome"] = metadata[
             "download_attempt_outcome"
         ].astype("string")
+        metadata["export_requested_on"] = pd.NaT
 
-        if "export_requested_on" not in metadata.columns:
-            metadata["export_requested_on"] = pd.NaT
-        metadata["export_requested_on"] = pd.to_datetime(
-            metadata["export_requested_on"], errors="coerce"
-        )
+        # load previous export state from separate file if it exists
+        if Path(EXPORT_STATE_FILE).exists():
+            export_state = pd.read_csv(EXPORT_STATE_FILE)
+            print(f"Loaded {len(export_state):,} rows from export state file.")
+            export_state["Study DateTime"] = pd.to_datetime(
+                export_state["Study DateTime"], errors="coerce"
+            )
+            export_state["export_requested_on"] = pd.to_datetime(
+                export_state["export_requested_on"], errors="coerce"
+            )
+            export_state["is_exported"] = (
+                export_state["is_exported"].fillna(False).astype(bool)
+            )
+            export_state["download_attempt_outcome"] = export_state[
+                "download_attempt_outcome"
+            ].astype("string")
+            # merge export state back into metadata on the key columns
+            metadata = metadata.merge(
+                export_state,
+                on=MERGE_KEY_COLUMNS,
+                how="left",
+                suffixes=("", "_state"),
+            )
+            # prefer values from export state file
+            for col in [
+                "is_exported",
+                "download_attempt_outcome",
+                "export_requested_on",
+            ]:
+                state_col = f"{col}_state"
+                if state_col in metadata.columns:
+                    mask = metadata[state_col].notna()
+                    if col == "is_exported":
+                        mask = mask | metadata[state_col].fillna(False).astype(bool)
+                    metadata.loc[mask, col] = metadata.loc[mask, state_col]
+                    metadata.drop(columns=[state_col], inplace=True)
     except FileNotFoundError as e:
         print(f"ERROR: Input file not found - {e}", file=sys.stderr)
         sys.exit(1)
@@ -921,7 +933,7 @@ def run_export_cycle(args, cycle_number: int):
 
     # Save final state
     save_current_state(db)
-    print(f"\nCycle complete. Metadata updates have been written to '{METADATA_FILE}'")
+    print(f"\nCycle complete. Export state written to '{EXPORT_STATE_FILE}'")
 
     return {
         "submitted": successfully_exported_count,
@@ -1119,7 +1131,7 @@ def refresh_export_status(
     )
 
     save_current_state(refresh_db)
-    print(f"Audit metadata persisted to '{METADATA_FILE}'.")
+    print(f"Audit state persisted to '{EXPORT_STATE_FILE}'.")
 
 
 def main():
