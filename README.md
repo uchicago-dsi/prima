@@ -1,88 +1,25 @@
 # prima
 Polygenic Risk and Imaging Multimodal Assessment
 
-# chimec list
-/gpfs/data/phs/groups/Projects/Huo_projects/SPORE/annawoodard/List_ChiMEC_priority_2025July30.csv
-
-Micromamba install:
-```
-curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xvj bin/micromamba
-./bin/micromamba shell init -s bash -r ~/micromamba 
-source ~/.bashrc
-micromamba config append channels conda-forge
-```
-
-Installation recipe:
-```bash
-# create + activate
-micromamba create -y -f env.yaml
-eval "$(micromamba shell hook -s bash)"
-micromamba activate prima
-
-# install torch/vision matching cu111 wheels (from the official index)
-python -m pip install \
-  torch==1.9.0+cu111 torchvision==0.10.0+cu111 \
-  -f https://download.pytorch.org/whl/torch_stable.html  # from “previous versions”
-
-# your repo + mirai fork (zarr patch)
-git clone --recursive git@github.com:uchicago-dsi/prima.git
-cd prima
-git submodule add git@github.com:annawoodard/Mirai vendor/mirai
-git submodule update --init --recursive
-
-# install your code + mirai
-pip install -e .
-pip install -r requirements.txt
-pip install -r requirements-dev.txt  # optional: linting + notebook extras
-pip install -e vendor/mirai
-
-# fix GLIBCXX/libstdc++ compatibility issue for lifelines/pandas
-# add conda/micromamba lib to LD_LIBRARY_PATH (required for survival analysis)
-export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
-# add to ~/.bashrc or ~/.bash_profile to make permanent:
-# echo 'export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH' >> ~/.bashrc
-
-
-```
-
-### Selenium environment for export.py
-
-The main `prima` environment has dependency conflicts with selenium/geckodriver. Use a separate environment for running `export.py`:
-
-```bash
-micromamba create -n selenium-ff python=3.11 selenium geckodriver firefox -c conda-forge
-micromamba activate selenium-ff
-pip install pandas requests lxml tqdm
-```
-
-Then run exports with:
-```bash
-micromamba activate selenium-ff
-python export.py --auto-confirm
-```
-
-Runtime dependencies live in `requirements.txt`; install `requirements-dev.txt` to pick up
-tooling such as Ruff and optional notebook helpers used during development.
-
-Before sending changes, run the project formatters:
-
-```bash
-ruff format .
-ruff check --fix .
-```
-
 ## Pipeline Overview
 
 The end-to-end workflow for training/inference is:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ DATA SOURCES                                                                │
+│ DATA ACQUISITION                                                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ 1. scrape_ibroker.py  → scrapes iBroker for study metadata                  │
+│ 2. export.py          → requests exports from iBroker based on metadata     │
+│ 3. HIRO rsync         → syncs exported DICOMs to GPFS (manual or automated) │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ DATA SOURCES (after acquisition)                                            │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ 1. Disk DICOMs     /gpfs/.../ChiMEC/MG/  → actual imaging data              │
 │ 2. Phenotype CSV   Phenotype_ChiMEC_*.csv → labels (case/control, datedx)   │
-│ 3. iBroker metadata (optional) → export tracking only, NOT needed for       │
-│                                  preprocessing/training                     │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
@@ -111,12 +48,188 @@ The end-to-end workflow for training/inference is:
 that exists on disk but is missing from iBroker (e.g., from earlier studies) will still
 be processed and can be used for training, as long as patients have phenotype labels.
 
-## Preprocessing Pipeline
+---
+
+## Installation
+
+### Main environment
+
+```bash
+# install micromamba if needed
+curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xvj bin/micromamba
+./bin/micromamba shell init -s bash -r ~/micromamba 
+source ~/.bashrc
+micromamba config append channels conda-forge
+
+# create + activate
+micromamba create -y -f env.yaml
+eval "$(micromamba shell hook -s bash)"
+micromamba activate prima
+
+# install torch/vision matching cu111 wheels (from the official index)
+python -m pip install \
+  torch==1.9.0+cu111 torchvision==0.10.0+cu111 \
+  -f https://download.pytorch.org/whl/torch_stable.html  # from "previous versions"
+
+# your repo + mirai fork (zarr patch)
+git clone --recursive git@github.com:uchicago-dsi/prima.git
+cd prima
+git submodule add git@github.com:annawoodard/Mirai vendor/mirai
+git submodule update --init --recursive
+
+# install your code + mirai
+pip install -e .
+pip install -r requirements.txt
+pip install -r requirements-dev.txt  # optional: linting + notebook extras
+pip install -e vendor/mirai
+
+# fix GLIBCXX/libstdc++ compatibility issue for lifelines/pandas
+# add conda/micromamba lib to LD_LIBRARY_PATH (required for survival analysis)
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+# add to ~/.bashrc or ~/.bash_profile to make permanent:
+# echo 'export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH' >> ~/.bashrc
+```
+
+### Selenium environment (for export.py and scrape_ibroker.py)
+
+The main `prima` environment has dependency conflicts with selenium/geckodriver. Use a separate environment:
+
+```bash
+micromamba create -n selenium-ff python=3.11 selenium geckodriver firefox -c conda-forge
+micromamba activate selenium-ff
+pip install pandas requests lxml tqdm
+```
+
+### Development
+
+Runtime dependencies live in `requirements.txt`; install `requirements-dev.txt` for tooling (Ruff, notebook helpers).
+
+Before sending changes:
+```bash
+ruff format .
+ruff check --fix .
+```
+
+---
+
+## Data Acquisition
+
+Data acquisition involves scraping metadata from iBroker, requesting exports, and syncing files to GPFS. These steps use the `selenium-ff` environment.
+
+### scrape_ibroker.py
+
+Scrapes the iBroker web interface to build a catalog of all imaging studies for ChiMEC patients. For each patient, it extracts both "Exported" studies (already requested) and "Available" studies (not yet exported), collecting metadata like study date, description, modality, accession number, and export status.
+
+```bash
+micromamba activate selenium-ff
+export IBROKER_USERNAME=your_username
+export IBROKER_PASSWORD=your_password
+python scrape_ibroker.py
+```
+
+Output: `data/imaging_metadata.csv` — the complete catalog of studies in iBroker.
+
+The script:
+- Uses Selenium for login, then switches to fast HTTP requests for scraping
+- Resumes from where it left off if interrupted
+- Records which studies are already on disk
+
+### export.py
+
+Uses the metadata from `scrape_ibroker.py` to request exports from iBroker. It identifies studies that need to be downloaded (matching modality, not already exported, not already on disk) and submits export requests via the web interface.
+
+```bash
+micromamba activate selenium-ff
+export IBROKER_USERNAME=your_username
+export IBROKER_PASSWORD=your_password
+python export.py --auto-confirm
+```
+
+Common options:
+```bash
+# check status without exporting anything
+python export.py --status-only
+
+# run continuously with 1-hour waits between cycles
+python export.py --auto-confirm --loop-wait 1h
+
+# export a different modality
+python export.py --auto-confirm --modality CT
+
+# include patients without genotyping data
+python export.py --auto-confirm --no-genotyping-filter
+
+# limit batch size per cycle
+python export.py --auto-confirm --batch-size 50
+```
+
+The script:
+- Merges patient phenotype data, study keys, and iBroker metadata
+- Filters to target modality (default: MG) and excludes already-exported or on-disk studies
+- Submits export requests in batches, saving progress to `data/export_state.csv`
+- Optionally audits pending exports to update status (`--refresh-export-status`)
+
+### HIRO → ChiMEC Data Transfer
+
+After exports are requested, files appear on a HIRO CIFS share. Use rsync to sync them to GPFS.
+
+#### Mount the HIRO share
+
+**On macOS:**
+- Finder → Go → Connect to Server...
+- Enter: `smb://UCHAD;annawoodard@cifs01uchadccd.uchad.uchospitals.edu/radiology/HIRO/16352A`
+- Authenticate with your UCHAD password
+- Mounts under `/Volumes/16352a`
+
+**On Linux:**
+```bash
+sudo mount -t cifs //cifs01uchadccd.uchad.uchospitals.edu/radiology/HIRO /mnt/uchad_samba \
+  -o credentials=/home/annawoodard/creds,vers=3.0,noperm,uid=$(id -u),gid=$(id -g),file_mode=0660,dir_mode=0770
+```
+
+Credentials file format:
+```
+username=your_username
+password=your_password
+domain=UCHAD
+```
+
+#### Run rsync
+
+```bash
+# install modern rsync on macOS if needed
+brew install rsync
+
+SRC="/Volumes/16352a/"  # mounted HIRO subdir; note trailing slash
+DST="annawoodard@cri-ksysappdsp3.cri.uchicago.edu:/gpfs/data/huo-lab/Image/ChiMEC/"
+
+# dry run first
+/opt/homebrew/bin/rsync -aHvn --itemize-changes --append-verify --partial \
+  --remove-source-files "$SRC" "$DST"
+
+# real transfer (resumable, deletes from source after successful copy)
+LOG="$HOME/hiro2chimec-$(date +%F).log"
+caffeinate -dims /opt/homebrew/bin/rsync \
+  -aH --info=progress2 --human-readable \
+  --append-verify --partial --remove-source-files \
+  --log-file="$LOG" \
+  "$SRC" "$DST"
+```
+
+Performance: ~3 MB/s over VPN (approximately 4 days per terabyte).
+
+Check transferred exams:
+```bash
+grep '<f++++++++++' hiro2chimec-2025-08-21.log | awk '{print $5}' | cut -d/ -f1-2 | sort -u | wc -l
+```
+
+---
+
+## Preprocessing
 
 ### Step 1: Run preprocessing
 
-Scan disk DICOMs, extract metadata, select full-quad exams (L-CC, L-MLO, R-CC, R-MLO),
-and write Zarr cache:
+Scan disk DICOMs, extract metadata, select full-quad exams (L-CC, L-MLO, R-CC, R-MLO), and write Zarr cache:
 
 ```bash
 # full preprocessing (discovery + zarr cache)
@@ -132,25 +245,19 @@ python preprocess.py preprocess \
 ```
 
 Outputs are written to `{raw}/sot/` and `{raw}/out/` by default:
-- `sot/views.parquet` - individual DICOM views with metadata
-- `sot/exams.parquet` - exam-level aggregated metadata
-- `sot/dicom_tags.parquet` - all DICOM tags (wide format)
-- `out/manifest.parquet` - Zarr URIs for each view
-- `out/mirai_manifest.csv` - Mirai-compatible CSV with labels (auto-generated if --labels provided)
+- `sot/views.parquet` — individual DICOM views with metadata
+- `sot/exams.parquet` — exam-level aggregated metadata
+- `sot/dicom_tags.parquet` — all DICOM tags (wide format)
+- `out/manifest.parquet` — Zarr URIs for each view
+- `out/mirai_manifest.csv` — Mirai-compatible CSV with labels (auto-generated if --labels provided)
 
 ### Step 2: Generate Mirai CSV (if not done in step 1)
-
-If you need to regenerate the Mirai CSV without reprocessing:
 
 ```bash
 python preprocess.py emit-csv \
   --raw /gpfs/data/huo-lab/Image/ChiMEC/MG \
   --labels /gpfs/data/phs/groups/Projects/Huo_projects/SPORE/annawoodard/Phenotype_ChiMEC_2025Oct4.csv
 ```
-
-### Step 3: Run Mirai inference
-
-See "running mirai" section below for single-GPU and sharded multi-GPU options.
 
 ### Incremental processing
 
@@ -163,16 +270,12 @@ python preprocess.py preprocess \
   --incremental
 ```
 
-### Monitoring progress
+### Monitoring and checkpoints
 
-In a separate terminal:
 ```bash
+# monitor progress in a separate terminal
 python preprocess.py monitor --interval 30
-```
 
-### Checkpoint management
-
-```bash
 # list checkpoints
 python preprocess.py checkpoint list
 
@@ -183,128 +286,19 @@ python preprocess.py checkpoint status
 python preprocess.py checkpoint clean --max-age-days 7
 ```
 
-
-## HIRO → ChiMEC Data Transfer Instructions (macOS client → GPFS)
-
-This document describes the tested steps for moving data from a HIRO CIFS share to our ChiMEC GPFS storage.
-
-Goal: one-way, resumable, safe copy of files. Files are deleted from HIRO after successful transfer; nothing is ever deleted from ChiMEC.
-
 ---
-### 1. Mount the HIRO share on macOS
 
-- Open Finder → Go → Connect to Server...
-- Enter the server string (use your UCHAD username):
-  `smb://UCHAD;annawoodard@cifs01uchadccd.uchad.uchospitals.edu/radiology/HIRO/16352A`
-- Authenticate with your UCHAD password.
-- Finder mounts the share under `/Volumes/16352a` (the exact name may vary if you remount multiple times). This mounted path is the source for rsync.
+## Running Mirai
 
----
-### 2. Mount the HIRO share on Linux
-
-To mount the HIRO share on a Linux system:
-
-```bash
-sudo mount -t cifs //cifs01uchadccd.uchad.uchospitals.edu/radiology/HIRO /mnt/uchad_samba \
-  -o credentials=/home/annawoodard/creds,vers=3.0,noperm,uid=$(id -u),gid=$(id -g),file_mode=0660,dir_mode=0770
-```
-
-This mounts the share at `/mnt/uchad_samba`. Ensure the credentials file exists and contains your UCHAD username and password in the format:
-```
-username=your_username
-password=your_password
-domain=UCHAD
-```
-
-This requires special access granted from the admins, e.g.:
-```
-# cat /etc/sudoers.d/annawoodard.conf
-annawoodard ALL=(root) NOPASSWD: /usr/sbin/mount.cifs
-annawoodard ALL=(root) NOPASSWD: /usr/sbin/umount
-```
----
-### 3. Install a modern rsync on macOS
-
-The Apple-provided rsync is outdated. Use **Homebrew** to install a modern version.
-
-```bash
-brew install rsync
-```
-
-This installs modern rsync as `/opt/homebrew/bin/rsync` (Apple Silicon) or `/usr/local/bin/rsync` (Intel).
-
----
-### 4. Set source and destination paths
-
-```bash
-SRC="/Volumes/16352a/"  # mounted HIRO subdir; note trailing slash
-DST="annawoodard@cri-ksysappdsp3.cri.uchicago.edu:/gpfs/data/huo-lab/Image/ChiMEC/"
-```
-
----
-### 5. Dry run (safe preview)
-
-This command performs a dry run, showing what will be copied without actually moving any files.
-
-```bash
-/opt/homebrew/bin/rsync -aHvn --itemize-changes --append-verify --partial \
-  --remove-source-files \
-  "$SRC" "$DST"
-```
-- `-n`: dry run, nothing is copied or removed
-- `--itemize-changes`: shows a detailed list of what would happen
-- `--remove-source-files`: is inert in a dry-run but will delete files from HIRO after a successful copy in a real run
-
-Check that the file mapping is correct (`/Volumes/16352a/...` → `/gpfs/.../ChiMEC/...`).
-
----
-### 6. Real transfer (resumable, safe delete-on-success)
-
-This command performs the actual data transfer and can be stopped and restarted as needed.
-
-```bash
-LOG="$HOME/hiro2chimec-$(date +%F).log"
-caffeinate -dims /opt/homebrew/bin/rsync \
-  -aH --info=progress2 --human-readable \
-  --append-verify --partial --remove-source-files \
-  --log-file="$LOG" \
-  "$SRC" "$DST"
-```
-- `caffeinate`: prevents the Mac from sleeping during the transfer
-- `--append-verify`: enables robust resume on partial files and ensures checksum verification
-- `--partial`: keeps partially copied files to allow for a restart
-- `--remove-source-files`: deletes files from HIRO only after a successful copy to the destination
-- `--log-file`: records all transfers to a log file
-
----
-### 7. Cleanup (optional)
-
-Directories on HIRO will remain after the files are moved. They can be pruned manually later if desired, but this is not required.
-
----
-### Performance note
-
-Over VPN, throughput was measured at ~3 MB/s (approximately 4 days per terabyte).
-
-### check how many exams have transferred
-
-```bash
-grep '<f++++++++++' hiro2chimec-2025-08-21.log  | awk '{print $5}' | cut -d/ -f1-2 | sort -u | wc -l
-```
-
-### running mirai
-
-**Important**: Before running mirai, ensure LD_LIBRARY_PATH is set to use conda's libstdc++:
+**Important**: Before running mirai, ensure LD_LIBRARY_PATH is set:
 ```bash
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 ```
 
-Then run:
-
-**GPU Compatibility Check**: Ensure PyTorch is compiled for your GPU architecture:
+### GPU compatibility
 
 ```bash
-# check your GPU compute capability (on compute node with GPU access)
+# check your GPU compute capability
 nvidia-smi --query-gpu=name,compute_cap --format=csv
 ```
 
@@ -313,22 +307,19 @@ Common GPUs and required PyTorch:
 - **V100** (compute 7.0): needs CUDA 10+ with sm_70 → use `cu102` or higher
 - **P100** (compute 6.0): needs CUDA 9+ with sm_60 → use `cu102` or higher
 
-Install PyTorch for your setup (A100 example with CUDA 11.8):
 ```bash
-# install/reinstall PyTorch with correct CUDA version
+# install/reinstall PyTorch with correct CUDA version (A100 example)
 pip install torch==2.0.1 torchvision==0.15.2 --index-url https://download.pytorch.org/whl/cu118
 
-# verify GPU is detected and supported
+# verify GPU is detected
 python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}')"
-```
 
-If you get `RuntimeError: CUDA error: no kernel image is available for execution on the device`, your PyTorch doesn't support your GPU. Check compiled architectures and reinstall:
-```bash
+# check compiled architectures if you get "no kernel image" errors
 python -c "import torch; print(f'Compiled for: {torch.cuda.get_arch_list()}')"
-# should include sm_XX matching your GPU's compute capability (e.g., sm_80 for A100)
 ```
 
-For single GPU:
+### Single GPU
+
 ```bash
 python scripts/main.py \
   --model_name mirai_full \
@@ -347,35 +338,8 @@ python scripts/main.py \
   --cuda
 ```
 
-**Performance monitoring and tuning**:
+### Multi-GPU
 
-Monitor GPU utilization in another terminal:
-```bash
-watch -n 1 nvidia-smi
-```
-
-If process seems hung or slow (check `nvidia-smi`):
-```bash
-# LOW GPU MEMORY (<1GB) = stuck in data loading, not GPU compute
-# Try with NO multiprocessing first:
---num_workers 0 --batch_size 16
-
-# If that works, gradually increase:
---num_workers 2 --batch_size 32
---num_workers 4 --batch_size 64
-
-# add CUDA_LAUNCH_BLOCKING=1 to see exactly where it hangs
-CUDA_LAUNCH_BLOCKING=1 python scripts/main.py ... --cuda
-```
-
-Common bottlenecks:
-- **GPU memory <1GB, stuck at 0%**: data loading hang - use `--num_workers 0` to disable multiprocessing
-- **First batch very slow**: normal with large images (1664x2048) - can take 2-5 minutes per batch initially
-- **Low GPU utilization** (<50%): increase `--batch_size` 
-- **High GPU memory**: decrease `--batch_size`
-- **Network filesystem**: multiprocessing (`--num_workers`) can cause deadlocks - start with `0`
-
-For multi-GPU inference, add `--num_gpus N` and `--data_parallel`:
 ```bash
 python scripts/main.py \
   --model_name mirai_full \
@@ -396,7 +360,8 @@ python scripts/main.py \
   --data_parallel
 ```
 
-For parallel processing across multiple GPU jobs (recommended for large datasets):
+### Sharded parallel processing (recommended for large datasets)
+
 ```bash
 python run_mirai_sharded.py \
   --max_samples_per_shard 500 \
@@ -413,8 +378,7 @@ python run_mirai_sharded.py \
   --img_size 1664 2048 \
   --img_std 12005.5 \
   --test \
-  --cuda \
-  --debug_max_samples 20
+  --cuda
 ```
 
 The sharded script will:
@@ -423,197 +387,141 @@ The sharded script will:
 - Automatically collate results when jobs complete
 - Save recovery metadata for resuming if the main process dies
 
-To recover from a crashed run:
+Recovery and debugging:
 ```bash
+# recover from a crashed run
 python run_mirai_sharded.py --recover /path/to/mirai_shards/job_metadata.json
-```
 
-For debugging with a small sample:
-```bash
+# debug with a small sample
 python run_mirai_sharded.py --debug_max_samples 100 --num_shards 2 ...
 ```
 
-**Checkpointing workaround** (manual alternative): Mirai doesn't save incremental results. To avoid losing work, split your metadata CSV into chunks and process separately:
+### Performance tuning
+
+Monitor GPU utilization:
 ```bash
-# split manifest into chunks of 1000 patients each
-split -l 1000 -d --additional-suffix=.csv mirai_manifest.csv chunk_
-
-# process each chunk (keep header row)
-head -1 mirai_manifest.csv > chunk_00_with_header.csv
-tail -n +2 chunk_00.csv >> chunk_00_with_header.csv
-
-python scripts/main.py ... \
-  --metadata_path chunk_00_with_header.csv \
-  --prediction_save_path output_00.csv
-
-# merge results
-head -1 output_00.csv > final_output.csv
-tail -n +2 -q output_*.csv >> final_output.csv
+watch -n 1 nvidia-smi
 ```
+
+If process seems hung or slow:
+```bash
+# LOW GPU MEMORY (<1GB) = stuck in data loading, not GPU compute
+# Try with NO multiprocessing first:
+--num_workers 0 --batch_size 16
+
+# If that works, gradually increase:
+--num_workers 2 --batch_size 32
+--num_workers 4 --batch_size 64
+
+# add CUDA_LAUNCH_BLOCKING=1 to see exactly where it hangs
+CUDA_LAUNCH_BLOCKING=1 python scripts/main.py ... --cuda
+```
+
+Common bottlenecks:
+- **GPU memory <1GB, stuck at 0%**: data loading hang — use `--num_workers 0`
+- **First batch very slow**: normal with large images (1664x2048) — can take 2-5 minutes initially
+- **Low GPU utilization** (<50%): increase `--batch_size`
+- **High GPU memory**: decrease `--batch_size`
+- **Network filesystem**: multiprocessing can cause deadlocks — start with `--num_workers 0`
 
 **Notes**:
-- The LD_LIBRARY_PATH setting is required because pandas (a lifelines dependency) needs GLIBCXX_3.4.29, which is provided by conda/micromamba's libstdc++ but not by the system library. Setting this before Python starts ensures the correct library is used.
-- Ignore "Restarting run from scratch" message during inference - it's always printed even when only running `--test` (not training).
+- The LD_LIBRARY_PATH setting is required because pandas (a lifelines dependency) needs GLIBCXX_3.4.29
+- Ignore "Restarting run from scratch" message during inference — it's always printed even when only running `--test`
 
-### analyzing mirai output
+---
 
-After running Mirai inference, use `analyze_mirai.py` to compute per-horizon AUC and survival metrics (Uno's C-index, time-dependent AUC, integrated Brier score).
+## Analysis
 
-The script expects `validation_output.csv` and `mirai_manifest.csv` in the same directory. Basic usage:
+### analyze_mirai.py
+
+Compute per-horizon AUC and survival metrics (Uno's C-index, time-dependent AUC, integrated Brier score).
+
 ```bash
-python analyze_mirai.py \
-  --out-dir /gpfs/data/huo-lab/Image/ChiMEC/MG/out
-```
+# basic usage (expects validation_output.csv and mirai_manifest.csv in same directory)
+python analyze_mirai.py --out-dir /gpfs/data/huo-lab/Image/ChiMEC/MG/out
 
-This will write results to `{out_dir}/summary.json` by default. To specify a different output path:
-```bash
+# custom output path
 python analyze_mirai.py \
   --out-dir /gpfs/data/huo-lab/Image/ChiMEC/MG/out \
   --out /path/to/custom_summary.json
-```
 
-The script auto-detects prediction columns (looks for names containing 'risk', 'pred', or 'prob' with horizon numbers). To override:
-```bash
+# override prediction column mapping
 python analyze_mirai.py \
   --out-dir /gpfs/data/huo-lab/Image/ChiMEC/MG/out \
   --map 1:risk_1year 5:risk_5year
-```
 
-Filter to a specific split (if your metadata has a `split_group` column):
-```bash
+# filter to a specific split
 python analyze_mirai.py \
   --out-dir /gpfs/data/huo-lab/Image/ChiMEC/MG/out \
   --split test
-```
 
-**k-fold cross-validation for IPCW sensitivity**: When all your data is "test" (no separate training set), use k-fold CV to assess how sensitive IPCW-based metrics are to the censoring distribution estimate:
-```bash
+# k-fold cross-validation for IPCW sensitivity
 python analyze_mirai.py \
   --out-dir /gpfs/data/huo-lab/Image/ChiMEC/MG/out \
   --kfold 5
 ```
 
-This splits at the patient level (not exam level) to avoid leakage. For each fold, the training fold estimates the IPCW censoring distribution, and the test fold evaluates metrics using that estimate. Results include mean ± std across folds.
-
-**Output**: The script prints:
-- Per-horizon summary: cases, controls, excluded, prevalence, AUC
-- Survival metrics: time-dependent AUC, Uno's C-index, integrated Brier score
-- With `--kfold`: aggregated statistics across folds
-
-JSON output includes detailed per-fold results when using k-fold CV.
+K-fold CV splits at the patient level to avoid leakage and assesses IPCW sensitivity when all data is "test".
 
 ### analyze_metadata.py
 
-Use `analyze_metadata.py` to analyze imaging metadata and generate summary plots for a specified modality. The script performs ChiMEC patient data analysis, generates distribution plots, and tracks download status.
+Analyze imaging metadata and generate summary plots.
 
-**Basic usage**:
 ```bash
+# basic usage
 python analyze_metadata.py --modality MG
-```
 
-This analyzes mammography (MG) data and generates plots in the `plots/` directory, including:
-- Download status by category
-- Scans per patient distributions
-- Modality distributions
-- Time-to-diagnosis analysis
-- Cases vs controls comparisons
-
-**Available modalities**: CR, DX, MG, US, CT, MR, NM, PT, XA, RF, ES, XC, PX, RG
-
-**Dump screening patients**:
-```bash
+# dump screening patients (scans ≥3 months before diagnosis)
 python analyze_metadata.py --modality MG --dump-screening-patients
 ```
 
-This generates a CSV of patients with screening scans at least 3 months before diagnosis, useful for identifying screening cohorts.
+Available modalities: CR, DX, MG, US, CT, MR, NM, PT, XA, RF, ES, XC, PX, RG
 
-The script creates both "all" and "genotyped" versions of all plots, comparing the full dataset against the genotyped subset.
+Creates plots in `plots/` including download status, scans per patient distributions, modality distributions, and time-to-diagnosis analysis.
 
-### QC gallery
+---
 
-Use `qc_gallery.py` to interactively review and mark mammogram exams for quality control. The tool generates combined 4-view figures (L CC, L MLO, R CC, R MLO) and provides an HTML gallery with keyboard navigation and QC marking.
+## Quality Control
 
-**Basic usage** (server mode, recommended for remote work):
+### qc_gallery.py
+
+Interactively review and mark mammogram exams for quality control. Generates combined 4-view figures (L CC, L MLO, R CC, R MLO) with an HTML gallery.
+
 ```bash
+# server mode (recommended for remote work)
 python qc_gallery.py --serve --max-exams 100 --random
 ```
 
-This will:
-1. Generate combined 4-view figures for each exam
-2. Create an interactive HTML gallery
-3. Start an HTTP server on port 5000
-
-**Accessing the gallery remotely**:
-
-If running on a remote server, set up SSH port forwarding:
+For remote access, set up SSH port forwarding:
 ```bash
-# In a separate terminal on your local machine
 ssh -L 5000:localhost:5000 user@remote-host
 ```
-
 Then open `http://localhost:5000/` in your browser.
 
-**QC workflow**:
+QC workflow:
+1. Mark exams using keyboard shortcuts: `G` = Good, `R` = Needs review, `B` = Bad, Arrow keys = Navigate
+2. QC status auto-saves to `data/qc_status.json`
+3. Re-run the script to continue — exams marked "good" are automatically skipped
 
-1. Mark exams using keyboard shortcuts:
-   - `G` = Good
-   - `R` = Needs review
-   - `B` = Bad
-   - Arrow keys = Navigate between exams
-
-2. QC status auto-saves to the server after each click (saved to `data/qc_status.json` by default)
-
-3. To continue QC on remaining exams, re-run the script - exams already marked "good" will be automatically skipped
-
-**Common options**:
-
-Limit number of exams and sample randomly:
+Common options:
 ```bash
-python qc_gallery.py --serve --max-exams 50 --random
-```
-
-Use a custom port:
-```bash
+# custom port
 python qc_gallery.py --serve --port 8080
-```
 
-Filter to a specific patient:
-```bash
+# filter to specific patient
 python qc_gallery.py --serve --patient 12345
-```
 
-Use a custom QC file location:
-```bash
-python qc_gallery.py --serve --qc-file /path/to/my_qc_status.json
-```
-
-Specify custom input/output paths:
-```bash
+# custom paths
 python qc_gallery.py \
   --serve \
   --views /path/to/views.parquet \
   --raw /gpfs/data/huo-lab/Image/ChiMEC/MG \
-  --output qc_output
+  --output qc_output \
+  --qc-file /path/to/my_qc_status.json
 ```
 
-**Local mode** (without server):
-
-If you prefer not to use the server, you can generate the gallery and open it directly:
+Local mode (without server):
 ```bash
 python qc_gallery.py --max-exams 10
+# then open qc_output/gallery.html
 ```
-
-Then open `qc_output/gallery.html` in your browser. Note: in local mode, QC data downloads as `qc_status.json` on each click - you'll need to manually move it to your desired location.
-
-**QC file format**:
-
-The QC status file is a JSON mapping exam IDs to status:
-```json
-{
-  "exam_id_1": "good",
-  "exam_id_2": "review",
-  "exam_id_3": "bad"
-}
-```
-
-Valid statuses are: `"good"`, `"review"`, `"bad"`. Exams marked as "good" are automatically skipped on subsequent runs.
