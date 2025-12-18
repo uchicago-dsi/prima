@@ -3,8 +3,45 @@
 ## Project Structure & Module Organization
 Root scripts (`fingerprinter.py`, `sync.py`, `export.py`, `download_data.py`) drive data movement and fingerprinting. Shared helpers (`fingerprint_utils.py`, `filesystem_utils.py`, `analyze_mirai.py`) centralize IO, hashing, and plotting—extend these instead of cloning code. The lightweight package stub lives in `prima/`; cache inventories sit under `data/`, figures under `plots/`, and external dependencies under `vendor/` (treat the Mirai submodule as read-only unless mirroring upstream).
 
+## Environment Setup
+Use the `prima` micromamba environment for all operations:
+```bash
+eval "$(micromamba shell hook -s bash)"
+micromamba activate prima
+```
+This environment has all required dependencies (torch, pydicom, zarr, pandas, etc.).
+
 ## Build, Test, and Development Commands
-Create the micromamba env once with `micromamba create -n prima python=3.11`, then `micromamba activate prima`, `pip install -e .`, `pip install -r requirements.txt`, and `pip install -r requirements-dev.txt` for linting/notebook extras. Scripts expose CLI help; run `python fingerprinter.py --help` or `python sync.py --dry-run` before touching production mounts. After refactors, execute `python -m compileall prima fingerprint_utils.py filesystem_utils.py` as a quick syntax check, then format with `ruff format .` followed by `ruff check --fix .`.
+Create the micromamba env once with `micromamba create -y -f env.yaml`, then `micromamba activate prima`, `pip install -e .`, `pip install -r requirements.txt`, and `pip install -r requirements-dev.txt` for linting/notebook extras. Scripts expose CLI help; run `python fingerprinter.py --help` or `python sync.py --dry-run` before touching production mounts. After refactors, execute `python -m compileall prima fingerprint_utils.py filesystem_utils.py` as a quick syntax check, then format with `ruff format .` followed by `ruff check --fix .`.
+
+## Data Sources & Pipeline
+
+### Three Data Sources
+1. **iBroker metadata** (`data/imaging_metadata.csv`) - tracks exports from hospital PACS. Used for sync/export tracking only, NOT needed for preprocessing/training.
+2. **Disk DICOMs** (`/gpfs/data/huo-lab/Image/ChiMEC/MG/`) - actual imaging data. The preprocessing pipeline works directly on these.
+3. **Phenotype labels** (`Phenotype_ChiMEC_*.csv`) - case/control status, diagnosis dates. Required for training labels.
+
+### Key Insight
+**Preprocessing does NOT depend on iBroker metadata.** Historical data on disk but missing from iBroker (e.g., from earlier studies) CAN be used for training, as long as patients have phenotype labels. The disk fingerprint cache (`data/destination_fingerprints.json`) tracks what's actually on disk.
+
+### Pipeline Flow
+```
+Disk DICOMs → preprocess.py → SoT tables (views.parquet, exams.parquet)
+                           → Zarr cache + manifest.parquet
+                           → emit-csv joins with phenotype → mirai_manifest.csv
+                           → run_mirai_sharded.py → predictions
+```
+
+### Running Analysis
+```bash
+# analyze metadata and show data coverage summary
+python analyze_metadata.py --modality MG
+
+# see DATA SOURCES SUMMARY section for:
+# - current training data (on disk with labels)
+# - remaining to download (in iBroker but not on disk)
+# - historical data (on disk but not in iBroker, most have labels!)
+```
 
 ## Coding Style & Naming Conventions
 Keep configuration in module-level constants or argparse defaults—no hidden fallbacks scattered across call sites. Follow PEP 8 with 4-space indentation, snake_case functions, CamelCase classes, and ALL_CAPS constants (see `sync.py`). Prefer `pathlib.Path`, structured logging, and concise comments; document tensor or array shapes only when needed. Favor vectorized NumPy/PyTorch utilities for volume work.

@@ -5,6 +5,8 @@ Performs ChiMEC patient data analysis and generates plots
 """
 
 import argparse
+import json
+from collections import defaultdict
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -73,7 +75,6 @@ print(f"ChiMEC patients: {len(chimec_patients):,}")
 print(f"Key table records: {len(key):,}")
 print(f"All metadata records: {len(all_metadata):,}")
 print(f"{SELECTED_MODALITY} metadata records: {len(metadata):,}")
-
 
 # update metadata with current disk status using StudyDate matching
 # (fingerprint cache is modality-specific, matches filtered metadata)
@@ -1987,79 +1988,178 @@ if args.dump_screening_patients:
         )
         print("CSV file not created")
 
-# add analysis of disk-only data for manual verification
-print("\n=== DISK-ONLY DATA ANALYSIS ===")
-print("Finding patients with downloaded exams not in database...")
+# comprehensive data sources analysis
+print("\n" + "=" * 80)
+print("DATA SOURCES SUMMARY")
+print("=" * 80)
+print("""
+This analysis compares three data sources:
+1. iBroker metadata (imaging_metadata.csv) - tracks exports, NOT needed for preprocessing
+2. Disk fingerprints - actual imaging data available for training
+3. Phenotype labels - case/control status and diagnosis dates
 
-# build filesystem inventory using shared function
-basedir = "/gpfs/data/huo-lab/Image/ChiMEC/"
-if Path(basedir).is_dir():
-    from filesystem_utils import build_disk_inventory
+Key insight: Preprocessing works directly on disk DICOMs. Historical data on disk but
+missing from iBroker CAN be used for training, as long as patients have phenotype labels.
+""")
 
-    # get database accessions
-    db_accessions = set()
-    if "Accession" in metadata.columns:
-        db_accessions = set(
-            metadata[metadata["Accession"].notna()]["Accession"].astype(str)
-        )
+# load phenotype data
+phenotype_path = Path(
+    "/gpfs/data/phs/groups/Projects/Huo_projects/SPORE/annawoodard/Phenotype_ChiMEC_2025Oct4.csv"
+)
+mrn_mapping_path = Path("/gpfs/data/huo-lab/Image/ChiMEC/study-16352a.csv")
+fingerprint_cache = Path("data/destination_fingerprints.json")
 
-    print(f"database contains {len(db_accessions):,} accessions")
+if phenotype_path.exists() and mrn_mapping_path.exists() and fingerprint_cache.exists():
+    # load MRN -> AnonymousID mapping
+    mrn_map = pd.read_csv(mrn_mapping_path)
+    mrn_map["MRN"] = mrn_map["MRN"].astype(str).str.strip().str.zfill(8)
+    mrn_to_anon = dict(zip(mrn_map["MRN"], mrn_map["AnonymousID"].astype(str)))
 
-    # use shared inventory function (handles modality subdirs)
-    disk_inventory = build_disk_inventory(basedir)
+    # load phenotype
+    phenotype_df = pd.read_csv(phenotype_path)
+    phenotype_df["MRN"] = phenotype_df["MRN"].astype(str).str.strip().str.zfill(8)
+    phenotype_df["patient_id"] = phenotype_df["MRN"].map(mrn_to_anon)
 
-    # find patients with accessions on disk but not in database
-    patients_with_disk_only = {}
-    for patient_id, disk_accessions in disk_inventory.items():
-        disk_only = disk_accessions - db_accessions
-        if disk_only:
-            patients_with_disk_only[patient_id] = {
-                "total_on_disk": len(disk_accessions),
-                "in_database": len(disk_accessions.intersection(db_accessions)),
-                "disk_only": len(disk_only),
-                "example_disk_only": sorted(disk_only)[:5],
-            }
+    phenotype_patients = set(phenotype_df["patient_id"].dropna().astype(str))
+    phenotype_cases = set(
+        phenotype_df[
+            phenotype_df["CaseControl"].str.lower().str.contains("case", na=False)
+        ]["patient_id"]
+        .dropna()
+        .astype(str)
+    )
+    phenotype_controls = set(
+        phenotype_df[
+            phenotype_df["CaseControl"].str.lower().str.contains("control", na=False)
+        ]["patient_id"]
+        .dropna()
+        .astype(str)
+    )
 
-    print(f"found {len(patients_with_disk_only):,} patients with disk-only data")
+    # load disk fingerprints
+    with open(fingerprint_cache) as f:
+        fp_data = json.load(f)
 
-    if patients_with_disk_only:
-        print("\n=== PATIENTS WITH DOWNLOADED DATA NOT IN DATABASE ===")
-        print("(for manual verification in iBroker)")
-        print()
+    disk_patient_dates = defaultdict(set)
+    disk_patients = set(fp_data.keys())
+    for pid, exams in fp_data.items():
+        for exam_name, data in exams.items():
+            uid, hashes, study_date, study_time = data
+            if study_date and len(study_date) >= 8:
+                date_str = f"{study_date[:4]}-{study_date[4:6]}-{study_date[6:8]}"
+                disk_patient_dates[pid].add(date_str)
 
-        # sort by number of disk-only accessions (most first)
-        sorted_patients = sorted(
-            patients_with_disk_only.items(),
-            key=lambda x: x[1]["disk_only"],
-            reverse=True,
-        )
+    disk_exam_keys = set()
+    for pid, dates in disk_patient_dates.items():
+        for d in dates:
+            disk_exam_keys.add((pid, d))
 
-        for i, (patient_id, info) in enumerate(sorted_patients[:10]):  # top 10
-            print(f"{i + 1}. Patient ID: {patient_id}")
-            print(f"   - total exams on disk: {info['total_on_disk']:,}")
-            print(f"   - exams in database: {info['in_database']:,}")
-            print(f"   - exams ONLY on disk: {info['disk_only']:,}")
-            print(
-                f"   - example disk-only accessions: {', '.join(info['example_disk_only'])}"
-            )
-            print()
+    # get iBroker MG data
+    ibroker_patient_dates = defaultdict(set)
+    ibroker_patients = set(metadata["study_id"].dropna().astype(str).unique())
+    metadata["Study DateTime"] = pd.to_datetime(
+        metadata["Study DateTime"], errors="coerce"
+    )
+    for _, row in metadata.iterrows():
+        pid = str(row["study_id"]) if pd.notna(row["study_id"]) else None
+        dt = row["Study DateTime"]
+        if pid and pd.notna(dt):
+            ibroker_patient_dates[pid].add(dt.strftime("%Y-%m-%d"))
 
-        if len(sorted_patients) > 10:
-            print(
-                f"... and {len(sorted_patients) - 10:,} more patients with disk-only data"
-            )
+    ibroker_exam_keys = set()
+    for pid, dates in ibroker_patient_dates.items():
+        for d in dates:
+            ibroker_exam_keys.add((pid, d))
 
-        print("=== MANUAL VERIFICATION INSTRUCTIONS ===")
-        print("1. log into iBroker")
-        print("2. search for any of the patient IDs above")
-        print("3. look for the example accession numbers in their imaging history")
-        print(
-            "4. check if these older studies show up in iBroker but weren't included in recent exports"
-        )
-    else:
-        print("no patients found with disk-only data in the sample checked")
+    # calculate overlaps
+    disk_only_keys = disk_exam_keys - ibroker_exam_keys
+    disk_only_patients = set(k[0] for k in disk_only_keys)
+    ibroker_only_keys = ibroker_exam_keys - disk_exam_keys
+    matched_keys = disk_exam_keys & ibroker_exam_keys
+
+    print(f"=== iBROKER {SELECTED_MODALITY} METADATA ===")
+    print(f"  patients: {len(ibroker_patients):,}")
+    print(f"  unique (patient, date) pairs: {len(ibroker_exam_keys):,}")
+
+    print("\n=== DISK (from fingerprints) ===")
+    print(f"  patients: {len(disk_patients):,}")
+    print(f"  unique (patient, date) pairs: {len(disk_exam_keys):,}")
+
+    print("\n=== PHENOTYPE (labels) ===")
+    print(f"  patients with labels: {len(phenotype_patients):,}")
+    print(f"    - cases: {len(phenotype_cases):,}")
+    print(f"    - controls: {len(phenotype_controls):,}")
+
+    print("\n=== OVERLAP ANALYSIS ===")
+    print(
+        f"  matched (on both disk and iBroker): {len(matched_keys):,} (patient, date) pairs"
+    )
+    print(
+        f"  disk-only (historical, not in iBroker): {len(disk_only_keys):,} (patient, date) pairs"
+    )
+    print(
+        f"  iBroker-only (need to download): {len(ibroker_only_keys):,} (patient, date) pairs"
+    )
+
+    # disk-only with phenotype
+    disk_only_with_labels = sum(
+        1 for pid, d in disk_only_keys if pid in phenotype_patients
+    )
+    disk_only_patients_with_labels = disk_only_patients & phenotype_patients
+
+    print("\n=== DISK-ONLY DATA (historical exams not in iBroker) ===")
+    print(f"  total disk-only patients: {len(disk_only_patients):,}")
+    print(
+        f"  disk-only patients WITH phenotype labels: {len(disk_only_patients_with_labels):,}"
+    )
+    print(f"  disk-only (patient, date) pairs with labels: {disk_only_with_labels:,}")
+    print("  → these CAN be used for training!")
+
+    # remaining to download
+    ibroker_only_with_labels = sum(
+        1 for pid, d in ibroker_only_keys if pid in phenotype_patients
+    )
+
+    print("\n=== REMAINING TO DOWNLOAD ===")
+    print(
+        f"  (patient, date) pairs in iBroker but NOT on disk: {len(ibroker_only_keys):,}"
+    )
+    print(
+        f"  remaining (patient, date) pairs WITH labels: {ibroker_only_with_labels:,}"
+    )
+
+    # training data summary
+    all_disk_with_labels = sum(
+        1 for pid, d in disk_exam_keys if pid in phenotype_patients
+    )
+    disk_patients_with_labels = disk_patients & phenotype_patients
+
+    all_potential = disk_exam_keys | ibroker_exam_keys
+    all_potential_with_labels = sum(
+        1 for pid, d in all_potential if pid in phenotype_patients
+    )
+    all_potential_patients = (disk_patients | ibroker_patients) & phenotype_patients
+
+    print("\n=== TRAINING DATA SUMMARY ===")
+    print("  CURRENT (on disk with labels):")
+    print(f"    patients: {len(disk_patients_with_labels):,}")
+    print(f"    (patient, date) pairs: {all_disk_with_labels:,}")
+    print("\n  POTENTIAL (after downloading remaining):")
+    print(f"    patients: {len(all_potential_patients):,}")
+    print(f"    (patient, date) pairs: {all_potential_with_labels:,}")
+    print(
+        f"\n  NOTE: {len(disk_only_keys):,} historical exams on disk are NOT in iBroker"
+    )
+    print(f"        but {disk_only_with_labels:,} of them have labels and CAN be used!")
 else:
-    print(f"base directory not found: {basedir}")
+    missing = []
+    if not phenotype_path.exists():
+        missing.append(f"phenotype: {phenotype_path}")
+    if not mrn_mapping_path.exists():
+        missing.append(f"MRN mapping: {mrn_mapping_path}")
+    if not fingerprint_cache.exists():
+        missing.append(f"fingerprint cache: {fingerprint_cache}")
+    print(f"skipping data sources analysis - missing files: {', '.join(missing)}")
 
 print("\n=== ANALYSIS COMPLETE ===")
 print(f"plots saved to: {plots_dir.absolute()}")

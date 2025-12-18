@@ -45,6 +45,22 @@ export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 
 ```
 
+### Selenium environment for export.py
+
+The main `prima` environment has dependency conflicts with selenium/geckodriver. Use a separate environment for running `export.py`:
+
+```bash
+micromamba create -n selenium-ff python=3.11 selenium geckodriver firefox -c conda-forge
+micromamba activate selenium-ff
+pip install pandas requests lxml tqdm
+```
+
+Then run exports with:
+```bash
+micromamba activate selenium-ff
+python export.py --auto-confirm
+```
+
 Runtime dependencies live in `requirements.txt`; install `requirements-dev.txt` to pick up
 tooling such as Ruff and optional notebook helpers used during development.
 
@@ -55,8 +71,117 @@ ruff format .
 ruff check --fix .
 ```
 
+## Pipeline Overview
 
+The end-to-end workflow for training/inference is:
 
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ DATA SOURCES                                                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ 1. Disk DICOMs     /gpfs/.../ChiMEC/MG/  → actual imaging data              │
+│ 2. Phenotype CSV   Phenotype_ChiMEC_*.csv → labels (case/control, datedx)   │
+│ 3. iBroker metadata (optional) → export tracking only, NOT needed for       │
+│                                  preprocessing/training                     │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ STEP 1: PREPROCESSING (preprocess.py)                                       │
+│   Scans disk DICOMs → extracts metadata from DICOM headers                  │
+│   Outputs: sot/views.parquet, sot/exams.parquet, out/manifest.parquet       │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ STEP 2: EMIT CSV (preprocess.py emit-csv or automatic)                      │
+│   Joins exams with phenotype CSV → creates Mirai-compatible manifest        │
+│   Output: out/mirai_manifest.csv (only exams with labels)                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ STEP 3: INFERENCE (run_mirai_sharded.py)                                    │
+│   Runs Mirai model on manifest → predictions                                │
+│   Output: out/validation_output.csv                                         │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Important**: The preprocessing pipeline works directly on disk DICOMs. Historical data
+that exists on disk but is missing from iBroker (e.g., from earlier studies) will still
+be processed and can be used for training, as long as patients have phenotype labels.
+
+## Preprocessing Pipeline
+
+### Step 1: Run preprocessing
+
+Scan disk DICOMs, extract metadata, select full-quad exams (L-CC, L-MLO, R-CC, R-MLO),
+and write Zarr cache:
+
+```bash
+# full preprocessing (discovery + zarr cache)
+python preprocess.py preprocess \
+  --raw /gpfs/data/huo-lab/Image/ChiMEC/MG \
+  --workers 32
+
+# summary only (skip zarr cache, useful for quick analysis)
+python preprocess.py preprocess \
+  --raw /gpfs/data/huo-lab/Image/ChiMEC/MG \
+  --workers 32 \
+  --summary
+```
+
+Outputs are written to `{raw}/sot/` and `{raw}/out/` by default:
+- `sot/views.parquet` - individual DICOM views with metadata
+- `sot/exams.parquet` - exam-level aggregated metadata
+- `sot/dicom_tags.parquet` - all DICOM tags (wide format)
+- `out/manifest.parquet` - Zarr URIs for each view
+- `out/mirai_manifest.csv` - Mirai-compatible CSV with labels (auto-generated if --labels provided)
+
+### Step 2: Generate Mirai CSV (if not done in step 1)
+
+If you need to regenerate the Mirai CSV without reprocessing:
+
+```bash
+python preprocess.py emit-csv \
+  --raw /gpfs/data/huo-lab/Image/ChiMEC/MG \
+  --labels /gpfs/data/phs/groups/Projects/Huo_projects/SPORE/annawoodard/Phenotype_ChiMEC_2025Oct4.csv
+```
+
+### Step 3: Run Mirai inference
+
+See "running mirai" section below for single-GPU and sharded multi-GPU options.
+
+### Incremental processing
+
+To process only new exams (append to existing SoT tables):
+
+```bash
+python preprocess.py preprocess \
+  --raw /gpfs/data/huo-lab/Image/ChiMEC/MG \
+  --workers 32 \
+  --incremental
+```
+
+### Monitoring progress
+
+In a separate terminal:
+```bash
+python preprocess.py monitor --interval 30
+```
+
+### Checkpoint management
+
+```bash
+# list checkpoints
+python preprocess.py checkpoint list
+
+# show detailed status
+python preprocess.py checkpoint status
+
+# clean old checkpoints (>7 days)
+python preprocess.py checkpoint clean --max-age-days 7
+```
 
 
 ## HIRO → ChiMEC Data Transfer Instructions (macOS client → GPFS)

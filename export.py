@@ -15,8 +15,24 @@ from tqdm.auto import tqdm
 
 from filesystem_utils import update_metadata_with_disk_status_by_date
 
-# Assuming scrape_ibroker.py is in the same directory or accessible
-from scrape_ibroker import login, make_driver, wait_aspnet_idle
+# scrape_ibroker imports are deferred to avoid credential check at import time
+# when running in --status-only mode
+login = None
+make_driver = None
+wait_aspnet_idle = None
+
+
+def _import_scrape_ibroker():
+    """Import scrape_ibroker functions (triggers credential check)."""
+    global login, make_driver, wait_aspnet_idle
+    from scrape_ibroker import login as _login
+    from scrape_ibroker import make_driver as _make_driver
+    from scrape_ibroker import wait_aspnet_idle as _wait_aspnet_idle
+
+    login = _login
+    make_driver = _make_driver
+    wait_aspnet_idle = _wait_aspnet_idle
+
 
 # --- Configuration ---
 CHIMEC_PATIENTS_FILE = "/gpfs/data/phs/groups/Projects/Huo_projects/SPORE/annawoodard/List_ChiMEC_priority_2025July30.csv"
@@ -642,11 +658,41 @@ def identify_download_targets(
         df["is_exported"] = df["is_exported"].fillna(False).astype(bool)
     else:
         df["is_exported"] = False
-    print(f"Initial pool: {len(df):,} exams")
 
+    # filter to modality first for summary
     modality_mask = df["base_modality"] == modality
+    modality_df = df[modality_mask].copy()
+
+    # comprehensive export status summary
+    print(f"\n{'=' * 60}")
+    print(f"EXPORT STATUS SUMMARY FOR {modality}")
+    print(f"{'=' * 60}")
+    total_modality = len(modality_df)
+    on_disk = modality_df["is_on_disk"].sum()
+    exported_not_on_disk = (
+        (modality_df["is_exported"]) & (~modality_df["is_on_disk"])
+    ).sum()
+    not_exported = ((~modality_df["is_exported"]) & (~modality_df["is_on_disk"])).sum()
+
+    print(f"  Total {modality} exams in iBroker:     {total_modality:>8,}")
+    print(f"  Already on disk (done):              {on_disk:>8,}")
+    print(f"  Exported but not on disk (sync?):    {exported_not_on_disk:>8,}")
+    print(f"  Not yet exported (REMAINING):        {not_exported:>8,}")
+
+    # check phenotype coverage for remaining
+    if "chip" in modality_df.columns:
+        remaining_mask = (~modality_df["is_on_disk"]) & (~modality_df["is_exported"])
+        remaining_df = modality_df[remaining_mask]
+        with_genotype = remaining_df["chip"].notna().sum()
+        print(f"\n  Of the {not_exported:,} remaining to export:")
+        print(f"    - with genotype data: {with_genotype:,}")
+        print(f"    - without genotype:   {not_exported - with_genotype:,}")
+
+    print(f"{'=' * 60}\n")
+
+    print(f"Initial pool: {len(df):,} exams")
     df.loc[~modality_mask, "rejection_reason"] = f"Wrong modality (not {modality})"
-    targets = df[modality_mask].copy()
+    targets = modality_df.copy()
     print(f"  - Kept {len(targets):,} exams after filtering for modality '{modality}'.")
 
     mask_on_disk = targets["is_on_disk"]
@@ -1193,14 +1239,34 @@ def main():
         default=0,
         help="Max number of exams to audit during each refresh cycle (0 means all).",
     )
+    parser.add_argument(
+        "--status-only",
+        action="store_true",
+        help="Show export status summary and exit without exporting anything.",
+    )
 
     args = parser.parse_args()
+
+    # status-only mode doesn't need credentials
+    if args.status_only:
+        print("Running in --status-only mode (no exports will be performed)\n")
+        db = load_and_merge_data()
+        db = update_metadata_with_disk_status_by_date(db, conservative=True)
+        identify_download_targets(
+            db,
+            filter_by_genotyping=not args.no_genotyping_filter,
+            modality=args.modality.upper(),
+        )
+        sys.exit(0)
 
     if not all([USERNAME, PASSWORD]):
         print(
             "ERROR: IBROKER_USERNAME and IBROKER_PASSWORD must be set.", file=sys.stderr
         )
         sys.exit(1)
+
+    # import scrape_ibroker now that we know we need it (triggers credential check)
+    _import_scrape_ibroker()
 
     cycles_run = 0
     last_target_indices: list[int] | None = None
