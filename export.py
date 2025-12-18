@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
 
-from filesystem_utils import check_disk_for_downloads
+from filesystem_utils import update_metadata_with_disk_status_by_date
 
 # Assuming scrape_ibroker.py is in the same directory or accessible
 from scrape_ibroker import login, make_driver, wait_aspnet_idle
@@ -289,7 +289,7 @@ def investigate_file_system(
         print(
             f"\nAccession MATCHES but still marked missing ({accession_match.sum()} total):"
         )
-        print("  This suggests check_disk_for_downloads() is working correctly")
+        print("  This suggests disk status check is working correctly")
         print(
             "  but these exams might have OTHER issues (wrong modality, wrong study, etc.)"
         )
@@ -860,7 +860,8 @@ def run_export_cycle(args, cycle_number: int):
     print(cycle_banner)
 
     db = load_and_merge_data()
-    db = check_disk_for_downloads(db, BASE_DOWNLOAD_DIR)
+    # conservative=True: only mark is_on_disk if 1:1 match, otherwise re-export to be safe
+    db = update_metadata_with_disk_status_by_date(db, conservative=True)
 
     targets = identify_download_targets(
         db,
@@ -1064,7 +1065,8 @@ def refresh_export_status(
     )
 
     refresh_db = load_and_merge_data()
-    refresh_db = check_disk_for_downloads(refresh_db, BASE_DOWNLOAD_DIR)
+    # conservative=True: only mark is_on_disk if 1:1 match, otherwise re-export to be safe
+    refresh_db = update_metadata_with_disk_status_by_date(refresh_db, conservative=True)
 
     modality = args.modality.upper()
     base_modality = refresh_db.get("base_modality")

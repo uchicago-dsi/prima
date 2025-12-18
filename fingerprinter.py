@@ -326,70 +326,53 @@ def main(root_dir: Path, output_file: Path, parallel_jobs: int):
             f"Resuming... {len(patients_to_process)} patients remaining to be processed."
         )
 
-        # Process patients in batches to reduce main process overhead.
-        chunk_size = 1  # keep simple/robust; prevents large stuck batches
         overall_failure_reasons = {}
 
-        logging.info(
-            f"Using {parallel_jobs} parallel workers with chunk size {chunk_size}"
-        )
+        logging.info(f"Using {parallel_jobs} parallel workers")
         log_memory_usage("before_processing")
 
         with ProcessPoolExecutor(max_workers=parallel_jobs) as executor:
+            # submit all tasks upfront - executor manages the queue
+            futures = {
+                executor.submit(fingerprint_all_exams_for_patient, path): path
+                for path in patients_to_process
+            }
+            logging.info(f"Submitted {len(futures)} tasks to executor")
+
+            # process results as they complete (streaming)
             with tqdm(
                 total=len(patients_to_process), desc="Fingerprinting Patients"
             ) as pbar:
-                for i in range(0, len(patients_to_process), chunk_size):
-                    chunk = patients_to_process[i : i + chunk_size]
-                    chunk_start_time = time.time()
+                for future in as_completed(futures):
+                    try:
+                        patient_id, patient_inventory, failure_reasons = future.result()
 
-                    logging.info(
-                        f"Processing chunk {i // chunk_size + 1}/"
-                        f"{(len(patients_to_process) + chunk_size - 1) // chunk_size} "
-                        f"({len(chunk)} patients)"
-                    )
+                        checkpoint_data = {
+                            "inventory": patient_inventory,
+                            "failure_reasons": failure_reasons,
+                            "processed_at": time.time(),
+                        }
 
-                    futures = {
-                        executor.submit(fingerprint_all_exams_for_patient, path): path
-                        for path in chunk
-                    }
+                        with open(CHECKPOINT_DIR / f"{patient_id}.json", "w") as f:
+                            json.dump(checkpoint_data, f)
 
-                    for future in as_completed(futures):
-                        try:
-                            patient_id, patient_inventory, failure_reasons = (
-                                future.result()
+                        logging.info(
+                            f"Saved checkpoint for patient {patient_id} "
+                            f"({len(patient_inventory)} exams, {sum(failure_reasons.values())} failures)"
+                        )
+
+                        for reason, count in failure_reasons.items():
+                            overall_failure_reasons[reason] = (
+                                overall_failure_reasons.get(reason, 0) + count
                             )
 
-                            checkpoint_data = {
-                                "inventory": patient_inventory,
-                                "failure_reasons": failure_reasons,
-                                "processed_at": time.time(),
-                            }
+                    except Exception as e:
+                        path = futures[future]
+                        logging.error(
+                            f"A master process future failed for patient {path.name}: {e}"
+                        )
 
-                            with open(CHECKPOINT_DIR / f"{patient_id}.json", "w") as f:
-                                json.dump(checkpoint_data, f)
-
-                            logging.info(
-                                f"Saved checkpoint for patient {patient_id} "
-                                f"({len(patient_inventory)} exams, {sum(failure_reasons.values())} failures)"
-                            )
-
-                            for reason, count in failure_reasons.items():
-                                overall_failure_reasons[reason] = (
-                                    overall_failure_reasons.get(reason, 0) + count
-                                )
-
-                        except Exception as e:
-                            path = futures[future]
-                            logging.error(
-                                f"A master process future failed for patient {path.name}: {e}"
-                            )
-
-                        pbar.update(1)
-
-                    chunk_time = time.time() - chunk_start_time
-                    logging.info(f"Chunk completed in {chunk_time:.1f} seconds")
-                    log_memory_usage(f"chunk_{i // chunk_size + 1}_complete")
+                    pbar.update(1)
 
     # Consolidation and summary
     processing_time = time.time() - start_time

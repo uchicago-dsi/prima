@@ -10,7 +10,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from filesystem_utils import update_metadata_with_disk_status
+from filesystem_utils import update_metadata_with_disk_status_by_date
 from metadata_utils import extract_base_modality
 
 # argument parser
@@ -58,27 +58,26 @@ chimec_patients = pd.read_csv(
     "/gpfs/data/phs/groups/Projects/Huo_projects/SPORE/annawoodard/List_ChiMEC_priority_2025July30.csv"
 )
 key = pd.read_csv("/gpfs/data/huo-lab/Image/ChiMEC/study-16352a.csv")
-metadata = pd.read_csv(
+all_metadata = pd.read_csv(
     "/gpfs/data/huo-lab/Image/annawoodard/prima/data/imaging_metadata.csv"
 )
-# use the corrected is_on_disk column
-if "is_on_disk_corrected" in metadata.columns:
-    metadata["is_on_disk"] = metadata["is_on_disk_corrected"]
-    print("Using corrected is_on_disk values")
-
 # add base modality column to metadata (use StudyDescription when Modality is missing)
-metadata["base_modality"] = metadata.apply(
+all_metadata["base_modality"] = all_metadata.apply(
     lambda row: extract_base_modality(row["Modality"], row["StudyDescription"]), axis=1
 )
 
+# filter to selected modality FIRST (simplifies all downstream calculations)
+metadata = all_metadata[all_metadata["base_modality"] == SELECTED_MODALITY].copy()
+
 print(f"ChiMEC patients: {len(chimec_patients):,}")
 print(f"Key table records: {len(key):,}")
-print(f"Metadata records: {len(metadata):,}")
+print(f"All metadata records: {len(all_metadata):,}")
+print(f"{SELECTED_MODALITY} metadata records: {len(metadata):,}")
 
 
-# update metadata with current disk status
-BASE_DOWNLOAD_DIR = "/gpfs/data/huo-lab/Image/ChiMEC/"
-metadata = update_metadata_with_disk_status(metadata, BASE_DOWNLOAD_DIR)
+# update metadata with current disk status using StudyDate matching
+# (fingerprint cache is modality-specific, matches filtered metadata)
+metadata = update_metadata_with_disk_status_by_date(metadata)
 
 # modality labels for plotting
 BASE_MODALITY_LABELS = {
@@ -1785,27 +1784,41 @@ create_comprehensive_download_status_plot(
 create_comprehensive_export_analysis_plot(metadata_with_patient_data, plots_dir)
 
 # count and report exams with exported_on date but not on disk
-print("\n=== EXPORT STATUS ANALYSIS ===")
+print(f"\n=== EXPORT STATUS ANALYSIS ({SELECTED_MODALITY}) ===")
+print(f"Total {SELECTED_MODALITY} exams in iBroker: {len(metadata):,}")
 
 # show Status column breakdown by on_disk status
 if "Status" in metadata.columns and "is_on_disk" in metadata.columns:
-    print("Status breakdown (from iBroker 'Exported' table):")
+    exported_count = metadata["Status"].notna().sum()
+    not_exported_count = metadata["Status"].isna().sum()
+    print(f"  - with export status (in Exported table): {exported_count:,}")
+    print(f"  - no export status (Available only):      {not_exported_count:,}")
     print()
+    print("Breakdown by export status and disk presence:")
 
     # get unique status values (excluding NaN)
     status_values = metadata["Status"].dropna().unique()
 
     is_on_disk = metadata["is_on_disk"].fillna(False)
 
-    print(f"{'Status':<25} {'on disk':>12} {'not on disk':>12} {'total':>12}")
-    print("-" * 65)
+    # find max status length for alignment
+    not_exported_label = "(not exported yet)"
+    max_status_len = max(
+        max((len(str(s)) for s in status_values), default=0),
+        len(not_exported_label),
+        len("TOTAL"),
+    )
+    col_w = max(max_status_len + 2, 50)
+
+    print(f"{'Status':<{col_w}} {'on disk':>12} {'not on disk':>12} {'total':>12}")
+    print("-" * (col_w + 40))
 
     for status in sorted(status_values):
         mask = metadata["Status"] == status
         on_disk = (mask & is_on_disk).sum()
         not_on_disk = (mask & ~is_on_disk).sum()
         total = mask.sum()
-        print(f"{status:<25} {on_disk:>12,} {not_on_disk:>12,} {total:>12,}")
+        print(f"{status:<{col_w}} {on_disk:>12,} {not_on_disk:>12,} {total:>12,}")
 
     # also show records with no Status (from Available table, not yet exported)
     no_status = metadata["Status"].isna()
@@ -1813,15 +1826,15 @@ if "Status" in metadata.columns and "is_on_disk" in metadata.columns:
     not_on_disk_no_status = (no_status & ~is_on_disk).sum()
     total_no_status = no_status.sum()
     print(
-        f"{'(no status/available)':<25} {on_disk_no_status:>12,} {not_on_disk_no_status:>12,} {total_no_status:>12,}"
+        f"{not_exported_label:<{col_w}} {on_disk_no_status:>12,} {not_on_disk_no_status:>12,} {total_no_status:>12,}"
     )
-    print("-" * 65)
+    print("-" * (col_w + 40))
 
     # totals
     total_on_disk = is_on_disk.sum()
     total_not_on_disk = (~is_on_disk).sum()
     print(
-        f"{'TOTAL':<25} {total_on_disk:>12,} {total_not_on_disk:>12,} {len(metadata):>12,}"
+        f"{'TOTAL':<{col_w}} {total_on_disk:>12,} {total_not_on_disk:>12,} {len(metadata):>12,}"
     )
     print()
 
