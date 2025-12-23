@@ -8,13 +8,13 @@ import shutil
 import signal
 import stat
 import subprocess
+import threading
 import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from time import monotonic
 from typing import Tuple
-
-from tqdm import tqdm
 
 # suppress pydicom VR UI validation warnings for non-standard UIDs
 warnings.filterwarnings("ignore", message=".*Invalid value for VR UI.*", append=True)
@@ -30,6 +30,40 @@ STABILITY_THRESHOLD_SEC = 600
 RESTART_DELAY_SEC = 120
 EMPTY_DIR_MIN_AGE_SEC = 3600  # only delete empty patient dirs older than 1 hour
 # --- END CONFIGURATION ---
+
+PROGRESS_BAR_WIDTH = 28
+DEFAULT_WORKERS = 8
+
+
+def _format_interval(seconds: float) -> str:
+    """format seconds as HH:MM:SS or MM:SS"""
+    seconds = max(0, int(round(seconds)))
+    minutes, sec = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{sec:02d}"
+    return f"{minutes:02d}:{sec:02d}"
+
+
+def _format_progress_bar(fraction: float, width: int = PROGRESS_BAR_WIDTH) -> str:
+    """format a progress bar like [####------]"""
+    frac = max(0.0, min(1.0, float(fraction)))
+    filled = int(round(frac * width))
+    filled = min(filled, width)
+    empty = max(width - filled, 0)
+    return "[" + ("#" * filled) + ("-" * empty) + "]"
+
+
+def _format_size(num_bytes: float | int) -> str:
+    """format bytes as human-readable size"""
+    if num_bytes >= 1_000_000_000_000:
+        return f"{num_bytes / 1_000_000_000_000:.2f} TB"
+    if num_bytes >= 1_000_000_000:
+        return f"{num_bytes / 1_000_000_000:.2f} GB"
+    if num_bytes >= 1_000_000:
+        return f"{num_bytes / 1_000_000:.1f} MB"
+    return f"{num_bytes / 1_000:.1f} KB"
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -477,18 +511,15 @@ def process_single_exam(
     return logical_bytes, transfer_time
 
 
-def run_single_sync(dry_run: bool, immediate_delete: bool):
-    """run a single sync pass"""
-    setup_signal_handlers()
+def _collect_pending_exams(
+    dry_run: bool,
+) -> tuple[list[tuple[Path, str, int]], int, int]:
+    """
+    scan source directory and collect exams pending transfer
 
-    if dry_run:
-        logging.info(
-            "--- DRY RUN MODE ENABLED: No files will be moved or transferred. ---"
-        )
-
-    logging.info("=== STARTING SYNC ===")
-
-    # discover source exams
+    returns (pending_exams, skipped_unstable, skipped_exists) where pending_exams
+    is a list of (src_path, patient_id, size_bytes) tuples
+    """
     logging.info("Step 1: Scanning source directory...")
     scan_start = monotonic()
     logging.info(f"Scanning top-level in {SRC_ROOT} for patient directories...")
@@ -507,122 +538,312 @@ def run_single_sync(dry_run: bool, immediate_delete: bool):
         )
 
     # collect all exams
-    logging.info("Step 2: Collecting all exam directories...")
+    logging.info("Step 2: Collecting and filtering exam directories...")
     collect_start = monotonic()
-    all_exams = []
+    all_exams: list[tuple[Path, str]] = []
     for idx, p_dir in enumerate(patient_dirs):
         if idx % 100 == 0 and idx > 0:
-            logging.info(
-                f"  Processed {idx}/{len(patient_dirs)} patient directories..."
-            )
+            logging.info(f"  Scanned {idx}/{len(patient_dirs)} patient directories...")
         try:
-            exam_paths = [p for p in p_dir.iterdir() if p.is_dir()]
-            all_exams.extend(exam_paths)
+            for exam_path in p_dir.iterdir():
+                if exam_path.is_dir():
+                    all_exams.append((exam_path, p_dir.name))
         except Exception as e:
             logging.warning(f"Failed to list exams in {p_dir}: {e}")
 
+    logging.info(
+        f"Found {len(all_exams)} total exams. Filtering with {DEFAULT_WORKERS} workers..."
+    )
+
+    # filter to pending exams (stable and not already at destination)
+    pending: list[tuple[Path, str, int]] = []
+    skipped_unstable = 0
+    skipped_exists = 0
+    filter_start = monotonic()
+    last_filter_log = filter_start
+    lock = threading.Lock()
+    completed_filter = 0
+
+    def filter_exam(
+        item: tuple[Path, str],
+    ) -> tuple[str, Path, str, int, float] | None:
+        """
+        check if exam should be transferred; returns (status, src, patient_id, size, age)
+        status is 'pending', 'exists', or 'unstable'
+        """
+        src_path, patient_id = item
+
+        # check if already exists at destination first (fast local check)
+        dest_exam = DST_ROOT / patient_id / src_path.name
+        if dest_exam.exists():
+            return ("exists", src_path, patient_id, 0, 0.0)
+
+        # stability check (slow - walks SMB)
+        is_stable, most_recent_age = _is_exam_stable(src_path, STABILITY_THRESHOLD_SEC)
+        if not is_stable:
+            return ("unstable", src_path, patient_id, 0, most_recent_age)
+
+        # compute size for progress tracking (slow - walks SMB)
+        size_bytes = _calculate_dir_size(src_path)
+        return ("pending", src_path, patient_id, size_bytes, 0.0)
+
+    with ThreadPoolExecutor(max_workers=DEFAULT_WORKERS) as executor:
+        futures = {executor.submit(filter_exam, item): item for item in all_exams}
+
+        for future in as_completed(futures):
+            if shutdown_requested:
+                executor.shutdown(wait=False, cancel_futures=True)
+                break
+
+            result = future.result()
+            if result is None:
+                continue
+
+            status, src_path, patient_id, size_bytes, most_recent_age = result
+
+            with lock:
+                completed_filter += 1
+
+                if status == "exists":
+                    if dry_run:
+                        logging.info(
+                            f"[DRY RUN] SKIP EXISTS: {src_path.name} already at destination"
+                        )
+                    skipped_exists += 1
+                elif status == "unstable":
+                    if dry_run:
+                        logging.info(
+                            f"[DRY RUN] SKIP UNSTABLE: {src_path.name} "
+                            f"(most recent file {most_recent_age / 60:.1f}min old)"
+                        )
+                    skipped_unstable += 1
+                else:  # pending
+                    pending.append((src_path, patient_id, size_bytes))
+
+                # progress logging every 10 seconds
+                now = monotonic()
+                if now - last_filter_log >= 10.0:
+                    elapsed = now - filter_start
+                    rate = completed_filter / elapsed if elapsed > 0 else 0
+                    remaining = len(all_exams) - completed_filter
+                    eta = remaining / rate if rate > 0 else 0
+                    logging.info(
+                        f"  Filtering {completed_filter}/{len(all_exams)} exams... "
+                        f"({skipped_exists} exist, {skipped_unstable} unstable, {len(pending)} pending) "
+                        f"ETA≈{_format_interval(eta)}"
+                    )
+                    last_filter_log = now
+
     collect_time = monotonic() - collect_start
-    total_exams = len(all_exams)
-    logging.info(f"Exam collection took {collect_time:.1f}s")
-    logging.info(f"Found {total_exams} source exams to process.")
+    total_pending_bytes = sum(size for _, _, size in pending)
+    logging.info(
+        f"Filtering took {collect_time:.1f}s. "
+        f"Pending: {len(pending)} exams ({_format_size(total_pending_bytes)}), "
+        f"skipped: {skipped_unstable} unstable, {skipped_exists} already exist"
+    )
 
-    # process exams
-    logging.info("=== PROCESSING EXAMS ===")
+    return pending, skipped_unstable, skipped_exists
 
-    sync_start = monotonic()
-    last_hb = sync_start
-    bytes_log_total = 0
-    transfers_done = 0
-    transfer_time_total = 0.0
-    completed = 0
-    skipped = 0
-    HEARTBEAT_SEC = 60
-    deletion_log: list[tuple[str, str]] = []
+
+def run_single_sync(
+    dry_run: bool, immediate_delete: bool, workers: int = DEFAULT_WORKERS
+):
+    """run a single sync pass with parallel transfers"""
+    global shutdown_requested
+    setup_signal_handlers()
+
+    if dry_run:
+        logging.info(
+            "--- DRY RUN MODE ENABLED: No files will be moved or transferred. ---"
+        )
+
+    logging.info("=== STARTING SYNC ===")
 
     used_gb, free_gb, total_gb = _share_usage_gb()
     logging.info(
         f"[USAGE mount] {SRC_ROOT}: used {used_gb:.1f} GB / total {total_gb:.1f} GB (free {free_gb:.1f} GB)"
     )
 
-    pbar = tqdm(total=total_exams, desc="Processing Exams")
+    # phase 1: collect pending exams with sizes
+    pending_exams, skipped_unstable, skipped_exists = _collect_pending_exams(dry_run)
 
-    for src_path in all_exams:
+    if not pending_exams:
+        logging.info("No exams pending transfer. Nothing to do.")
+        _cleanup_empty_patient_dirs(dry_run)
+        return
+
+    if shutdown_requested:
+        logging.info("Shutdown requested during scan. Exiting.")
+        return
+
+    total_bytes = sum(size for _, _, size in pending_exams)
+    total_exams = len(pending_exams)
+    logging.info(
+        f"=== STARTING PARALLEL TRANSFER: {total_exams} exams, "
+        f"{_format_size(total_bytes)}, {workers} workers ==="
+    )
+
+    # phase 2: parallel transfer with progress tracking
+    sync_start = monotonic()
+    PROGRESS_INTERVAL_SEC = 30.0
+
+    # thread-safe counters
+    lock = threading.Lock()
+    completed_bytes = 0
+    completed_exams = 0
+    transfers_done = 0
+    transfer_time_total = 0.0
+    deletion_log: list[tuple[str, str]] = []
+    first_error: Exception | None = None
+    progress_stop = threading.Event()
+
+    def process_exam_wrapper(
+        item: tuple[Path, str, int],
+    ) -> tuple[Path, int, float, list[tuple[str, str]]]:
+        """wrapper for thread pool - returns (path, bytes, time, deletion_entries)"""
+        src_path, patient_id, expected_size = item
+        local_deletion_log: list[tuple[str, str]] = []
+
         if shutdown_requested:
-            logging.info("Shutdown requested. Exiting gracefully...")
-            break
+            return src_path, 0, 0.0, local_deletion_log
 
-        try:
-            patient_id = src_path.parent.name
-            logical_bytes, transfer_time = process_single_exam(
-                src_path, patient_id, dry_run, immediate_delete, deletion_log
+        logical_bytes, transfer_time = process_single_exam(
+            src_path, patient_id, dry_run, immediate_delete, local_deletion_log
+        )
+        return src_path, logical_bytes, transfer_time, local_deletion_log
+
+    def log_progress() -> None:
+        """log progress bar - call with lock held"""
+        elapsed = monotonic() - sync_start
+        if total_bytes > 0:
+            fraction = completed_bytes / total_bytes
+            pct = min(100.0, fraction * 100.0)
+            bar = _format_progress_bar(fraction)
+            if completed_bytes > 0:
+                eta_sec = elapsed * (total_bytes - completed_bytes) / completed_bytes
+                eta = _format_interval(eta_sec)
+            else:
+                eta = "??:??"
+            rate_mb_s = completed_bytes / elapsed / 1_000_000 if elapsed > 0 else 0.0
+            in_flight = workers - (
+                total_exams - completed_exams - len(pending_exams) + completed_exams
+            )
+            in_flight = min(workers, total_exams - completed_exams)
+            logging.info(
+                f"[PROGRESS] {bar} {pct:5.1f}%  "
+                f"{_format_size(completed_bytes)} / {_format_size(total_bytes)}  "
+                f"elapsed={_format_interval(elapsed)} ETA≈{eta}  "
+                f"rate={rate_mb_s:.1f} MB/s ({completed_exams}/{total_exams} done, {in_flight} in-flight)"
+            )
+        else:
+            fraction = completed_exams / total_exams if total_exams > 0 else 0
+            bar = _format_progress_bar(fraction)
+            logging.info(
+                f"[PROGRESS] {bar} {completed_exams}/{total_exams} exams  "
+                f"elapsed={_format_interval(elapsed)}"
             )
 
-            bytes_log_total += logical_bytes
-            if logical_bytes > 0:
-                transfers_done += 1
-                transfer_time_total += transfer_time
-            else:
-                skipped += 1
-            completed += 1
-            pbar.update(1)
+    def progress_thread_fn() -> None:
+        """background thread that logs progress every PROGRESS_INTERVAL_SEC"""
+        while not progress_stop.wait(timeout=PROGRESS_INTERVAL_SEC):
+            if shutdown_requested:
+                break
+            with lock:
+                log_progress()
 
-            # heartbeat
-            now = monotonic()
-            if now - last_hb >= HEARTBEAT_SEC:
-                elapsed = now - sync_start
-                used_gb, free_gb, total_gb = _share_usage_gb()
+    if dry_run:
+        # in dry-run, just log what would happen (already done in _collect_pending_exams)
+        for src_path, patient_id, size_bytes in pending_exams:
+            logging.info(
+                f"[DRY RUN] WOULD COPY: {src_path} -> "
+                f"{DST_ROOT / patient_id / src_path.name} ({_format_size(size_bytes)})"
+            )
+            action = "DELETE" if immediate_delete else "QUEUE FOR DELETE"
+            logging.info(f"[DRY RUN] WOULD {action} (LOCAL): {src_path}")
+            deletion_log.append((str(src_path), f"dry-run {action.lower()}"))
+            completed_bytes += size_bytes
+            completed_exams += 1
+        transfers_done = total_exams
+    else:
+        # start background progress thread
+        progress_thread = threading.Thread(target=progress_thread_fn, daemon=True)
+        progress_thread.start()
 
-                avg_rate = (
-                    (bytes_log_total / elapsed / 1_000_000) if elapsed > 0 else 0.0
-                )
-                transfer_avg_rate = (
-                    (bytes_log_total / transfer_time_total / 1_000_000)
-                    if transfer_time_total > 0
-                    else 0.0
-                )
+        # actual parallel transfer
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(process_exam_wrapper, item): item
+                for item in pending_exams
+            }
 
-                logging.info(
-                    f"[HEARTBEAT] processed {completed}/{total_exams} | "
-                    f"{transfers_done} transferred ({bytes_log_total / 1e6:.1f} MB) | "
-                    f"{skipped} skipped | "
-                    f"throughput: {avg_rate:.2f} MB/s overall, "
-                    f"{transfer_avg_rate:.2f} MB/s transfer-only | "
-                    f"rate {(completed / elapsed * 3600.0) if elapsed > 0 else 0.0:.1f} exams/hr | "
-                    f"share {used_gb:.1f}/{total_gb:.1f} GB used"
-                )
-                last_hb = now
+            for future in as_completed(futures):
+                if first_error is not None:
+                    # already failed, just drain remaining futures
+                    continue
 
-        except KeyboardInterrupt:
-            logging.info("Received KeyboardInterrupt. Exiting...")
-            raise
-        except Exception as e:
-            logging.error(f"FATAL ERROR processing {src_path}: {e}", exc_info=True)
-            logging.error("Exiting immediately on error.")
-            raise
+                item = futures[future]
+                src_path, patient_id, expected_size = item
 
-    pbar.close()
+                try:
+                    _, logical_bytes, transfer_time, local_deletions = future.result()
+
+                    with lock:
+                        completed_bytes += expected_size
+                        completed_exams += 1
+                        if logical_bytes > 0:
+                            transfers_done += 1
+                            transfer_time_total += transfer_time
+                        deletion_log.extend(local_deletions)
+                        log_progress()
+
+                except KeyboardInterrupt:
+                    logging.info("KeyboardInterrupt received. Cancelling remaining...")
+                    shutdown_requested = True
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise
+
+                except Exception as e:
+                    logging.error(
+                        f"FATAL ERROR processing {src_path}: {e}", exc_info=True
+                    )
+                    first_error = e
+                    shutdown_requested = True
+                    executor.shutdown(wait=False, cancel_futures=True)
+
+        # stop progress thread
+        progress_stop.set()
+        progress_thread.join(timeout=1.0)
+
+        if first_error is not None:
+            logging.error("Exiting immediately on error (fail-fast mode).")
+            raise first_error
+
+    # log final progress
+    with lock:
+        log_progress()
 
     total_elapsed = monotonic() - sync_start
 
     logging.info("=== SYNC COMPLETE ===")
     logging.info(f"Total time: {total_elapsed / 60:.1f} minutes")
-    if total_elapsed > 0 and completed > 0:
-        logging.info(f"Overall rate: {completed / total_elapsed * 3600:.1f} exams/hour")
-    logging.info(f"Processed {completed}/{total_exams} exams.")
+    if total_elapsed > 0 and completed_exams > 0:
+        logging.info(
+            f"Overall rate: {completed_exams / total_elapsed * 3600:.1f} exams/hour"
+        )
+    logging.info(f"Processed {completed_exams}/{total_exams} exams.")
 
     logging.info("SUMMARY:")
     logging.info(f"  - Transferred: {transfers_done}")
-    logging.info(f"  - Skipped (unstable/exists): {skipped}")
-    logging.info(
-        f"  - Total bytes transferred: {bytes_log_total / 1e6:.1f} MB ({bytes_log_total / 1e9:.2f} GB)"
-    )
+    logging.info(f"  - Skipped (unstable): {skipped_unstable}")
+    logging.info(f"  - Skipped (already exists): {skipped_exists}")
+    logging.info(f"  - Total bytes transferred: {_format_size(completed_bytes)}")
 
-    if transfers_done > 0:
+    if transfers_done > 0 and not dry_run:
         overall_avg = (
-            bytes_log_total / total_elapsed / 1_000_000 if total_elapsed > 0 else 0.0
+            completed_bytes / total_elapsed / 1_000_000 if total_elapsed > 0 else 0.0
         )
         transfer_only_avg = (
-            bytes_log_total / transfer_time_total / 1_000_000
+            completed_bytes / transfer_time_total / 1_000_000
             if transfer_time_total > 0
             else 0.0
         )
@@ -672,7 +893,9 @@ def run_single_sync(dry_run: bool, immediate_delete: bool):
         logging.info(f"  - Empty patient directories {action}: {empty_removed}")
 
 
-def run_with_auto_restart(dry_run: bool, immediate_delete: bool):
+def run_with_auto_restart(
+    dry_run: bool, immediate_delete: bool, workers: int = DEFAULT_WORKERS
+):
     """run sync with automatic restart functionality"""
     setup_signal_handlers()
 
@@ -686,7 +909,7 @@ def run_with_auto_restart(dry_run: bool, immediate_delete: bool):
             logging.info("=== STARTING SYNC ===")
 
         try:
-            run_single_sync(dry_run, immediate_delete)
+            run_single_sync(dry_run, immediate_delete, workers)
 
             if shutdown_requested:
                 logging.info("Shutdown requested during sync. Exiting.")
@@ -712,12 +935,17 @@ def run_with_auto_restart(dry_run: bool, immediate_delete: bool):
             raise
 
 
-def main(dry_run: bool, immediate_delete: bool, auto_restart: bool):
+def main(
+    dry_run: bool,
+    immediate_delete: bool,
+    auto_restart: bool,
+    workers: int = DEFAULT_WORKERS,
+):
     """main entry point with optional auto-restart"""
     if auto_restart:
-        run_with_auto_restart(dry_run, immediate_delete)
+        run_with_auto_restart(dry_run, immediate_delete, workers)
     else:
-        run_single_sync(dry_run, immediate_delete)
+        run_single_sync(dry_run, immediate_delete, workers)
 
 
 if __name__ == "__main__":
@@ -739,9 +967,16 @@ if __name__ == "__main__":
         action="store_true",
         help="Run sync once and exit instead of automatically restarting.",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help=f"Number of parallel rsync processes (default: {DEFAULT_WORKERS}).",
+    )
     args = parser.parse_args()
     main(
         dry_run=args.dry_run,
         immediate_delete=not args.no_immediate_delete,
         auto_restart=not args.no_auto_restart,
+        workers=args.workers,
     )
