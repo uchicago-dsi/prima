@@ -21,8 +21,10 @@ warnings.filterwarnings("ignore", message=".*Invalid value for VR UI.*", append=
 logging.getLogger("pydicom.valuerep").setLevel(logging.ERROR)
 
 # --- CONFIGURATION ---
-SRC_ROOT = Path("/mnt/uchad_samba/16352A/")
-DST_ROOT = Path("/gpfs/data/huo-lab/Image/ChiMEC/MG")
+# SRC_ROOT = Path("/mnt/uchad_samba/16352A/")
+# DST_ROOT = Path("/gpfs/data/huo-lab/Image/ChiMEC/MG")
+SRC_ROOT = Path("/mnt/uchad_samba/13073B")
+DST_ROOT = Path("/gpfs/data/karczmar-lab/CAPS/MRI1.0")
 DELETE_QUEUE_DIR = SRC_ROOT / "_synced_and_queued_for_deletion"
 STABILITY_THRESHOLD_SEC = 600
 RESTART_DELAY_SEC = 120

@@ -481,6 +481,10 @@ def load_and_merge_data():
         metadata["base_modality"] = metadata["Modality"].apply(get_base_modality)
         print("  - Added 'base_modality' column.")
 
+        metadata["Study DateTime"] = pd.to_datetime(
+            metadata["Study DateTime"], errors="coerce"
+        )
+
         if "Exported On" in metadata.columns:
             metadata["Exported On"] = pd.to_datetime(
                 metadata["Exported On"], errors="coerce"

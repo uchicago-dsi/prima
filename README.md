@@ -11,7 +11,7 @@ The end-to-end workflow for training/inference is:
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ 1. scrape_ibroker.py  → scrapes iBroker for study metadata                  │
 │ 2. export.py          → requests exports from iBroker based on metadata     │
-│ 3. HIRO rsync         → syncs exported DICOMs to GPFS (manual or automated) │
+│ 3. sync_local.py      → syncs exported DICOMs to GPFS (from HIRO share)     │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
@@ -95,7 +95,7 @@ export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 The main `prima` environment has dependency conflicts with selenium/geckodriver. Use a separate environment:
 
 ```bash
-micromamba create -n selenium-ff python=3.11 selenium geckodriver firefox -c conda-forge
+micromamba create -y -f environment-selenium.yml
 micromamba activate selenium-ff
 pip install pandas requests lxml tqdm
 ```
@@ -171,17 +171,10 @@ The script:
 
 ### HIRO → ChiMEC Data Transfer
 
-After exports are requested, files appear on a HIRO CIFS share. Use rsync to sync them to GPFS.
+After exports are requested, files appear on a HIRO CIFS share. Use `sync_local.py` to sync them to GPFS.
 
 #### Mount the HIRO share
 
-**On macOS:**
-- Finder → Go → Connect to Server...
-- Enter: `smb://UCHAD;annawoodard@cifs01uchadccd.uchad.uchospitals.edu/radiology/HIRO/16352A`
-- Authenticate with your UCHAD password
-- Mounts under `/Volumes/16352a`
-
-**On Linux:**
 ```bash
 sudo mount -t cifs //cifs01uchadccd.uchad.uchospitals.edu/radiology/HIRO /mnt/uchad_samba \
   -o credentials=/home/annawoodard/creds,vers=3.0,noperm,uid=$(id -u),gid=$(id -g),file_mode=0660,dir_mode=0770
@@ -194,34 +187,37 @@ password=your_password
 domain=UCHAD
 ```
 
-#### Run rsync
+#### Run sync_local.py
 
-```bash
-# install modern rsync on macOS if needed
-brew install rsync
-
-SRC="/Volumes/16352a/"  # mounted HIRO subdir; note trailing slash
-DST="annawoodard@cri-ksysappdsp3.cri.uchicago.edu:/gpfs/data/huo-lab/Image/ChiMEC/"
-
-# dry run first
-/opt/homebrew/bin/rsync -aHvn --itemize-changes --append-verify --partial \
-  --remove-source-files "$SRC" "$DST"
-
-# real transfer (resumable, deletes from source after successful copy)
-LOG="$HOME/hiro2chimec-$(date +%F).log"
-caffeinate -dims /opt/homebrew/bin/rsync \
-  -aH --info=progress2 --human-readable \
-  --append-verify --partial --remove-source-files \
-  --log-file="$LOG" \
-  "$SRC" "$DST"
+Configure source/destination paths at the top of `sync_local.py`:
+```python
+SRC_ROOT = Path("/mnt/uchad_samba/16352A/")
+DST_ROOT = Path("/gpfs/data/huo-lab/Image/ChiMEC/MG")
 ```
 
-Performance: ~3 MB/s over VPN (approximately 4 days per terabyte).
-
-Check transferred exams:
 ```bash
-grep '<f++++++++++' hiro2chimec-2025-08-21.log | awk '{print $5}' | cut -d/ -f1-2 | sort -u | wc -l
+# dry run first (no files moved or transferred)
+python sync_local.py --dry-run --no-auto-restart
+
+# real transfer with immediate source deletion (default behavior)
+python sync_local.py
+
+# queue for deletion instead of immediate delete
+python sync_local.py --no-immediate-delete
+
+# single sync pass (default auto-restarts every 2 minutes)
+python sync_local.py --no-auto-restart
 ```
+
+The script:
+- Waits for exam stability (no file changes within 10 minutes) before transferring
+- Uses rsync internally for efficient copying with progress tracking
+- Deletes source files after successful transfer (or queues them to `_synced_and_queued_for_deletion/`)
+- Cleans up empty patient directories older than 1 hour
+- Auto-restarts every 2 minutes by default to pick up new exports
+- Handles SIGINT/SIGTERM gracefully for clean shutdown
+
+Logs are written to `sync.log` and stdout.
 
 ---
 
