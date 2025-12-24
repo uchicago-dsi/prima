@@ -238,10 +238,13 @@ def _robust_rmtree(path: Path):
         )
 
 
-def copy_exam_local(src: Path, patient_id: str, exam_name: str) -> Tuple[int, float]:
+def copy_exam_local(
+    src: Path, patient_id: str, exam_name: str
+) -> Tuple[int, float, int]:
     """
-    copy an exam directory locally with benchmarking; returns (logical_bytes, seconds)
+    copy an exam directory locally with benchmarking
 
+    returns (logical_bytes, seconds, rsync_exit_code)
     uses rsync for efficient local copying with progress tracking
     """
     import re
@@ -338,10 +341,19 @@ def copy_exam_local(src: Path, patient_id: str, exam_name: str) -> Tuple[int, fl
         logging.info("Shutdown requested. Exiting...")
         raise KeyboardInterrupt("Shutdown requested")
 
-    if proc.returncode != 0:
-        if proc.returncode == 20:
+    rsync_exit_code = proc.returncode
+    if rsync_exit_code != 0:
+        if rsync_exit_code == 20:
             raise KeyboardInterrupt("rsync was interrupted")
-        raise subprocess.CalledProcessError(proc.returncode, command)
+        # exit codes 23/24 are partial transfers - some files couldn't be transferred
+        # this is usually harmless (files in use, vanished, etc.) and rsync will retry next run
+        if rsync_exit_code in (23, 24):
+            logging.warning(
+                f"rsync returned code {rsync_exit_code} (partial transfer) for {src.name}. "
+                "Some files may not have been transferred. Continuing..."
+            )
+        else:
+            raise subprocess.CalledProcessError(rsync_exit_code, command)
 
     combined = "".join(combined_lines)
 
@@ -361,10 +373,11 @@ def copy_exam_local(src: Path, patient_id: str, exam_name: str) -> Tuple[int, fl
 
     mb_log = logical_bytes / 1_000_000
     rate_mb_s = (logical_bytes / dt / 1_000_000) if dt > 0 else 0.0
+    status = "with warnings" if rsync_exit_code in (23, 24) else "successful"
     logging.info(
-        f"COPY successful for {src.name} [logical {mb_log:.1f} MB in {dt:.1f}s, {rate_mb_s:.2f} MB/s]"
+        f"COPY {status} for {src.name} [logical {mb_log:.1f} MB in {dt:.1f}s, {rate_mb_s:.2f} MB/s]"
     )
-    return logical_bytes, dt
+    return logical_bytes, dt, rsync_exit_code
 
 
 def process_single_exam(
@@ -373,11 +386,12 @@ def process_single_exam(
     dry_run: bool,
     immediate_delete: bool,
     deletion_log: list[tuple[str, str]],
-) -> Tuple[int, float]:
+) -> Tuple[int, float, int]:
     """
     process a single exam: copy from source to destination.
 
-    returns (logical_bytes, transfer_time_seconds)
+    returns (logical_bytes, transfer_time_seconds, rsync_exit_code)
+    rsync_exit_code is 0 for success, 23/24 for partial transfer warnings
     """
     exam_name = src_path.name
 
@@ -389,7 +403,7 @@ def process_single_exam(
             f"(most recent file {most_recent_age / 60:.1f}min old, "
             f"need {STABILITY_THRESHOLD_SEC / 60:.1f}min)"
         )
-        return 0, 0.0
+        return 0, 0.0, 0
 
     # check if already exists at destination
     dest_exam = DST_ROOT / patient_id / exam_name
@@ -447,7 +461,7 @@ def process_single_exam(
                         f"QUEUED FOR DELETE (LOCAL): moved {src_path} -> {dst}"
                     )
                     deletion_log.append((str(src_path), f"queued (exists) -> {dst}"))
-        return 0, 0.0
+        return 0, 0.0, 0
 
     # copy exam
     logging.info(f"NEW: {exam_name} not found at destination. Copying.")
@@ -457,8 +471,11 @@ def process_single_exam(
         )
         logical_bytes = 0
         transfer_time = 0.0
+        rsync_exit_code = 0
     else:
-        logical_bytes, transfer_time = copy_exam_local(src_path, patient_id, exam_name)
+        logical_bytes, transfer_time, rsync_exit_code = copy_exam_local(
+            src_path, patient_id, exam_name
+        )
 
     # queue/delete source after transfer
     if dry_run:
@@ -508,7 +525,7 @@ def process_single_exam(
                 logging.info(f"QUEUED FOR DELETE (LOCAL): moved {src_path} -> {dst}")
                 deletion_log.append((str(src_path), f"queued for delete -> {dst}"))
 
-    return logical_bytes, transfer_time
+    return logical_bytes, transfer_time, rsync_exit_code
 
 
 def _collect_pending_exams(
@@ -573,26 +590,32 @@ def _collect_pending_exams(
         """
         src_path, patient_id = item
 
-        # check if already exists at destination first (fast local check)
-        dest_exam = DST_ROOT / patient_id / src_path.name
-        if dest_exam.exists():
-            return ("exists", src_path, patient_id, 0, 0.0)
-
-        # stability check (slow - walks SMB)
+        # stability check first (slow - walks SMB, but we need size anyway)
         is_stable, most_recent_age = _is_exam_stable(src_path, STABILITY_THRESHOLD_SEC)
         if not is_stable:
             return ("unstable", src_path, patient_id, 0, most_recent_age)
 
-        # compute size for progress tracking (slow - walks SMB)
-        size_bytes = _calculate_dir_size(src_path)
-        return ("pending", src_path, patient_id, size_bytes, 0.0)
+        # compute source size (slow - walks SMB)
+        src_size = _calculate_dir_size(src_path)
+
+        # check if destination exists and has same size (fast local check)
+        dest_exam = DST_ROOT / patient_id / src_path.name
+        if dest_exam.exists():
+            dest_size = _calculate_dir_size(dest_exam)
+            if dest_size == src_size:
+                return ("exists", src_path, patient_id, 0, 0.0)
+            # destination exists but size differs - needs sync (partial transfer)
+            # return the difference as size estimate for progress tracking
+            return ("pending", src_path, patient_id, max(0, src_size - dest_size), 0.0)
+
+        return ("pending", src_path, patient_id, src_size, 0.0)
 
     with ThreadPoolExecutor(max_workers=DEFAULT_WORKERS) as executor:
         futures = {executor.submit(filter_exam, item): item for item in all_exams}
 
         for future in as_completed(futures):
             if shutdown_requested:
-                executor.shutdown(wait=False, cancel_futures=True)
+                executor.shutdown(wait=False)
                 break
 
             result = future.result()
@@ -607,7 +630,7 @@ def _collect_pending_exams(
                 if status == "exists":
                     if dry_run:
                         logging.info(
-                            f"[DRY RUN] SKIP EXISTS: {src_path.name} already at destination"
+                            f"[DRY RUN] SKIP EXISTS: {src_path.name} already at destination (size matches)"
                         )
                     skipped_exists += 1
                 elif status == "unstable":
@@ -619,6 +642,12 @@ def _collect_pending_exams(
                     skipped_unstable += 1
                 else:  # pending
                     pending.append((src_path, patient_id, size_bytes))
+                    dest_exam = DST_ROOT / patient_id / src_path.name
+                    if dry_run and dest_exam.exists():
+                        logging.info(
+                            f"[DRY RUN] RESUME PARTIAL: {src_path.name} "
+                            f"(~{_format_size(size_bytes)} remaining)"
+                        )
 
                 # progress logging every 10 seconds
                 now = monotonic()
@@ -686,6 +715,7 @@ def run_single_sync(
     # phase 2: parallel transfer with progress tracking
     sync_start = monotonic()
     PROGRESS_INTERVAL_SEC = 30.0
+    RATE_WINDOW_SEC = 3600.0  # 1 hour sliding window for rate calculation
 
     # thread-safe counters
     lock = threading.Lock()
@@ -694,40 +724,67 @@ def run_single_sync(
     transfers_done = 0
     transfer_time_total = 0.0
     deletion_log: list[tuple[str, str]] = []
+    partial_transfers: list[tuple[str, int]] = []  # (exam_path, rsync_exit_code)
     first_error: Exception | None = None
     progress_stop = threading.Event()
+    # sliding window: list of (timestamp, cumulative_bytes) for rate calculation
+    progress_samples: list[tuple[float, int]] = [(sync_start, 0)]
 
     def process_exam_wrapper(
         item: tuple[Path, str, int],
-    ) -> tuple[Path, int, float, list[tuple[str, str]]]:
-        """wrapper for thread pool - returns (path, bytes, time, deletion_entries)"""
+    ) -> tuple[Path, int, float, int, list[tuple[str, str]]]:
+        """wrapper for thread pool - returns (path, bytes, time, rsync_exit_code, deletion_entries)"""
         src_path, patient_id, expected_size = item
         local_deletion_log: list[tuple[str, str]] = []
 
         if shutdown_requested:
-            return src_path, 0, 0.0, local_deletion_log
+            return src_path, 0, 0.0, 0, local_deletion_log
 
-        logical_bytes, transfer_time = process_single_exam(
+        logical_bytes, transfer_time, rsync_exit_code = process_single_exam(
             src_path, patient_id, dry_run, immediate_delete, local_deletion_log
         )
-        return src_path, logical_bytes, transfer_time, local_deletion_log
+        return (
+            src_path,
+            logical_bytes,
+            transfer_time,
+            rsync_exit_code,
+            local_deletion_log,
+        )
 
     def log_progress() -> None:
-        """log progress bar - call with lock held"""
-        elapsed = monotonic() - sync_start
+        """log progress bar - call with lock held, uses 5-min sliding window for rate"""
+        now = monotonic()
+        elapsed = now - sync_start
+
+        # record sample for sliding window
+        progress_samples.append((now, completed_bytes))
+
+        # prune old samples outside the window
+        cutoff = now - RATE_WINDOW_SEC
+        while len(progress_samples) > 1 and progress_samples[0][0] < cutoff:
+            progress_samples.pop(0)
+
+        # calculate rate from sliding window
+        if len(progress_samples) >= 2:
+            oldest_time, oldest_bytes = progress_samples[0]
+            window_elapsed = now - oldest_time
+            window_bytes = completed_bytes - oldest_bytes
+            rate_mb_s = (
+                window_bytes / window_elapsed / 1_000_000 if window_elapsed > 0 else 0.0
+            )
+        else:
+            rate_mb_s = completed_bytes / elapsed / 1_000_000 if elapsed > 0 else 0.0
+
         if total_bytes > 0:
             fraction = completed_bytes / total_bytes
             pct = min(100.0, fraction * 100.0)
             bar = _format_progress_bar(fraction)
-            if completed_bytes > 0:
-                eta_sec = elapsed * (total_bytes - completed_bytes) / completed_bytes
+            remaining_bytes = total_bytes - completed_bytes
+            if rate_mb_s > 0:
+                eta_sec = remaining_bytes / (rate_mb_s * 1_000_000)
                 eta = _format_interval(eta_sec)
             else:
                 eta = "??:??"
-            rate_mb_s = completed_bytes / elapsed / 1_000_000 if elapsed > 0 else 0.0
-            in_flight = workers - (
-                total_exams - completed_exams - len(pending_exams) + completed_exams
-            )
             in_flight = min(workers, total_exams - completed_exams)
             logging.info(
                 f"[PROGRESS] {bar} {pct:5.1f}%  "
@@ -785,7 +842,13 @@ def run_single_sync(
                 src_path, patient_id, expected_size = item
 
                 try:
-                    _, logical_bytes, transfer_time, local_deletions = future.result()
+                    (
+                        _,
+                        logical_bytes,
+                        transfer_time,
+                        rsync_exit_code,
+                        local_deletions,
+                    ) = future.result()
 
                     with lock:
                         completed_bytes += expected_size
@@ -793,13 +856,15 @@ def run_single_sync(
                         if logical_bytes > 0:
                             transfers_done += 1
                             transfer_time_total += transfer_time
+                        if rsync_exit_code in (23, 24):
+                            partial_transfers.append((str(src_path), rsync_exit_code))
                         deletion_log.extend(local_deletions)
                         log_progress()
 
                 except KeyboardInterrupt:
                     logging.info("KeyboardInterrupt received. Cancelling remaining...")
                     shutdown_requested = True
-                    executor.shutdown(wait=False, cancel_futures=True)
+                    executor.shutdown(wait=False)
                     raise
 
                 except Exception as e:
@@ -808,7 +873,7 @@ def run_single_sync(
                     )
                     first_error = e
                     shutdown_requested = True
-                    executor.shutdown(wait=False, cancel_futures=True)
+                    executor.shutdown(wait=False)
 
         # stop progress thread
         progress_stop.set()
@@ -880,6 +945,15 @@ def run_single_sync(
         if len(failures) > max_show:
             logging.info(f"    ... plus {len(failures) - max_show} more")
 
+    if partial_transfers:
+        logging.warning(f"PARTIAL TRANSFERS ({len(partial_transfers)} exams):")
+        logging.warning(
+            "  These exams had rsync warnings (code 23/24). Some files may not have transferred."
+        )
+        logging.warning("  Re-run sync to retry, or manually verify these exams:")
+        for exam_path, exit_code in partial_transfers:
+            logging.warning(f"    * {exam_path} (rsync exit code {exit_code})")
+
     used_gb, free_gb, total_gb = _share_usage_gb()
     logging.info(
         f"[FINAL USAGE] {SRC_ROOT}: used {used_gb:.1f} GB / total {total_gb:.1f} GB (free {free_gb:.1f} GB)"
@@ -891,6 +965,33 @@ def run_single_sync(
     if empty_removed > 0:
         action = "would remove" if dry_run else "removed"
         logging.info(f"  - Empty patient directories {action}: {empty_removed}")
+
+    # clean up rsync partial directories from destination
+    logging.info("Cleaning up rsync partial directories...")
+    partial_removed = 0
+    partial_bytes = 0
+    for partial_dir in DST_ROOT.rglob(".rsync-partial"):
+        if partial_dir.is_dir():
+            dir_size = _calculate_dir_size(partial_dir)
+            if dry_run:
+                logging.info(
+                    f"[DRY RUN] WOULD REMOVE: {partial_dir} ({_format_size(dir_size)})"
+                )
+            else:
+                try:
+                    shutil.rmtree(partial_dir)
+                    logging.info(f"REMOVED: {partial_dir} ({_format_size(dir_size)})")
+                except Exception as e:
+                    logging.warning(f"Failed to remove {partial_dir}: {e}")
+                    continue
+            partial_removed += 1
+            partial_bytes += dir_size
+    if partial_removed > 0:
+        action = "would remove" if dry_run else "removed"
+        logging.info(
+            f"  - Rsync partial directories {action}: {partial_removed} "
+            f"({_format_size(partial_bytes)})"
+        )
 
 
 def run_with_auto_restart(
