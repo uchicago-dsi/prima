@@ -23,8 +23,9 @@ logging.getLogger("pydicom.valuerep").setLevel(logging.ERROR)
 # --- CONFIGURATION ---
 # SRC_ROOT = Path("/mnt/uchad_samba/16352A/")
 # DST_ROOT = Path("/gpfs/data/huo-lab/Image/ChiMEC/MG")
-SRC_ROOT = Path("/mnt/uchad_samba/13073B")
-DST_ROOT = Path("/gpfs/data/karczmar-lab/CAPS/MRI1.0")
+# SRC_ROOT = Path("/mnt/uchad_samba/13073B")
+SRC_ROOT = Path("/gpfs/data/karczmar-lab/CAPS/MRI1.0")
+DST_ROOT = Path("/gpfs/data/huo-lab/Image/MRI1.0")
 DELETE_QUEUE_DIR = SRC_ROOT / "_synced_and_queued_for_deletion"
 STABILITY_THRESHOLD_SEC = 600
 RESTART_DELAY_SEC = 120
@@ -239,13 +240,14 @@ def _robust_rmtree(path: Path):
 
 
 def copy_exam_local(
-    src: Path, patient_id: str, exam_name: str
+    src: Path, patient_id: str, exam_name: str, whole_file: bool = False
 ) -> Tuple[int, float, int]:
     """
     copy an exam directory locally with benchmarking
 
     returns (logical_bytes, seconds, rsync_exit_code)
     uses rsync for efficient local copying with progress tracking
+    whole_file: if True, skip rsync delta algorithm (faster for local copies)
     """
     import re
 
@@ -266,6 +268,8 @@ def copy_exam_local(
         f"{src}/",
         str(dest_dir),
     ]
+    if whole_file:
+        command.insert(2, "--whole-file")  # skip delta algorithm for local copies
 
     t0 = monotonic()
     proc = subprocess.Popen(
@@ -345,6 +349,17 @@ def copy_exam_local(
     if rsync_exit_code != 0:
         if rsync_exit_code == 20:
             raise KeyboardInterrupt("rsync was interrupted")
+        # exit code 11 is I/O error - often disk full
+        if rsync_exit_code == 11:
+            logging.error(
+                f"rsync I/O error (code 11) for {src.name}. "
+                "This usually means the destination disk is full. "
+                f"Check: df -h {dest_dir.parent}"
+            )
+            raise RuntimeError(
+                f"Destination disk full - rsync failed with I/O error. "
+                f"Free space on {DST_ROOT} and retry."
+            )
         # exit codes 23/24 are partial transfers - some files couldn't be transferred
         # this is usually harmless (files in use, vanished, etc.) and rsync will retry next run
         if rsync_exit_code in (23, 24):
@@ -386,85 +401,27 @@ def process_single_exam(
     dry_run: bool,
     immediate_delete: bool,
     deletion_log: list[tuple[str, str]],
+    whole_file: bool = False,
 ) -> Tuple[int, float, int]:
     """
     process a single exam: copy from source to destination.
 
     returns (logical_bytes, transfer_time_seconds, rsync_exit_code)
     rsync_exit_code is 0 for success, 23/24 for partial transfer warnings
+    whole_file: if True, use rsync --whole-file (faster for local copies)
     """
     exam_name = src_path.name
 
-    # stability check
-    is_stable, most_recent_age = _is_exam_stable(src_path, STABILITY_THRESHOLD_SEC)
-    if not is_stable:
-        logging.info(
-            f"SKIP UNSTABLE: {exam_name} "
-            f"(most recent file {most_recent_age / 60:.1f}min old, "
-            f"need {STABILITY_THRESHOLD_SEC / 60:.1f}min)"
-        )
-        return 0, 0.0, 0
-
-    # check if already exists at destination
-    dest_exam = DST_ROOT / patient_id / exam_name
-    if dest_exam.exists():
-        logging.info(f"SKIP EXISTS: {exam_name} already exists at destination")
-        # still queue/delete source since it's already synced
-        if dry_run:
-            action = "DELETE" if immediate_delete else "QUEUE FOR DELETE"
-            logging.info(f"[DRY RUN] WOULD {action} (LOCAL): {src_path}")
-            deletion_log.append((str(src_path), f"dry-run {action.lower()} (exists)"))
-        else:
-            if immediate_delete:
-                try:
-                    _robust_rmtree(src_path)
-                    logging.info(f"DELETED (LOCAL): {src_path}")
-                    deletion_log.append((str(src_path), "deleted (exists at dst)"))
-                except Exception as e:
-                    logging.error(f"Failed to delete {src_path}: {e}")
-                    deletion_log.append(
-                        (str(src_path), f"failed delete (exists at dst): {e}")
-                    )
-                    raise
-            else:
-                dst = DELETE_QUEUE_DIR / patient_id / exam_name
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    shutil.move(str(src_path), str(dst))
-                    logging.info(
-                        f"QUEUED FOR DELETE (LOCAL): moved {src_path} -> {dst}"
-                    )
-                    deletion_log.append((str(src_path), f"queued (exists) -> {dst}"))
-                except PermissionError:
-                    # if move fails due to permissions, try making writable first
-                    logging.warning(
-                        f"Permission error moving {src_path}, attempting to fix permissions..."
-                    )
-                    for root, dirs, files in os.walk(src_path):
-                        for d in dirs:
-                            try:
-                                os.chmod(
-                                    os.path.join(root, d),
-                                    stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC,
-                                )
-                            except Exception:
-                                pass
-                        for f in files:
-                            try:
-                                os.chmod(
-                                    os.path.join(root, f), stat.S_IWRITE | stat.S_IREAD
-                                )
-                            except Exception:
-                                pass
-                    shutil.move(str(src_path), str(dst))
-                    logging.info(
-                        f"QUEUED FOR DELETE (LOCAL): moved {src_path} -> {dst}"
-                    )
-                    deletion_log.append((str(src_path), f"queued (exists) -> {dst}"))
-        return 0, 0.0, 0
+    # NOTE: stability and exists checks are now done in _collect_pending_exams filtering
+    # if we reach here, the exam is in the pending list because:
+    # 1. source is stable (not being written to)
+    # 2. destination either doesn't exist OR exists but has different size (partial transfer)
+    # rsync will handle both cases correctly (skip existing files, transfer missing ones)
 
     # copy exam
-    logging.info(f"NEW: {exam_name} not found at destination. Copying.")
+    dest_exam = DST_ROOT / patient_id / exam_name
+    action = "RESUME" if dest_exam.exists() else "NEW"
+    logging.info(f"{action}: {exam_name} -> copying to destination")
     if dry_run:
         logging.info(
             f"[DRY RUN] WOULD COPY: {src_path} -> {DST_ROOT / patient_id / exam_name}"
@@ -474,7 +431,7 @@ def process_single_exam(
         rsync_exit_code = 0
     else:
         logical_bytes, transfer_time, rsync_exit_code = copy_exam_local(
-            src_path, patient_id, exam_name
+            src_path, patient_id, exam_name, whole_file=whole_file
         )
 
     # queue/delete source after transfer
@@ -675,7 +632,10 @@ def _collect_pending_exams(
 
 
 def run_single_sync(
-    dry_run: bool, immediate_delete: bool, workers: int = DEFAULT_WORKERS
+    dry_run: bool,
+    immediate_delete: bool,
+    workers: int = DEFAULT_WORKERS,
+    whole_file: bool = False,
 ):
     """run a single sync pass with parallel transfers"""
     global shutdown_requested
@@ -741,7 +701,12 @@ def run_single_sync(
             return src_path, 0, 0.0, 0, local_deletion_log
 
         logical_bytes, transfer_time, rsync_exit_code = process_single_exam(
-            src_path, patient_id, dry_run, immediate_delete, local_deletion_log
+            src_path,
+            patient_id,
+            dry_run,
+            immediate_delete,
+            local_deletion_log,
+            whole_file,
         )
         return (
             src_path,
@@ -995,7 +960,10 @@ def run_single_sync(
 
 
 def run_with_auto_restart(
-    dry_run: bool, immediate_delete: bool, workers: int = DEFAULT_WORKERS
+    dry_run: bool,
+    immediate_delete: bool,
+    workers: int = DEFAULT_WORKERS,
+    whole_file: bool = False,
 ):
     """run sync with automatic restart functionality"""
     setup_signal_handlers()
@@ -1010,7 +978,7 @@ def run_with_auto_restart(
             logging.info("=== STARTING SYNC ===")
 
         try:
-            run_single_sync(dry_run, immediate_delete, workers)
+            run_single_sync(dry_run, immediate_delete, workers, whole_file)
 
             if shutdown_requested:
                 logging.info("Shutdown requested during sync. Exiting.")
@@ -1041,12 +1009,13 @@ def main(
     immediate_delete: bool,
     auto_restart: bool,
     workers: int = DEFAULT_WORKERS,
+    whole_file: bool = False,
 ):
     """main entry point with optional auto-restart"""
     if auto_restart:
-        run_with_auto_restart(dry_run, immediate_delete, workers)
+        run_with_auto_restart(dry_run, immediate_delete, workers, whole_file)
     else:
-        run_single_sync(dry_run, immediate_delete, workers)
+        run_single_sync(dry_run, immediate_delete, workers, whole_file)
 
 
 if __name__ == "__main__":
@@ -1074,10 +1043,16 @@ if __name__ == "__main__":
         default=DEFAULT_WORKERS,
         help=f"Number of parallel rsync processes (default: {DEFAULT_WORKERS}).",
     )
+    parser.add_argument(
+        "--whole-file",
+        action="store_true",
+        help="Use rsync --whole-file (skip delta algorithm, faster for local copies).",
+    )
     args = parser.parse_args()
     main(
         dry_run=args.dry_run,
         immediate_delete=not args.no_immediate_delete,
         auto_restart=not args.no_auto_restart,
         workers=args.workers,
+        whole_file=args.whole_file,
     )
