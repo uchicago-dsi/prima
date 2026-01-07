@@ -265,13 +265,15 @@ def copy_exam_local(
         "-aH",
         "--partial",
         "--partial-dir=.rsync-partial",
+        "--no-inc-recursive",  # build full file list first (faster for GPFS)
+        "--block-size=131072",  # 128KB blocks (faster for large files on GPFS)
         "--info=stats2,progress2",
         "--stats",
         f"{src}/",
         str(dest_dir),
     ]
     if whole_file:
-        command.insert(4, "--whole-file")  # skip delta algorithm for local copies
+        command.insert(6, "--whole-file")  # skip delta algorithm for local copies
 
     t0 = monotonic()
     proc = subprocess.Popen(
