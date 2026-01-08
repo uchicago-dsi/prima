@@ -221,6 +221,12 @@ def update_metadata_with_disk_status_by_date(
     if conservative:
         print("  (conservative mode: only 1:1 matches count as on disk)")
 
+    # handle empty DataFrames
+    if len(metadata_df) == 0:
+        print("  WARNING: metadata DataFrame is empty, skipping disk status update")
+        metadata_df["is_on_disk"] = False
+        return metadata_df
+
     # load disk dates from fingerprint cache
     disk_dates = load_disk_dates_from_fingerprints(fingerprint_cache)
 
@@ -299,7 +305,11 @@ def update_metadata_with_disk_status_by_date(
             return False
 
     print("matching metadata against disk dates...")
-    metadata_df["is_on_disk"] = metadata_df.apply(check_on_disk, axis=1)
+    if len(metadata_df) == 0:
+        metadata_df["is_on_disk"] = pd.Series([], dtype=bool, index=metadata_df.index)
+    else:
+        is_on_disk_series = metadata_df.apply(check_on_disk, axis=1)
+        metadata_df["is_on_disk"] = is_on_disk_series
 
     # find disk exams not in ibroker
     disk_only_keys = disk_exam_keys - ibroker_exam_keys

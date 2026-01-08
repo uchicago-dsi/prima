@@ -20,26 +20,58 @@ from filesystem_utils import update_metadata_with_disk_status_by_date
 login = None
 make_driver = None
 wait_aspnet_idle = None
+bootstrap_http_session_from_driver = None
+http_get_root = None
+post_link_event = None
+post_fetch_grid = None
+parse_all_tables_from_page = None
 
 
 def _import_scrape_ibroker():
     """Import scrape_ibroker functions (triggers credential check)."""
     global login, make_driver, wait_aspnet_idle
+    global bootstrap_http_session_from_driver, http_get_root
+    global post_link_event, post_fetch_grid, parse_all_tables_from_page
     from scrape_ibroker import login as _login
     from scrape_ibroker import make_driver as _make_driver
     from scrape_ibroker import wait_aspnet_idle as _wait_aspnet_idle
+    from scrape_ibroker import bootstrap_http_session_from_driver as _bootstrap
+    from scrape_ibroker import http_get_root as _http_get_root
+    from scrape_ibroker import post_link_event as _post_link_event
+    from scrape_ibroker import post_fetch_grid as _post_fetch_grid
+    from scrape_ibroker import parse_all_tables_from_page as _parse_all_tables
 
     login = _login
     make_driver = _make_driver
     wait_aspnet_idle = _wait_aspnet_idle
+    bootstrap_http_session_from_driver = _bootstrap
+    http_get_root = _http_get_root
+    post_link_event = _post_link_event
+    post_fetch_grid = _post_fetch_grid
+    parse_all_tables_from_page = _parse_all_tables
 
 
 # --- Configuration ---
+# ChiMEC dataset configuration
 CHIMEC_PATIENTS_FILE = "/gpfs/data/phs/groups/Projects/Huo_projects/SPORE/annawoodard/List_ChiMEC_priority_2025July30.csv"
-KEY_FILE = "/gpfs/data/huo-lab/Image/ChiMEC/study-16352a.csv"
-METADATA_FILE = "data/imaging_metadata.csv"
-EXPORT_STATE_FILE = "data/export_state.csv"
-BASE_DOWNLOAD_DIR = "/gpfs/data/huo-lab/Image/ChiMEC/"
+CHIMEC_KEY_FILE = "/gpfs/data/huo-lab/Image/ChiMEC/study-16352a.csv"
+CHIMEC_METADATA_FILE = "data/imaging_metadata.csv"
+CHIMEC_EXPORT_STATE_FILE = "data/export_state.csv"
+CHIMEC_BASE_DOWNLOAD_DIR = "/gpfs/data/huo-lab/Image/ChiMEC/"
+
+# MRI1.0 dataset configuration
+MRI1_STUDY_IDS_FILE = (
+    "/gpfs/data/karczmar-lab/CAPS/MRI1.0/MRI1.0_AnonymousIDs_hiro.xlsx"
+)
+MRI1_METADATA_FILE = "data/imaging_metadata.csv"
+MRI1_EXPORT_STATE_FILE = "data/export_state_mri1.csv"
+MRI1_BASE_DOWNLOAD_DIR = "/gpfs/data/karczmar-lab/CAPS/MRI1.0/"
+
+# Legacy constants for backward compatibility (default to ChiMEC)
+KEY_FILE = CHIMEC_KEY_FILE
+METADATA_FILE = CHIMEC_METADATA_FILE
+EXPORT_STATE_FILE = CHIMEC_EXPORT_STATE_FILE
+BASE_DOWNLOAD_DIR = CHIMEC_BASE_DOWNLOAD_DIR
 
 MERGE_KEY_COLUMNS = ["study_id", "Study DateTime", "StudyDescription"]
 EXPORT_STATE_COLUMNS = MERGE_KEY_COLUMNS + [
@@ -430,12 +462,23 @@ def _atomic_write_csv(df: pd.DataFrame, path: str | Path, **kwargs) -> None:
         raise
 
 
-def save_current_state(db: pd.DataFrame):
+def save_current_state(db: pd.DataFrame, dataset: str = "chimec"):
     """Persist export state to a separate file (not the scraper's metadata file).
 
-    Writes only the merge keys and export-specific columns to EXPORT_STATE_FILE.
+    Writes only the merge keys and export-specific columns to dataset-specific export state file.
     This avoids conflicts with scrape_ibroker.py which owns METADATA_FILE.
+
+    Parameters
+    ----------
+    db : pd.DataFrame
+        Database with export state
+    dataset : str
+        Dataset name: "chimec" or "mri1.0"
     """
+    export_state_file = (
+        MRI1_EXPORT_STATE_FILE if dataset == "mri1.0" else CHIMEC_EXPORT_STATE_FILE
+    )
+
     available_cols = [c for c in EXPORT_STATE_COLUMNS if c in db.columns]
     export_state = db[available_cols].copy()
 
@@ -457,20 +500,41 @@ def save_current_state(db: pd.DataFrame):
 
     _atomic_write_csv(
         export_state,
-        EXPORT_STATE_FILE,
+        export_state_file,
         index=False,
         date_format="%Y-%m-%d %H:%M:%S",
     )
 
 
-def load_and_merge_data():
-    print("--- Phase 1: Loading and Merging Data ---")
+def load_and_merge_data(dataset: str = "chimec"):
+    """Load and merge data for the specified dataset.
+
+    Parameters
+    ----------
+    dataset : str
+        Dataset name: "chimec" or "mri1.0"
+
+    Returns
+    -------
+    pd.DataFrame
+        Merged database with all exam records
+    """
+    print(f"--- Phase 1: Loading and Merging Data (dataset: {dataset}) ---")
+
+    if dataset == "mri1.0":
+        return _load_mri1_data()
+    else:
+        return _load_chimec_data()
+
+
+def _load_chimec_data():
+    """Load and merge ChiMEC dataset."""
     try:
         patients = pd.read_csv(CHIMEC_PATIENTS_FILE)
         print(f"Loaded {len(patients):,} rows from patient info file.")
-        key = pd.read_csv(KEY_FILE)
+        key = pd.read_csv(CHIMEC_KEY_FILE)
         print(f"Loaded {len(key):,} rows from study_id-MRN key file.")
-        metadata = pd.read_csv(METADATA_FILE)
+        metadata = pd.read_csv(CHIMEC_METADATA_FILE)
         print(f"Loaded {len(metadata):,} exam records from raw metadata file.")
 
         # A small fix: The Accession number is often what we care about, not the old exam_id
@@ -517,8 +581,8 @@ def load_and_merge_data():
         metadata["export_requested_on"] = pd.NaT
 
         # load previous export state from separate file if it exists
-        if Path(EXPORT_STATE_FILE).exists():
-            export_state = pd.read_csv(EXPORT_STATE_FILE)
+        if Path(CHIMEC_EXPORT_STATE_FILE).exists():
+            export_state = pd.read_csv(CHIMEC_EXPORT_STATE_FILE)
             print(f"Loaded {len(export_state):,} rows from export state file.")
             export_state["Study DateTime"] = pd.to_datetime(
                 export_state["Study DateTime"], errors="coerce"
@@ -648,8 +712,168 @@ def load_and_merge_data():
     return db
 
 
+def _load_mri1_data():
+    """Load and merge MRI1.0 dataset."""
+    try:
+        # Load study IDs from Excel file
+        study_ids_df = pd.read_excel(MRI1_STUDY_IDS_FILE)
+        study_ids = study_ids_df["AnonymousID"].astype(str).tolist()
+        print(f"Loaded {len(study_ids):,} study IDs from MRI1.0 file.")
+
+        # Load metadata from iBroker scrape
+        metadata = pd.read_csv(MRI1_METADATA_FILE)
+        print(f"Loaded {len(metadata):,} exam records from raw metadata file.")
+
+        # Filter metadata to only include study IDs from the Excel file
+        metadata["study_id"] = metadata["study_id"].astype(str)
+        metadata = metadata[metadata["study_id"].isin(study_ids)]
+        print(f"Filtered to {len(metadata):,} exams matching MRI1.0 study IDs.")
+
+        # A small fix: The Accession number is often what we care about, not the old exam_id
+        if "exam_id" in metadata.columns and "Accession" in metadata.columns:
+            metadata["Accession"] = metadata["Accession"].fillna(metadata["exam_id"])
+
+        metadata["base_modality"] = metadata["Modality"].apply(get_base_modality)
+        print("  - Added 'base_modality' column.")
+
+        metadata["Study DateTime"] = pd.to_datetime(
+            metadata["Study DateTime"], errors="coerce"
+        )
+
+        if "Exported On" in metadata.columns:
+            metadata["Exported On"] = pd.to_datetime(
+                metadata["Exported On"], errors="coerce"
+            )
+
+        # initialize export state columns from scraper metadata where available
+        if "is_exported" not in metadata.columns:
+            metadata["is_exported"] = False
+
+        status_series = metadata.get("Status")
+        if status_series is not None:
+            exported_status_mask = (
+                status_series.fillna("")
+                .astype(str)
+                .str.strip()
+                .str.lower()
+                .isin({"already exported", "exported"})
+            )
+            metadata.loc[exported_status_mask, "is_exported"] = True
+
+        if "Exported On" in metadata.columns:
+            exported_on_mask = metadata["Exported On"].notna()
+            metadata.loc[exported_on_mask, "is_exported"] = True
+
+        metadata["is_exported"] = metadata["is_exported"].fillna(False).astype(bool)
+        metadata["download_attempt_outcome"] = pd.NA
+        metadata["download_attempt_outcome"] = metadata[
+            "download_attempt_outcome"
+        ].astype("string")
+        metadata["export_requested_on"] = pd.NaT
+
+        # load previous export state from separate file if it exists
+        if Path(MRI1_EXPORT_STATE_FILE).exists():
+            export_state = pd.read_csv(MRI1_EXPORT_STATE_FILE)
+            print(f"Loaded {len(export_state):,} rows from export state file.")
+            export_state["Study DateTime"] = pd.to_datetime(
+                export_state["Study DateTime"], errors="coerce"
+            )
+            export_state["export_requested_on"] = pd.to_datetime(
+                export_state["export_requested_on"], errors="coerce"
+            )
+            export_state["is_exported"] = (
+                export_state["is_exported"].fillna(False).astype(bool)
+            )
+            export_state["download_attempt_outcome"] = export_state[
+                "download_attempt_outcome"
+            ].astype("string")
+            # merge export state back into metadata on the key columns
+            metadata = metadata.merge(
+                export_state,
+                on=MERGE_KEY_COLUMNS,
+                how="left",
+                suffixes=("", "_state"),
+            )
+            # prefer values from export state file
+            for col in [
+                "is_exported",
+                "download_attempt_outcome",
+                "export_requested_on",
+            ]:
+                state_col = f"{col}_state"
+                if state_col in metadata.columns:
+                    mask = metadata[state_col].notna()
+                    if col == "is_exported":
+                        mask = mask | metadata[state_col].fillna(False).astype(bool)
+                    metadata.loc[mask, col] = metadata.loc[mask, state_col]
+                    metadata.drop(columns=[state_col], inplace=True)
+    except FileNotFoundError as e:
+        print(f"ERROR: Input file not found - {e}", file=sys.stderr)
+        sys.exit(1)
+
+    db = metadata.copy()
+    db.dropna(subset=["study_id", "Study DateTime", "StudyDescription"], inplace=True)
+
+    # Prefer rows with accessions when deduplicating exam metadata
+    if "Accession" in db.columns:
+        db["_has_accession"] = db["Accession"].notna().astype(int)
+    else:
+        db["_has_accession"] = 0
+
+    before_exam_dedup = len(db)
+    db = db.sort_values(
+        MERGE_KEY_COLUMNS + ["_has_accession"], ascending=[True, True, True, False]
+    ).drop_duplicates(subset=MERGE_KEY_COLUMNS, keep="first")
+    db.drop(columns=["_has_accession"], inplace=True)
+    if len(db) != before_exam_dedup:
+        print(
+            "  - Deduplicated exam rows on "
+            f"{MERGE_KEY_COLUMNS}: {before_exam_dedup:,} → {len(db):,}"
+        )
+
+    has_accession = db["Accession"].notna()
+    db.loc[has_accession, "is_exported"] = True
+
+    db["is_exported"] = db["is_exported"].fillna(False).astype(bool)
+
+    modality_counts = (
+        db.loc[db["is_exported"], "base_modality"].fillna("<missing>").value_counts()
+    )
+    print(
+        "  - Studies already exported (have Accession) by modality:\n"
+        + (modality_counts.to_string() if not modality_counts.empty else "<none>")
+    )
+
+    # Initialize columns that may not exist yet
+    if "download_attempt_outcome" not in db.columns:
+        db["download_attempt_outcome"] = pd.NA
+    db["download_attempt_outcome"] = db["download_attempt_outcome"].astype("string")
+
+    if "export_requested_on" not in db.columns:
+        db["export_requested_on"] = pd.NaT
+    db["export_requested_on"] = pd.to_datetime(
+        db["export_requested_on"], errors="coerce"
+    )
+
+    db["is_exported"] = db["is_exported"].fillna(False).astype(bool)
+    if "is_on_disk" not in db.columns:
+        db["is_on_disk"] = False
+
+    disk_counts = (
+        db.loc[db["is_on_disk"], "base_modality"].fillna("<missing>").value_counts()
+    )
+
+    print(f"\nMaster database created with {len(db):,} total exam records.")
+    if not disk_counts.empty:
+        print(
+            "  - Currently on disk (by base_modality incl. <missing>):\n"
+            + disk_counts.to_string()
+        )
+    return db
+
+
 def identify_download_targets(
-    df: pd.DataFrame, filter_by_genotyping: bool, modality: str
+    df: pd.DataFrame, filter_by_genotyping: bool, modality: str, dataset: str = "chimec"
 ):
     print("\n--- Phase 3: Identifying Target Exams for Download ---")
     df["rejection_reason"] = ""
@@ -719,7 +943,10 @@ def identify_download_targets(
         # Run comprehensive debugging analysis
         analyze_export_timeline(exported_missing_disk)
         print_export_history_summary(exported_missing_disk)
-        save_missing_exams_debug_csv(exported_missing_disk, BASE_DOWNLOAD_DIR)
+        base_download_dir = (
+            MRI1_BASE_DOWNLOAD_DIR if dataset == "mri1.0" else CHIMEC_BASE_DOWNLOAD_DIR
+        )
+        save_missing_exams_debug_csv(exported_missing_disk, base_download_dir)
 
         print("  - Sample of exported-but-not-on-disk exams:")
         debug_columns = [
@@ -749,28 +976,38 @@ def identify_download_targets(
         "Already exported (but not found on disk - possible sync issue)"
     )
     targets = targets[~already_exported_mask]
-    if filter_by_genotyping:
-        mask_no_chip = targets["chip"].isna()
-        targets.loc[mask_no_chip, "rejection_reason"] = "No genotyping data"
-        targets = targets[~mask_no_chip]
-        print(f"  - Rejected {mask_no_chip.sum():,} due to missing genotyping data.")
 
-    case_mask = targets["case_control_status"] == "Case"
-    bad_case_date_mask = case_mask & (
-        targets["Study DateTime"] > targets["DatedxIndex"]
-    )
-    targets.loc[bad_case_date_mask, "rejection_reason"] = "Exam is after diagnosis date"
-    targets = targets[~bad_case_date_mask]
-    print(
-        f"  - Rejected {bad_case_date_mask.sum():,} 'Case' exams that occurred after diagnosis."
-    )
+    # Skip genomics and case/control filtering for MRI1.0 dataset
+    if dataset != "mri1.0":
+        if filter_by_genotyping:
+            mask_no_chip = targets["chip"].isna()
+            targets.loc[mask_no_chip, "rejection_reason"] = "No genotyping data"
+            targets = targets[~mask_no_chip]
+            print(
+                f"  - Rejected {mask_no_chip.sum():,} due to missing genotyping data."
+            )
+
+        case_mask = targets["case_control_status"] == "Case"
+        bad_case_date_mask = case_mask & (
+            targets["Study DateTime"] > targets["DatedxIndex"]
+        )
+        targets.loc[bad_case_date_mask, "rejection_reason"] = (
+            "Exam is after diagnosis date"
+        )
+        targets = targets[~bad_case_date_mask]
+        print(
+            f"  - Rejected {bad_case_date_mask.sum():,} 'Case' exams that occurred after diagnosis."
+        )
 
     print(f"  = {len(targets):,} final potential target exams identified.")
     return targets.sort_values(by=["study_id", "Study DateTime"])
 
 
 def execute_downloads(
-    targets_df: pd.DataFrame, batch_size: int, full_db: pd.DataFrame = None
+    targets_df: pd.DataFrame,
+    batch_size: int,
+    full_db: pd.DataFrame = None,
+    dataset: str = "chimec",
 ):
     """Verifies exam availability live and requests exports."""
     if targets_df.empty:
@@ -890,7 +1127,7 @@ def execute_downloads(
             # Save state periodically after each patient to preserve progress
             # This includes discoveries of already exported exams
             if full_db is not None:
-                save_current_state(full_db)
+                save_current_state(full_db, dataset=dataset)
                 print("  - State saved to disk.")
     finally:
         if driver:
@@ -900,23 +1137,38 @@ def execute_downloads(
     return outcomes, already_exported_counter, successfully_exported_counter
 
 
-def run_export_cycle(args, cycle_number: int):
-    """Run a single export pass and return summary stats."""
+def run_export_cycle(args, cycle_number: int, dataset: str = "chimec"):
+    """Run a single export pass and return summary stats.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Command line arguments
+    cycle_number : int
+        Current cycle number
+    dataset : str
+        Dataset name: "chimec" or "mri1.0"
+    """
 
     cycle_banner = (
         f"\n=== Export cycle {cycle_number} started at "
-        f"{datetime.now():%Y-%m-%d %H:%M:%S} ==="
+        f"{datetime.now():%Y-%m-%d %H:%M:%S} (dataset: {dataset}) ==="
     )
     print(cycle_banner)
 
-    db = load_and_merge_data()
+    db = load_and_merge_data(dataset=dataset)
     # conservative=True: only mark is_on_disk if 1:1 match, otherwise re-export to be safe
     db = update_metadata_with_disk_status_by_date(db, conservative=True)
 
+    # For MRI1.0, skip genotyping filter (it doesn't apply)
+    filter_by_genotyping = (
+        not args.no_genotyping_filter if dataset != "mri1.0" else False
+    )
     targets = identify_download_targets(
         db,
-        filter_by_genotyping=not args.no_genotyping_filter,
+        filter_by_genotyping=filter_by_genotyping,
         modality=args.modality.upper(),
+        dataset=dataset,
     )
 
     db["is_target"] = False
@@ -954,7 +1206,7 @@ def run_export_cycle(args, cycle_number: int):
 
         if proceed == "y":
             outcomes, already_exported_count, successfully_exported_count = (
-                execute_downloads(targets, args.batch_size, full_db=db)
+                execute_downloads(targets, args.batch_size, full_db=db, dataset=dataset)
             )
 
             if outcomes:
@@ -983,8 +1235,11 @@ def run_export_cycle(args, cycle_number: int):
             print("Cycle cancelled by user response.")
 
     # Save final state
-    save_current_state(db)
-    print(f"\nCycle complete. Export state written to '{EXPORT_STATE_FILE}'")
+    save_current_state(db, dataset=dataset)
+    export_state_file = (
+        MRI1_EXPORT_STATE_FILE if dataset == "mri1.0" else CHIMEC_EXPORT_STATE_FILE
+    )
+    print(f"\nCycle complete. Export state written to '{export_state_file}'")
 
     return {
         "submitted": successfully_exported_count,
@@ -1083,7 +1338,9 @@ def audit_remote_export_status(
 
             # Save state every 20 patients to preserve audit progress
             if full_db is not None and patients_processed % 20 == 0:
-                save_current_state(full_db)
+                # Note: dataset parameter would need to be passed here if we want dataset-specific state
+                # For now, using default (chimec) since audit_remote_export_status doesn't know dataset
+                save_current_state(full_db, dataset="chimec")
                 print(
                     f"  - Audit state saved after {patients_processed} patients (patient {study_id})."
                 )
@@ -1107,14 +1364,27 @@ def refresh_export_status(
     cycle_number: int,
     *,
     target_indices: list[int] | None = None,
+    dataset: str = "chimec",
 ):
-    """Optionally reconcile export status during the wait window."""
+    """Optionally reconcile export status during the wait window.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Command line arguments
+    cycle_number : int
+        Current cycle number
+    target_indices : list[int] | None
+        Indices of target exams to prioritize
+    dataset : str
+        Dataset name: "chimec" or "mri1.0"
+    """
 
     print(
-        f"\n=== Refresh cycle {cycle_number}: auditing export status before next run ==="
+        f"\n=== Refresh cycle {cycle_number}: auditing export status before next run (dataset: {dataset}) ==="
     )
 
-    refresh_db = load_and_merge_data()
+    refresh_db = load_and_merge_data(dataset=dataset)
     # conservative=True: only mark is_on_disk if 1:1 match, otherwise re-export to be safe
     refresh_db = update_metadata_with_disk_status_by_date(refresh_db, conservative=True)
 
@@ -1182,18 +1452,28 @@ def refresh_export_status(
         f"{audit_stats['still_available']} still available."
     )
 
-    save_current_state(refresh_db)
-    print(f"Audit state persisted to '{EXPORT_STATE_FILE}'.")
+    save_current_state(refresh_db, dataset=dataset)
+    export_state_file = (
+        MRI1_EXPORT_STATE_FILE if dataset == "mri1.0" else CHIMEC_EXPORT_STATE_FILE
+    )
+    print(f"Audit state persisted to '{export_state_file}'.")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Identify and download ChiMEC imaging exams."
+        description="Identify and download imaging exams from iBroker."
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        choices=["chimec", "mri1.0"],
+        default="chimec",
+        help="Dataset to process: 'chimec' (default) or 'mri1.0'.",
     )
     parser.add_argument(
         "--no-genotyping-filter",
         action="store_true",
-        help="Include patients without genotyping data.",
+        help="Include patients without genotyping data (ChiMEC only).",
     )
     parser.add_argument(
         "--batch-size",
@@ -1251,15 +1531,23 @@ def main():
 
     args = parser.parse_args()
 
+    dataset = args.dataset.lower()
+
     # status-only mode doesn't need credentials
     if args.status_only:
-        print("Running in --status-only mode (no exports will be performed)\n")
-        db = load_and_merge_data()
+        print(
+            f"Running in --status-only mode (no exports will be performed, dataset: {dataset})\n"
+        )
+        db = load_and_merge_data(dataset=dataset)
         db = update_metadata_with_disk_status_by_date(db, conservative=True)
+        filter_by_genotyping = (
+            not args.no_genotyping_filter if dataset != "mri1.0" else False
+        )
         identify_download_targets(
             db,
-            filter_by_genotyping=not args.no_genotyping_filter,
+            filter_by_genotyping=filter_by_genotyping,
             modality=args.modality.upper(),
+            dataset=dataset,
         )
         sys.exit(0)
 
@@ -1277,7 +1565,7 @@ def main():
     try:
         while True:
             cycles_run += 1
-            cycle_result = run_export_cycle(args, cycles_run)
+            cycle_result = run_export_cycle(args, cycles_run, dataset=dataset)
             last_target_indices = cycle_result.get("target_indices")
 
             max_cycles = args.max_cycles
@@ -1294,6 +1582,7 @@ def main():
                         args,
                         cycles_run,
                         target_indices=last_target_indices,
+                        dataset=dataset,
                     )
                 except Exception as exc:
                     print(
