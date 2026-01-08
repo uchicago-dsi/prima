@@ -36,6 +36,12 @@ PROGRESS_BAR_WIDTH = 28
 DEFAULT_WORKERS = 8
 
 
+class SkippableIOError(RuntimeError):
+    """I/O error that can be skipped if --skip-io-errors flag is set"""
+
+    pass
+
+
 def _format_interval(seconds: float) -> str:
     """format seconds as HH:MM:SS or MM:SS"""
     seconds = max(0, int(round(seconds)))
@@ -64,6 +70,50 @@ def _format_size(num_bytes: float | int) -> str:
     if num_bytes >= 1_000_000:
         return f"{num_bytes / 1_000_000:.1f} MB"
     return f"{num_bytes / 1_000:.1f} KB"
+
+
+def _format_rsync_line_with_gb(line: str) -> str:
+    """parse rsync output line and convert byte values to GB where applicable"""
+    import re
+
+    # convert byte string to human-readable format
+    def bytes_to_human(b_str: str) -> str:
+        try:
+            b = float(b_str.replace(",", ""))
+            if b >= 1_000_000_000:
+                return f"{b / 1_000_000_000:.2f} GB"
+            elif b >= 1_000_000:
+                return f"{b / 1_000_000:.2f} MB"
+            elif b >= 1_000:
+                return f"{b / 1_000:.2f} KB"
+            else:
+                return f"{int(b)} bytes"
+        except ValueError:
+            return b_str
+
+    # pattern 1: "Total file size: X bytes" or "Total transferred file size: X bytes"
+    line = re.sub(
+        r"(Total (?:transferred )?file size:\s*)([\d,]+)\s*bytes",
+        lambda m: f"{m.group(1)}{bytes_to_human(m.group(2))}",
+        line,
+        flags=re.IGNORECASE,
+    )
+
+    # pattern 2: "sent X bytes  received Y bytes  Z bytes/sec"
+    def replace_sent_received(match):
+        sent = bytes_to_human(match.group(1))
+        received = bytes_to_human(match.group(2))
+        rate = bytes_to_human(match.group(3))
+        return f"sent {sent}  received {received}  {rate}/sec"
+
+    line = re.sub(
+        r"sent\s+([\d,]+)\s+bytes\s+received\s+([\d,]+)\s+bytes\s+([\d,.]+)\s+bytes/sec",
+        replace_sent_received,
+        line,
+        flags=re.IGNORECASE,
+    )
+
+    return line
 
 
 logging.basicConfig(
@@ -240,7 +290,11 @@ def _robust_rmtree(path: Path):
 
 
 def copy_exam_local(
-    src: Path, patient_id: str, exam_name: str, whole_file: bool = False
+    src: Path,
+    patient_id: str,
+    exam_name: str,
+    whole_file: bool = False,
+    skip_io_errors: bool = False,
 ) -> Tuple[int, float, int]:
     """
     copy an exam directory locally with benchmarking
@@ -320,7 +374,9 @@ def copy_exam_local(
             combined_lines.append(line)
             msg = line.rstrip()
             if msg and should_log(msg):
-                logging.info(f"[COPY] {msg}")
+                # format byte values as GB for readability
+                formatted_msg = _format_rsync_line_with_gb(msg)
+                logging.info(f"[COPY] {formatted_msg}")
             if "to-chk=" in msg:
                 last_progress_line = msg
 
@@ -353,17 +409,69 @@ def copy_exam_local(
     if rsync_exit_code != 0:
         if rsync_exit_code == 20:
             raise KeyboardInterrupt("rsync was interrupted")
-        # exit code 11 is I/O error - often disk full
+        # exit code 11 is I/O error - could be disk full, quota exceeded, or other I/O issues
         if rsync_exit_code == 11:
-            logging.error(
-                f"rsync I/O error (code 11) for {src.name}. "
-                "This usually means the destination disk is full. "
-                f"Check: df -h {dest_dir.parent}"
-            )
-            raise RuntimeError(
-                f"Destination disk full - rsync failed with I/O error. "
-                f"Free space on {DST_ROOT} and retry."
-            )
+            combined = "".join(combined_lines)
+            # check actual disk space before assuming it's full
+            try:
+                usage = shutil.disk_usage(DST_ROOT)
+                free_gb = usage.free / 1_000_000_000
+                total_gb = usage.total / 1_000_000_000
+                used_gb = usage.used / 1_000_000_000
+                logging.error(
+                    f"rsync I/O error (code 11) for {src.name}. "
+                    f"Disk space check: {free_gb:.1f} GB free / {total_gb:.1f} GB total "
+                    f"({used_gb:.1f} GB used) on {DST_ROOT}"
+                )
+            except Exception as e:
+                logging.warning(f"Could not check disk space: {e}")
+
+            # log full rsync output to help diagnose the issue
+            logging.error(f"Full rsync output for {src.name}:")
+            for line in combined_lines[-50:]:  # last 50 lines should have the error
+                logging.error(f"  {line.rstrip()}")
+
+            # check if rsync output mentions specific errors
+            combined_lower = combined.lower()
+            if "no space left" in combined_lower or "disk full" in combined_lower:
+                # check if it's a directory creation failure (GPFS directory-level inode limit)
+                if "mkdir" in combined_lower:
+                    error_msg = (
+                        f"GPFS directory-level inode limit reached for parent directory. "
+                        f"rsync failed to create directory for {src.name}. "
+                        f"This is a GPFS metadata quota issue, not block quota. "
+                        f"Check: stat -f {dest_dir.parent} | grep Inodes "
+                        f"or contact GPFS admins to increase directory inode limit."
+                    )
+                    if skip_io_errors:
+                        raise SkippableIOError(error_msg)
+                    else:
+                        raise RuntimeError(error_msg)
+                else:
+                    error_msg = (
+                        "Destination disk/quota full - rsync failed with I/O error. "
+                        "Check quota: mmlsquota -j karczmar-lab --block-size auto data1"
+                    )
+                    if skip_io_errors:
+                        raise SkippableIOError(error_msg)
+                    else:
+                        raise RuntimeError(error_msg)
+            elif "quota" in combined_lower:
+                raise RuntimeError(
+                    "Quota exceeded - rsync failed with I/O error. "
+                    "Check quota: mmlsquota -j karczmar-lab --block-size auto data1"
+                )
+            else:
+                # generic I/O error - could be network, filesystem, or other issue
+                error_msg = (
+                    f"rsync I/O error (code 11) for {src.name}. "
+                    f"Check rsync output above for details. "
+                    f"May be disk/quota issue or other I/O problem."
+                )
+                if skip_io_errors:
+                    raise SkippableIOError(error_msg)
+                else:
+                    raise RuntimeError(error_msg)
         # exit codes 23/24 are partial transfers - some files couldn't be transferred
         # this is usually harmless (files in use, vanished, etc.) and rsync will retry next run
         if rsync_exit_code in (23, 24):
@@ -374,6 +482,7 @@ def copy_exam_local(
         else:
             raise subprocess.CalledProcessError(rsync_exit_code, command)
 
+    # combine output for parsing (already done above for exit code 11, but need it here for success case)
     combined = "".join(combined_lines)
 
     logical_bytes = logical_bytes_src
@@ -406,6 +515,7 @@ def process_single_exam(
     immediate_delete: bool,
     deletion_log: list[tuple[str, str]],
     whole_file: bool = False,
+    skip_io_errors: bool = False,
 ) -> Tuple[int, float, int]:
     """
     process a single exam: copy from source to destination.
@@ -435,7 +545,11 @@ def process_single_exam(
         rsync_exit_code = 0
     else:
         logical_bytes, transfer_time, rsync_exit_code = copy_exam_local(
-            src_path, patient_id, exam_name, whole_file=whole_file
+            src_path,
+            patient_id,
+            exam_name,
+            whole_file=whole_file,
+            skip_io_errors=skip_io_errors,
         )
 
     # queue/delete source after transfer
@@ -640,6 +754,7 @@ def run_single_sync(
     immediate_delete: bool,
     workers: int = DEFAULT_WORKERS,
     whole_file: bool = False,
+    skip_io_errors: bool = False,
 ):
     """run a single sync pass with parallel transfers"""
     global shutdown_requested
@@ -689,6 +804,7 @@ def run_single_sync(
     transfer_time_total = 0.0
     deletion_log: list[tuple[str, str]] = []
     partial_transfers: list[tuple[str, int]] = []  # (exam_path, rsync_exit_code)
+    skipped_io_errors: list[tuple[str, str]] = []  # (exam_path, error_message)
     first_error: Exception | None = None
     progress_stop = threading.Event()
     # sliding window: list of (timestamp, cumulative_bytes) for rate calculation
@@ -711,6 +827,7 @@ def run_single_sync(
             immediate_delete,
             local_deletion_log,
             whole_file,
+            skip_io_errors,
         )
         return (
             src_path,
@@ -836,21 +953,39 @@ def run_single_sync(
                     executor.shutdown(wait=False)
                     raise
 
+                except SkippableIOError as e:
+                    # I/O error that can be skipped if flag is set
+                    error_msg = str(e)
+                    logging.warning(
+                        f"SKIPPING {src_path} due to I/O error: {error_msg}"
+                    )
+                    with lock:
+                        skipped_io_errors.append((str(src_path), error_msg))
+                        completed_bytes += expected_size  # count as "done" for progress
+                        completed_exams += 1
+                        log_progress()
                 except Exception as e:
                     logging.error(
                         f"FATAL ERROR processing {src_path}: {e}", exc_info=True
                     )
                     first_error = e
-                    shutdown_requested = True
-                    executor.shutdown(wait=False)
+                    if not skip_io_errors:
+                        shutdown_requested = True
+                        executor.shutdown(wait=False)
 
         # stop progress thread
         progress_stop.set()
         progress_thread.join(timeout=1.0)
 
-        if first_error is not None:
+        if first_error is not None and not skip_io_errors:
             logging.error("Exiting immediately on error (fail-fast mode).")
             raise first_error
+        elif first_error is not None and skip_io_errors:
+            # non-skippable error occurred, but we're in skip mode
+            # only raise if it's not a SkippableIOError (shouldn't happen, but be safe)
+            if not isinstance(first_error, SkippableIOError):
+                logging.error("Non-skippable error occurred. Exiting.")
+                raise first_error
 
     # log final progress
     with lock:
@@ -914,6 +1049,17 @@ def run_single_sync(
         if len(failures) > max_show:
             logging.info(f"    ... plus {len(failures) - max_show} more")
 
+    if skipped_io_errors:
+        logging.warning(f"SKIPPED I/O ERRORS ({len(skipped_io_errors)} exams):")
+        logging.warning(
+            "  These exams failed with I/O errors (e.g., GPFS directory inode limits). "
+            "They were skipped and will be retried on the next sync run."
+        )
+        logging.warning("  Exams skipped:")
+        for exam_path, error_msg in skipped_io_errors:
+            logging.warning(f"    * {exam_path}")
+            logging.warning(f"      Error: {error_msg}")
+
     if partial_transfers:
         logging.warning(f"PARTIAL TRANSFERS ({len(partial_transfers)} exams):")
         logging.warning(
@@ -968,6 +1114,7 @@ def run_with_auto_restart(
     immediate_delete: bool,
     workers: int = DEFAULT_WORKERS,
     whole_file: bool = False,
+    skip_io_errors: bool = False,
 ):
     """run sync with automatic restart functionality"""
     setup_signal_handlers()
@@ -982,7 +1129,9 @@ def run_with_auto_restart(
             logging.info("=== STARTING SYNC ===")
 
         try:
-            run_single_sync(dry_run, immediate_delete, workers, whole_file)
+            run_single_sync(
+                dry_run, immediate_delete, workers, whole_file, skip_io_errors
+            )
 
             if shutdown_requested:
                 logging.info("Shutdown requested during sync. Exiting.")
@@ -1014,12 +1163,15 @@ def main(
     auto_restart: bool,
     workers: int = DEFAULT_WORKERS,
     whole_file: bool = False,
+    skip_io_errors: bool = False,
 ):
     """main entry point with optional auto-restart"""
     if auto_restart:
-        run_with_auto_restart(dry_run, immediate_delete, workers, whole_file)
+        run_with_auto_restart(
+            dry_run, immediate_delete, workers, whole_file, skip_io_errors
+        )
     else:
-        run_single_sync(dry_run, immediate_delete, workers, whole_file)
+        run_single_sync(dry_run, immediate_delete, workers, whole_file, skip_io_errors)
 
 
 if __name__ == "__main__":
@@ -1052,6 +1204,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Use rsync --whole-file (skip delta algorithm, faster for local copies).",
     )
+    parser.add_argument(
+        "--skip-io-errors",
+        action="store_true",
+        help="Skip exams that fail with I/O errors (e.g., GPFS directory inode limits) and continue processing others.",
+    )
     args = parser.parse_args()
     main(
         dry_run=args.dry_run,
@@ -1059,4 +1216,5 @@ if __name__ == "__main__":
         auto_restart=not args.no_auto_restart,
         workers=args.workers,
         whole_file=args.whole_file,
+        skip_io_errors=args.skip_io_errors,
     )
