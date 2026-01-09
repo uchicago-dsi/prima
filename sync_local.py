@@ -603,14 +603,166 @@ def process_single_exam(
     return logical_bytes, transfer_time, rsync_exit_code
 
 
+def _cleanup_orphaned_incomplete_exams(
+    dry_run: bool, known_sources: set[tuple[str, str]]
+) -> tuple[int, int]:
+    """
+    clean up orphaned incomplete exam directories on destination
+
+    removes exam directories where:
+    - source no longer exists (not in SRC_ROOT or DELETE_QUEUE_DIR)
+    - destination has .rsync-partial directory (indicating incomplete transfer)
+
+    known_sources: set of (patient_id, exam_name) tuples from source scan
+    returns (removed_count, freed_bytes)
+    """
+    removed_count = 0
+    freed_bytes = 0
+
+    logging.info("Scanning destination for orphaned incomplete exams...")
+    scan_start = monotonic()
+
+    # collect all exam directories on destination
+    dest_exams: list[tuple[Path, str, str]] = []  # (exam_path, patient_id, exam_name)
+    for patient_dir in DST_ROOT.iterdir():
+        if not patient_dir.is_dir() or not patient_dir.name.isdigit():
+            continue
+        patient_id = patient_dir.name
+        try:
+            for exam_path in patient_dir.iterdir():
+                if exam_path.is_dir() and not exam_path.name.startswith("."):
+                    dest_exams.append((exam_path, patient_id, exam_path.name))
+        except Exception as e:
+            logging.warning(f"Failed to scan patient dir {patient_dir}: {e}")
+            continue
+
+    logging.info(f"Found {len(dest_exams)} exam directories on destination")
+
+    # check each destination exam
+    for exam_path, patient_id, exam_name in dest_exams:
+        if shutdown_requested:
+            break
+
+        # check if source exists
+        src_exam = SRC_ROOT / patient_id / exam_name
+        queued_exam = DELETE_QUEUE_DIR / patient_id / exam_name
+        source_exists = src_exam.exists() or queued_exam.exists()
+
+        # check if we know about this exam from our source scan
+        known_source = (patient_id, exam_name) in known_sources
+
+        if source_exists or known_source:
+            # source exists or we saw it in scan, skip
+            continue
+
+        # check if destination has .rsync-partial directory (incomplete transfer)
+        partial_dir = exam_path / ".rsync-partial"
+        if not partial_dir.exists():
+            # no partial directory, assume complete (or at least not obviously incomplete)
+            continue
+
+        # this is an orphaned incomplete exam - remove it
+        exam_size = _calculate_dir_size(exam_path)
+        if dry_run:
+            logging.info(
+                f"[DRY RUN] WOULD REMOVE ORPHANED INCOMPLETE: {exam_path} "
+                f"({_format_size(exam_size)})"
+            )
+        else:
+            try:
+                shutil.rmtree(exam_path)
+                logging.info(
+                    f"REMOVED ORPHANED INCOMPLETE: {exam_path} ({_format_size(exam_size)})"
+                )
+            except Exception as e:
+                logging.warning(f"Failed to remove orphaned exam {exam_path}: {e}")
+                continue
+
+        removed_count += 1
+        freed_bytes += exam_size
+
+    scan_time = monotonic() - scan_start
+    if removed_count > 0:
+        action = "would remove" if dry_run else "removed"
+        logging.info(
+            f"Orphaned incomplete exam cleanup: {action} {removed_count} exams "
+            f"({_format_size(freed_bytes)}) in {scan_time:.1f}s"
+        )
+    else:
+        logging.info(f"No orphaned incomplete exams found (scan took {scan_time:.1f}s)")
+
+    return removed_count, freed_bytes
+
+
+def _verify_exams_match(src: Path, dest: Path) -> bool:
+    """
+    verify that two exam directories match exactly using rsync dry-run
+
+    returns True if directories match exactly, False otherwise
+    """
+    command = [
+        "rsync",
+        "-aHn",  # archive, hard links, dry-run
+        "--checksum",  # compare checksums, not just size/mtime
+        "-i",  # itemize changes
+        "--out-format=%i %n",  # output format: change code + filename
+        f"{src}/",
+        str(dest),
+    ]
+
+    try:
+        proc = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=300,  # 5 minute timeout
+        )
+
+        if proc.returncode != 0:
+            logging.warning(
+                f"rsync verification failed for {src.name}: {proc.stderr[:200]}"
+            )
+            return False
+
+        # parse output: lines starting with >, <, c, h, or d indicate changes
+        # (>, < = file differences, c = checksum diff, h = hard link diff, d = dir diff)
+        output = proc.stdout
+        changes = [
+            line
+            for line in output.splitlines()
+            if line and line[0] in "><chd" and not line.startswith(".d")
+        ]
+
+        if changes:
+            logging.debug(
+                f"Verification found differences for {src.name} "
+                f"(showing first 5): {changes[:5]}"
+            )
+            return False
+
+        return True
+
+    except subprocess.TimeoutExpired:
+        logging.warning(f"rsync verification timed out for {src.name}")
+        return False
+    except Exception as e:
+        logging.warning(f"rsync verification error for {src.name}: {e}")
+        return False
+
+
 def _collect_pending_exams(
     dry_run: bool,
-) -> tuple[list[tuple[Path, str, int]], int, int]:
+) -> tuple[
+    list[tuple[Path, str, int]], list[tuple[Path, str]], int, int, set[tuple[str, str]]
+]:
     """
     scan source directory and collect exams pending transfer
 
-    returns (pending_exams, skipped_unstable, skipped_exists) where pending_exams
-    is a list of (src_path, patient_id, size_bytes) tuples
+    returns (pending_exams, exists_exams, skipped_unstable, skipped_exists, known_sources) where:
+    - pending_exams is a list of (src_path, patient_id, size_bytes) tuples
+    - exists_exams is a list of (src_path, patient_id) tuples for exams that exist on dest
+    - known_sources is a set of (patient_id, exam_name) tuples for all exams found in source
     """
     logging.info("Step 1: Scanning source directory...")
     scan_start = monotonic()
@@ -647,8 +799,14 @@ def _collect_pending_exams(
         f"Found {len(all_exams)} total exams. Filtering with {DEFAULT_WORKERS} workers..."
     )
 
+    # build set of known sources for cleanup tracking
+    known_sources: set[tuple[str, str]] = {
+        (exam_path.parent.name, exam_path.name) for exam_path, _ in all_exams
+    }
+
     # filter to pending exams (stable and not already at destination)
     pending: list[tuple[Path, str, int]] = []
+    exists: list[tuple[Path, str]] = []  # exams that exist on dest (same size)
     skipped_unstable = 0
     skipped_exists = 0
     filter_start = monotonic()
@@ -707,6 +865,7 @@ def _collect_pending_exams(
                         logging.info(
                             f"[DRY RUN] SKIP EXISTS: {src_path.name} already at destination (size matches)"
                         )
+                    exists.append((src_path, patient_id))
                     skipped_exists += 1
                 elif status == "unstable":
                     if dry_run:
@@ -743,10 +902,10 @@ def _collect_pending_exams(
     logging.info(
         f"Filtering took {collect_time:.1f}s. "
         f"Pending: {len(pending)} exams ({_format_size(total_pending_bytes)}), "
-        f"skipped: {skipped_unstable} unstable, {skipped_exists} already exist"
+        f"skipped: {skipped_unstable} unstable, {skipped_exists} already exist (will verify at end)"
     )
 
-    return pending, skipped_unstable, skipped_exists
+    return pending, exists, skipped_unstable, skipped_exists, known_sources
 
 
 def run_single_sync(
@@ -773,42 +932,55 @@ def run_single_sync(
     )
 
     # phase 1: collect pending exams with sizes
-    pending_exams, skipped_unstable, skipped_exists = _collect_pending_exams(dry_run)
+    (
+        pending_exams,
+        exists_exams,
+        skipped_unstable,
+        skipped_exists,
+        known_sources,
+    ) = _collect_pending_exams(dry_run)
 
-    if not pending_exams:
-        logging.info("No exams pending transfer. Nothing to do.")
-        _cleanup_empty_patient_dirs(dry_run)
-        return
-
-    if shutdown_requested:
-        logging.info("Shutdown requested during scan. Exiting.")
-        return
-
-    total_bytes = sum(size for _, _, size in pending_exams)
-    total_exams = len(pending_exams)
-    logging.info(
-        f"=== STARTING PARALLEL TRANSFER: {total_exams} exams, "
-        f"{_format_size(total_bytes)}, {workers} workers ==="
-    )
-
-    # phase 2: parallel transfer with progress tracking
+    # initialize variables used throughout the function
     sync_start = monotonic()
-    PROGRESS_INTERVAL_SEC = 30.0
-    RATE_WINDOW_SEC = 3600.0  # 1 hour sliding window for rate calculation
-
-    # thread-safe counters
-    lock = threading.Lock()
+    deletion_log: list[tuple[str, str]] = []
+    partial_transfers: list[tuple[str, int]] = []  # (exam_path, rsync_exit_code)
+    skipped_io_errors: list[tuple[str, str]] = []  # (exam_path, error_message)
     completed_bytes = 0
     completed_exams = 0
     transfers_done = 0
     transfer_time_total = 0.0
-    deletion_log: list[tuple[str, str]] = []
-    partial_transfers: list[tuple[str, int]] = []  # (exam_path, rsync_exit_code)
-    skipped_io_errors: list[tuple[str, str]] = []  # (exam_path, error_message)
-    first_error: Exception | None = None
-    progress_stop = threading.Event()
-    # sliding window: list of (timestamp, cumulative_bytes) for rate calculation
-    progress_samples: list[tuple[float, int]] = [(sync_start, 0)]
+
+    if not pending_exams:
+        logging.info("No exams pending transfer.")
+        if exists_exams:
+            logging.info(
+                f"Verifying {len(exists_exams)} exams that exist on destination..."
+            )
+        else:
+            _cleanup_empty_patient_dirs(dry_run)
+            return
+    else:
+        if shutdown_requested:
+            logging.info("Shutdown requested during scan. Exiting.")
+            return
+
+        total_bytes = sum(size for _, _, size in pending_exams)
+        total_exams = len(pending_exams)
+        logging.info(
+            f"=== STARTING PARALLEL TRANSFER: {total_exams} exams, "
+            f"{_format_size(total_bytes)}, {workers} workers ==="
+        )
+
+        # phase 2: parallel transfer with progress tracking
+        PROGRESS_INTERVAL_SEC = 30.0
+        RATE_WINDOW_SEC = 3600.0  # 1 hour sliding window for rate calculation
+
+        # thread-safe counters
+        lock = threading.Lock()
+        first_error: Exception | None = None
+        progress_stop = threading.Event()
+        # sliding window: list of (timestamp, cumulative_bytes) for rate calculation
+        progress_samples: list[tuple[float, int]] = [(sync_start, 0)]
 
     def process_exam_wrapper(
         item: tuple[Path, str, int],
@@ -886,120 +1058,131 @@ def run_single_sync(
                 f"elapsed={_format_interval(elapsed)}"
             )
 
-    def progress_thread_fn() -> None:
-        """background thread that logs progress every PROGRESS_INTERVAL_SEC"""
-        while not progress_stop.wait(timeout=PROGRESS_INTERVAL_SEC):
-            if shutdown_requested:
-                break
-            with lock:
-                log_progress()
+    if pending_exams:
 
-    if dry_run:
-        # in dry-run, just log what would happen (already done in _collect_pending_exams)
-        for src_path, patient_id, size_bytes in pending_exams:
-            logging.info(
-                f"[DRY RUN] WOULD COPY: {src_path} -> "
-                f"{DST_ROOT / patient_id / src_path.name} ({_format_size(size_bytes)})"
-            )
-            action = "DELETE" if immediate_delete else "QUEUE FOR DELETE"
-            logging.info(f"[DRY RUN] WOULD {action} (LOCAL): {src_path}")
-            deletion_log.append((str(src_path), f"dry-run {action.lower()}"))
-            completed_bytes += size_bytes
-            completed_exams += 1
-        transfers_done = total_exams
-    else:
-        # start background progress thread
-        progress_thread = threading.Thread(target=progress_thread_fn, daemon=True)
-        progress_thread.start()
+        def progress_thread_fn() -> None:
+            """background thread that logs progress every PROGRESS_INTERVAL_SEC"""
+            while not progress_stop.wait(timeout=PROGRESS_INTERVAL_SEC):
+                if shutdown_requested:
+                    break
+                with lock:
+                    log_progress()
 
-        # actual parallel transfer
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {
-                executor.submit(process_exam_wrapper, item): item
-                for item in pending_exams
-            }
+        if dry_run:
+            # in dry-run, just log what would happen (already done in _collect_pending_exams)
+            for src_path, patient_id, size_bytes in pending_exams:
+                logging.info(
+                    f"[DRY RUN] WOULD COPY: {src_path} -> "
+                    f"{DST_ROOT / patient_id / src_path.name} ({_format_size(size_bytes)})"
+                )
+                action = "DELETE" if immediate_delete else "QUEUE FOR DELETE"
+                logging.info(f"[DRY RUN] WOULD {action} (LOCAL): {src_path}")
+                deletion_log.append((str(src_path), f"dry-run {action.lower()}"))
+                completed_bytes += size_bytes
+                completed_exams += 1
+            transfers_done = len(pending_exams)
+        else:
+            # start background progress thread
+            progress_thread = threading.Thread(target=progress_thread_fn, daemon=True)
+            progress_thread.start()
 
-            for future in as_completed(futures):
-                if first_error is not None:
-                    # already failed, just drain remaining futures
-                    continue
+            # actual parallel transfer
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {
+                    executor.submit(process_exam_wrapper, item): item
+                    for item in pending_exams
+                }
 
-                item = futures[future]
-                src_path, patient_id, expected_size = item
+                for future in as_completed(futures):
+                    if first_error is not None:
+                        # already failed, just drain remaining futures
+                        continue
 
-                try:
-                    (
-                        _,
-                        logical_bytes,
-                        transfer_time,
-                        rsync_exit_code,
-                        local_deletions,
-                    ) = future.result()
+                    item = futures[future]
+                    src_path, patient_id, expected_size = item
 
-                    with lock:
-                        completed_bytes += expected_size
-                        completed_exams += 1
-                        if logical_bytes > 0:
-                            transfers_done += 1
-                            transfer_time_total += transfer_time
-                        if rsync_exit_code in (23, 24):
-                            partial_transfers.append((str(src_path), rsync_exit_code))
-                        deletion_log.extend(local_deletions)
-                        log_progress()
+                    try:
+                        (
+                            _,
+                            logical_bytes,
+                            transfer_time,
+                            rsync_exit_code,
+                            local_deletions,
+                        ) = future.result()
 
-                except KeyboardInterrupt:
-                    logging.info("KeyboardInterrupt received. Cancelling remaining...")
-                    shutdown_requested = True
-                    executor.shutdown(wait=False)
-                    raise
+                        with lock:
+                            completed_bytes += expected_size
+                            completed_exams += 1
+                            if logical_bytes > 0:
+                                transfers_done += 1
+                                transfer_time_total += transfer_time
+                            if rsync_exit_code in (23, 24):
+                                partial_transfers.append(
+                                    (str(src_path), rsync_exit_code)
+                                )
+                            deletion_log.extend(local_deletions)
+                            log_progress()
 
-                except SkippableIOError as e:
-                    # I/O error that can be skipped if flag is set
-                    error_msg = str(e)
-                    logging.warning(
-                        f"SKIPPING {src_path} due to I/O error: {error_msg}"
-                    )
-                    with lock:
-                        skipped_io_errors.append((str(src_path), error_msg))
-                        completed_bytes += expected_size  # count as "done" for progress
-                        completed_exams += 1
-                        log_progress()
-                except Exception as e:
-                    logging.error(
-                        f"FATAL ERROR processing {src_path}: {e}", exc_info=True
-                    )
-                    first_error = e
-                    if not skip_io_errors:
+                    except KeyboardInterrupt:
+                        logging.info(
+                            "KeyboardInterrupt received. Cancelling remaining..."
+                        )
                         shutdown_requested = True
                         executor.shutdown(wait=False)
+                        raise
 
-        # stop progress thread
-        progress_stop.set()
-        progress_thread.join(timeout=1.0)
+                    except SkippableIOError as e:
+                        # I/O error that can be skipped if flag is set
+                        error_msg = str(e)
+                        logging.warning(
+                            f"SKIPPING {src_path} due to I/O error: {error_msg}"
+                        )
+                        with lock:
+                            skipped_io_errors.append((str(src_path), error_msg))
+                            completed_bytes += (
+                                expected_size  # count as "done" for progress
+                            )
+                            completed_exams += 1
+                            log_progress()
+                    except Exception as e:
+                        logging.error(
+                            f"FATAL ERROR processing {src_path}: {e}", exc_info=True
+                        )
+                        first_error = e
+                        if not skip_io_errors:
+                            shutdown_requested = True
+                            executor.shutdown(wait=False)
 
-        if first_error is not None and not skip_io_errors:
-            logging.error("Exiting immediately on error (fail-fast mode).")
-            raise first_error
-        elif first_error is not None and skip_io_errors:
-            # non-skippable error occurred, but we're in skip mode
-            # only raise if it's not a SkippableIOError (shouldn't happen, but be safe)
-            if not isinstance(first_error, SkippableIOError):
-                logging.error("Non-skippable error occurred. Exiting.")
+            # stop progress thread
+            progress_stop.set()
+            progress_thread.join(timeout=1.0)
+
+            if first_error is not None and not skip_io_errors:
+                logging.error("Exiting immediately on error (fail-fast mode).")
                 raise first_error
+            elif first_error is not None and skip_io_errors:
+                # non-skippable error occurred, but we're in skip mode
+                # only raise if it's not a SkippableIOError (shouldn't happen, but be safe)
+                if not isinstance(first_error, SkippableIOError):
+                    logging.error("Non-skippable error occurred. Exiting.")
+                    raise first_error
 
-    # log final progress
-    with lock:
-        log_progress()
+        # log final progress
+        if pending_exams:
+            with lock:
+                log_progress()
 
     total_elapsed = monotonic() - sync_start
 
     logging.info("=== SYNC COMPLETE ===")
     logging.info(f"Total time: {total_elapsed / 60:.1f} minutes")
-    if total_elapsed > 0 and completed_exams > 0:
-        logging.info(
-            f"Overall rate: {completed_exams / total_elapsed * 3600:.1f} exams/hour"
-        )
-    logging.info(f"Processed {completed_exams}/{total_exams} exams.")
+    if pending_exams:
+        total_exams = len(pending_exams)
+        if total_elapsed > 0 and completed_exams > 0:
+            logging.info(
+                f"Overall rate: {completed_exams / total_elapsed * 3600:.1f} exams/hour"
+            )
+        logging.info(f"Processed {completed_exams}/{total_exams} exams.")
 
     logging.info("SUMMARY:")
     logging.info(f"  - Transferred: {transfers_done}")
@@ -1106,6 +1289,219 @@ def run_single_sync(
         logging.info(
             f"  - Rsync partial directories {action}: {partial_removed} "
             f"({_format_size(partial_bytes)})"
+        )
+
+    # verify and queue exams that exist on both sides
+    if exists_exams:
+        logging.info(
+            f"=== VERIFYING {len(exists_exams)} EXAMS THAT EXIST ON DESTINATION ==="
+        )
+        verify_start = monotonic()
+        verified_count = 0
+        queued_count = 0
+        mismatch_count = 0
+        failed_verifications: list[tuple[Path, str]] = []  # (src_path, patient_id)
+
+        for src_path, patient_id in exists_exams:
+            if shutdown_requested:
+                logging.info("Shutdown requested during verification. Exiting.")
+                break
+
+            dest_exam = DST_ROOT / patient_id / src_path.name
+            if not dest_exam.exists():
+                logging.warning(
+                    f"Destination exam disappeared: {dest_exam}. Skipping verification."
+                )
+                continue
+
+            logging.info(f"Verifying: {src_path.name}...")
+            matches = _verify_exams_match(src_path, dest_exam)
+
+            if matches:
+                verified_count += 1
+                exam_name = src_path.name
+                if dry_run:
+                    action = "DELETE" if immediate_delete else "QUEUE FOR DELETE"
+                    logging.info(
+                        f"[DRY RUN] VERIFIED MATCH: {exam_name} -> WOULD {action}"
+                    )
+                    deletion_log.append(
+                        (str(src_path), f"dry-run verified match {action.lower()}")
+                    )
+                    queued_count += 1
+                else:
+                    if immediate_delete:
+                        try:
+                            _robust_rmtree(src_path)
+                            logging.info(f"VERIFIED MATCH - DELETED: {src_path}")
+                            deletion_log.append(
+                                (str(src_path), "deleted after verification")
+                            )
+                            queued_count += 1
+                        except Exception as e:
+                            msg = f"failed delete after verification: {e}"
+                            logging.error(f"Failed to delete {src_path}: {e}")
+                            deletion_log.append((str(src_path), msg))
+                    else:
+                        dst = DELETE_QUEUE_DIR / patient_id / exam_name
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        try:
+                            shutil.move(str(src_path), str(dst))
+                            logging.info(
+                                f"VERIFIED MATCH - QUEUED FOR DELETE: moved {src_path} -> {dst}"
+                            )
+                            deletion_log.append(
+                                (
+                                    str(src_path),
+                                    f"queued for delete after verification -> {dst}",
+                                )
+                            )
+                            queued_count += 1
+                        except PermissionError:
+                            logging.warning(
+                                f"Permission error moving {src_path}, attempting to fix permissions..."
+                            )
+                            for root, dirs, files in os.walk(src_path):
+                                for d in dirs:
+                                    try:
+                                        os.chmod(
+                                            os.path.join(root, d),
+                                            stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC,
+                                        )
+                                    except Exception:
+                                        pass
+                                for f in files:
+                                    try:
+                                        os.chmod(
+                                            os.path.join(root, f),
+                                            stat.S_IWRITE | stat.S_IREAD,
+                                        )
+                                    except Exception:
+                                        pass
+                            shutil.move(str(src_path), str(dst))
+                            logging.info(
+                                f"VERIFIED MATCH - QUEUED FOR DELETE: moved {src_path} -> {dst}"
+                            )
+                            deletion_log.append(
+                                (
+                                    str(src_path),
+                                    f"queued for delete after verification -> {dst}",
+                                )
+                            )
+                            queued_count += 1
+                        except Exception as e:
+                            msg = f"failed queue after verification: {e}"
+                            logging.error(f"Failed to queue {src_path}: {e}")
+                            deletion_log.append((str(src_path), msg))
+            else:
+                mismatch_count += 1
+                logging.warning(
+                    f"VERIFICATION FAILED: {src_path.name} does not match destination. "
+                    "Will sync immediately."
+                )
+                failed_verifications.append((src_path, patient_id))
+
+        verify_time = monotonic() - verify_start
+        logging.info(
+            f"Verification complete in {verify_time:.1f}s: "
+            f"{verified_count} matched, {mismatch_count} mismatched, {queued_count} queued/deleted"
+        )
+
+        # sync exams that failed verification immediately
+        if failed_verifications:
+            logging.info(
+                f"Found {len(failed_verifications)} exams that failed verification: "
+                f"{[f'{pid}/{exam.name}' for exam, pid in failed_verifications]}"
+            )
+            logging.info(
+                f"=== SYNCING {len(failed_verifications)} EXAMS THAT FAILED VERIFICATION ==="
+            )
+            sync_start = monotonic()
+            synced_count = 0
+            sync_failed_count = 0
+
+            for src_path, patient_id in failed_verifications:
+                if shutdown_requested:
+                    logging.info("Shutdown requested during sync. Exiting.")
+                    break
+
+                exam_name = src_path.name
+
+                # verify source still exists before syncing
+                if not src_path.exists():
+                    logging.warning(
+                        f"Source exam disappeared before sync: {src_path}. Skipping."
+                    )
+                    sync_failed_count += 1
+                    continue
+
+                logging.info(f"Syncing failed verification: {exam_name}...")
+
+                if dry_run:
+                    logging.info(
+                        f"[DRY RUN] WOULD SYNC: {src_path} -> "
+                        f"{DST_ROOT / patient_id / exam_name}"
+                    )
+                    action = "DELETE" if immediate_delete else "QUEUE FOR DELETE"
+                    logging.info(f"[DRY RUN] WOULD {action} (LOCAL): {src_path}")
+                    deletion_log.append(
+                        (str(src_path), f"dry-run sync {action.lower()}")
+                    )
+                    synced_count += 1
+                else:
+                    try:
+                        logical_bytes, transfer_time, rsync_exit_code = (
+                            process_single_exam(
+                                src_path,
+                                patient_id,
+                                dry_run,
+                                immediate_delete,
+                                deletion_log,
+                                whole_file,
+                                skip_io_errors,
+                            )
+                        )
+                        synced_count += 1
+                        logging.info(
+                            f"Successfully synced failed verification: {exam_name} "
+                            f"({_format_size(logical_bytes)} in {transfer_time:.1f}s)"
+                        )
+                        if rsync_exit_code in (23, 24):
+                            partial_transfers.append((str(src_path), rsync_exit_code))
+                    except SkippableIOError as e:
+                        error_msg = str(e)
+                        logging.warning(
+                            f"SKIPPING {src_path} due to I/O error: {error_msg}"
+                        )
+                        skipped_io_errors.append((str(src_path), error_msg))
+                    except Exception as e:
+                        logging.error(
+                            f"Failed to sync {src_path} after verification failure: {e}",
+                            exc_info=True,
+                        )
+                        sync_failed_count += 1
+
+            sync_time = monotonic() - sync_start
+            logging.info(
+                f"Sync of failed verifications complete in {sync_time:.1f}s: "
+                f"{synced_count} synced, {sync_failed_count} failed"
+            )
+        elif mismatch_count > 0:
+            logging.warning(
+                f"WARNING: Found {mismatch_count} mismatched exams but failed_verifications list is empty. "
+                "This should not happen - exams may not be synced."
+            )
+
+    # clean up orphaned incomplete exams on destination
+    logging.info("=== CLEANING UP ORPHANED INCOMPLETE EXAMS ===")
+    orphaned_removed, orphaned_freed = _cleanup_orphaned_incomplete_exams(
+        dry_run, known_sources
+    )
+    if orphaned_removed > 0:
+        action = "would free" if dry_run else "freed"
+        logging.info(
+            f"Orphaned incomplete exam cleanup: {action} {_format_size(orphaned_freed)} "
+            f"by removing {orphaned_removed} incomplete exams"
         )
 
 

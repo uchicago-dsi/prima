@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -32,14 +34,14 @@ def _import_scrape_ibroker():
     global login, make_driver, wait_aspnet_idle
     global bootstrap_http_session_from_driver, http_get_root
     global post_link_event, post_fetch_grid, parse_all_tables_from_page
-    from scrape_ibroker import login as _login
-    from scrape_ibroker import make_driver as _make_driver
-    from scrape_ibroker import wait_aspnet_idle as _wait_aspnet_idle
     from scrape_ibroker import bootstrap_http_session_from_driver as _bootstrap
     from scrape_ibroker import http_get_root as _http_get_root
-    from scrape_ibroker import post_link_event as _post_link_event
-    from scrape_ibroker import post_fetch_grid as _post_fetch_grid
+    from scrape_ibroker import login as _login
+    from scrape_ibroker import make_driver as _make_driver
     from scrape_ibroker import parse_all_tables_from_page as _parse_all_tables
+    from scrape_ibroker import post_fetch_grid as _post_fetch_grid
+    from scrape_ibroker import post_link_event as _post_link_event
+    from scrape_ibroker import wait_aspnet_idle as _wait_aspnet_idle
 
     login = _login
     make_driver = _make_driver
@@ -63,7 +65,7 @@ CHIMEC_BASE_DOWNLOAD_DIR = "/gpfs/data/huo-lab/Image/ChiMEC/"
 MRI1_STUDY_IDS_FILE = (
     "/gpfs/data/karczmar-lab/CAPS/MRI1.0/MRI1.0_AnonymousIDs_hiro.xlsx"
 )
-MRI1_METADATA_FILE = "data/imaging_metadata.csv"
+MRI1_METADATA_FILE = "data/imaging_metadata_mri1.csv"
 MRI1_EXPORT_STATE_FILE = "data/export_state_mri1.csv"
 MRI1_BASE_DOWNLOAD_DIR = "/gpfs/data/karczmar-lab/CAPS/MRI1.0/"
 
@@ -366,9 +368,19 @@ def investigate_file_system(
 
 
 def save_missing_exams_debug_csv(
-    missing_exams_df: pd.DataFrame, base_download_dir: str
+    missing_exams_df: pd.DataFrame, base_download_dir: str, dataset: str = "chimec"
 ) -> None:
-    """Save comprehensive debug information for missing exams to CSV."""
+    """Save comprehensive debug information for missing exams to CSV.
+
+    Parameters
+    ----------
+    missing_exams_df : pd.DataFrame
+        DataFrame with missing exams to debug
+    base_download_dir : str
+        Base download directory for the dataset
+    dataset : str
+        Dataset name: "chimec" or "mri1.0" (used for filename)
+    """
 
     print("\n--- Saving Missing Exams Debug CSV ---")
 
@@ -399,9 +411,10 @@ def save_missing_exams_debug_csv(
     ]
     debug_df = enhanced_df[debug_columns].copy()
 
-    # Save to CSV
+    # Save to CSV with dataset-specific filename
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    debug_filename = f"data/missing_exams_debug_{timestamp}.csv"
+    dataset_suffix = "_mri1" if dataset == "mri1.0" else ""
+    debug_filename = f"data/missing_exams_debug{dataset_suffix}_{timestamp}.csv"
     Path("data").mkdir(exist_ok=True)
 
     debug_df.to_csv(debug_filename, index=False)
@@ -506,23 +519,50 @@ def save_current_state(db: pd.DataFrame, dataset: str = "chimec"):
     )
 
 
-def load_and_merge_data(dataset: str = "chimec"):
+def load_and_merge_data(
+    dataset: str = "chimec",
+    max_exams: int | None = None,
+    submit_exports: bool = False,
+    batch_size: int | None = None,
+    full_db: pd.DataFrame | None = None,
+):
     """Load and merge data for the specified dataset.
 
     Parameters
     ----------
     dataset : str
         Dataset name: "chimec" or "mri1.0"
+    max_exams : int | None
+        For MRI1.0: stop querying once we have this many MR+BREAST exams.
+        None means query all study IDs.
+    submit_exports : bool
+        For MRI1.0: if True, submit export requests during query phase.
+    batch_size : int | None
+        For MRI1.0: max export requests to submit (only if submit_exports=True).
+    full_db : pd.DataFrame | None
+        For MRI1.0: database to update with export outcomes (only if submit_exports=True).
 
     Returns
     -------
-    pd.DataFrame
-        Merged database with all exam records
+    pd.DataFrame | tuple[pd.DataFrame, dict]
+        For ChiMEC: Merged database with all exam records.
+        For MRI1.0: (Merged database, export_stats dict) if submit_exports=True,
+        else just the merged database.
     """
     print(f"--- Phase 1: Loading and Merging Data (dataset: {dataset}) ---")
 
     if dataset == "mri1.0":
-        return _load_mri1_data()
+        result = _load_mri1_data(
+            max_exams=max_exams,
+            submit_exports=submit_exports,
+            batch_size=batch_size,
+            full_db=full_db,
+        )
+        # Always returns tuple, but for backward compatibility, unpack if not submitting exports
+        if submit_exports:
+            return result  # (db, export_stats)
+        else:
+            return result[0]  # Just db
     else:
         return _load_chimec_data()
 
@@ -712,29 +752,445 @@ def _load_chimec_data():
     return db
 
 
-def _load_mri1_data():
-    """Load and merge MRI1.0 dataset."""
+def _load_mri1_data(
+    max_exams: int | None = None,
+    submit_exports: bool = False,
+    batch_size: int | None = None,
+    full_db: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, dict]:
+    """Load MRI1.0 dataset by querying iBroker directly for MR exams with BREAST in description.
+
+    Parameters
+    ----------
+    max_exams : int | None
+        Stop querying once we have this many MR+BREAST exams ready to export
+        (not on disk, not already exported). None means query all study IDs.
+    submit_exports : bool
+        If True, submit export requests as we find ready-to-export exams using Selenium.
+        Requires driver to remain open.
+    batch_size : int | None
+        Maximum number of export requests to submit (only used if submit_exports=True).
+    full_db : pd.DataFrame | None
+        Database to update with export outcomes (only used if submit_exports=True).
+
+    Returns
+    -------
+    tuple[pd.DataFrame, dict]
+        Metadata DataFrame and export statistics dict with keys:
+        - 'submitted': number of export requests submitted
+        - 'already_exported': number discovered to be already exported
+        - 'processed': total exams processed for export
+    """
+    # Import scrape functions (requires credentials)
+    _import_scrape_ibroker()
+
+    # Load fingerprint cache for disk status checking (MRI1.0 specific only)
+    # Don't use ChiMEC cache - patient IDs don't match between datasets
+    import json
+
+    mri1_fingerprint_cache = Path("data/destination_fingerprints_mri1.json")
+    disk_exam_counts = {}
+
+    if mri1_fingerprint_cache.exists():
+        print(f"Loading MRI1.0 disk fingerprint cache: {mri1_fingerprint_cache}")
+        # Load raw fingerprints for counting exams per (patient_id, date)
+        with open(mri1_fingerprint_cache) as f:
+            raw_fingerprints = json.load(f)
+        for patient_id, exams in raw_fingerprints.items():
+            for exam_name, data in exams.items():
+                uid, hashes, study_date, study_time = data
+                if study_date and len(study_date) >= 8:
+                    date_str = f"{study_date[:4]}-{study_date[4:6]}-{study_date[6:8]}"
+                    key = (patient_id, date_str)
+                    disk_exam_counts[key] = disk_exam_counts.get(key, 0) + 1
+        print(
+            f"Loaded {len(disk_exam_counts):,} (patient_id, date) pairs from fingerprint cache."
+        )
+    else:
+        print(
+            f"Note: No MRI1.0 fingerprint cache found at {mri1_fingerprint_cache}. "
+            "Disk status checking will be skipped (all exams assumed not on disk)."
+        )
+
     try:
         # Load study IDs from Excel file
         study_ids_df = pd.read_excel(MRI1_STUDY_IDS_FILE)
         study_ids = study_ids_df["AnonymousID"].astype(str).tolist()
         print(f"Loaded {len(study_ids):,} study IDs from MRI1.0 file.")
 
-        # Load metadata from iBroker scrape
-        metadata = pd.read_csv(MRI1_METADATA_FILE)
-        print(f"Loaded {len(metadata):,} exam records from raw metadata file.")
+        # Query iBroker directly for each study ID
+        if submit_exports:
+            print("Querying iBroker and submitting export requests for MR exams...")
+        else:
+            print("Querying iBroker for MR exams...")
+        driver = None
+        session = None
+        export_stats = {"submitted": 0, "already_exported": 0, "processed": 0}
+        try:
+            print("Starting browser driver...")
+            driver = make_driver()
+            print("Logging into iBroker...")
+            try:
+                login(driver, USERNAME, PASSWORD)
+            except Exception as login_error:
+                # Save page HTML for debugging
+                try:
+                    page_source = driver.page_source
+                    Path("data").mkdir(exist_ok=True)
+                    debug_file = Path("data/debug_login_failure.html")
+                    with open(debug_file, "w", encoding="utf-8") as f:
+                        f.write(page_source)
+                    print(
+                        f"Saved page HTML to {debug_file} for debugging",
+                        file=sys.stderr,
+                    )
+                    # Check what's actually on the page
+                    if "tbxUsername" in page_source or "tbxPassword" in page_source:
+                        print(
+                            "Page still shows login form - login may have failed",
+                            file=sys.stderr,
+                        )
+                    elif "lbUser" in page_source:
+                        print(
+                            "Page contains 'lbUser' element but Selenium couldn't find it - timing issue?",
+                            file=sys.stderr,
+                        )
+                except Exception as debug_error:
+                    print(f"Could not save debug HTML: {debug_error}", file=sys.stderr)
+                raise login_error
+            print("Login successful. Bootstrapping HTTP session...")
+            session = bootstrap_http_session_from_driver(driver)
+            print("HTTP session created.")
+        except Exception as e:
+            print(f"ERROR: Failed to login to iBroker: {e}", file=sys.stderr)
+            print("This may be due to:", file=sys.stderr)
+            print("  - Network/VPN connectivity issues", file=sys.stderr)
+            print("  - Invalid credentials", file=sys.stderr)
+            print("  - iBroker server issues", file=sys.stderr)
+            print(
+                "  - Check data/debug_login_failure.html if it was created",
+                file=sys.stderr,
+            )
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+            raise
 
-        # Filter metadata to only include study IDs from the Excel file
-        metadata["study_id"] = metadata["study_id"].astype(str)
-        metadata = metadata[metadata["study_id"].isin(study_ids)]
-        print(f"Filtered to {len(metadata):,} exams matching MRI1.0 study IDs.")
+        if session is None:
+            raise RuntimeError("Failed to create HTTP session - cannot query iBroker")
+
+        # Initialize HTTP session state
+        print("Initializing iBroker session state...")
+        try:
+            page_html, state = http_get_root(session)
+            page_html, state = post_link_event(session, state, "lbAll")
+        except Exception as e:
+            print(f"ERROR: Failed to initialize iBroker session: {e}", file=sys.stderr)
+            raise
+
+        # Initialize export state columns if submitting exports
+        if submit_exports:
+            # These will be added to each df as we process them
+            pass
+
+        # Query study IDs incrementally and stop when we have enough ready-to-export exams
+        # This avoids querying all study IDs when we only need a small batch
+        all_exams = []
+        ready_to_export_count = 0
+
+        query_desc = "Querying iBroker"
+        if submit_exports:
+            query_desc = "Querying iBroker and submitting exports"
+        if max_exams is not None:
+            query_desc = f"{query_desc} (target: {max_exams} ready-to-export exams)"
+            # Create progress bar with target as total
+            pbar = tqdm(total=max_exams, desc=query_desc, unit="exam")
+        else:
+            # No target, show progress through study IDs
+            pbar = tqdm(study_ids, desc=query_desc)
+
+        def check_exam_on_disk(study_id: str, study_datetime: pd.Timestamp) -> bool:
+            """Check if an exam is on disk using fingerprint cache."""
+            try:
+                patient_id = str(int(study_id))
+                if pd.isna(study_datetime):
+                    return False
+                date_str = study_datetime.strftime("%Y-%m-%d")
+                key = (patient_id, date_str)
+                return key in disk_exam_counts
+            except (ValueError, TypeError):
+                return False
+
+        def submit_exports_for_patient(
+            driver, study_id: str, ready_exams_df: pd.DataFrame
+        ) -> tuple[int, int, list]:
+            """Submit export requests for ready-to-export exams using Selenium.
+
+            Returns
+            -------
+            tuple[int, int, list]
+                (submitted_count, already_exported_count, submitted_exam_keys)
+                submitted_exam_keys is a list of (Study DateTime date, StudyDescription) tuples
+            """
+            submitted = 0
+            already_exported = 0
+            submitted_keys = []
+
+            try:
+                # Navigate to patient's page
+                driver.find_element(by="name", value="tbxAssignedID").clear()
+                driver.find_element(by="name", value="tbxAssignedID").send_keys(
+                    str(int(study_id))
+                )
+                driver.find_element(by="name", value="btnFetch").click()
+                wait_aspnet_idle(driver)
+
+                # Get available exams on the page
+                available_on_page = {}
+                page_rows = driver.find_elements(
+                    by="xpath",
+                    value="//table[@id='TabContainer1_tabPanel1_gv1']//tr[position()>1]",
+                )
+                for row in page_rows:
+                    try:
+                        cells = row.find_elements(by="tag name", value="td")
+                        row_date = pd.to_datetime(cells[2].text).date()
+                        row_desc = cells[3].text.strip()
+                        checkbox = row.find_element(
+                            by="xpath", value=".//input[@type='checkbox']"
+                        )
+                        available_on_page[(row_date, row_desc)] = checkbox
+                    except Exception:
+                        pass
+
+                # Match ready exams with available exams on page
+                requested_any = False
+                for _, exam_row in ready_exams_df.iterrows():
+                    if (
+                        batch_size is not None
+                        and export_stats["submitted"] >= batch_size
+                    ):
+                        break
+
+                    target_key = (
+                        exam_row["Study DateTime"].date(),
+                        exam_row["StudyDescription"],
+                    )
+
+                    if target_key in available_on_page:
+                        print(
+                            f"  - Found available exam from {target_key[0]}. Selecting checkbox."
+                        )
+                        available_on_page[target_key].click()
+                        submitted += 1
+                        export_stats["submitted"] += 1
+                        export_stats["processed"] += 1
+                        requested_any = True
+                        submitted_keys.append(target_key)
+                    else:
+                        print(
+                            f"  - INFO: Exam from {target_key[0]} is no longer available (already exported)."
+                        )
+                        already_exported += 1
+                        export_stats["already_exported"] += 1
+                        export_stats["processed"] += 1
+
+                # Submit export request if any exams were selected
+                if requested_any:
+                    print(f"  Submitting export request for {submitted} exam(s)...")
+                    driver.find_element(by="name", value="btnExport").click()
+                    wait_aspnet_idle(driver)
+                    print(f"  ✓ Export request submitted for {submitted} exam(s).")
+
+            except Exception as e:
+                print(f"ERROR submitting exports for study_id {study_id}: {e}")
+                # Continue processing other patients
+
+            return submitted, already_exported, submitted_keys
+
+        for study_id in study_ids:
+            # Check if we've reached batch limit
+            if (
+                submit_exports
+                and batch_size is not None
+                and export_stats["submitted"] >= batch_size
+            ):
+                pbar.close()
+                print(
+                    f"\nReached batch limit of {batch_size} export requests. Stopping."
+                )
+                break
+
+            try:
+                page_html, state = post_fetch_grid(session, state, str(study_id))
+                df = parse_all_tables_from_page(page_html)
+
+                if not df.empty:
+                    df["study_id"] = study_id
+                    # Filter for MR+BREAST immediately
+                    df["base_modality"] = df["Modality"].apply(get_base_modality)
+                    df = df[df["base_modality"] == "MR"]
+
+                    if "StudyDescription" in df.columns:
+                        breast_mask = df["StudyDescription"].str.contains(
+                            "BREAST", case=False, na=False
+                        )
+                        df = df[breast_mask]
+
+                    if not df.empty:
+                        # Parse Study DateTime
+                        df["Study DateTime"] = pd.to_datetime(
+                            df["Study DateTime"], errors="coerce"
+                        )
+
+                        # Initialize export state columns if submitting exports
+                        if submit_exports:
+                            if "download_attempt_outcome" not in df.columns:
+                                df["download_attempt_outcome"] = pd.NA
+                            df["download_attempt_outcome"] = df[
+                                "download_attempt_outcome"
+                            ].astype("string")
+                            if "export_requested_on" not in df.columns:
+                                df["export_requested_on"] = pd.NaT
+                            if "Status" not in df.columns:
+                                df["Status"] = pd.NA
+
+                        # Check disk status and export status incrementally
+                        df["is_on_disk"] = df.apply(
+                            lambda row: check_exam_on_disk(
+                                row["study_id"], row["Study DateTime"]
+                            ),
+                            axis=1,
+                        )
+
+                        # Check if already exported (has Accession or Status indicates exported)
+                        if "Accession" in df.columns:
+                            has_accession = df["Accession"].notna()
+                        else:
+                            has_accession = pd.Series([False] * len(df), index=df.index)
+
+                        if "Status" in df.columns:
+                            status_exported = (
+                                df["Status"]
+                                .fillna("")
+                                .astype(str)
+                                .str.strip()
+                                .str.lower()
+                                .isin({"already exported", "exported"})
+                            )
+                        else:
+                            status_exported = pd.Series(
+                                [False] * len(df), index=df.index
+                            )
+
+                        df["is_exported"] = has_accession | status_exported
+
+                        # Count ready-to-export exams (not on disk, not exported)
+                        ready_mask = (~df["is_on_disk"]) & (~df["is_exported"])
+                        ready_count = ready_mask.sum()
+                        ready_to_export_count += ready_count
+
+                        # Submit exports if requested
+                        if submit_exports and ready_count > 0:
+                            ready_exams = df[ready_mask]
+                            _, _, submitted_keys = submit_exports_for_patient(
+                                driver, study_id, ready_exams
+                            )
+                            # Update df with export outcomes
+                            submission_ts = pd.Timestamp.now()
+                            for target_key in submitted_keys:
+                                mask = (
+                                    df["Study DateTime"].dt.date == target_key[0]
+                                ) & (df["StudyDescription"] == target_key[1])
+                                if mask.any():
+                                    df.loc[mask, "download_attempt_outcome"] = (
+                                        "Request Submitted"
+                                    )
+                                    df.loc[mask, "export_requested_on"] = submission_ts
+                                    if "Status" in df.columns:
+                                        df.loc[mask, "Status"] = "Request Submitted"
+
+                        all_exams.append(df)
+
+                        # Update progress bar
+                        if max_exams is not None:
+                            # Update to show current count (capped at total)
+                            pbar.n = min(ready_to_export_count, max_exams)
+                            pbar.refresh()
+
+                        if max_exams is not None and ready_to_export_count >= max_exams:
+                            pbar.close()
+                            print(
+                                f"\nReached target of {max_exams} ready-to-export exams "
+                                f"(found {ready_to_export_count} total). "
+                                f"Stopped querying after processing {len(all_exams)} study IDs."
+                            )
+                            break
+            except Exception as e:
+                print(f"Warning: Failed to query study_id {study_id}: {e}")
+                continue
+
+        # Close progress bar if still open
+        if max_exams is not None:
+            pbar.close()
+
+        # Close driver if we're not submitting exports (or if we're done submitting)
+        if not submit_exports and driver:
+            try:
+                print("Closing browser driver...")
+                driver.quit()
+            except Exception:
+                pass
+
+        if not all_exams:
+            metadata = pd.DataFrame(
+                columns=[
+                    "Modality",
+                    "Study DateTime",
+                    "StudyDescription",
+                    "Status",
+                    "Accession",
+                    "Exported On",
+                    "study_id",
+                ]
+            )
+        else:
+            metadata = pd.concat(all_exams, ignore_index=True)
+
+        print(f"Retrieved {len(metadata):,} total exam records from iBroker.")
+
+        # Filter for MR modality
+        metadata["base_modality"] = metadata["Modality"].apply(get_base_modality)
+        metadata = metadata[metadata["base_modality"] == "MR"]
+        print(f"Filtered to {len(metadata):,} MR exams.")
+
+        # Filter for BREAST in study description
+        if "StudyDescription" in metadata.columns:
+            breast_mask = metadata["StudyDescription"].str.contains(
+                "BREAST", case=False, na=False
+            )
+            metadata = metadata[breast_mask]
+            print(
+                f"Filtered to {len(metadata):,} MR exams with 'BREAST' in description."
+            )
+
+        # Deduplicate by (study_id, Study DateTime, StudyDescription) to avoid counting timepoints as separate exams
+        # This matches the MERGE_KEY_COLUMNS used elsewhere
+        before_dedup = len(metadata)
+        metadata = metadata.sort_values(
+            MERGE_KEY_COLUMNS, ascending=[True, True, True]
+        ).drop_duplicates(subset=MERGE_KEY_COLUMNS, keep="first")
+        if len(metadata) != before_dedup:
+            print(
+                f"Deduplicated exam rows on {MERGE_KEY_COLUMNS}: "
+                f"{before_dedup:,} → {len(metadata):,}"
+            )
 
         # A small fix: The Accession number is often what we care about, not the old exam_id
         if "exam_id" in metadata.columns and "Accession" in metadata.columns:
             metadata["Accession"] = metadata["Accession"].fillna(metadata["exam_id"])
-
-        metadata["base_modality"] = metadata["Modality"].apply(get_base_modality)
-        print("  - Added 'base_modality' column.")
 
         metadata["Study DateTime"] = pd.to_datetime(
             metadata["Study DateTime"], errors="coerce"
@@ -869,7 +1325,16 @@ def _load_mri1_data():
             "  - Currently on disk (by base_modality incl. <missing>):\n"
             + disk_counts.to_string()
         )
-    return db
+
+    # Close driver if we were submitting exports
+    if submit_exports and driver:
+        try:
+            print("Closing browser driver after export submission...")
+            driver.quit()
+        except Exception:
+            pass
+
+    return db, export_stats
 
 
 def identify_download_targets(
@@ -946,7 +1411,9 @@ def identify_download_targets(
         base_download_dir = (
             MRI1_BASE_DOWNLOAD_DIR if dataset == "mri1.0" else CHIMEC_BASE_DOWNLOAD_DIR
         )
-        save_missing_exams_debug_csv(exported_missing_disk, base_download_dir)
+        save_missing_exams_debug_csv(
+            exported_missing_disk, base_download_dir, dataset=dataset
+        )
 
         print("  - Sample of exported-but-not-on-disk exams:")
         debug_columns = [
@@ -1003,13 +1470,135 @@ def identify_download_targets(
     return targets.sort_values(by=["study_id", "Study DateTime"])
 
 
+def _populate_mri1_fingerprint_cache(cache_path: Path, base_dir: str) -> Path | None:
+    """Populate MRI1.0 fingerprint cache by running fingerprinter on the MRI1.0 directory.
+
+    Handles both flat structure (base_dir/patient_id/exam_dir/) and
+    modality-grouped structure (base_dir/MR/patient_id/exam_dir/).
+
+    Parameters
+    ----------
+    cache_path : Path
+        Path where the fingerprint cache should be created
+    base_dir : str
+        Base directory for MRI1.0 data (e.g., MRI1_BASE_DOWNLOAD_DIR)
+
+    Returns
+    -------
+    Path | None
+        Path to the created cache file, or None if creation failed
+    """
+    fingerprinter_script = Path(__file__).parent / "fingerprinter.py"
+    log_file = Path("data") / "fingerprinter_mri1.log"
+
+    if not fingerprinter_script.exists():
+        print(f"  ERROR: fingerprinter.py not found at {fingerprinter_script}")
+        return None
+
+    base_path = Path(base_dir)
+    if not base_path.exists():
+        print(f"  WARNING: MRI1.0 base directory does not exist: {base_path}")
+        print("  Skipping fingerprint cache creation.")
+        return None
+
+    # Check if structure is modality-grouped (base_dir/MR/patient_id/) or flat (base_dir/patient_id/)
+    # Fingerprinter expects root_dir/patient_id/exam_dir/, so point it at the right level
+    fingerprint_root = base_path
+    mr_subdir = base_path / "MR"
+    if mr_subdir.exists() and mr_subdir.is_dir():
+        # Modality-grouped structure: use MR subdirectory
+        fingerprint_root = mr_subdir
+        print(f"  Detected modality-grouped structure, using: {fingerprint_root}")
+    else:
+        # Flat structure: use base directory directly
+        print(f"  Detected flat structure, using: {fingerprint_root}")
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"  Running fingerprinter on {fingerprint_root}")
+    print(f"  Output cache: {cache_path}")
+    print(f"  Log file: {log_file}")
+
+    cmd = [
+        sys.executable,
+        "-u",
+        str(fingerprinter_script),
+        str(fingerprint_root),
+        str(cache_path),
+        "--parallel-jobs",
+        "4",  # Conservative parallel jobs for MRI1.0
+    ]
+
+    print(f"  Executing: {' '.join(cmd)}")
+    print(f"  (Also logging to: {log_file})")
+    try:
+        # Stream stdout to both terminal and log file
+        with open(log_file, "w") as log_f:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,  # Line buffered
+            )
+
+            # Timeout handler
+            timeout_occurred = threading.Event()
+
+            def timeout_handler():
+                time.sleep(3600)  # 1 hour timeout
+                if process.poll() is None:  # Process still running
+                    timeout_occurred.set()
+                    process.kill()
+
+            timeout_thread = threading.Thread(target=timeout_handler, daemon=True)
+            timeout_thread.start()
+
+            # Read and print lines in real-time
+            for line in process.stdout:
+                if timeout_occurred.is_set():
+                    raise subprocess.TimeoutExpired(cmd, 3600)
+                print(f"  {line.rstrip()}")
+                log_f.write(line)
+                log_f.flush()
+
+            process.wait()
+            result = type("obj", (object,), {"returncode": process.returncode})()
+
+        if result.returncode != 0:
+            print(
+                f"  WARNING: Fingerprinter failed with return code {result.returncode}"
+            )
+            print(f"  Check log file: {log_file}")
+            return None
+
+        if not cache_path.exists():
+            print(f"  WARNING: Cache file was not created: {cache_path}")
+            return None
+
+        size_mb = cache_path.stat().st_size / 1_000_000
+        print(f"  Created cache file: {cache_path} ({size_mb:.2f} MB)")
+        return cache_path
+    except subprocess.TimeoutExpired:
+        print("  ERROR: Fingerprinter timed out after 1 hour")
+        return None
+    except Exception as e:
+        print(f"  ERROR: Failed to run fingerprinter: {e}")
+        return None
+
+
 def execute_downloads(
     targets_df: pd.DataFrame,
     batch_size: int,
     full_db: pd.DataFrame = None,
     dataset: str = "chimec",
 ):
-    """Verifies exam availability live and requests exports."""
+    """Verifies exam availability live and requests exports.
+
+    Exports are chunked - stops after batch_size successful export requests.
+    This prevents overwhelming the iBroker system with too many simultaneous requests.
+    """
     if targets_df.empty:
         return {}, 0, 0
 
@@ -1084,6 +1673,12 @@ def execute_downloads(
                     print(
                         f"  - Found available exam from {target_key[0]}. Selecting checkbox."
                     )
+                    # Print all metadata for this exam
+                    print("    Exam metadata:")
+                    for col in full_db.columns if full_db is not None else []:
+                        val = target_exam.get(col, "N/A")
+                        if pd.notna(val) and str(val).strip():
+                            print(f"      {col}: {val}")
                     available_on_page[target_key].click()
                     outcomes[index] = "Request Submitted"
                     successfully_exported_counter += 1
@@ -1115,10 +1710,14 @@ def execute_downloads(
                                 full_db.loc[index, "Exported On"] = pd.Timestamp.now()
 
             if requested_this_patient:
-                print("  Submitting export request for selected exams...")
+                print(
+                    f"  Submitting export request for {len(requested_indices)} exam(s)..."
+                )
                 driver.find_element(by="name", value="btnExport").click()
                 wait_aspnet_idle(driver)
-                print("  Export request submitted.")
+                print(
+                    f"  ✓ Export request submitted for {len(requested_indices)} exam(s)."
+                )
                 if full_db is not None and requested_indices:
                     submission_ts = pd.Timestamp.now()
                     for idx in requested_indices:
@@ -1133,6 +1732,17 @@ def execute_downloads(
         if driver:
             print("Closing webdriver session.")
             driver.quit()
+
+    print("\n--- Export Execution Summary ---")
+    print(
+        f"Successfully submitted export requests: {successfully_exported_counter} exam(s)"
+    )
+    print(f"Discovered to be already exported:      {already_exported_counter} exam(s)")
+    print(f"Total exams processed:                   {len(outcomes)} exam(s)")
+    if successfully_exported_counter == 0 and already_exported_counter == 0:
+        print(
+            "⚠ No exports were requested - all exams may have been unavailable or skipped."
+        )
 
     return outcomes, already_exported_counter, successfully_exported_counter
 
@@ -1156,9 +1766,43 @@ def run_export_cycle(args, cycle_number: int, dataset: str = "chimec"):
     )
     print(cycle_banner)
 
-    db = load_and_merge_data(dataset=dataset)
+    # For MRI1.0, submit exports during query phase to avoid double-pass
+    # For ChiMEC, query first then submit exports separately
+    max_exams_to_query = None
+    export_stats = {}
+    if dataset == "mri1.0":
+        max_exams_to_query = args.batch_size
+        # Submit exports during query phase for MRI1.0
+        result = load_and_merge_data(
+            dataset=dataset,
+            max_exams=max_exams_to_query,
+            submit_exports=True,
+            batch_size=args.batch_size,
+            full_db=None,
+        )
+        db, export_stats = result
+    else:
+        db = load_and_merge_data(dataset=dataset, max_exams=max_exams_to_query)
+
     # conservative=True: only mark is_on_disk if 1:1 match, otherwise re-export to be safe
-    db = update_metadata_with_disk_status_by_date(db, conservative=True)
+    # For MRI1.0, use MRI1.0-specific fingerprint cache if it exists, or populate it if missing
+    fingerprint_cache = None
+    if dataset == "mri1.0":
+        mri1_cache = Path("data/destination_fingerprints_mri1.json")
+        if mri1_cache.exists():
+            fingerprint_cache = mri1_cache
+            print(f"Using MRI1.0-specific fingerprint cache: {fingerprint_cache}")
+        else:
+            print(f"MRI1.0 fingerprint cache not found at {mri1_cache}")
+            print("Populating fingerprint cache by scanning MRI1.0 directory...")
+            fingerprint_cache = _populate_mri1_fingerprint_cache(
+                mri1_cache, MRI1_BASE_DOWNLOAD_DIR
+            )
+            if fingerprint_cache:
+                print(f"✓ Created MRI1.0 fingerprint cache: {fingerprint_cache}")
+    db = update_metadata_with_disk_status_by_date(
+        db, conservative=True, fingerprint_cache=fingerprint_cache
+    )
 
     # For MRI1.0, skip genotyping filter (it doesn't apply)
     filter_by_genotyping = (
@@ -1183,8 +1827,19 @@ def run_export_cycle(args, cycle_number: int, dataset: str = "chimec"):
     already_exported_count = 0
     successfully_exported_count = 0
 
-    if targets.empty:
-        print("\nNo new exams to download based on the current criteria.")
+    # For MRI1.0, exports were already submitted during query phase
+    if dataset == "mri1.0" and export_stats:
+        print("\n--- Exports Already Submitted During Query Phase ---")
+        successfully_exported_count = export_stats.get("submitted", 0)
+        already_exported_count = export_stats.get("already_exported", 0)
+        print(
+            f"✓ Successfully submitted export requests: {successfully_exported_count} exam(s)"
+        )
+        print(f"  Discovered to be already exported: {already_exported_count} exam(s)")
+        print(f"  Total exams processed: {export_stats.get('processed', 0)} exam(s)")
+    elif targets.empty:
+        print("\n⚠ No new exams to download based on the current criteria.")
+        print("   All exams may already be exported, on disk, or filtered out.")
     else:
         print("\n--- Summary of Exams to Download ---")
         print(f"Total potential targets: {len(targets)}")
@@ -1223,16 +1878,20 @@ def run_export_cycle(args, cycle_number: int, dataset: str = "chimec"):
                         ):
                             db.loc[index, "Exported On"] = pd.Timestamp.now()
 
-            print("\n--- Cycle Summary ---")
-            print(
-                f"Successfully submitted export requests for: {successfully_exported_count} exams."
-            )
-            print(
-                f"Discovered to be already exported:        {already_exported_count} exams."
-            )
-            print(f"Total exams processed:                    {len(outcomes)} exams.")
+            print("\n--- Final Cycle Summary ---")
+            if successfully_exported_count > 0:
+                print(
+                    f"✓ Successfully submitted export requests: {successfully_exported_count} exam(s)"
+                )
+            else:
+                print("✗ No export requests were submitted: 0 exam(s)")
+            if already_exported_count > 0:
+                print(
+                    f"  Discovered to be already exported: {already_exported_count} exam(s)"
+                )
+            print(f"  Total exams processed: {len(outcomes)} exam(s)")
         else:
-            print("Cycle cancelled by user response.")
+            print("✗ Cycle cancelled by user - no exports were requested.")
 
     # Save final state
     save_current_state(db, dataset=dataset)
@@ -1384,9 +2043,18 @@ def refresh_export_status(
         f"\n=== Refresh cycle {cycle_number}: auditing export status before next run (dataset: {dataset}) ==="
     )
 
-    refresh_db = load_and_merge_data(dataset=dataset)
+    # In refresh mode, query all exams (no limit) to get accurate status
+    refresh_db = load_and_merge_data(dataset=dataset, max_exams=None)
     # conservative=True: only mark is_on_disk if 1:1 match, otherwise re-export to be safe
-    refresh_db = update_metadata_with_disk_status_by_date(refresh_db, conservative=True)
+    # For MRI1.0, use MRI1.0-specific fingerprint cache if it exists
+    fingerprint_cache = None
+    if dataset == "mri1.0":
+        mri1_cache = Path("data/destination_fingerprints_mri1.json")
+        if mri1_cache.exists():
+            fingerprint_cache = mri1_cache
+    refresh_db = update_metadata_with_disk_status_by_date(
+        refresh_db, conservative=True, fingerprint_cache=fingerprint_cache
+    )
 
     modality = args.modality.upper()
     base_modality = refresh_db.get("base_modality")
@@ -1533,12 +2201,21 @@ def main():
 
     dataset = args.dataset.lower()
 
-    # status-only mode doesn't need credentials
+    # MRI1.0 dataset requires credentials even for status-only mode (needs to query iBroker)
+    if dataset == "mri1.0" and not all([USERNAME, PASSWORD]):
+        print(
+            "ERROR: IBROKER_USERNAME and IBROKER_PASSWORD must be set for MRI1.0 dataset.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # status-only mode doesn't need credentials for ChiMEC (uses existing metadata file)
     if args.status_only:
         print(
             f"Running in --status-only mode (no exports will be performed, dataset: {dataset})\n"
         )
-        db = load_and_merge_data(dataset=dataset)
+        # In status-only mode, query all exams (no limit)
+        db = load_and_merge_data(dataset=dataset, max_exams=None)
         db = update_metadata_with_disk_status_by_date(db, conservative=True)
         filter_by_genotyping = (
             not args.no_genotyping_filter if dataset != "mri1.0" else False

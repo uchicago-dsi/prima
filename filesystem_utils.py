@@ -227,6 +227,12 @@ def update_metadata_with_disk_status_by_date(
         metadata_df["is_on_disk"] = False
         return metadata_df
 
+    # handle None fingerprint_cache (e.g., when dataset-specific cache doesn't exist)
+    if fingerprint_cache is None:
+        print("  Note: No fingerprint cache provided, skipping disk status check")
+        metadata_df["is_on_disk"] = False
+        return metadata_df
+
     # load disk dates from fingerprint cache
     disk_dates = load_disk_dates_from_fingerprints(fingerprint_cache)
 
