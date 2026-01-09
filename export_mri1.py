@@ -156,6 +156,38 @@ def build_mri1_disk_cache_simple(cache_path: Path, base_dir: str) -> Path | None
     return cache_path
 
 
+def _calculate_export_requested(status_df: pd.DataFrame) -> pd.Series:
+    """Calculate export_requested from other columns.
+
+    Logic: if on disk, export_requested=True (can't be on disk without requesting)
+           if has Accession, export_requested=True (exported in iBroker)
+           if Status indicates exported, export_requested=True
+           otherwise export_requested=False
+    """
+    export_requested = (
+        status_df.get("is_on_disk", False).fillna(False).astype(bool).copy()
+    )
+
+    # Also mark as requested if has Accession (exported in iBroker)
+    if "Accession" in status_df.columns:
+        has_accession = status_df["Accession"].notna()
+        export_requested = export_requested | has_accession
+
+    # Also mark as requested if Status indicates exported
+    if "Status" in status_df.columns:
+        status_exported = (
+            status_df["Status"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .isin({"already exported", "exported", "completed"})
+        )
+        export_requested = export_requested | status_exported
+
+    return export_requested
+
+
 def load_mri1_data(
     max_exams: int | None = None,
     submit_exports: bool = False,
@@ -237,10 +269,13 @@ def load_mri1_data(
                 status_df = pd.read_csv(status_file)
                 status_df["study_id"] = status_df["study_id"].astype(str)
 
+                # Calculate export_requested from other columns
+                export_requested = _calculate_export_requested(status_df)
+
                 # Find study IDs with unexported exams
-                unexported_mask = (
-                    ~status_df.get("export_requested", False).fillna(False)
-                ) & (~status_df.get("is_on_disk", False).fillna(False))
+                unexported_mask = (~export_requested) & (
+                    ~status_df.get("is_on_disk", False).fillna(False)
+                )
                 study_ids_with_unexported = set(
                     status_df.loc[unexported_mask, "study_id"].unique()
                 )
@@ -250,8 +285,9 @@ def load_mri1_data(
                 all_exported_study_ids = set()
                 for sid, group in study_id_groups:
                     # Check if all exams for this study_id are exported
+                    group_export_requested = _calculate_export_requested(group)
                     all_exported = (
-                        group.get("export_requested", False).fillna(False).all()
+                        group_export_requested.all()
                         | group.get("is_on_disk", False).fillna(False).all()
                     )
                     if all_exported and len(group) > 0:
@@ -965,9 +1001,8 @@ def update_status_csv(
         "Accession",
         "Study DateTime",
         "StudyDescription",
-        "Status",
+        "Status",  # Raw status from iBroker (e.g., "completed", "exported", etc.)
         "Exported On",
-        "export_requested_on",
     ]
 
     # Build status DataFrame
@@ -978,12 +1013,6 @@ def update_status_csv(
         exams_df["Study DateTime"], errors="coerce"
     )
     status_df["StudyDescription"] = exams_df.get("StudyDescription", "")
-
-    # Export status columns
-    status_df["export_requested"] = exams_df.get("is_exported", False) | (
-        exams_df.get("export_requested_on", pd.NaT).notna()
-    )
-    status_df["export_requested_on"] = exams_df.get("export_requested_on", pd.NaT)
     status_df["Status"] = exams_df.get("Status", pd.NA)
     status_df["Exported On"] = pd.to_datetime(
         exams_df.get("Exported On", pd.NaT), errors="coerce"
@@ -1003,9 +1032,6 @@ def update_status_csv(
     if "is_on_disk" not in status_df.columns:
         status_df["is_on_disk"] = False
 
-    # Add last_updated timestamp
-    status_df["last_updated"] = pd.Timestamp.now()
-
     # Load existing status CSV if it exists
     if status_file.exists():
         existing_status = pd.read_csv(status_file)
@@ -1013,14 +1039,8 @@ def update_status_csv(
         existing_status["Study DateTime"] = pd.to_datetime(
             existing_status["Study DateTime"], errors="coerce"
         )
-        if "last_updated" in existing_status.columns:
-            existing_status["last_updated"] = pd.to_datetime(
-                existing_status["last_updated"], errors="coerce"
-            )
-        else:
-            existing_status["last_updated"] = pd.Timestamp.min
 
-        # Merge: update existing rows if newer, add new rows
+        # Merge: update existing rows, add new rows
         merged = existing_status.merge(
             status_df,
             on=["study_id", "Study DateTime", "StudyDescription"],
@@ -1028,19 +1048,16 @@ def update_status_csv(
             suffixes=("_old", "_new"),
         )
 
-        # For each column, prefer newer value if available
-        for col in status_cols + ["is_on_disk", "last_updated"]:
+        # For each column, prefer new value (latest query takes precedence)
+        for col in status_cols + ["is_on_disk"]:
             old_col = f"{col}_old" if col in existing_status.columns else None
             new_col = f"{col}_new"
 
             if old_col and old_col in merged.columns and new_col in merged.columns:
-                # Use new value if newer timestamp, otherwise keep old
-                mask_newer = merged["last_updated_new"].notna() & (
-                    merged["last_updated_new"]
-                    > merged["last_updated_old"].fillna(pd.Timestamp.min)
-                )
+                # Prefer new value if available, otherwise keep old
+                mask_has_new = merged[new_col].notna()
                 merged[col] = merged[old_col]
-                merged.loc[mask_newer, col] = merged.loc[mask_newer, new_col]
+                merged.loc[mask_has_new, col] = merged.loc[mask_has_new, new_col]
             elif new_col in merged.columns:
                 merged[col] = merged[new_col]
             elif old_col and old_col in merged.columns:
@@ -1062,18 +1079,13 @@ def update_status_csv(
         "Accession",
         "Study DateTime",
         "StudyDescription",
-        "export_requested",
-        "export_requested_on",
         "Status",
         "Exported On",
         "is_on_disk",
-        "last_updated",
     ]
     for col in required_cols:
         if col not in final_status.columns:
-            if col == "export_requested":
-                final_status[col] = False
-            elif col in ["export_requested_on", "Exported On", "last_updated"]:
+            if col == "Exported On":
                 final_status[col] = pd.NaT
             else:
                 final_status[col] = pd.NA
@@ -1103,12 +1115,12 @@ def print_status_summary(status_file: Path) -> None:
     status_df["is_on_disk"] = (
         status_df.get("is_on_disk", False).fillna(False).astype(bool)
     )
-    status_df["export_requested"] = (
-        status_df.get("export_requested", False).fillna(False).astype(bool)
-    )
     status_df["Exported On"] = pd.to_datetime(
         status_df.get("Exported On", pd.NaT), errors="coerce"
     )
+
+    # Calculate export_requested from other columns
+    export_requested = _calculate_export_requested(status_df)
 
     total = len(status_df)
     on_disk = status_df["is_on_disk"].sum()
@@ -1116,19 +1128,9 @@ def print_status_summary(status_file: Path) -> None:
         status_df["Exported On"].notna() & (~status_df["is_on_disk"])
     ).sum()
     export_requested_pending = (
-        status_df["export_requested"]
-        & status_df["Exported On"].isna()
-        & (~status_df["is_on_disk"])
+        export_requested & status_df["Exported On"].isna() & (~status_df["is_on_disk"])
     ).sum()
-    not_exported = ((~status_df["export_requested"]) & (~status_df["is_on_disk"])).sum()
-
-    last_updated = "unknown"
-    if "last_updated" in status_df.columns:
-        last_updated_ts = pd.to_datetime(
-            status_df["last_updated"], errors="coerce"
-        ).max()
-        if pd.notna(last_updated_ts):
-            last_updated = last_updated_ts.strftime("%Y-%m-%d %H:%M:%S")
+    not_exported = ((~export_requested) & (~status_df["is_on_disk"])).sum()
 
     print("\n--- Status CSV Summary ---")
     print(f"Total MR+BREAST exams: {total:,}")
@@ -1140,7 +1142,6 @@ def print_status_summary(status_file: Path) -> None:
         f"  - Export requested (pending): {export_requested_pending:,} ({export_requested_pending / total * 100:.1f}%)"
     )
     print(f"  - Not yet exported: {not_exported:,} ({not_exported / total * 100:.1f}%)")
-    print(f"Last updated: {last_updated}")
 
 
 def query_and_update_status_during_wait(
