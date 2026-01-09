@@ -13,6 +13,9 @@ from pathlib import Path
 
 import pandas as pd
 import pydicom
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 from tqdm.auto import tqdm
 
 from export_utils import (
@@ -34,6 +37,7 @@ MRI1_STUDY_IDS_FILE = (
 )
 MRI1_EXPORT_STATE_FILE = Path("data/export_state_mri1.csv")
 MRI1_BASE_DOWNLOAD_DIR = "/gpfs/data/karczmar-lab/CAPS/MRI1.0/"
+MRI1_STATUS_FILE = Path(MRI1_BASE_DOWNLOAD_DIR) / "export_status.csv"
 
 warnings.filterwarnings("ignore", message=".*Invalid value for VR UI.*")
 
@@ -156,6 +160,7 @@ def load_mri1_data(
     max_exams: int | None = None,
     submit_exports: bool = False,
     batch_size: int | None = None,
+    include_biopsy: bool = False,
 ) -> tuple[pd.DataFrame, dict]:
     """Load MRI1.0 dataset by querying iBroker directly for MR exams with BREAST in description.
 
@@ -169,6 +174,9 @@ def load_mri1_data(
         Requires driver to remain open.
     batch_size : int | None
         Maximum number of export requests to submit (only used if submit_exports=True).
+    include_biopsy : bool
+        If False (default), exclude exams with "biopsy" in study description.
+        If True, include all exams regardless of biopsy status.
 
     Returns
     -------
@@ -220,6 +228,60 @@ def load_mri1_data(
         study_ids_df = pd.read_excel(MRI1_STUDY_IDS_FILE)
         study_ids = study_ids_df["AnonymousID"].astype(str).tolist()
         print(f"Loaded {len(study_ids):,} study IDs from MRI1.0 file.")
+
+        # Prioritize study IDs that are more likely to have unexported exams
+        # Use status CSV if it exists to prioritize
+        status_file = Path(MRI1_BASE_DOWNLOAD_DIR) / "export_status.csv"
+        if status_file.exists():
+            try:
+                status_df = pd.read_csv(status_file)
+                status_df["study_id"] = status_df["study_id"].astype(str)
+
+                # Find study IDs with unexported exams
+                unexported_mask = (
+                    ~status_df.get("export_requested", False).fillna(False)
+                ) & (~status_df.get("is_on_disk", False).fillna(False))
+                study_ids_with_unexported = set(
+                    status_df.loc[unexported_mask, "study_id"].unique()
+                )
+
+                # Find study IDs where ALL exams are exported (skip these)
+                study_id_groups = status_df.groupby("study_id")
+                all_exported_study_ids = set()
+                for sid, group in study_id_groups:
+                    # Check if all exams for this study_id are exported
+                    all_exported = (
+                        group.get("export_requested", False).fillna(False).all()
+                        | group.get("is_on_disk", False).fillna(False).all()
+                    )
+                    if all_exported and len(group) > 0:
+                        all_exported_study_ids.add(sid)
+
+                # Find study IDs that are not in status CSV at all (never queried)
+                all_status_study_ids = set(status_df["study_id"].unique())
+                never_queried = set(study_ids) - all_status_study_ids
+
+                # Filter out study IDs where all exams are already exported
+                study_ids = [
+                    sid for sid in study_ids if sid not in all_exported_study_ids
+                ]
+
+                # Prioritize: never queried first, then those with unexported exams
+                priority_ids = list(never_queried) + list(study_ids_with_unexported)
+                remaining_ids = [sid for sid in study_ids if sid not in priority_ids]
+
+                # Reorder: priority IDs first, then remaining
+                study_ids = priority_ids + remaining_ids
+
+                print(
+                    f"Prioritized {len(priority_ids):,} study IDs "
+                    f"({len(never_queried):,} never queried, "
+                    f"{len(study_ids_with_unexported):,} with unexported exams). "
+                    f"Skipped {len(all_exported_study_ids):,} study IDs with all exams exported."
+                )
+            except Exception as e:
+                print(f"Warning: Could not prioritize study IDs from status CSV: {e}")
+                print("Using original order.")
 
         # Query iBroker directly for each study ID
         if submit_exports:
@@ -304,11 +366,6 @@ def load_mri1_data(
             query_desc = "Querying iBroker and submitting exports"
         if max_exams is not None:
             query_desc = f"{query_desc} (target: {max_exams} ready-to-export exams)"
-            # Create progress bar with target as total
-            pbar = tqdm(total=max_exams, desc=query_desc, unit="exam")
-        else:
-            # No target, show progress through study IDs
-            pbar = tqdm(study_ids, desc=query_desc)
 
         def submit_exports_for_patient(
             driver, study_id: str, ready_exams_df: pd.DataFrame
@@ -326,6 +383,18 @@ def load_mri1_data(
             submitted_keys = []
 
             try:
+                # Wait for any modal from previous exports to close before navigating
+                # The modal (mdlPopup_backgroundElement) can block btnFetch
+                try:
+                    WebDriverWait(driver, 5).until(
+                        EC.invisibility_of_element_located(
+                            (By.ID, "mdlPopup_backgroundElement")
+                        )
+                    )
+                except Exception:
+                    # If modal doesn't exist or timeout, continue anyway
+                    pass
+
                 # Navigate to patient's page
                 driver.find_element(by="name", value="tbxAssignedID").clear()
                 driver.find_element(by="name", value="tbxAssignedID").send_keys(
@@ -368,7 +437,7 @@ def load_mri1_data(
 
                     if target_key in available_on_page:
                         print(
-                            f"  - Found available exam from {target_key[0]}. Selecting checkbox."
+                            f"  - Found available exam from {target_key[0]} ({target_key[1]}). Selecting checkbox."
                         )
                         available_on_page[target_key].click()
                         submitted += 1
@@ -378,7 +447,7 @@ def load_mri1_data(
                         submitted_keys.append(target_key)
                     else:
                         print(
-                            f"  - INFO: Exam from {target_key[0]} is no longer available (already exported)."
+                            f"  - INFO: Exam from {target_key[0]} ({target_key[1]}) is no longer available (already exported)."
                         )
                         already_exported += 1
                         export_stats["already_exported"] += 1
@@ -389,6 +458,21 @@ def load_mri1_data(
                     print(f"  Submitting export request for {submitted} exam(s)...")
                     driver.find_element(by="name", value="btnExport").click()
                     wait_aspnet_idle(driver)
+
+                    # Wait for modal popup to close before proceeding to next patient
+                    # The modal (mdlPopup_backgroundElement) can block btnFetch for the next patient
+                    try:
+                        # Wait for modal background to disappear (or not be present)
+                        WebDriverWait(driver, 10).until(
+                            EC.invisibility_of_element_located(
+                                (By.ID, "mdlPopup_backgroundElement")
+                            )
+                        )
+                    except Exception:
+                        # If modal doesn't exist or timeout, continue anyway
+                        # It might have already closed or not appeared
+                        pass
+
                     print(f"  ✓ Export request submitted for {submitted} exam(s).")
 
             except Exception as e:
@@ -397,34 +481,65 @@ def load_mri1_data(
 
             return submitted, already_exported, submitted_keys
 
-        for study_id in study_ids:
+        # Track exams for incremental status CSV updates
+        status_update_chunk_size = 5  # Update status CSV every N study IDs
+        exams_for_status_update = []
+        status_file_path = Path(MRI1_BASE_DOWNLOAD_DIR) / "export_status.csv"
+
+        for idx, study_id in enumerate(study_ids, 1):
             # Check if we've reached batch limit
             if (
                 submit_exports
                 and batch_size is not None
                 and export_stats["submitted"] >= batch_size
             ):
-                pbar.close()
                 print(
                     f"\nReached batch limit of {batch_size} export requests. Stopping."
                 )
+                # Update status CSV with any remaining exams before breaking
+                if exams_for_status_update:
+                    combined_chunk = pd.concat(
+                        exams_for_status_update, ignore_index=True
+                    )
+                    update_status_csv(
+                        combined_chunk,
+                        status_file_path,
+                        fingerprint_cache=mri1_fingerprint_cache,
+                    )
+                    exams_for_status_update = []
                 break
 
+            print(
+                f"\n[{idx}/{len(study_ids)}] Querying study_id {study_id}...",
+                end=" ",
+                flush=True,
+            )
             try:
                 page_html, state = post_fetch_grid(session, state, str(study_id))
                 df = parse_all_tables_from_page(page_html)
+                print(f"Found {len(df)} total exams", end="", flush=True)
 
                 if not df.empty:
-                    df["study_id"] = study_id
+                    df["study_id"] = str(study_id)  # Ensure string type
                     # Filter for MR+BREAST immediately
                     df["base_modality"] = df["Modality"].apply(get_base_modality)
                     df = df[df["base_modality"] == "MR"]
+                    print(f", {len(df)} MR exams", end="", flush=True)
 
                     if "StudyDescription" in df.columns:
                         breast_mask = df["StudyDescription"].str.contains(
                             "BREAST", case=False, na=False
                         )
                         df = df[breast_mask]
+                        print(f", {len(df)} BREAST exams", end="", flush=True)
+
+                        # Filter out biopsy exams unless include_biopsy is True
+                        if not include_biopsy:
+                            biopsy_mask = df["StudyDescription"].str.contains(
+                                "biopsy", case=False, na=False
+                            )
+                            df = df[~biopsy_mask]
+                            print(f", {len(df)} non-biopsy exams", end="", flush=True)
 
                     if not df.empty:
                         # Parse Study DateTime
@@ -492,10 +607,20 @@ def load_mri1_data(
                         ready_mask = (~df["is_on_disk"]) & (~df["is_exported"])
                         ready_count = ready_mask.sum()
                         ready_to_export_count += ready_count
+                        print(
+                            f" → {ready_count} ready-to-export "
+                            f"(on_disk: {(~df['is_on_disk']).sum()}, "
+                            f"exported: {df['is_exported'].sum()})",
+                            flush=True,
+                        )
 
                         # Submit exports if requested
                         if submit_exports and ready_count > 0:
                             ready_exams = df[ready_mask]
+                            print(
+                                f"  Submitting exports for {len(ready_exams)} exam(s)...",
+                                flush=True,
+                            )
                             _, _, submitted_keys = submit_exports_for_patient(
                                 driver, study_id, ready_exams
                             )
@@ -515,27 +640,65 @@ def load_mri1_data(
 
                         all_exams.append(df)
 
-                        # Update progress bar
-                        if max_exams is not None:
-                            # Update to show current count (capped at total)
-                            pbar.n = min(ready_to_export_count, max_exams)
-                            pbar.refresh()
+                        # Add to status update chunk (even if already exported)
+                        exams_for_status_update.append(df)
+
+                        # Update status CSV incrementally every chunk_size study IDs
+                        if len(exams_for_status_update) >= status_update_chunk_size:
+                            combined_chunk = pd.concat(
+                                exams_for_status_update, ignore_index=True
+                            )
+                            update_status_csv(
+                                combined_chunk,
+                                status_file_path,
+                                fingerprint_cache=mri1_fingerprint_cache,
+                            )
+                            exams_for_status_update = []
+                            print(
+                                f"  [Status CSV updated after {idx} study IDs]",
+                                flush=True,
+                            )
 
                         if max_exams is not None and ready_to_export_count >= max_exams:
-                            pbar.close()
                             print(
-                                f"\nReached target of {max_exams} ready-to-export exams "
+                                f"\n✓ Reached target of {max_exams} ready-to-export exams "
                                 f"(found {ready_to_export_count} total). "
-                                f"Stopped querying after processing {len(all_exams)} study IDs."
+                                f"Stopped querying after processing {idx} study IDs."
                             )
+                            # Update status CSV with any remaining exams before breaking
+                            if exams_for_status_update:
+                                combined_chunk = pd.concat(
+                                    exams_for_status_update, ignore_index=True
+                                )
+                                update_status_csv(
+                                    combined_chunk,
+                                    status_file_path,
+                                    fingerprint_cache=mri1_fingerprint_cache,
+                                )
+                                exams_for_status_update = []
                             break
+                    else:
+                        print(" → No MR+BREAST exams", flush=True)
+                else:
+                    print(" → No exams found", flush=True)
             except Exception as e:
-                print(f"Warning: Failed to query study_id {study_id}: {e}")
+                print(f" → ERROR: {e}", flush=True)
                 continue
 
-        # Close progress bar if still open
-        if max_exams is not None:
-            pbar.close()
+        # Update status CSV with any remaining exams at the end
+        if exams_for_status_update:
+            combined_chunk = pd.concat(exams_for_status_update, ignore_index=True)
+            update_status_csv(
+                combined_chunk,
+                status_file_path,
+                fingerprint_cache=mri1_fingerprint_cache,
+            )
+            print(
+                f"  [Final status CSV update with {len(combined_chunk)} exams]",
+                flush=True,
+            )
+
+        # Progress tracking complete
 
         # Close driver if we're not submitting exports
         # (if submitting exports, driver is closed after all processing)
@@ -584,6 +747,20 @@ def load_mri1_data(
             print(
                 f"Filtered to {len(metadata):,} MR exams with 'BREAST' in description."
             )
+
+            # Filter out biopsy exams unless include_biopsy is True
+            if not include_biopsy:
+                before_biopsy_filter = len(metadata)
+                biopsy_mask = metadata["StudyDescription"].str.contains(
+                    "biopsy", case=False, na=False
+                )
+                metadata = metadata[~biopsy_mask]
+                excluded_count = biopsy_mask.sum()
+                if excluded_count > 0:
+                    print(
+                        f"Excluded {excluded_count:,} exams with 'biopsy' in description "
+                        f"({before_biopsy_filter:,} → {len(metadata):,})."
+                    )
 
         # Deduplicate by (study_id, Study DateTime, StudyDescription)
         before_dedup = len(metadata)
@@ -639,6 +816,9 @@ def load_mri1_data(
         if MRI1_EXPORT_STATE_FILE.exists():
             export_state = pd.read_csv(MRI1_EXPORT_STATE_FILE)
             print(f"Loaded {len(export_state):,} rows from export state file.")
+            # Ensure study_id is string type to match metadata
+            if "study_id" in export_state.columns:
+                export_state["study_id"] = export_state["study_id"].astype(str)
             export_state["Study DateTime"] = pd.to_datetime(
                 export_state["Study DateTime"], errors="coerce"
             )
@@ -651,6 +831,9 @@ def load_mri1_data(
             export_state["download_attempt_outcome"] = export_state[
                 "download_attempt_outcome"
             ].astype("string")
+            # Ensure study_id is string in metadata as well
+            if "study_id" in metadata.columns:
+                metadata["study_id"] = metadata["study_id"].astype(str)
             # merge export state back into metadata on the key columns
             metadata = metadata.merge(
                 export_state,
@@ -741,6 +924,347 @@ def load_mri1_data(
     return db, export_stats
 
 
+def update_status_csv(
+    exams_df: pd.DataFrame,
+    status_file: Path,
+    fingerprint_cache: Path | None = None,
+) -> None:
+    """Update status CSV with current exam data.
+
+    Merges new/updated rows, preserves existing data.
+    Only includes MR+BREAST exams (filtered before calling).
+    Updates rows if newer data is available (based on last_updated timestamp).
+
+    Parameters
+    ----------
+    exams_df : pd.DataFrame
+        DataFrame with exam data from iBroker query
+    status_file : Path
+        Path to status CSV file
+    fingerprint_cache : Path | None
+        Path to fingerprint cache for disk status checking
+    """
+    if exams_df.empty:
+        return
+
+    # Ensure we only have MR+BREAST exams
+    if "base_modality" in exams_df.columns:
+        exams_df = exams_df[exams_df["base_modality"] == "MR"].copy()
+    if "StudyDescription" in exams_df.columns:
+        breast_mask = exams_df["StudyDescription"].str.contains(
+            "BREAST", case=False, na=False
+        )
+        exams_df = exams_df[breast_mask]
+
+    if exams_df.empty:
+        return
+
+    # Prepare status DataFrame with required columns
+    status_cols = [
+        "study_id",
+        "Accession",
+        "Study DateTime",
+        "StudyDescription",
+        "Status",
+        "Exported On",
+        "export_requested_on",
+    ]
+
+    # Build status DataFrame
+    status_df = pd.DataFrame()
+    status_df["study_id"] = exams_df["study_id"].astype(str)
+    status_df["Accession"] = exams_df.get("Accession", pd.NA)
+    status_df["Study DateTime"] = pd.to_datetime(
+        exams_df["Study DateTime"], errors="coerce"
+    )
+    status_df["StudyDescription"] = exams_df.get("StudyDescription", "")
+
+    # Export status columns
+    status_df["export_requested"] = exams_df.get("is_exported", False) | (
+        exams_df.get("export_requested_on", pd.NaT).notna()
+    )
+    status_df["export_requested_on"] = exams_df.get("export_requested_on", pd.NaT)
+    status_df["Status"] = exams_df.get("Status", pd.NA)
+    status_df["Exported On"] = pd.to_datetime(
+        exams_df.get("Exported On", pd.NaT), errors="coerce"
+    )
+
+    # Check disk status using fingerprint cache
+    if fingerprint_cache and fingerprint_cache.exists():
+        # Use filesystem_utils to check disk status
+        status_df = update_metadata_with_disk_status_by_date(
+            status_df,
+            conservative=True,
+            fingerprint_cache=fingerprint_cache,
+        )
+    else:
+        status_df["is_on_disk"] = False
+
+    if "is_on_disk" not in status_df.columns:
+        status_df["is_on_disk"] = False
+
+    # Add last_updated timestamp
+    status_df["last_updated"] = pd.Timestamp.now()
+
+    # Load existing status CSV if it exists
+    if status_file.exists():
+        existing_status = pd.read_csv(status_file)
+        existing_status["study_id"] = existing_status["study_id"].astype(str)
+        existing_status["Study DateTime"] = pd.to_datetime(
+            existing_status["Study DateTime"], errors="coerce"
+        )
+        if "last_updated" in existing_status.columns:
+            existing_status["last_updated"] = pd.to_datetime(
+                existing_status["last_updated"], errors="coerce"
+            )
+        else:
+            existing_status["last_updated"] = pd.Timestamp.min
+
+        # Merge: update existing rows if newer, add new rows
+        merged = existing_status.merge(
+            status_df,
+            on=["study_id", "Study DateTime", "StudyDescription"],
+            how="outer",
+            suffixes=("_old", "_new"),
+        )
+
+        # For each column, prefer newer value if available
+        for col in status_cols + ["is_on_disk", "last_updated"]:
+            old_col = f"{col}_old" if col in existing_status.columns else None
+            new_col = f"{col}_new"
+
+            if old_col and old_col in merged.columns and new_col in merged.columns:
+                # Use new value if newer timestamp, otherwise keep old
+                mask_newer = merged["last_updated_new"].notna() & (
+                    merged["last_updated_new"]
+                    > merged["last_updated_old"].fillna(pd.Timestamp.min)
+                )
+                merged[col] = merged[old_col]
+                merged.loc[mask_newer, col] = merged.loc[mask_newer, new_col]
+            elif new_col in merged.columns:
+                merged[col] = merged[new_col]
+            elif old_col and old_col in merged.columns:
+                merged[col] = merged[old_col]
+
+        # Clean up merge columns
+        drop_cols = [
+            c for c in merged.columns if c.endswith("_old") or c.endswith("_new")
+        ]
+        merged = merged.drop(columns=drop_cols)
+
+        final_status = merged
+    else:
+        final_status = status_df
+
+    # Ensure all required columns exist
+    required_cols = [
+        "study_id",
+        "Accession",
+        "Study DateTime",
+        "StudyDescription",
+        "export_requested",
+        "export_requested_on",
+        "Status",
+        "Exported On",
+        "is_on_disk",
+        "last_updated",
+    ]
+    for col in required_cols:
+        if col not in final_status.columns:
+            if col == "export_requested":
+                final_status[col] = False
+            elif col in ["export_requested_on", "Exported On", "last_updated"]:
+                final_status[col] = pd.NaT
+            else:
+                final_status[col] = pd.NA
+
+    # Sort by study_id and Study DateTime
+    final_status = final_status.sort_values(
+        by=["study_id", "Study DateTime", "StudyDescription"]
+    )
+
+    # Write to CSV
+    status_file.parent.mkdir(parents=True, exist_ok=True)
+    final_status.to_csv(status_file, index=False)
+
+    print(f"Updated status CSV: {len(final_status):,} exams ({status_file})")
+
+
+def print_status_summary(status_file: Path) -> None:
+    """Print summary statistics from status CSV."""
+    if not status_file.exists():
+        print("Status CSV does not exist yet.")
+        return
+
+    status_df = pd.read_csv(status_file)
+    status_df["Study DateTime"] = pd.to_datetime(
+        status_df["Study DateTime"], errors="coerce"
+    )
+    status_df["is_on_disk"] = (
+        status_df.get("is_on_disk", False).fillna(False).astype(bool)
+    )
+    status_df["export_requested"] = (
+        status_df.get("export_requested", False).fillna(False).astype(bool)
+    )
+    status_df["Exported On"] = pd.to_datetime(
+        status_df.get("Exported On", pd.NaT), errors="coerce"
+    )
+
+    total = len(status_df)
+    on_disk = status_df["is_on_disk"].sum()
+    exported_not_on_disk = (
+        status_df["Exported On"].notna() & (~status_df["is_on_disk"])
+    ).sum()
+    export_requested_pending = (
+        status_df["export_requested"]
+        & status_df["Exported On"].isna()
+        & (~status_df["is_on_disk"])
+    ).sum()
+    not_exported = ((~status_df["export_requested"]) & (~status_df["is_on_disk"])).sum()
+
+    last_updated = "unknown"
+    if "last_updated" in status_df.columns:
+        last_updated_ts = pd.to_datetime(
+            status_df["last_updated"], errors="coerce"
+        ).max()
+        if pd.notna(last_updated_ts):
+            last_updated = last_updated_ts.strftime("%Y-%m-%d %H:%M:%S")
+
+    print("\n--- Status CSV Summary ---")
+    print(f"Total MR+BREAST exams: {total:,}")
+    print(f"  - On disk: {on_disk:,} ({on_disk / total * 100:.1f}%)")
+    print(
+        f"  - Exported (not on disk): {exported_not_on_disk:,} ({exported_not_on_disk / total * 100:.1f}%)"
+    )
+    print(
+        f"  - Export requested (pending): {export_requested_pending:,} ({export_requested_pending / total * 100:.1f}%)"
+    )
+    print(f"  - Not yet exported: {not_exported:,} ({not_exported / total * 100:.1f}%)")
+    print(f"Last updated: {last_updated}")
+
+
+def query_and_update_status_during_wait(
+    study_ids: list[str],
+    already_queried: set[str],
+    status_file: Path,
+    fingerprint_cache: Path | None,
+    wait_seconds: float,
+    include_biopsy: bool = False,
+) -> set[str]:
+    """Query remaining study IDs and update status CSV during wait period.
+
+    Parameters
+    ----------
+    study_ids : list[str]
+        All study IDs to query
+    already_queried : set[str]
+        Study IDs already queried in this session
+    status_file : Path
+        Path to status CSV file
+    fingerprint_cache : Path | None
+        Path to fingerprint cache for disk status
+    wait_seconds : float
+        Maximum seconds to spend querying (should be less than wait period)
+    include_biopsy : bool
+        Whether to include biopsy exams
+
+    Returns
+    -------
+    set[str]
+        Set of newly queried study IDs
+    """
+    from export_utils import (
+        bootstrap_http_session_from_driver,
+        http_get_root,
+        login,
+        make_driver,
+        parse_all_tables_from_page,
+        post_fetch_grid,
+        post_link_event,
+    )
+
+    remaining_ids = [sid for sid in study_ids if sid not in already_queried]
+    if not remaining_ids:
+        return set()
+
+    print(
+        f"\nQuerying {len(remaining_ids):,} remaining study IDs to update status CSV..."
+    )
+
+    driver = None
+    session = None
+    newly_queried = set()
+    start_time = time.time()
+
+    try:
+        driver = make_driver()
+        login(driver, USERNAME, PASSWORD)
+        session = bootstrap_http_session_from_driver(driver)
+
+        # Initialize HTTP session state
+        page_html, state = http_get_root(session)
+        page_html, state = post_link_event(session, state, "lbAll")
+
+        all_exams = []
+
+        for study_id in remaining_ids:
+            # Check if we've used up our time budget
+            elapsed = time.time() - start_time
+            if elapsed >= wait_seconds * 0.9:  # Use 90% of wait time for querying
+                print(f"Time budget reached ({elapsed:.1f}s). Stopping query.")
+                break
+
+            try:
+                page_html, state = post_fetch_grid(session, state, str(study_id))
+                df = parse_all_tables_from_page(page_html)
+
+                if not df.empty:
+                    df["study_id"] = str(study_id)
+                    df["base_modality"] = df["Modality"].apply(get_base_modality)
+                    df = df[df["base_modality"] == "MR"]
+
+                    if "StudyDescription" in df.columns:
+                        breast_mask = df["StudyDescription"].str.contains(
+                            "BREAST", case=False, na=False
+                        )
+                        df = df[breast_mask]
+
+                        if not include_biopsy:
+                            biopsy_mask = df["StudyDescription"].str.contains(
+                                "biopsy", case=False, na=False
+                            )
+                            df = df[~biopsy_mask]
+
+                    if not df.empty:
+                        df["Study DateTime"] = pd.to_datetime(
+                            df["Study DateTime"], errors="coerce"
+                        )
+                        all_exams.append(df)
+                        newly_queried.add(study_id)
+            except Exception as e:
+                print(f"Warning: Failed to query study_id {study_id}: {e}")
+                continue
+
+        # Update status CSV with all queried exams
+        if all_exams:
+            combined_df = pd.concat(all_exams, ignore_index=True)
+            update_status_csv(combined_df, status_file, fingerprint_cache)
+            print(
+                f"Updated status CSV with {len(combined_df):,} exams from {len(newly_queried):,} study IDs."
+            )
+
+    except Exception as e:
+        print(f"Error during status update query: {e}")
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+    return newly_queried
+
+
 def run_export_cycle(args, cycle_number: int):
     """Run a single export pass and return summary stats.
 
@@ -763,6 +1287,7 @@ def run_export_cycle(args, cycle_number: int):
         max_exams=max_exams_to_query,
         submit_exports=True,
         batch_size=args.batch_size,
+        include_biopsy=args.include_biopsy,
     )
     db, export_stats = result
 
@@ -819,6 +1344,10 @@ def run_export_cycle(args, cycle_number: int):
         # But we need to make sure they're persisted
         pass
 
+    # Update status CSV with all exams from this cycle
+    update_status_csv(db, MRI1_STATUS_FILE, fingerprint_cache=fingerprint_cache)
+    print_status_summary(MRI1_STATUS_FILE)
+
     # Save final state
     save_current_state(db, MRI1_EXPORT_STATE_FILE, MERGE_KEY_COLUMNS)
     print(f"\nCycle complete. Export state written to '{MRI1_EXPORT_STATE_FILE}'")
@@ -853,7 +1382,9 @@ def refresh_export_status(
         f"\n=== Refresh cycle {cycle_number}: auditing export status before next run (MRI1.0) ==="
     )
 
-    refresh_db, _ = load_mri1_data(max_exams=None, submit_exports=False)
+    refresh_db, _ = load_mri1_data(
+        max_exams=None, submit_exports=False, include_biopsy=args.include_biopsy
+    )
 
     # Use MRI1.0-specific fingerprint cache if it exists
     fingerprint_cache = None
@@ -988,6 +1519,11 @@ def main():
         action="store_true",
         help="Show export status summary and exit without exporting anything.",
     )
+    parser.add_argument(
+        "--include-biopsy",
+        action="store_true",
+        help="Include exams with 'biopsy' in study description (default: exclude biopsy exams).",
+    )
 
     args = parser.parse_args()
 
@@ -1002,23 +1538,35 @@ def main():
     # import scrape_ibroker now that we know we need it (triggers credential check)
     import_scrape_ibroker()
 
-    # status-only mode
+    # status-only mode: do full refresh of all study IDs
     if args.status_only:
         print("Running in --status-only mode (no exports will be performed)\n")
-        db, _ = load_mri1_data(max_exams=None, submit_exports=False)
+        print("Querying all study IDs to refresh status CSV...")
+
+        # Load all study IDs
+        study_ids_df = pd.read_excel(MRI1_STUDY_IDS_FILE)
+        study_ids = study_ids_df["AnonymousID"].astype(str).tolist()
+
+        # Query all study IDs and update status CSV
         mri1_cache = Path("data/destination_fingerprints_mri1.json")
         fingerprint_cache = mri1_cache if mri1_cache.exists() else None
-        db = update_metadata_with_disk_status_by_date(
-            db, conservative=True, fingerprint_cache=fingerprint_cache
+
+        newly_queried = query_and_update_status_during_wait(
+            study_ids=study_ids,
+            already_queried=set(),
+            status_file=MRI1_STATUS_FILE,
+            fingerprint_cache=fingerprint_cache,
+            wait_seconds=float("inf"),  # No time limit for status-only mode
+            include_biopsy=args.include_biopsy,
         )
-        identify_download_targets(
-            db,
-            filter_by_genotyping=False,
-            modality="MR",
-            base_download_dir=MRI1_BASE_DOWNLOAD_DIR,
-            dataset="mri1.0",
-        )
+
+        print_status_summary(MRI1_STATUS_FILE)
         sys.exit(0)
+
+    # Load all study IDs for status tracking
+    study_ids_df = pd.read_excel(MRI1_STUDY_IDS_FILE)
+    all_study_ids = study_ids_df["AnonymousID"].astype(str).tolist()
+    queried_study_ids: set[str] = set()
 
     cycles_run = 0
     last_target_indices: list[int] | None = None
@@ -1028,6 +1576,10 @@ def main():
             cycle_result = run_export_cycle(args, cycles_run)
             last_target_indices = cycle_result.get("target_indices")
 
+            # Track which study IDs were queried in this cycle
+            # (load_mri1_data queries study IDs, but we don't have direct access here)
+            # We'll track them during the wait period instead
+
             max_cycles = args.max_cycles
             if max_cycles > 0 and cycles_run >= max_cycles:
                 break
@@ -1035,6 +1587,29 @@ def main():
             wait_seconds = args.loop_wait
             if wait_seconds <= 0:
                 break
+
+            # During wait period, query remaining study IDs and update status CSV
+            if len(queried_study_ids) < len(all_study_ids):
+                mri1_cache = Path("data/destination_fingerprints_mri1.json")
+                fingerprint_cache = mri1_cache if mri1_cache.exists() else None
+
+                try:
+                    newly_queried = query_and_update_status_during_wait(
+                        study_ids=all_study_ids,
+                        already_queried=queried_study_ids,
+                        status_file=MRI1_STATUS_FILE,
+                        fingerprint_cache=fingerprint_cache,
+                        wait_seconds=wait_seconds,
+                        include_biopsy=args.include_biopsy,
+                    )
+                    queried_study_ids.update(newly_queried)
+                    print(
+                        f"Total study IDs queried: {len(queried_study_ids):,} / {len(all_study_ids):,}"
+                    )
+                except Exception as exc:
+                    print(
+                        f"\nWARNING: Status update during wait failed with error: {exc}. Continuing."
+                    )
 
             if args.refresh_export_status:
                 try:
@@ -1048,14 +1623,18 @@ def main():
                         f"\nWARNING: Refresh step failed with error: {exc}. Continuing to wait."
                     )
 
-            print(
-                f"\nWaiting {wait_seconds:.1f} seconds before starting the next cycle..."
-            )
-            try:
-                time.sleep(wait_seconds)
-            except KeyboardInterrupt:
-                print("\nLoop interrupted during wait; exiting.")
-                break
+            # Calculate remaining wait time (if any)
+            # query_and_update_status_during_wait uses up to 90% of wait_seconds
+            remaining_wait = max(0, wait_seconds * 0.1)
+            if remaining_wait > 0:
+                print(
+                    f"\nWaiting {remaining_wait:.1f} seconds before starting the next cycle..."
+                )
+                try:
+                    time.sleep(remaining_wait)
+                except KeyboardInterrupt:
+                    print("\nLoop interrupted during wait; exiting.")
+                    break
     except KeyboardInterrupt:
         print("\nLoop interrupted; exiting.")
 
