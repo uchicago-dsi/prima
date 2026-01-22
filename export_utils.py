@@ -505,6 +505,7 @@ def identify_download_targets(
     modality: str,
     base_download_dir: str,
     dataset: str = "chimec",
+    verbose: bool = True,
 ):
     """Identify target exams for download.
 
@@ -520,13 +521,16 @@ def identify_download_targets(
         Base download directory for the dataset
     dataset : str
         Dataset name: "chimec" or "mri1.0"
+    verbose : bool
+        Whether to print detailed summary (default: True)
 
     Returns
     -------
     pd.DataFrame
         Filtered targets ready for export
     """
-    print("\n--- Phase 3: Identifying Target Exams for Download ---")
+    if verbose:
+        print("\n--- Phase 3: Identifying Target Exams for Download ---")
     df["rejection_reason"] = ""
     if "is_on_disk" in df.columns:
         df["is_on_disk"] = df["is_on_disk"].fillna(False).astype(bool)
@@ -543,9 +547,10 @@ def identify_download_targets(
     modality_df = df[modality_mask].copy()
 
     # comprehensive export status summary
-    print(f"\n{'=' * 60}")
-    print(f"EXPORT STATUS SUMMARY FOR {modality}")
-    print(f"{'=' * 60}")
+    if verbose:
+        print(f"\n{'=' * 60}")
+        print(f"EXPORT STATUS SUMMARY FOR {modality}")
+        print(f"{'=' * 60}")
     total_modality = len(modality_df)
     on_disk = modality_df["is_on_disk"].sum()
     exported_not_on_disk = (
@@ -553,41 +558,50 @@ def identify_download_targets(
     ).sum()
     not_exported = ((~modality_df["is_exported"]) & (~modality_df["is_on_disk"])).sum()
 
-    print(f"  Total {modality} exams in iBroker:     {total_modality:>8,}")
-    print(f"  Already on disk (done):              {on_disk:>8,}")
-    print(f"  Exported but not on disk (sync?):    {exported_not_on_disk:>8,}")
-    print(f"  Not yet exported (REMAINING):        {not_exported:>8,}")
+    if verbose:
+        print(f"  Total {modality} exams in iBroker:     {total_modality:>8,}")
+        print(f"  Already on disk (done):              {on_disk:>8,}")
+        print(f"  Exported but not on disk (sync?):    {exported_not_on_disk:>8,}")
+        print(f"  Not yet exported (REMAINING):        {not_exported:>8,}")
 
-    # check phenotype coverage for remaining
-    if "chip" in modality_df.columns:
-        remaining_mask = (~modality_df["is_on_disk"]) & (~modality_df["is_exported"])
-        remaining_df = modality_df[remaining_mask]
-        with_genotype = remaining_df["chip"].notna().sum()
-        print(f"\n  Of the {not_exported:,} remaining to export:")
-        print(f"    - with genotype data: {with_genotype:,}")
-        print(f"    - without genotype:   {not_exported - with_genotype:,}")
+        # check phenotype coverage for remaining
+        if "chip" in modality_df.columns:
+            remaining_mask = (~modality_df["is_on_disk"]) & (
+                ~modality_df["is_exported"]
+            )
+            remaining_df = modality_df[remaining_mask]
+            with_genotype = remaining_df["chip"].notna().sum()
+            print(f"\n  Of the {not_exported:,} remaining to export:")
+            print(f"    - with genotype data: {with_genotype:,}")
+            print(f"    - without genotype:   {not_exported - with_genotype:,}")
 
-    print(f"{'=' * 60}\n")
+        print(f"{'=' * 60}\n")
 
-    print(f"Initial pool: {len(df):,} exams")
+    if verbose:
+        print(f"Initial pool: {len(df):,} exams")
     df.loc[~modality_mask, "rejection_reason"] = f"Wrong modality (not {modality})"
     targets = modality_df.copy()
-    print(f"  - Kept {len(targets):,} exams after filtering for modality '{modality}'.")
+    if verbose:
+        print(
+            f"  - Kept {len(targets):,} exams after filtering for modality '{modality}'."
+        )
 
     mask_on_disk = targets["is_on_disk"]
     targets.loc[mask_on_disk, "rejection_reason"] = "Already on disk"
     targets = targets[~mask_on_disk]
-    print(f"  - Rejected {mask_on_disk.sum():,} because they are already on disk.")
+    if verbose:
+        print(f"  - Rejected {mask_on_disk.sum():,} because they are already on disk.")
 
     # We still check if it's exported, but now it's a secondary check.
     # An exam could be exported but the sync failed, so it's not on disk.
     # This includes exams with Accession numbers AND exams discovered as already exported in previous runs
     already_exported_mask = targets["is_exported"]
     exported_missing_disk = targets[already_exported_mask]
-    print(
-        f"  - Rejected {already_exported_mask.sum():,} exams because already exported, but not on disk."
-    )
-    if not exported_missing_disk.empty:
+    if verbose:
+        print(
+            f"  - Rejected {already_exported_mask.sum():,} exams because already exported, but not on disk."
+        )
+    if not exported_missing_disk.empty and verbose:
         print("  - Found exported-but-not-on-disk exams!")
         print(f"  - Total missing exams: {len(exported_missing_disk)}")
 
@@ -633,9 +647,10 @@ def identify_download_targets(
             mask_no_chip = targets["chip"].isna()
             targets.loc[mask_no_chip, "rejection_reason"] = "No genotyping data"
             targets = targets[~mask_no_chip]
-            print(
-                f"  - Rejected {mask_no_chip.sum():,} due to missing genotyping data."
-            )
+            if verbose:
+                print(
+                    f"  - Rejected {mask_no_chip.sum():,} due to missing genotyping data."
+                )
 
         case_mask = targets["case_control_status"] == "Case"
         bad_case_date_mask = case_mask & (
@@ -645,11 +660,13 @@ def identify_download_targets(
             "Exam is after diagnosis date"
         )
         targets = targets[~bad_case_date_mask]
-        print(
-            f"  - Rejected {bad_case_date_mask.sum():,} 'Case' exams that occurred after diagnosis."
-        )
+        if verbose:
+            print(
+                f"  - Rejected {bad_case_date_mask.sum():,} 'Case' exams that occurred after diagnosis."
+            )
 
-    print(f"  = {len(targets):,} final potential target exams identified.")
+    if verbose:
+        print(f"  = {len(targets):,} final potential target exams identified.")
     return targets.sort_values(by=["study_id", "Study DateTime"])
 
 

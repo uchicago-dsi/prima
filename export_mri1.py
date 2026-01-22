@@ -27,7 +27,6 @@ from export_utils import (
     identify_download_targets,
     import_scrape_ibroker,
     parse_wait_interval,
-    save_current_state,
 )
 from filesystem_utils import update_metadata_with_disk_status_by_date
 
@@ -35,7 +34,6 @@ from filesystem_utils import update_metadata_with_disk_status_by_date
 MRI1_STUDY_IDS_FILE = (
     "/gpfs/data/karczmar-lab/CAPS/MRI1.0/MRI1.0_AnonymousIDs_hiro.xlsx"
 )
-MRI1_EXPORT_STATE_FILE = Path("data/export_state_mri1.csv")
 MRI1_BASE_DOWNLOAD_DIR = "/gpfs/data/karczmar-lab/CAPS/MRI1.0/"
 MRI1_STATUS_FILE = Path(MRI1_BASE_DOWNLOAD_DIR) / "export_status.csv"
 
@@ -193,7 +191,7 @@ def load_mri1_data(
     submit_exports: bool = False,
     batch_size: int | None = None,
     include_biopsy: bool = False,
-) -> tuple[pd.DataFrame, dict]:
+) -> tuple[pd.DataFrame, dict, set[str]]:
     """Load MRI1.0 dataset by querying iBroker directly for MR exams with BREAST in description.
 
     Parameters
@@ -212,8 +210,9 @@ def load_mri1_data(
 
     Returns
     -------
-    tuple[pd.DataFrame, dict]
-        Metadata DataFrame and export statistics dict with keys:
+    tuple[pd.DataFrame, dict, set[str]]
+        Metadata DataFrame, export statistics dict, and set of queried study IDs.
+        Export statistics dict has keys:
         - 'submitted': number of export requests submitted
         - 'already_exported': number discovered to be already exported
         - 'processed': total exams processed for export
@@ -521,6 +520,7 @@ def load_mri1_data(
         status_update_chunk_size = 5  # Update status CSV every N study IDs
         exams_for_status_update = []
         status_file_path = Path(MRI1_BASE_DOWNLOAD_DIR) / "export_status.csv"
+        queried_study_ids_set: set[str] = set()
 
         for idx, study_id in enumerate(study_ids, 1):
             # Check if we've reached batch limit
@@ -553,6 +553,9 @@ def load_mri1_data(
             try:
                 page_html, state = post_fetch_grid(session, state, str(study_id))
                 df = parse_all_tables_from_page(page_html)
+                queried_study_ids_set.add(
+                    study_id
+                )  # Track that we queried this study ID
                 print(f"Found {len(df)} total exams", end="", flush=True)
 
                 if not df.empty:
@@ -848,48 +851,6 @@ def load_mri1_data(
         ].astype("string")
         metadata["export_requested_on"] = pd.NaT
 
-        # load previous export state from separate file if it exists
-        if MRI1_EXPORT_STATE_FILE.exists():
-            export_state = pd.read_csv(MRI1_EXPORT_STATE_FILE)
-            print(f"Loaded {len(export_state):,} rows from export state file.")
-            # Ensure study_id is string type to match metadata
-            if "study_id" in export_state.columns:
-                export_state["study_id"] = export_state["study_id"].astype(str)
-            export_state["Study DateTime"] = pd.to_datetime(
-                export_state["Study DateTime"], errors="coerce"
-            )
-            export_state["export_requested_on"] = pd.to_datetime(
-                export_state["export_requested_on"], errors="coerce"
-            )
-            export_state["is_exported"] = (
-                export_state["is_exported"].fillna(False).astype(bool)
-            )
-            export_state["download_attempt_outcome"] = export_state[
-                "download_attempt_outcome"
-            ].astype("string")
-            # Ensure study_id is string in metadata as well
-            if "study_id" in metadata.columns:
-                metadata["study_id"] = metadata["study_id"].astype(str)
-            # merge export state back into metadata on the key columns
-            metadata = metadata.merge(
-                export_state,
-                on=MERGE_KEY_COLUMNS,
-                how="left",
-                suffixes=("", "_state"),
-            )
-            # prefer values from export state file
-            for col in [
-                "is_exported",
-                "download_attempt_outcome",
-                "export_requested_on",
-            ]:
-                state_col = f"{col}_state"
-                if state_col in metadata.columns:
-                    mask = metadata[state_col].notna()
-                    if col == "is_exported":
-                        mask = mask | metadata[state_col].fillna(False).astype(bool)
-                    metadata.loc[mask, col] = metadata.loc[mask, state_col]
-                    metadata.drop(columns=[state_col], inplace=True)
     except FileNotFoundError as e:
         print(f"ERROR: Input file not found - {e}", file=sys.stderr)
         sys.exit(1)
@@ -957,7 +918,7 @@ def load_mri1_data(
     # Driver is defined in the inner try block, so we need to handle cleanup there
     # For now, driver cleanup happens in the loop above
 
-    return db, export_stats
+    return db, export_stats, queried_study_ids_set
 
 
 def update_status_csv(
@@ -1019,13 +980,18 @@ def update_status_csv(
     )
 
     # Check disk status using fingerprint cache
+    # Suppress verbose output - we show full comparison in print_status_summary()
     if fingerprint_cache and fingerprint_cache.exists():
-        # Use filesystem_utils to check disk status
-        status_df = update_metadata_with_disk_status_by_date(
-            status_df,
-            conservative=True,
-            fingerprint_cache=fingerprint_cache,
-        )
+        import io
+        from contextlib import redirect_stdout
+
+        f = io.StringIO()
+        with redirect_stdout(f):
+            status_df = update_metadata_with_disk_status_by_date(
+                status_df,
+                conservative=True,
+                fingerprint_cache=fingerprint_cache,
+            )
     else:
         status_df["is_on_disk"] = False
 
@@ -1102,8 +1068,18 @@ def update_status_csv(
     print(f"Updated status CSV: {len(final_status):,} exams ({status_file})")
 
 
-def print_status_summary(status_file: Path) -> None:
-    """Print summary statistics from status CSV."""
+def print_status_summary(
+    status_file: Path, fingerprint_cache: Path | None = None
+) -> None:
+    """Print summary statistics from status CSV, including disk status comparison.
+
+    Parameters
+    ----------
+    status_file : Path
+        Path to status CSV file
+    fingerprint_cache : Path | None
+        Optional path to fingerprint cache for disk status comparison
+    """
     if not status_file.exists():
         print("Status CSV does not exist yet.")
         return
@@ -1132,8 +1108,8 @@ def print_status_summary(status_file: Path) -> None:
     ).sum()
     not_exported = ((~export_requested) & (~status_df["is_on_disk"])).sum()
 
-    print("\n--- Status CSV Summary ---")
-    print(f"Total MR+BREAST exams: {total:,}")
+    print("\n--- Full Status CSV Summary (All Known Exams) ---")
+    print(f"Total MR+BREAST exams in status CSV: {total:,}")
     print(f"  - On disk: {on_disk:,} ({on_disk / total * 100:.1f}%)")
     print(
         f"  - Exported (not on disk): {exported_not_on_disk:,} ({exported_not_on_disk / total * 100:.1f}%)"
@@ -1142,6 +1118,43 @@ def print_status_summary(status_file: Path) -> None:
         f"  - Export requested (pending): {export_requested_pending:,} ({export_requested_pending / total * 100:.1f}%)"
     )
     print(f"  - Not yet exported: {not_exported:,} ({not_exported / total * 100:.1f}%)")
+
+    # Show disk status comparison if fingerprint cache is available
+    if fingerprint_cache is not None and fingerprint_cache.exists():
+        from filesystem_utils import load_disk_dates_from_fingerprints
+
+        disk_dates = load_disk_dates_from_fingerprints(fingerprint_cache)
+        if disk_dates:
+            # Count unique (patient, date) pairs on disk
+            total_disk_pairs = sum(len(dates) for dates in disk_dates.values())
+            total_disk_patients = len(disk_dates)
+
+            # Count unique (patient, date) pairs in status CSV
+            status_df["_study_date_str"] = status_df["Study DateTime"].dt.strftime(
+                "%Y%m%d"
+            )
+            status_pairs = set(
+                (str(int(row["study_id"])), row["_study_date_str"])
+                for _, row in status_df.iterrows()
+                if pd.notna(row["Study DateTime"]) and pd.notna(row["study_id"])
+            )
+            status_df.drop(columns=["_study_date_str"], inplace=True)
+
+            matched_pairs = sum(
+                1
+                for pid, date_str in status_pairs
+                if pid in disk_dates and date_str in disk_dates[pid]
+            )
+
+            print("\n--- Disk Status Comparison (Full Picture) ---")
+            print(
+                f"  - Unique (patient, date) pairs in status CSV: {len(status_pairs):,}"
+            )
+            print(
+                f"  - Unique (patient, date) pairs on disk: {total_disk_pairs:,} ({total_disk_patients:,} patients)"
+            )
+            print(f"  - Matched pairs: {matched_pairs:,}")
+            print(f"  - Disk-only pairs: {total_disk_pairs - matched_pairs:,}")
 
 
 def query_and_update_status_during_wait(
@@ -1207,17 +1220,52 @@ def query_and_update_status_during_wait(
         page_html, state = post_link_event(session, state, "lbAll")
 
         all_exams = []
+        status_update_chunk_size = 10  # Update status CSV every N study IDs
+        exams_for_status_update = []
 
-        for study_id in remaining_ids:
+        # Track stats for less verbose output
+        no_exams_count = 0
+        no_breast_count = 0
+        last_summary_idx = 0
+        batch_size = 20  # Print summary every N study IDs
+
+        for idx, study_id in enumerate(remaining_ids, 1):
             # Check if we've used up our time budget
             elapsed = time.time() - start_time
             if elapsed >= wait_seconds * 0.9:  # Use 90% of wait time for querying
-                print(f"Time budget reached ({elapsed:.1f}s). Stopping query.")
+                print(f"\nTime budget reached ({elapsed:.1f}s). Stopping query.")
                 break
+
+            # Print summary every batch_size study IDs
+            if idx % batch_size == 1 and idx > 1:
+                summary_parts = []
+                if no_exams_count > 0:
+                    summary_parts.append(f"{no_exams_count} with no exams")
+                if no_breast_count > 0:
+                    summary_parts.append(f"{no_breast_count} with no BREAST exams")
+                if summary_parts:
+                    print(
+                        f"  [{last_summary_idx}-{idx - 1}] Summary: {', '.join(summary_parts)}",
+                        flush=True,
+                    )
+                no_exams_count = 0
+                no_breast_count = 0
+                last_summary_idx = idx
+
+            # Only print individual progress every 10 study IDs or when we find BREAST exams
+            verbose_progress = idx % 10 == 1 or idx == len(remaining_ids)
+            if verbose_progress:
+                print(
+                    f"[{idx}/{len(remaining_ids)}] Querying study_id {study_id}...",
+                    end=" ",
+                    flush=True,
+                )
 
             try:
                 page_html, state = post_fetch_grid(session, state, str(study_id))
                 df = parse_all_tables_from_page(page_html)
+                # Track that we queried this study ID regardless of results
+                newly_queried.add(study_id)
 
                 if not df.empty:
                     df["study_id"] = str(study_id)
@@ -1241,18 +1289,63 @@ def query_and_update_status_during_wait(
                             df["Study DateTime"], errors="coerce"
                         )
                         all_exams.append(df)
-                        newly_queried.add(study_id)
+                        exams_for_status_update.append(df)
+                        # Always print when we find BREAST exams
+                        print(f"Found {len(df)} BREAST exam(s) ✓", flush=True)
+
+                        # Update status CSV incrementally every chunk_size study IDs
+                        if len(exams_for_status_update) >= status_update_chunk_size:
+                            combined_chunk = pd.concat(
+                                exams_for_status_update, ignore_index=True
+                            )
+                            update_status_csv(
+                                combined_chunk, status_file, fingerprint_cache
+                            )
+                            exams_for_status_update = []
+                            print(
+                                f"  [Status CSV updated after {idx} study IDs]",
+                                flush=True,
+                            )
+                            # Print periodic status summary every 50 study IDs
+                            if idx % 50 == 0:
+                                print("\n--- Periodic Status Summary ---", flush=True)
+                                print_status_summary(status_file, fingerprint_cache)
+                    else:
+                        no_breast_count += 1
+                        if verbose_progress:
+                            print("No MR+BREAST exams", flush=True)
+                else:
+                    no_exams_count += 1
+                    if verbose_progress:
+                        print("No exams found", flush=True)
             except Exception as e:
-                print(f"Warning: Failed to query study_id {study_id}: {e}")
+                print(f" → ERROR: {e}", flush=True)
                 continue
 
-        # Update status CSV with all queried exams
-        if all_exams:
-            combined_df = pd.concat(all_exams, ignore_index=True)
-            update_status_csv(combined_df, status_file, fingerprint_cache)
+        # Print final summary
+        if no_exams_count > 0 or no_breast_count > 0:
+            summary_parts = []
+            if no_exams_count > 0:
+                summary_parts.append(f"{no_exams_count} with no exams")
+            if no_breast_count > 0:
+                summary_parts.append(f"{no_breast_count} with no BREAST exams")
+            if summary_parts:
+                print(
+                    f"  [{last_summary_idx}-{len(remaining_ids)}] Summary: {', '.join(summary_parts)}",
+                    flush=True,
+                )
+
+        # Update status CSV with any remaining exams
+        if exams_for_status_update:
+            combined_chunk = pd.concat(exams_for_status_update, ignore_index=True)
+            update_status_csv(combined_chunk, status_file, fingerprint_cache)
             print(
-                f"Updated status CSV with {len(combined_df):,} exams from {len(newly_queried):,} study IDs."
+                f"  [Final status CSV update with {len(combined_chunk):,} exams from chunk]",
+                flush=True,
             )
+            # Print final status summary
+            print("\n--- Final Status Summary ---", flush=True)
+            print_status_summary(status_file, fingerprint_cache)
 
     except Exception as e:
         print(f"Error during status update query: {e}")
@@ -1290,34 +1383,55 @@ def run_export_cycle(args, cycle_number: int):
         batch_size=args.batch_size,
         include_biopsy=args.include_biopsy,
     )
-    db, export_stats = result
+    db, export_stats, cycle_queried_study_ids = result
 
-    # Use MRI1.0-specific fingerprint cache if it exists, or populate it if missing
+    # Rebuild fingerprint cache at start of each cycle to include newly downloaded exams
     fingerprint_cache = None
     mri1_cache = Path("data/destination_fingerprints_mri1.json")
-    if mri1_cache.exists():
-        fingerprint_cache = mri1_cache
-        print(f"Using MRI1.0-specific fingerprint cache: {fingerprint_cache}")
+    print("Rebuilding MRI1.0 fingerprint cache to reflect current disk state...")
+    fingerprint_cache = build_mri1_disk_cache_simple(mri1_cache, MRI1_BASE_DOWNLOAD_DIR)
+    if fingerprint_cache:
+        print(f"✓ Updated MRI1.0 fingerprint cache: {fingerprint_cache}")
     else:
-        print(f"MRI1.0 fingerprint cache not found at {mri1_cache}")
-        print("Populating fingerprint cache by scanning MRI1.0 directory...")
-        fingerprint_cache = build_mri1_disk_cache_simple(
-            mri1_cache, MRI1_BASE_DOWNLOAD_DIR
-        )
-        if fingerprint_cache:
-            print(f"✓ Created MRI1.0 fingerprint cache: {fingerprint_cache}")
-    db = update_metadata_with_disk_status_by_date(
-        db, conservative=True, fingerprint_cache=fingerprint_cache
-    )
+        print("WARNING: Failed to build fingerprint cache")
+    # Suppress verbose disk status summary - we show full comparison in print_status_summary()
+    import io
+    from contextlib import redirect_stdout
 
-    # No genotyping filter for MRI1.0
-    # Modality is always MR for MRI1.0
+    f = io.StringIO()
+    with redirect_stdout(f):
+        db = update_metadata_with_disk_status_by_date(
+            db, conservative=True, fingerprint_cache=fingerprint_cache
+        )
+
+    # Update status CSV with all exams from this cycle first
+    update_status_csv(db, MRI1_STATUS_FILE, fingerprint_cache=fingerprint_cache)
+
+    # Print cycle-specific summary (what happened THIS cycle)
+    successfully_exported_count = export_stats.get("submitted", 0)
+    already_exported_count = export_stats.get("already_exported", 0)
+    processed_count = export_stats.get("processed", 0)
+
+    print("\n--- Cycle Summary (This Cycle Only) ---")
+    print(f"Study IDs queried this cycle: {len(cycle_queried_study_ids):,}")
+    print(f"Exams found this cycle: {len(db):,}")
+    print(
+        f"  - Successfully submitted export requests: {successfully_exported_count} exam(s)"
+    )
+    print(f"  - Discovered to be already exported: {already_exported_count} exam(s)")
+    print(f"  - Total exams processed: {processed_count} exam(s)")
+
+    # Print full status CSV summary (complete picture of everything we know)
+    print_status_summary(MRI1_STATUS_FILE, fingerprint_cache=fingerprint_cache)
+
+    # Identify targets for next cycle (suppress verbose output since we show full status CSV summary above)
     targets = identify_download_targets(
         db,
         filter_by_genotyping=False,
         modality="MR",
         base_download_dir=MRI1_BASE_DOWNLOAD_DIR,
         dataset="mri1.0",
+        verbose=False,  # Suppress cycle-specific summary - we show full status CSV summary instead
     )
 
     db["is_target"] = False
@@ -1328,37 +1442,13 @@ def run_export_cycle(args, cycle_number: int):
     db.loc[new_targets_mask, "download_attempt_outcome"] = pd.NA
     db.loc[new_targets_mask, "export_requested_on"] = pd.NaT
 
-    # Exports were already submitted during query phase
-    print("\n--- Exports Already Submitted During Query Phase ---")
-    successfully_exported_count = export_stats.get("submitted", 0)
-    already_exported_count = export_stats.get("already_exported", 0)
-    print(
-        f"✓ Successfully submitted export requests: {successfully_exported_count} exam(s)"
-    )
-    print(f"  Discovered to be already exported: {already_exported_count} exam(s)")
-    print(f"  Total exams processed: {export_stats.get('processed', 0)} exam(s)")
-
-    # Update db with export outcomes from query phase
-    # Find rows that match submitted exams and update them
-    if successfully_exported_count > 0:
-        # The export outcomes were already set in load_mri1_data during query phase
-        # But we need to make sure they're persisted
-        pass
-
-    # Update status CSV with all exams from this cycle
-    update_status_csv(db, MRI1_STATUS_FILE, fingerprint_cache=fingerprint_cache)
-    print_status_summary(MRI1_STATUS_FILE)
-
-    # Save final state
-    save_current_state(db, MRI1_EXPORT_STATE_FILE, MERGE_KEY_COLUMNS)
-    print(f"\nCycle complete. Export state written to '{MRI1_EXPORT_STATE_FILE}'")
-
     return {
         "submitted": successfully_exported_count,
         "already_exported": already_exported_count,
         "processed": export_stats.get("processed", 0),
         "targets_considered": len(targets),
         "target_indices": targets.index.tolist(),
+        "queried_study_ids": cycle_queried_study_ids,
     }
 
 
@@ -1383,18 +1473,28 @@ def refresh_export_status(
         f"\n=== Refresh cycle {cycle_number}: auditing export status before next run (MRI1.0) ==="
     )
 
-    refresh_db, _ = load_mri1_data(
+    refresh_db, _, _ = load_mri1_data(
         max_exams=None, submit_exports=False, include_biopsy=args.include_biopsy
     )
 
-    # Use MRI1.0-specific fingerprint cache if it exists
+    # Rebuild fingerprint cache to reflect current disk state
     fingerprint_cache = None
     mri1_cache = Path("data/destination_fingerprints_mri1.json")
-    if mri1_cache.exists():
-        fingerprint_cache = mri1_cache
-    refresh_db = update_metadata_with_disk_status_by_date(
-        refresh_db, conservative=True, fingerprint_cache=fingerprint_cache
-    )
+    print("Rebuilding MRI1.0 fingerprint cache to reflect current disk state...")
+    fingerprint_cache = build_mri1_disk_cache_simple(mri1_cache, MRI1_BASE_DOWNLOAD_DIR)
+    if fingerprint_cache:
+        print(f"✓ Updated MRI1.0 fingerprint cache: {fingerprint_cache}")
+    else:
+        print("WARNING: Failed to build fingerprint cache")
+    # Suppress verbose disk status summary - we show full comparison in print_status_summary()
+    import io
+    from contextlib import redirect_stdout
+
+    f = io.StringIO()
+    with redirect_stdout(f):
+        refresh_db = update_metadata_with_disk_status_by_date(
+            refresh_db, conservative=True, fingerprint_cache=fingerprint_cache
+        )
 
     # Modality is always MR for MRI1.0
     modality = "MR"
@@ -1454,7 +1554,7 @@ def refresh_export_status(
         subset,
         full_db=refresh_db,
         max_exams=max_to_audit,
-        export_state_file=MRI1_EXPORT_STATE_FILE,
+        export_state_file=None,  # Status CSV is now the source of truth
         merge_key_columns=MERGE_KEY_COLUMNS,
     )
 
@@ -1464,9 +1564,6 @@ def refresh_export_status(
         f"marked {audit_stats['marked_exported']} as exported, "
         f"{audit_stats['still_available']} still available."
     )
-
-    save_current_state(refresh_db, MRI1_EXPORT_STATE_FILE, MERGE_KEY_COLUMNS)
-    print(f"Audit state persisted to '{MRI1_EXPORT_STATE_FILE}'.")
 
 
 def main():
@@ -1548,9 +1645,16 @@ def main():
         study_ids_df = pd.read_excel(MRI1_STUDY_IDS_FILE)
         study_ids = study_ids_df["AnonymousID"].astype(str).tolist()
 
-        # Query all study IDs and update status CSV
+        # Rebuild fingerprint cache to reflect current disk state
+        print("Rebuilding MRI1.0 fingerprint cache to reflect current disk state...")
         mri1_cache = Path("data/destination_fingerprints_mri1.json")
-        fingerprint_cache = mri1_cache if mri1_cache.exists() else None
+        fingerprint_cache = build_mri1_disk_cache_simple(
+            mri1_cache, MRI1_BASE_DOWNLOAD_DIR
+        )
+        if fingerprint_cache:
+            print(f"✓ Updated MRI1.0 fingerprint cache: {fingerprint_cache}")
+        else:
+            print("WARNING: Failed to build fingerprint cache")
 
         newly_queried = query_and_update_status_during_wait(
             study_ids=study_ids,
@@ -1561,7 +1665,7 @@ def main():
             include_biopsy=args.include_biopsy,
         )
 
-        print_status_summary(MRI1_STATUS_FILE)
+        print_status_summary(MRI1_STATUS_FILE, fingerprint_cache=fingerprint_cache)
         sys.exit(0)
 
     # Load all study IDs for status tracking
@@ -1578,8 +1682,12 @@ def main():
             last_target_indices = cycle_result.get("target_indices")
 
             # Track which study IDs were queried in this cycle
-            # (load_mri1_data queries study IDs, but we don't have direct access here)
-            # We'll track them during the wait period instead
+            cycle_queried = cycle_result.get("queried_study_ids", set())
+            queried_study_ids.update(cycle_queried)
+            if cycle_queried:
+                print(
+                    f"Cycle queried {len(cycle_queried):,} study IDs. Total queried: {len(queried_study_ids):,} / {len(all_study_ids):,}"
+                )
 
             max_cycles = args.max_cycles
             if max_cycles > 0 and cycles_run >= max_cycles:

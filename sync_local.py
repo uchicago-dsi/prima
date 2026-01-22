@@ -23,13 +23,13 @@ logging.getLogger("pydicom.valuerep").setLevel(logging.ERROR)
 # --- CONFIGURATION ---
 # SRC_ROOT = Path("/mnt/uchad_samba/16352A/")
 # DST_ROOT = Path("/gpfs/data/huo-lab/Image/ChiMEC/MG")
-# SRC_ROOT = Path("/mnt/uchad_samba/13073B")
-SRC_ROOT = Path("/gpfs/data/huo-lab/Image/MRI1.0")
+SRC_ROOT = Path("/mnt/uchad_samba/13073B")
 DST_ROOT = Path("/gpfs/data/karczmar-lab/CAPS/MRI1.0")
 DELETE_QUEUE_DIR = SRC_ROOT / "_synced_and_queued_for_deletion"
-STABILITY_THRESHOLD_SEC = 600
 RESTART_DELAY_SEC = 120
-EMPTY_DIR_MIN_AGE_SEC = 3600  # only delete empty patient dirs older than 1 hour
+STABILITY_THRESHOLD_SEC = (
+    3600  # minimum age before syncing or deleting empty patient dirs (1 hour)
+)
 # --- END CONFIGURATION ---
 
 PROGRESS_BAR_WIDTH = 28
@@ -129,8 +129,24 @@ shutdown_requested = False
 def signal_handler(signum, frame):
     """handle SIGINT and SIGTERM for graceful shutdown"""
     global shutdown_requested
+    if shutdown_requested:
+        # second signal - force exit immediately
+        logging.warning("Received second interrupt signal. Forcing exit...")
+        import os
+
+        os._exit(1)
     logging.info(f"Received signal {signum}. Shutting down gracefully...")
     shutdown_requested = True
+    # raise KeyboardInterrupt in main thread to interrupt blocking operations
+    import threading
+
+    if threading.current_thread() is threading.main_thread():
+        raise KeyboardInterrupt("Shutdown requested")
+    else:
+        # if in a worker thread, schedule KeyboardInterrupt in main thread
+        import _thread
+
+        _thread.interrupt_main()
 
 
 def setup_signal_handlers():
@@ -186,7 +202,7 @@ def _calculate_dir_size(path: Path) -> int:
 
 def _cleanup_empty_patient_dirs(dry_run: bool) -> int:
     """
-    remove empty patient directories from SRC_ROOT if older than EMPTY_DIR_MIN_AGE_SEC
+    remove empty patient directories from SRC_ROOT if older than STABILITY_THRESHOLD_SEC
 
     returns number of directories removed (or would be removed in dry_run mode)
     """
@@ -212,10 +228,10 @@ def _cleanup_empty_patient_dirs(dry_run: bool) -> int:
         except Exception:
             continue
 
-        if dir_age < EMPTY_DIR_MIN_AGE_SEC:
+        if dir_age < STABILITY_THRESHOLD_SEC:
             logging.debug(
                 f"SKIP EMPTY DIR: {d.name} too recent ({dir_age / 60:.1f}min old, "
-                f"need {EMPTY_DIR_MIN_AGE_SEC / 60:.1f}min)"
+                f"need {STABILITY_THRESHOLD_SEC / 60:.1f}min)"
             )
             continue
 
@@ -824,6 +840,8 @@ def _collect_pending_exams(
         src_path, patient_id = item
 
         # stability check first (slow - walks SMB, but we need size anyway)
+        # use STABILITY_THRESHOLD_SEC to ensure directory hasn't been touched recently
+        # (might still be transferring in)
         is_stable, most_recent_age = _is_exam_stable(src_path, STABILITY_THRESHOLD_SEC)
         if not is_stable:
             return ("unstable", src_path, patient_id, 0, most_recent_age)
