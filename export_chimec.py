@@ -14,14 +14,14 @@ import pandas as pd
 
 from export_utils import (
     MERGE_KEY_COLUMNS,
-    USERNAME,
     PASSWORD,
+    USERNAME,
+    audit_remote_export_status,
+    execute_downloads,
     get_base_modality,
+    identify_download_targets,
     import_scrape_ibroker,
     parse_wait_interval,
-    identify_download_targets,
-    execute_downloads,
-    audit_remote_export_status,
     save_current_state,
 )
 from filesystem_utils import update_metadata_with_disk_status_by_date
@@ -30,7 +30,8 @@ from filesystem_utils import update_metadata_with_disk_status_by_date
 CHIMEC_PATIENTS_FILE = "/gpfs/data/phs/groups/Projects/Huo_projects/SPORE/annawoodard/List_ChiMEC_priority_2025July30.csv"
 CHIMEC_KEY_FILE = "/gpfs/data/huo-lab/Image/ChiMEC/study-16352a.csv"
 CHIMEC_METADATA_FILE = "data/imaging_metadata.csv"
-CHIMEC_EXPORT_STATE_FILE = Path("data/export_state.csv")
+CHIMEC_EXPORT_STATE_FILE = Path("data/export_state_chimec.csv")
+CHIMEC_FINGERPRINT_CACHE = Path("data/destination_fingerprints_chimec.json")
 CHIMEC_BASE_DOWNLOAD_DIR = "/gpfs/data/huo-lab/Image/ChiMEC/"
 
 
@@ -236,7 +237,9 @@ def run_export_cycle(args, cycle_number: int):
     print(cycle_banner)
 
     db = load_chimec_data()
-    db = update_metadata_with_disk_status_by_date(db, conservative=True)
+    db = update_metadata_with_disk_status_by_date(
+        db, conservative=True, fingerprint_cache=CHIMEC_FINGERPRINT_CACHE
+    )
 
     filter_by_genotyping = not args.no_genotyping_filter
     targets = identify_download_targets(
@@ -356,7 +359,9 @@ def refresh_export_status(
     )
 
     refresh_db = load_chimec_data()
-    refresh_db = update_metadata_with_disk_status_by_date(refresh_db, conservative=True)
+    refresh_db = update_metadata_with_disk_status_by_date(
+        refresh_db, conservative=True, fingerprint_cache=CHIMEC_FINGERPRINT_CACHE
+    )
 
     modality = args.modality.upper()
     base_modality = refresh_db.get("base_modality")
@@ -499,7 +504,9 @@ def main():
     if args.status_only:
         print("Running in --status-only mode (no exports will be performed)\n")
         db = load_chimec_data()
-        db = update_metadata_with_disk_status_by_date(db, conservative=True)
+        db = update_metadata_with_disk_status_by_date(
+            db, conservative=True, fingerprint_cache=CHIMEC_FINGERPRINT_CACHE
+        )
         filter_by_genotyping = not args.no_genotyping_filter
         identify_download_targets(
             db,

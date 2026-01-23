@@ -24,6 +24,11 @@ python analyze_mirai.py \
   --out-dir /prima/mirai-prep \
   --out /prima/mirai-prep/summary.json
 
+# with QC filtering (recommended)
+python analyze_mirai.py \
+  --out-dir /prima/mirai-prep \
+  --qc-file data/qc_status.json
+
 Expects validation_output.csv and mirai_manifest.csv in --out-dir.
 
 Requirements
@@ -92,6 +97,7 @@ class Config:
     colmap: dict[int, str] | None
     cindex_col: str | None
     kfold: int | None
+    qc_file: Path | None
 
 
 @dataclass(frozen=True)
@@ -376,6 +382,100 @@ def _load_enriched_manifest(cfg: Config) -> pd.DataFrame:
     return meta
 
 
+def _apply_auto_exclude_filters(
+    df: pd.DataFrame, views_path: Path, tags_path: Path
+) -> tuple[pd.DataFrame, int]:
+    """apply automatic exclusion filters from qc_auto_exclude.json
+
+    Args:
+        df: dataframe with exam_id column
+        views_path: path to views.parquet
+        tags_path: path to dicom_tags.parquet
+
+    Returns:
+        (filtered_df, num_excluded)
+    """
+    import json
+
+    auto_exclude_config = Path("data/qc_auto_exclude.json")
+    if not auto_exclude_config.exists():
+        return df, 0
+
+    with open(auto_exclude_config) as f:
+        config = json.load(f)
+
+    auto_filters = config.get("filters", [])
+    if not auto_filters:
+        return df, 0
+
+    # load data
+    views = pd.read_parquet(views_path)
+    tags = pd.read_parquet(tags_path)
+    merged = views.merge(tags, on="sop_instance_uid", how="left")
+
+    excluded_exams = set()
+
+    for filter_name in auto_filters:
+        if (
+            filter_name == "gems_ffdm_tc1"
+            and "AcquisitionDeviceProcessingCode" in merged.columns
+        ):
+            gems = merged[
+                merged["AcquisitionDeviceProcessingCode"] == "GEMS_FFDM_TC_1"
+            ]["exam_id"].unique()
+            excluded_exams.update(gems)
+        elif filter_name == "has_implant" and "has_implant" in views.columns:
+            implants = views[views["has_implant"]]["exam_id"].unique()
+            excluded_exams.update(implants)
+        elif filter_name == "scanned_film":
+            film_exams = set()
+            if "SOPClassUID" in merged.columns:
+                secondary = merged[
+                    merged["SOPClassUID"].str.contains(
+                        "1.2.840.10008.5.1.4.1.1.7", na=False
+                    )
+                ]["exam_id"].unique()
+                film_exams.update(secondary)
+            # R2 DigitalNow film digitizer
+            r2_film = views[
+                views["device_manufacturer"].str.contains(
+                    "R2 Technology", na=False, case=False
+                )
+                | views["device_model"].str.contains("DigitalNow", na=False, case=False)
+            ]["exam_id"].unique()
+            film_exams.update(r2_film)
+            excluded_exams.update(film_exams)
+
+    if excluded_exams:
+        filtered_df = df[~df["exam_id"].isin(excluded_exams)].copy()
+        return filtered_df, len(excluded_exams)
+
+    return df, 0
+
+
+def _load_qc_filter(qc_file: Path | None) -> set[str]:
+    """load manual QC decisions and return set of exam IDs to exclude.
+
+    Args:
+        qc_file: path to qc_status.json
+
+    Returns:
+        set of exam_id strings manually marked as "bad" or "review"
+    """
+    if qc_file is None or not qc_file.exists():
+        return set()
+
+    import json
+
+    with open(qc_file) as f:
+        qc_data = json.load(f)
+
+    # exclude exams manually marked as bad or needing review
+    # (auto_excluded is handled separately by _apply_auto_exclude_filters)
+    excluded = {eid for eid, status in qc_data.items() if status in ("bad", "review")}
+    return excluded
+
+
 def _load_exam_data(cfg: Config) -> ExamData:
     """load predictions merged with metadata, aggregated per exam"""
 
@@ -430,6 +530,33 @@ def _load_exam_data(cfg: Config) -> ExamData:
         agg_dict["split_group"] = "first"
 
     df_exam = df.groupby(["patient_id", "exam_id"], as_index=False).agg(agg_dict)
+
+    # always apply auto-exclude filters
+    views_path = cfg.pred_csv.parent.parent / "sot" / "views.parquet"
+    tags_path = cfg.pred_csv.parent.parent / "sot" / "dicom_tags.parquet"
+
+    if views_path.exists() and tags_path.exists():
+        df_exam, num_auto_excluded = _apply_auto_exclude_filters(
+            df_exam, views_path, tags_path
+        )
+        df, _ = _apply_auto_exclude_filters(df, views_path, tags_path)
+
+        if num_auto_excluded > 0:
+            print(f"Auto-exclude filters: excluded {num_auto_excluded} exams")
+            print("  (from data/qc_auto_exclude.json)")
+            print()
+
+    # apply manual QC filter if provided
+    qc_excluded = _load_qc_filter(cfg.qc_file)
+    if qc_excluded:
+        before_qc = len(df_exam)
+        df_exam = df_exam[~df_exam["exam_id"].isin(qc_excluded)].copy()
+        df = df[~df["exam_id"].isin(qc_excluded)].copy()
+        print(
+            f"Manual QC filter: excluded {before_qc - len(df_exam)} exams marked as 'bad' or 'review'"
+        )
+        print(f"  Remaining: {len(df_exam)} exams")
+        print()
 
     return ExamData(
         merged_views=df,
@@ -575,6 +702,12 @@ def parse_args() -> Config:
         type=int,
         help="k-fold CV for IPCW sensitivity analysis (e.g., 5); splits at patient level",
     )
+    p.add_argument(
+        "--qc-file",
+        dest="qc_file",
+        type=Path,
+        help="path to qc_status.json; exams marked 'bad', 'review', or 'auto_excluded' will be excluded from analysis",
+    )
     args = p.parse_args()
     colmap = _parse_map(args.map_kv) if args.map_kv else None
 
@@ -591,6 +724,7 @@ def parse_args() -> Config:
         colmap=colmap,
         cindex_col=args.cindex_col,
         kfold=args.kfold,
+        qc_file=args.qc_file,
     )
 
 

@@ -483,10 +483,19 @@ Creates plots in `plots/` including download status, scans per patient distribut
 
 Interactively review and mark mammogram exams for quality control. Generates combined 4-view figures (L CC, L MLO, R CC, R MLO) with an HTML gallery.
 
+#### Recommended workflow: Prioritize low-performing exams
+
 ```bash
-# server mode (recommended for remote work)
-python qc_gallery.py --serve --max-exams 100 --random
+# prioritize worst-performing exams for efficient QC
+python qc_gallery.py --serve --max-exams 100 --prioritize-errors \
+  --pred-csv /gpfs/data/huo-lab/Image/ChiMEC/MG/out/validation_output.csv \
+  --meta-csv /gpfs/data/huo-lab/Image/ChiMEC/MG/out/mirai_manifest.csv
 ```
+
+This will:
+1. Compute prediction error scores for each exam
+2. Show you the worst-performing exams first (missed cancers, false alarms)
+3. Weight misclassified cases 2x so you see them immediately
 
 For remote access, set up SSH port forwarding:
 ```bash
@@ -494,18 +503,115 @@ ssh -L 5000:localhost:5000 user@remote-host
 ```
 Then open `http://localhost:5000/` in your browser.
 
-QC workflow:
+#### QC workflow: Iterative pattern discovery (for large datasets)
+
+For large datasets (e.g., 18k exams), use an iterative approach:
+
+**Batch 1: Initial QC (100 worst-performing exams)**
+```bash
+# QC first batch prioritized by prediction error
+python qc_gallery.py --serve --max-exams 100 --prioritize-errors \
+  --pred-csv /gpfs/data/huo-lab/Image/ChiMEC/MG/out/validation_output.csv \
+  --meta-csv /gpfs/data/huo-lab/Image/ChiMEC/MG/out/mirai_manifest.csv
+```
+
+**Analyze patterns:**
+```bash
+# After QC'ing 20-50 exams, analyze what makes bad exams bad
+python analyze_qc_patterns.py --qc-file data/qc_status.json
+
+# This will print:
+# - DICOM tags that differ between bad and good exams
+# - Suggested filters (e.g., "Exclude if PositionerPrimaryAngle < 0")
+# - Known problematic patterns (implants, scanned film, positioning issues)
+# - Device models with high failure rates
+```
+
+**Test filter hypotheses (streamlined workflow):**
+```bash
+# Step 1: Test filters and generate exam lists
+python test_positioning_filters.py --max-samples 20
+
+# Output shows:
+# - How many exams each filter catches
+# - Saves exam IDs to data/filter_tests/*.txt
+
+# Step 2: QC ALL flagged exams at once (easy!)
+python qc_gallery.py --serve --exam-list data/filter_tests/all_flagged_exams.txt
+
+# Or QC specific filter category:
+python qc_gallery.py --serve --exam-list data/filter_tests/negative_positioner_angle_exams.txt
+python qc_gallery.py --serve --exam-list data/filter_tests/scanned_film_exams.txt
+
+# Step 3: After QC, analyze which filters worked
+python analyze_qc_patterns.py
+```
+
+**Batch 2+: Apply validated filters and repeat**
+
+After validating a filter catches only bad exams:
+
+1. **Add to auto-exclude config** (one line edit):
+```bash
+# Edit data/qc_auto_exclude.json
+{
+  "filters": ["gems_ffdm_tc1"]  # add validated filter names here
+}
+```
+
+2. **Restart server** - those exams automatically excluded:
+```bash
+python qc_gallery.py --serve --max-exams 100 --prioritize-errors \
+  --pred-csv ... --meta-csv ...
+# GEMS exams now auto-skipped, marked as "auto_excluded"
+```
+
+3. **View cutflow** (click "📊 Cutflow" button in browser):
+- See how many exams each filter excludes
+- See filter effectiveness (precision/recall)
+- Validate filters before adding to config
+
+**Warning**: Only add filters with >95% precision! Check cutflow first.
+
+With server running, you can also dynamically test filters:
+- Use dropdown to preview a filter
+- Click "Apply Filter" to see those exams
+- Manually QC the batch
+- If validated → add to `qc_auto_exclude.json`
+
+**Standard QC controls:**
 1. Mark exams using keyboard shortcuts: `G` = Good, `R` = Needs review, `B` = Bad, Arrow keys = Navigate
 2. QC status auto-saves to `data/qc_status.json`
-3. Re-run the script to continue — exams marked "good" are automatically skipped
+3. Re-run the script to continue — by default, exams marked "good" or "bad" are automatically skipped
+4. Apply QC filter in downstream analysis with `--qc-file` argument (see below)
 
-Common options:
+**Default behavior**: Future QC runs skip exams marked as "good" (already approved) or "bad" (already rejected), showing only "review" and unmarked exams.
+
+#### Alternative: Random sampling (if no predictions yet)
+
+```bash
+# server mode (recommended for remote work)
+python qc_gallery.py --serve --max-exams 100 --random
+```
+
+#### Common options
+
 ```bash
 # custom port
 python qc_gallery.py --serve --port 8080
 
 # filter to specific patient
 python qc_gallery.py --serve --patient 12345
+
+# re-visit exams previously marked as "bad"
+python qc_gallery.py --serve --max-exams 100 --qc-skip-status good
+
+# only show completely unmarked exams (skip all QC'd exams)
+python qc_gallery.py --serve --max-exams 100 --qc-skip-status good bad review
+
+# use different prediction horizon for error scoring (default: 5 years)
+python qc_gallery.py --serve --prioritize-errors --horizon 3 \
+  --pred-csv ... --meta-csv ...
 
 # custom paths
 python qc_gallery.py \
@@ -516,8 +622,39 @@ python qc_gallery.py \
   --qc-file /path/to/my_qc_status.json
 ```
 
-Local mode (without server):
+#### Local mode (without server)
+
 ```bash
 python qc_gallery.py --max-exams 10
 # then open qc_output/gallery.html
 ```
+
+### Applying QC filters to analysis
+
+After QC, exclude failed exams from downstream analysis by passing `--qc-file`:
+
+```bash
+# analyze_mirai.py with QC filtering
+python analyze_mirai.py \
+  --out-dir /gpfs/data/huo-lab/Image/ChiMEC/MG/out \
+  --qc-file data/qc_status.json
+```
+
+**QC filter behavior**:
+
+In future QC runs (default: `--qc-skip-status good bad`):
+- Exams marked `"good"` or `"bad"` are skipped (already decided)
+- Exams marked `"review"` or unmarked are shown (need attention)
+- To re-visit "bad" exams: `--qc-skip-status good`
+
+In downstream analysis (`analyze_mirai.py --qc-file`):
+- Exams marked `"bad"` or `"review"` are excluded from metrics
+- Exams marked `"good"` or unmarked are included
+- Original `validation_output.csv` remains unchanged
+- QC decisions stored separately in `qc_status.json`
+
+This design allows you to:
+- Efficiently QC by not showing already-decided exams
+- Re-run QC with different criteria
+- Audit what was excluded
+- Easily revert filtering decisions

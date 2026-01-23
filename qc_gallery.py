@@ -21,7 +21,8 @@ QC Workflow
 1. Run script with --serve flag to generate gallery and start HTTP server
 2. Open gallery in browser (with SSH port forwarding if remote)
 3. Mark exams using keyboard (G/R/B) or buttons - auto-saves to server after each click
-4. Re-run script to continue QC on remaining exams (already-marked "good" exams skipped)
+4. Re-run script to continue QC on remaining exams (by default, "good" and "bad" exams skipped)
+5. To re-visit "bad" exams: use --qc-skip-status good
 
 Server mode (recommended for remote work):
   python qc_gallery.py --serve --max-exams 100 --random
@@ -36,6 +37,17 @@ Usage
 -----
 # start QC session with HTTP server (recommended for remote work)
 python qc_gallery.py --serve --max-exams 100 --random
+
+# prioritize worst-performing exams for efficient QC (recommended!)
+python qc_gallery.py --serve --max-exams 100 --prioritize-errors \
+  --pred-csv /path/to/validation_output.csv \
+  --meta-csv /path/to/mirai_manifest.csv
+
+# re-visit exams previously marked as "bad"
+python qc_gallery.py --serve --max-exams 100 --qc-skip-status good
+
+# only show completely unmarked exams (skip all QC'd exams)
+python qc_gallery.py --serve --max-exams 100 --qc-skip-status good bad review
 
 # QC without server (downloads file on each click)
 python qc_gallery.py --max-exams 10 --random
@@ -56,14 +68,16 @@ import json
 import logging
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import pydicom
 from pydicom.dataset import FileDataset
 from pydicom.tag import Tag
+from sklearn.metrics import roc_curve
 from tqdm import tqdm
 
 # logging
@@ -78,6 +92,9 @@ logger = logging.getLogger(__name__)
 # global variables for HTTP server
 QC_FILE_PATH = None
 OUTPUT_DIR = None
+FILTER_DIR = None
+VIEWS_PATH = None
+TAGS_PATH = None
 
 
 class QCGalleryHandler(SimpleHTTPRequestHandler):
@@ -100,6 +117,73 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                 self.wfile.write(json.dumps(qc_data).encode())
             else:
                 self.wfile.write(b"{}")
+            return
+
+        if parsed_path.path == "/list-filters":
+            # list available filter files
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+            filters = []
+            if FILTER_DIR and FILTER_DIR.exists():
+                for f in FILTER_DIR.glob("*.txt"):
+                    filters.append(
+                        {
+                            "name": f.stem.replace("_", " ").title(),
+                            "path": str(f),
+                            "filename": f.name,
+                        }
+                    )
+            self.wfile.write(json.dumps(filters).encode())
+            return
+
+        if parsed_path.path.startswith("/load-filter/"):
+            # load specific filter file
+            filename = parsed_path.path.split("/load-filter/", 1)[1]
+
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+            if FILTER_DIR:
+                filter_path = FILTER_DIR / filename
+
+                if filter_path.exists():
+                    with open(filter_path) as f:
+                        exam_ids = [
+                            line.strip()
+                            for line in f
+                            if line.strip() and not line.startswith("#")
+                        ]
+                    self.wfile.write(json.dumps({"exam_ids": exam_ids}).encode())
+                else:
+                    self.wfile.write(
+                        json.dumps({"error": f"File not found: {filter_path}"}).encode()
+                    )
+            else:
+                self.wfile.write(
+                    json.dumps({"error": "Filter directory not configured"}).encode()
+                )
+            return
+
+        if parsed_path.path == "/cutflow":
+            # compute and return cutflow analysis
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+            try:
+                cutflow_data = self._compute_cutflow()
+                self.wfile.write(json.dumps(cutflow_data).encode())
+            except Exception as e:
+                import traceback
+
+                traceback.print_exc()
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
             return
 
         # silently ignore favicon requests
@@ -150,6 +234,140 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
+    def _compute_cutflow(self):
+        """compute cutflow analysis on demand"""
+        if not VIEWS_PATH or not TAGS_PATH:
+            return {"error": "Views/tags paths not configured"}
+
+        views_df = pd.read_parquet(VIEWS_PATH)
+        tags_df = pd.read_parquet(TAGS_PATH)
+        merged = views_df.merge(tags_df, on="sop_instance_uid", how="left")
+        exam_df = merged.groupby("exam_id").first().reset_index()
+
+        total_exams = len(exam_df)
+
+        # load QC data
+        qc_data = {}
+        if QC_FILE_PATH and QC_FILE_PATH.exists():
+            with open(QC_FILE_PATH) as f:
+                qc_data = json.load(f)
+
+        cutflow = []
+        excluded_exams = set()
+        filter_sets = {}
+
+        # Starting point
+        cutflow.append(
+            {
+                "step": "0. Total",
+                "filter": "All exams in dataset",
+                "exams_excluded_this_step": 0,
+                "total_excluded": 0,
+                "exams_remaining": total_exams,
+                "percent_remaining": 100.0,
+            }
+        )
+
+        # Apply filters
+        if "has_implant" in views_df.columns:
+            implant_exams = set(views_df[views_df["has_implant"]]["exam_id"].unique())
+            excluded_exams.update(implant_exams)
+            filter_sets["has_implant"] = implant_exams
+            cutflow.append(
+                {
+                    "step": "1. Implants",
+                    "filter": "has_implant == True",
+                    "exams_excluded_this_step": len(implant_exams),
+                    "total_excluded": len(excluded_exams),
+                    "exams_remaining": total_exams - len(excluded_exams),
+                    "percent_remaining": (total_exams - len(excluded_exams))
+                    / total_exams
+                    * 100,
+                }
+            )
+
+        if "SOPClassUID" in merged.columns:
+            film_mask = merged["SOPClassUID"].str.contains(
+                "1.2.840.10008.5.1.4.1.1.7", na=False
+            )
+            film_exams = set(merged[film_mask]["exam_id"].unique())
+            new_excluded = film_exams - excluded_exams
+            excluded_exams.update(film_exams)
+            filter_sets["scanned_film"] = film_exams
+            cutflow.append(
+                {
+                    "step": "2. Scanned Film",
+                    "filter": "Secondary Capture",
+                    "exams_excluded_this_step": len(new_excluded),
+                    "total_excluded": len(excluded_exams),
+                    "exams_remaining": total_exams - len(excluded_exams),
+                    "percent_remaining": (total_exams - len(excluded_exams))
+                    / total_exams
+                    * 100,
+                }
+            )
+
+        if "AcquisitionDeviceProcessingCode" in merged.columns:
+            gems_mask = merged["AcquisitionDeviceProcessingCode"] == "GEMS_FFDM_TC_1"
+            gems_exams = set(merged[gems_mask]["exam_id"].unique())
+            new_excluded = gems_exams - excluded_exams
+            excluded_exams.update(gems_exams)
+            filter_sets["gems_ffdm_tc1"] = gems_exams
+            cutflow.append(
+                {
+                    "step": "3. GEMS",
+                    "filter": "GE Senograph 2000D (GEMS_FFDM_TC_1)",
+                    "exams_excluded_this_step": len(new_excluded),
+                    "total_excluded": len(excluded_exams),
+                    "exams_remaining": total_exams - len(excluded_exams),
+                    "percent_remaining": (total_exams - len(excluded_exams))
+                    / total_exams
+                    * 100,
+                }
+            )
+
+        # Compute filter effectiveness if we have QC data
+        filter_effectiveness = None
+        summary = None
+
+        if qc_data:
+            bad_exams = {eid for eid, status in qc_data.items() if status == "bad"}
+            good_exams = {eid for eid, status in qc_data.items() if status == "good"}
+
+            effectiveness = []
+            total_caught = set()
+
+            for filter_name, filter_exams in filter_sets.items():
+                caught_bad = bad_exams & filter_exams
+                caught_good = good_exams & filter_exams
+                total_caught.update(caught_bad)
+
+                if len(caught_bad) > 0 or len(caught_good) > 0:
+                    precision = len(caught_bad) / (len(caught_bad) + len(caught_good))
+                    effectiveness.append(
+                        {
+                            "filter": filter_name,
+                            "bad_caught": len(caught_bad),
+                            "good_caught": len(caught_good),
+                            "precision": precision,
+                        }
+                    )
+
+            filter_effectiveness = sorted(
+                effectiveness, key=lambda x: x["bad_caught"], reverse=True
+            )
+            summary = {
+                "total_bad": len(bad_exams),
+                "caught_by_filters": len(total_caught),
+            }
+
+        return {
+            "total_exams": total_exams,
+            "cutflow": cutflow,
+            "filter_effectiveness": filter_effectiveness,
+            "summary": summary,
+        }
+
     def log_message(self, format, *args):
         """override to use our logger."""
         # skip logging favicon requests
@@ -158,7 +376,13 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
         logger.info(f"HTTP: {format % args}")
 
 
-def start_qc_server(output_dir: Path, qc_file: Path, port: int = 5000) -> None:
+def start_qc_server(
+    output_dir: Path,
+    qc_file: Path,
+    views_path: Path,
+    tags_path: Path,
+    port: int = 5000,
+) -> None:
     """start HTTP server to serve gallery and handle QC saves.
 
     parameters
@@ -167,13 +391,21 @@ def start_qc_server(output_dir: Path, qc_file: Path, port: int = 5000) -> None:
         directory containing gallery.html and images
     qc_file : Path
         path where QC data should be saved
+    views_path : Path
+        path to views.parquet (for cutflow)
+    tags_path : Path
+        path to dicom_tags.parquet (for cutflow)
     port : int
         port to listen on
     """
-    global QC_FILE_PATH, OUTPUT_DIR
+    global QC_FILE_PATH, OUTPUT_DIR, FILTER_DIR, VIEWS_PATH, TAGS_PATH
 
     QC_FILE_PATH = qc_file.resolve()
     OUTPUT_DIR = output_dir.resolve()
+    VIEWS_PATH = views_path.resolve()
+    TAGS_PATH = tags_path.resolve()
+    # store filter directory as absolute path before changing directory
+    FILTER_DIR = Path.cwd() / "data" / "filter_tests"
 
     # change to output directory so SimpleHTTPRequestHandler can serve files
     import os
@@ -184,15 +416,35 @@ def start_qc_server(output_dir: Path, qc_file: Path, port: int = 5000) -> None:
     server_address = ("", port)
     httpd = HTTPServer(server_address, QCGalleryHandler)
 
+    import os
+    import socket
+
+    hostname = socket.gethostname()
+    username = os.environ.get("USER", os.environ.get("USERNAME", "your_username"))
+
+    logger.info("=" * 60)
+    logger.info("QC SERVER STARTED")
+    logger.info("=" * 60)
     logger.info(f"QC file: {QC_FILE_PATH}")
     logger.info(f"Serving from: {OUTPUT_DIR}")
-    logger.info(f"Gallery URL: http://localhost:{port}/")
-    logger.info("=" * 60)
+    logger.info(f"Filter directory: {FILTER_DIR}")
+    if FILTER_DIR.exists():
+        filter_count = len(list(FILTER_DIR.glob("*.txt")))
+        logger.info(f"  → {filter_count} filter lists available in dropdown")
+    else:
+        logger.info("  → No filter lists found (run test_positioning_filters.py)")
+    logger.info("")
+    logger.info("FOR REMOTE ACCESS:")
+    logger.info("  1. In a NEW local terminal, run:")
+    logger.info(f"     ssh -L {port}:localhost:{port} {username}@{hostname}")
+    logger.info("  2. Open in your browser:")
+    logger.info(f"     http://localhost:{port}/")
+    logger.info("")
     logger.info("QC workflow:")
-    logger.info(f"  1. Open http://localhost:{port}/ in your browser")
-    logger.info("  2. Mark exams with G/R/B keys or buttons")
-    logger.info("  3. QC data auto-saves to server on each click")
-    logger.info("  4. Press Ctrl+C to stop server when done")
+    logger.info("  • Mark exams with G/R/B keys or arrow keys for navigation")
+    logger.info("  • Use dropdown to load filter lists (no restart needed!)")
+    logger.info("  • QC data auto-saves to server on each click")
+    logger.info("  • Press Ctrl+C to stop server when done")
     logger.info("=" * 60)
 
     if not (OUTPUT_DIR / "gallery.html").exists():
@@ -381,7 +633,7 @@ def _save_four_view_figure(
     patient_id: str,
     accession_number: str,
     exam_id: str,
-) -> bool:
+) -> Tuple[bool, bool]:
     """save a combined figure with all four views of an exam.
 
     Args:
@@ -392,8 +644,19 @@ def _save_four_view_figure(
         exam_id: exam identifier
 
     Returns:
-        True if successfully saved, False otherwise
+        (success: bool, was_cached: bool)
     """
+    # construct output path first to check if it exists
+    success_dir = debug_dir / "success"
+    patient_dir = success_dir / patient_id
+    accession_dir = patient_dir / accession_number
+    out_path = accession_dir / f"COMBINED_four_views_{exam_id}.png"
+
+    # if image already exists, skip regeneration
+    if out_path.exists():
+        logger.debug(f"    Using cached 4-view figure: {out_path.name}")
+        return True, True
+
     try:
         fig = plt.figure(figsize=(20, 5))
 
@@ -435,25 +698,157 @@ def _save_four_view_figure(
 
             ax.axis("off")
 
-        # save figure
-        success_dir = debug_dir / "success"
-        patient_dir = success_dir / patient_id
-        accession_dir = patient_dir / accession_number
+        # save figure (path already computed above for caching check)
         accession_dir.mkdir(parents=True, exist_ok=True)
-
-        out_path = accession_dir / f"COMBINED_four_views_{exam_id}.png"
         plt.tight_layout()
         plt.savefig(out_path, dpi=75, bbox_inches="tight")
         plt.close(fig)
 
         logger.debug(f"    Saved combined 4-view figure: {out_path.name}")
-        return True
+        return True, False
 
     except Exception as e:
         logger.warning(
             f"    Failed to save combined 4-view figure for exam {exam_id}: {e}"
         )
-        return False
+        return False, False
+
+
+def _compute_exam_error_scores(
+    views_df: pd.DataFrame,
+    pred_csv: Optional[Path],
+    meta_csv: Optional[Path],
+    horizon: int = 5,
+) -> pd.Series:
+    """compute prediction error score for each exam to prioritize QC.
+
+    Args:
+        views_df: dataframe with exam_id column
+        pred_csv: path to validation_output.csv with predictions
+        meta_csv: path to mirai_manifest.csv with labels
+        horizon: which prediction horizon to use for scoring (default: 5 years)
+
+    Returns:
+        series mapping exam_id to error score (higher = worse prediction)
+    """
+    if pred_csv is None or meta_csv is None:
+        logger.warning("no predictions provided; cannot prioritize by error score")
+        return pd.Series(dtype=float)
+
+    if not pred_csv.exists() or not meta_csv.exists():
+        logger.warning(f"prediction or metadata file not found: {pred_csv}, {meta_csv}")
+        return pd.Series(dtype=float)
+
+    try:
+        # load predictions
+        pred = pd.read_csv(pred_csv)
+        if {"patient_id", "exam_id"}.issubset(pred.columns):
+            pid = pred["patient_id"].astype(str)
+            eid = pred["exam_id"].astype(str)
+        elif "patient_exam_id" in pred.columns:
+            parts = (
+                pred["patient_exam_id"].astype(str).str.split("\t", n=1, expand=True)
+            )
+            pid = parts[0]
+            eid = parts[1]
+        else:
+            logger.warning("predictions missing patient_id/exam_id columns")
+            return pd.Series(dtype=float)
+
+        pred = pred.assign(patient_id=pid, exam_id=eid)
+
+        # load metadata
+        meta = (
+            pd.read_csv(meta_csv)
+            if meta_csv.suffix.lower() == ".csv"
+            else pd.read_parquet(meta_csv)
+        )
+
+        req = {"patient_id", "exam_id", "years_to_cancer", "years_to_last_followup"}
+        if not req.issubset(set(meta.columns)):
+            logger.warning(
+                f"metadata missing required columns: {req - set(meta.columns)}"
+            )
+            return pd.Series(dtype=float)
+
+        meta = meta.assign(
+            patient_id=meta["patient_id"].astype(str),
+            exam_id=meta["exam_id"].astype(str),
+        )
+
+        # merge predictions with metadata
+        df = pred.merge(meta, on=["patient_id", "exam_id"], how="inner")
+
+        # detect prediction column for this horizon
+        pred_col = None
+        for col in df.columns:
+            if f"{horizon}" in col and "risk" in col.lower():
+                pred_col = col
+                break
+
+        if pred_col is None:
+            logger.warning(f"no prediction column found for horizon {horizon}")
+            return pd.Series(dtype=float)
+
+        # aggregate per exam (mean prediction across views)
+        agg_dict = {
+            pred_col: "mean",
+            "years_to_cancer": "first",
+            "years_to_last_followup": "first",
+        }
+        df_exam = df.groupby(["patient_id", "exam_id"], as_index=False).agg(agg_dict)
+
+        # compute labels for this horizon
+        ytc = df_exam["years_to_cancer"].astype(float).to_numpy()
+        ylf = df_exam["years_to_last_followup"].astype(float).to_numpy()
+        scores = df_exam[pred_col].astype(float).to_numpy()
+
+        case = ytc <= horizon
+        ctrl = (ytc > horizon) & (ylf >= horizon)
+        include = case | ctrl
+
+        if include.sum() < 10:
+            logger.warning(f"insufficient samples with labels at horizon {horizon}")
+            return pd.Series(dtype=float)
+
+        y = case[include].astype(int)
+        s = scores[include]
+        exam_ids = df_exam["exam_id"].values[include]
+
+        # compute error magnitude: for each exam, how far is prediction from true label?
+        # higher error = worse prediction = higher priority for QC
+        # for cases (y=1): error = 1 - score (missed cases have low scores)
+        # for controls (y=0): error = score (false alarms have high scores)
+        errors = np.where(y == 1, 1.0 - s, s)
+
+        # additionally weight by distance from optimal threshold
+        # find optimal threshold (Youden's J statistic)
+        fpr, tpr, thresholds = roc_curve(y, s)
+        optimal_idx = np.argmax(tpr - fpr)
+        optimal_threshold = thresholds[optimal_idx]
+
+        # increase error for exams on the wrong side of threshold
+        misclassified = (s >= optimal_threshold) != (y == 1)
+        errors = np.where(misclassified, errors * 2.0, errors)
+
+        error_series = pd.Series(errors, index=exam_ids)
+
+        logger.info(
+            f"computed error scores for {len(error_series)} exams at {horizon}y horizon"
+        )
+        logger.info(
+            f"optimal threshold: {optimal_threshold:.3f}, "
+            f"misclassified: {misclassified.sum()}/{len(misclassified)}"
+        )
+
+        return error_series
+
+    except Exception as e:
+        logger.error(f"error computing exam error scores: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return pd.Series(dtype=float)
 
 
 def generate_gallery(
@@ -464,9 +859,16 @@ def generate_gallery(
     random_sample: bool = False,
     patient_id: Optional[str] = None,
     exam_id: Optional[str] = None,
+    exam_list_path: Optional[Path] = None,
     per_view: bool = False,
     no_gallery: bool = False,
     qc_file: Optional[Path] = None,
+    pred_csv: Optional[Path] = None,
+    meta_csv: Optional[Path] = None,
+    prioritize_errors: bool = False,
+    horizon: int = 5,
+    qc_skip_status: Optional[Set[str]] = None,
+    serve: bool = False,
 ) -> None:
     """generate interactive HTML gallery from processed views.
 
@@ -475,13 +877,22 @@ def generate_gallery(
         raw_dir: root directory where DICOMs are stored
         output_dir: output directory for figures and gallery
         max_exams: limit number of exams to visualize
-        random_sample: if True, sample randomly; else take first N
+        random_sample: if True, sample randomly; else take first N (or by error if prioritize_errors)
         patient_id: filter to specific patient
         exam_id: filter to specific exam
+        exam_list_path: path to text file with exam IDs (one per line) to review
         per_view: if True, also generate individual per-view debug figures
         no_gallery: if True, skip HTML gallery generation
-        qc_file: path to QC status file; exams marked "good" will be skipped
+        qc_file: path to QC status file; exams with status in qc_skip_status will be skipped
+        pred_csv: path to validation_output.csv with predictions (for error prioritization)
+        meta_csv: path to mirai_manifest.csv with labels (for error prioritization)
+        prioritize_errors: if True, sort by prediction error (worst first)
+        horizon: which prediction horizon to use for error scoring (default: 5 years)
+        qc_skip_status: set of QC statuses to skip (default: {"good", "bad"})
+        serve: if True, suppress non-server instructions in logging
     """
+    if qc_skip_status is None:
+        qc_skip_status = {"good", "bad"}
     # load existing QC data if available
     qc_data = {}
     if qc_file and qc_file.exists():
@@ -496,6 +907,90 @@ def generate_gallery(
         f"loaded {len(views_df)} views from {views_df['exam_id'].nunique()} exams"
     )
 
+    # apply auto-exclusions from config
+    auto_exclude_config = Path("data/qc_auto_exclude.json")
+    if auto_exclude_config.exists():
+        with open(auto_exclude_config) as f:
+            auto_config = json.load(f)
+
+        auto_filters = auto_config.get("filters", [])
+        if auto_filters:
+            logger.info(f"applying auto-exclusions: {', '.join(auto_filters)}")
+
+            # load tags to apply filters
+            tags_df = pd.read_parquet(raw_dir / "sot" / "dicom_tags.parquet")
+            merged = views_df.merge(tags_df, on="sop_instance_uid", how="left")
+
+            auto_excluded_exams = set()
+            for filter_name in auto_filters:
+                if (
+                    filter_name == "gems_ffdm_tc1"
+                    and "AcquisitionDeviceProcessingCode" in merged.columns
+                ):
+                    gems_exams = merged[
+                        merged["AcquisitionDeviceProcessingCode"] == "GEMS_FFDM_TC_1"
+                    ]["exam_id"].unique()
+                    auto_excluded_exams.update(gems_exams)
+                    logger.info(f"  {filter_name}: {len(gems_exams)} exams")
+                elif filter_name == "has_implant" and "has_implant" in views_df.columns:
+                    implant_exams = views_df[views_df["has_implant"]][
+                        "exam_id"
+                    ].unique()
+                    auto_excluded_exams.update(implant_exams)
+                    logger.info(f"  {filter_name}: {len(implant_exams)} exams")
+                elif filter_name == "scanned_film":
+                    film_exams = set()
+                    if "SOPClassUID" in merged.columns:
+                        secondary = merged[
+                            merged["SOPClassUID"].str.contains(
+                                "1.2.840.10008.5.1.4.1.1.7", na=False
+                            )
+                        ]["exam_id"].unique()
+                        film_exams.update(secondary)
+                    # R2 DigitalNow film digitizer
+                    r2_film = views_df[
+                        views_df["device_manufacturer"].str.contains(
+                            "R2 Technology", na=False, case=False
+                        )
+                        | views_df["device_model"].str.contains(
+                            "DigitalNow", na=False, case=False
+                        )
+                    ]["exam_id"].unique()
+                    film_exams.update(r2_film)
+                    auto_excluded_exams.update(film_exams)
+                    logger.info(f"  {filter_name}: {len(film_exams)} exams")
+                elif (
+                    filter_name == "negative_positioner_angle"
+                    and "PositionerPrimaryAngle" in merged.columns
+                ):
+                    angle = pd.to_numeric(
+                        merged["PositionerPrimaryAngle"], errors="coerce"
+                    )
+                    neg_exams = merged[angle < 0]["exam_id"].unique()
+                    auto_excluded_exams.update(neg_exams)
+                    logger.info(f"  {filter_name}: {len(neg_exams)} exams")
+                elif (
+                    filter_name == "zero_compression"
+                    and "CompressionForce" in merged.columns
+                ):
+                    comp = pd.to_numeric(merged["CompressionForce"], errors="coerce")
+                    zero_exams = merged[comp == 0]["exam_id"].unique()
+                    auto_excluded_exams.update(zero_exams)
+                    logger.info(f"  {filter_name}: {len(zero_exams)} exams")
+
+            if auto_excluded_exams:
+                before_count = views_df["exam_id"].nunique()
+                views_df = views_df[~views_df["exam_id"].isin(auto_excluded_exams)]
+                after_count = views_df["exam_id"].nunique()
+                logger.info(
+                    f"auto-excluded {before_count - after_count} exams total via config filters"
+                )
+
+                # mark these in QC data as auto-excluded (for tracking)
+                for eid in auto_excluded_exams:
+                    if eid not in qc_data:  # don't override manual QC
+                        qc_data[eid] = "auto_excluded"
+
     # filter by patient/exam if specified
     if patient_id:
         views_df = views_df[views_df["patient_id"] == patient_id]
@@ -507,26 +1002,79 @@ def generate_gallery(
         views_df = views_df[views_df["exam_id"] == exam_id]
         logger.info(f"filtered to exam {exam_id}: {len(views_df)} views")
 
-    # filter out exams already marked as "good" in QC
-    if qc_data:
-        good_exams = {eid for eid, status in qc_data.items() if status == "good"}
-        if good_exams:
-            before_count = views_df["exam_id"].nunique()
-            views_df = views_df[~views_df["exam_id"].isin(good_exams)]
-            after_count = views_df["exam_id"].nunique()
+    # filter by exam list if provided
+    if exam_list_path:
+        if exam_list_path.exists():
+            logger.info(f"loading exam list from {exam_list_path}")
+            with open(exam_list_path) as f:
+                # skip comment lines starting with #
+                exam_list = [
+                    line.strip()
+                    for line in f
+                    if line.strip() and not line.startswith("#")
+                ]
+            logger.info(f"loaded {len(exam_list)} exam IDs from list")
+            views_df = views_df[views_df["exam_id"].isin(exam_list)]
             logger.info(
-                f"filtered out {before_count - after_count} exams already marked 'good' in QC"
+                f"filtered to {views_df['exam_id'].nunique()} exams from list: {len(views_df)} views"
+            )
+        else:
+            logger.error(f"exam list file not found: {exam_list_path}")
+            return
+
+    # filter out exams with specified QC statuses
+    if qc_data and qc_skip_status:
+        skip_exams = {
+            eid for eid, status in qc_data.items() if status in qc_skip_status
+        }
+        if skip_exams:
+            before_count = views_df["exam_id"].nunique()
+            views_df = views_df[~views_df["exam_id"].isin(skip_exams)]
+            after_count = views_df["exam_id"].nunique()
+            status_str = ", ".join(f"'{s}'" for s in sorted(qc_skip_status))
+            logger.info(
+                f"filtered out {before_count - after_count} exams marked as {status_str} in QC"
             )
 
     if len(views_df) == 0:
         logger.error("no views to visualize after filtering")
         return
 
+    # compute error scores if requested
+    error_scores = pd.Series(dtype=float)
+    if prioritize_errors:
+        logger.info(
+            "computing prediction error scores to prioritize worst-performing exams..."
+        )
+        error_scores = _compute_exam_error_scores(
+            views_df, pred_csv, meta_csv, horizon=horizon
+        )
+        if len(error_scores) > 0:
+            # filter views to only exams with scores
+            views_df = views_df[views_df["exam_id"].isin(error_scores.index)]
+            logger.info(
+                f"filtered to {views_df['exam_id'].nunique()} exams with error scores"
+            )
+            # also filter error_scores to only exams in views_df
+            available_exam_ids = set(views_df["exam_id"].unique())
+            error_scores = error_scores[error_scores.index.isin(available_exam_ids)]
+            logger.info(
+                f"error scores available for {len(error_scores)} exams in views dataset"
+            )
+
     # sample exams if requested
     if max_exams:
         unique_exams = views_df["exam_id"].unique()
         if len(unique_exams) > max_exams:
-            if random_sample:
+            if prioritize_errors and len(error_scores) > 0:
+                # sort by error score (highest first), only from exams available in views
+                sorted_exams = error_scores.sort_values(ascending=False).index.tolist()
+                selected_exams = sorted_exams[:max_exams]
+                logger.info(
+                    f"selected top {max_exams} worst-performing exams from {len(unique_exams)} "
+                    f"(mean error: {error_scores[selected_exams].mean():.3f})"
+                )
+            elif random_sample:
                 selected_exams = (
                     pd.Series(unique_exams).sample(n=max_exams, random_state=42).values
                 )
@@ -545,69 +1093,135 @@ def generate_gallery(
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"output will be saved to: {output_dir}")
 
+    # first, identify which exams already have cached figures
+    logger.info("checking for cached figures...")
+    cached_exams = set()
+    exams_needing_generation = set()
+
+    for exam_id in views_df["exam_id"].unique():
+        exam_views = views_df[views_df["exam_id"] == exam_id]
+        if len(exam_views) == 0:
+            continue
+
+        row = exam_views.iloc[0]
+        patient_id = row["patient_id"]
+        accession = row.get("accession_number", "unknown")
+
+        # check if cached figure exists
+        success_dir = output_dir / "success"
+        cached_path = (
+            success_dir / patient_id / accession / f"COMBINED_four_views_{exam_id}.png"
+        )
+
+        if cached_path.exists():
+            cached_exams.add(exam_id)
+        else:
+            exams_needing_generation.add(exam_id)
+
+    logger.info(
+        f"found {len(cached_exams)} cached figures, need to generate {len(exams_needing_generation)}"
+    )
+
     # process each view and track by exam
     success_count = 0
     error_count = 0
-    combined_figure_count = 0
 
     # dict to track loaded views per exam: {exam_id: {view_key: (ds, path), ...}}
     exam_view_cache = {}
 
-    for idx, row in tqdm(
-        views_df.iterrows(), total=len(views_df), desc="loading DICOMs"
-    ):
-        try:
-            # construct full path to DICOM
-            dicom_path = Path(row["dicom_path"])
-            if not dicom_path.is_absolute():
-                dicom_path = raw_dir / dicom_path
+    # only load DICOMs for exams that need new figures
+    views_to_load = views_df[views_df["exam_id"].isin(exams_needing_generation)]
 
-            if not dicom_path.exists():
-                logger.warning(f"DICOM not found: {dicom_path}")
-                error_count += 1
-                continue
+    if len(views_to_load) > 0:
+        logger.info(f"loading DICOMs for {len(exams_needing_generation)} exams...")
+        for idx, row in tqdm(
+            views_to_load.iterrows(), total=len(views_to_load), desc="loading DICOMs"
+        ):
+            try:
+                # construct full path to DICOM
+                dicom_path = Path(row["dicom_path"])
+                if not dicom_path.is_absolute():
+                    dicom_path = raw_dir / dicom_path
 
-            # load DICOM
-            ds = pydicom.dcmread(str(dicom_path))
+                if not dicom_path.exists():
+                    logger.warning(f"DICOM not found: {dicom_path}")
+                    error_count += 1
+                    continue
 
-            # generate individual debug figure only if requested
-            if per_view:
-                view_label = f"{row['laterality']} {row['view']}"
-                _save_debug_figure(
-                    ds,
-                    dicom_path,
-                    "SUCCESS",
-                    view_label,
-                    output_dir,
-                    patient_id=row["patient_id"],
-                    exam_id=row["exam_id"],
-                    accession_number=row.get("accession_number", "unknown"),
+                # load DICOM
+                ds = pydicom.dcmread(str(dicom_path))
+
+                # generate individual debug figure only if requested
+                if per_view:
+                    view_label = f"{row['laterality']} {row['view']}"
+                    _save_debug_figure(
+                        ds,
+                        dicom_path,
+                        "SUCCESS",
+                        view_label,
+                        output_dir,
+                        patient_id=row["patient_id"],
+                        exam_id=row["exam_id"],
+                        accession_number=row.get("accession_number", "unknown"),
+                    )
+                success_count += 1
+
+                # cache view for combined figure
+                exam_key = row["exam_id"]
+                if exam_key not in exam_view_cache:
+                    exam_view_cache[exam_key] = {
+                        "patient_id": row["patient_id"],
+                        "accession_number": row.get("accession_number", "unknown"),
+                        "views": {},
+                    }
+
+                view_key = f"{row['laterality']}_{row['view']}"
+                exam_view_cache[exam_key]["views"][view_key] = (ds, dicom_path)
+
+            except Exception as e:
+                logger.error(
+                    f"error processing {row.get('dicom_path', 'unknown')}: {e}"
                 )
-            success_count += 1
+                error_count += 1
+    else:
+        logger.info("all figures cached, skipping DICOM loading")
 
-            # cache view for combined figure
-            exam_key = row["exam_id"]
-            if exam_key not in exam_view_cache:
-                exam_view_cache[exam_key] = {
-                    "patient_id": row["patient_id"],
-                    "accession_number": row.get("accession_number", "unknown"),
-                    "views": {},
-                }
-
-            view_key = f"{row['laterality']}_{row['view']}"
-            exam_view_cache[exam_key]["views"][view_key] = (ds, dicom_path)
-
-        except Exception as e:
-            logger.error(f"error processing {row.get('dicom_path', 'unknown')}: {e}")
-            error_count += 1
-
-    # generate combined 4-view figures for each exam
-    logger.info("generating combined 4-view figures...")
+    # generate combined 4-view figures for each exam (only those needing generation)
+    logger.info("processing figures...")
     combined_images = []  # track for HTML gallery
+    cached_count = len(cached_exams)
+    generated_count = 0
 
-    for exam_key, exam_data in tqdm(exam_view_cache.items(), desc="combined figures"):
+    # first, add cached exams to gallery list
+    for exam_id in cached_exams:
+        exam_views = views_df[views_df["exam_id"] == exam_id]
+        if len(exam_views) == 0:
+            continue
+
+        row = exam_views.iloc[0]
+        patient_id = row["patient_id"]
+        accession = row.get("accession_number", "unknown")
+
+        success_dir = output_dir / "success"
+        img_path = (
+            success_dir / patient_id / accession / f"COMBINED_four_views_{exam_id}.png"
+        )
+
+        combined_images.append(
+            {
+                "path": img_path.relative_to(output_dir),
+                "patient_id": patient_id,
+                "exam_id": exam_id,
+                "accession": accession,
+                "num_views": len(exam_views),
+                "qc_status": qc_data.get(exam_id, ""),
+            }
+        )
+
+    # then, generate new figures for exams that need them
+    for exam_key, exam_data in tqdm(exam_view_cache.items(), desc="generating figures"):
         try:
-            success = _save_four_view_figure(
+            success, was_cached = _save_four_view_figure(
                 view_data=exam_data["views"],
                 debug_dir=output_dir,
                 patient_id=exam_data["patient_id"],
@@ -616,7 +1230,11 @@ def generate_gallery(
             )
 
             if success:
-                combined_figure_count += 1
+                if was_cached:
+                    # shouldn't happen since we pre-filtered, but handle it
+                    cached_count += 1
+                else:
+                    generated_count += 1
 
                 # track for gallery only if save was successful
                 success_dir = output_dir / "success"
@@ -638,6 +1256,9 @@ def generate_gallery(
         except Exception as e:
             logger.error(f"error creating combined figure for exam {exam_key}: {e}")
 
+    # compute total figures
+    total_figures = cached_count + generated_count
+
     # generate HTML gallery
     if not no_gallery and combined_images:
         logger.info("generating HTML gallery...")
@@ -650,7 +1271,7 @@ def generate_gallery(
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>Mammogram QC - {combined_figure_count} exams</title>
+    <title>Mammogram QC - {total_figures} exams</title>
     <style>
         body {{
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -680,6 +1301,10 @@ def generate_gallery(
         .filter-controls {{
             flex-grow: 1;
             text-align: center;
+            display: flex;
+            gap: 10px;
+            justify-content: center;
+            align-items: center;
         }}
         .filter-controls input {{
             padding: 6px 12px;
@@ -688,11 +1313,39 @@ def generate_gallery(
             border-radius: 4px;
             background-color: #1e1e1e;
             color: #d4d4d4;
-            width: 300px;
+            width: 250px;
         }}
         .filter-controls input:focus {{
             outline: none;
             border-color: #4ec9b0;
+        }}
+        .filter-controls select {{
+            padding: 6px 12px;
+            font-size: 14px;
+            border: 1px solid #3e3e42;
+            border-radius: 4px;
+            background-color: #1e1e1e;
+            color: #d4d4d4;
+            cursor: pointer;
+        }}
+        .filter-controls select:focus {{
+            outline: none;
+            border-color: #4ec9b0;
+        }}
+        .filter-controls button {{
+            padding: 6px 12px;
+            font-size: 13px;
+            border: 1px solid #3e3e42;
+            border-radius: 4px;
+            background-color: #252526;
+            color: #d4d4d4;
+            cursor: pointer;
+            transition: all 0.2s;
+        }}
+        .filter-controls button:hover {{
+            background-color: #4ec9b0;
+            border-color: #4ec9b0;
+            color: #1e1e1e;
         }}
         .nav-buttons {{
             display: flex;
@@ -812,17 +1465,96 @@ def generate_gallery(
             border-radius: 4px;
             object-fit: contain;
         }}
+        .info-button {{
+            padding: 6px 12px;
+            font-size: 13px;
+            border: 1px solid #3e3e42;
+            border-radius: 4px;
+            background-color: #252526;
+            color: #9cdcfe;
+            cursor: pointer;
+            transition: all 0.2s;
+        }}
+        .info-button:hover {{
+            background-color: #3e3e42;
+        }}
+        .modal {{
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.8);
+        }}
+        .modal-content {{
+            background-color: #252526;
+            margin: 5% auto;
+            padding: 20px;
+            border: 1px solid #3e3e42;
+            border-radius: 8px;
+            width: 80%;
+            max-width: 900px;
+            max-height: 80vh;
+            overflow-y: auto;
+            color: #d4d4d4;
+        }}
+        .modal-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #3e3e42;
+        }}
+        .close {{
+            color: #d4d4d4;
+            font-size: 28px;
+            font-weight: bold;
+            cursor: pointer;
+        }}
+        .close:hover {{
+            color: #4ec9b0;
+        }}
+        .cutflow-table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }}
+        .cutflow-table th {{
+            background-color: #1e1e1e;
+            padding: 8px;
+            text-align: left;
+            border: 1px solid #3e3e42;
+            color: #4ec9b0;
+        }}
+        .cutflow-table td {{
+            padding: 8px;
+            border: 1px solid #3e3e42;
+        }}
+        .cutflow-table tr:hover {{
+            background-color: #2d2d30;
+        }}
     </style>
 </head>
 <body>
     <div class="container">
         <div class="controls">
             <div class="stats" id="stats">
-                {combined_figure_count} exams | {success_count} views loaded
+                {total_figures} exams
+            </div>
+            <div style="display: flex; gap: 5px;">
+                <button class="info-button" onclick="showCutflow()">📊 Cutflow</button>
             </div>
             <div class="filter-controls">
                 <input type="text" id="searchBox" placeholder="Filter by patient ID, exam ID, or accession..." 
                        onkeyup="filterGallery()">
+                <select id="filterSelect" onfocus="loadAvailableFilters()">
+                    <option value="">Load filter list...</option>
+                </select>
+                <button onclick="loadSelectedFilter()">Apply Filter</button>
+                <button onclick="clearExamFilter()">Clear Filter</button>
             </div>
             <div class="nav-buttons">
                 <button id="prevBtn" onclick="navigate(-1)">← Previous</button>
@@ -830,6 +1562,19 @@ def generate_gallery(
             </div>
         </div>
         <div class="viewer" id="viewer">
+        </div>
+    </div>
+    
+    <!-- Cutflow Modal -->
+    <div id="cutflowModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>QC Cutflow Analysis</h2>
+                <span class="close" onclick="closeCutflow()">&times;</span>
+            </div>
+            <div id="cutflowContent">
+                Loading...
+            </div>
         </div>
     </div>
     
@@ -860,6 +1605,7 @@ def generate_gallery(
         
         let filteredExams = [...allExams];
         let currentIndex = 0;
+        let activeExamFilter = null; // track active exam ID filter
         
         // track QC decisions (exam_id -> status)
         let qcData = {{}};
@@ -912,21 +1658,93 @@ def generate_gallery(
             navigate(1);
         }}
         
-        function filterGallery() {{
+        function skipExam() {{
+            // skip without marking - just advance
+            navigate(1);
+        }}
+        
+        function loadAvailableFilters() {{
+            fetch('/list-filters')
+                .then(response => response.json())
+                .then(filters => {{
+                    const select = document.getElementById('filterSelect');
+                    // keep the default option
+                    select.innerHTML = '<option value="">Load filter list...</option>';
+                    filters.forEach(filter => {{
+                        const option = document.createElement('option');
+                        option.value = filter.filename;
+                        option.textContent = filter.name;
+                        select.appendChild(option);
+                    }});
+                    console.log(`Loaded ${{filters.length}} filter options`);
+                }})
+                .catch(error => {{
+                    console.error('Failed to load filter list:', error);
+                }});
+        }}
+        
+        function loadSelectedFilter() {{
+            const select = document.getElementById('filterSelect');
+            const filename = select.value;
+            
+            if (!filename) {{
+                alert('Please select a filter from the dropdown');
+                return;
+            }}
+            
+            fetch('/load-filter/' + filename)
+                .then(response => response.json())
+                .then(data => {{
+                    if (data.error) {{
+                        alert('Error loading filter: ' + data.error);
+                        return;
+                    }}
+                    
+                    const examIds = new Set(data.exam_ids);
+                    activeExamFilter = examIds;
+                    applyFilters();
+                    console.log(`Loaded filter with ${{examIds.size}} exam IDs`);
+                }})
+                .catch(error => {{
+                    alert('Failed to load filter: ' + error);
+                    console.error('Filter load error:', error);
+                }});
+        }}
+        
+        function clearExamFilter() {{
+            activeExamFilter = null;
+            document.getElementById('filterSelect').value = '';
+            applyFilters();
+            console.log('Cleared exam ID filter');
+        }}
+        
+        function applyFilters() {{
             const searchTerm = document.getElementById('searchBox').value.toLowerCase();
             
-            if (searchTerm === '') {{
-                filteredExams = [...allExams];
-            }} else {{
-                filteredExams = allExams.filter(exam => 
+            // start with all exams
+            let exams = [...allExams];
+            
+            // apply exam ID filter if active
+            if (activeExamFilter) {{
+                exams = exams.filter(exam => activeExamFilter.has(exam.exam_id));
+            }}
+            
+            // apply text search filter
+            if (searchTerm !== '') {{
+                exams = exams.filter(exam => 
                     exam.patient_id.toLowerCase().includes(searchTerm) ||
                     exam.exam_id.toLowerCase().includes(searchTerm) ||
                     exam.accession.toLowerCase().includes(searchTerm)
                 );
             }}
             
+            filteredExams = exams;
             currentIndex = 0;
             updateView();
+        }}
+        
+        function filterGallery() {{
+            applyFilters();
         }}
         
         function navigate(direction) {{
@@ -953,12 +1771,15 @@ def generate_gallery(
             const exam = filteredExams[currentIndex];
             const currentStatus = qcData[exam.exam_id] || '';
             
-            // count QC statuses
+            // count QC statuses for exams in current gallery
             const qcCounts = {{good: 0, review: 0, bad: 0, pending: 0}};
-            Object.values(qcData).forEach(status => {{
-                if (status in qcCounts) qcCounts[status]++;
+            allExams.forEach(exam => {{
+                const status = qcData[exam.exam_id];
+                if (status === 'good') qcCounts.good++;
+                else if (status === 'review') qcCounts.review++;
+                else if (status === 'bad') qcCounts.bad++;
+                else qcCounts.pending++;
             }});
-            qcCounts.pending = allExams.length - Object.keys(qcData).length;
             
             viewer.innerHTML = 
                 '<div class="exam-info">' +
@@ -974,15 +1795,21 @@ def generate_gallery(
                         'onclick="setQCStatus(\\'review\\')" title="Needs review">? Review [r]</button>' +
                     '<button class="qc-button bad' + (currentStatus === 'bad' ? ' active' : '') + '" ' +
                         'onclick="setQCStatus(\\'bad\\')" title="Mark as bad">✗ Bad [b]</button>' +
+                    '<button class="nav-buttons button" style="margin-left: 20px;" ' +
+                        'onclick="skipExam()" title="Skip without marking">⏭ Skip [s]</button>' +
                 '</div>' +
                 '<div class="image-container">' +
                     '<img src="' + exam.path + '" alt="Exam ' + exam.exam_id + '">' +
                 '</div>';
             
-            stats.textContent = (currentIndex + 1) + '/' + filteredExams.length + ' | ' + 
-                                allExams.length + ' total | ' +
-                                'QC: ' + qcCounts.good + ' good, ' + qcCounts.review + ' review, ' + 
-                                qcCounts.bad + ' bad, ' + qcCounts.pending + ' pending';
+            let statsText = (currentIndex + 1) + '/' + filteredExams.length;
+            if (activeExamFilter) {{
+                statsText += ' (filtered)';
+            }}
+            statsText += ' | ' + allExams.length + ' total | ' +
+                         'QC: ' + qcCounts.good + ' good, ' + qcCounts.review + ' review, ' + 
+                         qcCounts.bad + ' bad, ' + qcCounts.pending + ' pending';
+            stats.textContent = statsText;
             
             prevBtn.disabled = currentIndex === 0;
             nextBtn.disabled = currentIndex === filteredExams.length - 1;
@@ -1003,17 +1830,111 @@ def generate_gallery(
                 setQCStatus('review');
             }} else if (e.key === 'b') {{
                 setQCStatus('bad');
+            }} else if (e.key === 's') {{
+                skipExam();
             }}
         }});
         
+        function showCutflow() {{
+            const modal = document.getElementById('cutflowModal');
+            const content = document.getElementById('cutflowContent');
+            
+            modal.style.display = 'block';
+            content.innerHTML = 'Loading cutflow data...';
+            
+            fetch('/cutflow')
+                .then(response => response.json())
+                .then(data => {{
+                    if (data.error) {{
+                        content.innerHTML = '<p style="color: #e06b6b;">Error: ' + data.error + '</p>';
+                        return;
+                    }}
+                    
+                    let html = '<h3>Dataset Overview</h3>';
+                    html += '<p>Total exams in dataset: <strong>' + data.total_exams.toLocaleString() + '</strong></p>';
+                    html += '<p>Currently loaded in gallery: <strong>' + allExams.length + '</strong></p>';
+                    html += '<p>Manually QC\\'d so far: <strong>' + Object.keys(qcData).length + '</strong></p>';
+                    html += '<hr style="border-color: #3e3e42; margin: 20px 0;">';
+                    
+                    html += '<h3>Automatic Filter Cutflow</h3>';
+                    html += '<table class="cutflow-table"><thead><tr>';
+                    html += '<th>Step</th><th>Filter</th><th>Excluded</th><th>Cumulative Excluded</th><th>Remaining</th><th>% Remaining</th>';
+                    html += '</tr></thead><tbody>';
+                    
+                    data.cutflow.forEach(row => {{
+                        html += '<tr>';
+                        html += '<td>' + row.step + '</td>';
+                        html += '<td>' + row.filter + '</td>';
+                        html += '<td>' + row.exams_excluded_this_step.toLocaleString() + '</td>';
+                        html += '<td>' + row.total_excluded.toLocaleString() + '</td>';
+                        html += '<td>' + row.exams_remaining.toLocaleString() + '</td>';
+                        html += '<td>' + row.percent_remaining.toFixed(1) + '%</td>';
+                        html += '</tr>';
+                    }});
+                    html += '</tbody></table>';
+                    
+                    if (data.filter_effectiveness) {{
+                        html += '<hr style="border-color: #3e3e42; margin: 20px 0;">';
+                        html += '<h3>Filter Effectiveness (Based on Manual QC)</h3>';
+                        html += '<table class="cutflow-table"><thead><tr>';
+                        html += '<th>Filter</th><th>Bad Caught</th><th>Good Caught</th><th>Precision</th><th>Recommendation</th>';
+                        html += '</tr></thead><tbody>';
+                        
+                        data.filter_effectiveness.forEach(f => {{
+                            let rec = '';
+                            if (f.precision >= 0.95) rec = '✅ AUTO-EXCLUDE';
+                            else if (f.precision >= 0.8) rec = '⚠️ VALIDATE';
+                            else if (f.precision >= 0.5) rec = '⚠️ MIXED';
+                            else rec = '❌ DO NOT USE';
+                            
+                            html += '<tr>';
+                            html += '<td>' + f.filter + '</td>';
+                            html += '<td>' + f.bad_caught + '</td>';
+                            html += '<td style="color: ' + (f.good_caught > 0 ? '#e06b6b' : '#6bcc6b') + '">' + f.good_caught + '</td>';
+                            html += '<td>' + (f.precision * 100).toFixed(1) + '%</td>';
+                            html += '<td>' + rec + '</td>';
+                            html += '</tr>';
+                        }});
+                        html += '</tbody></table>';
+                        
+                        html += '<p style="margin-top: 20px; color: #9cdcfe;">';
+                        html += '<strong>Summary:</strong> ' + data.summary.total_bad + ' manually marked bad, ';
+                        html += data.summary.caught_by_filters + ' caught by filters ';
+                        html += '(' + (data.summary.caught_by_filters / data.summary.total_bad * 100).toFixed(1) + '%)';
+                        html += '</p>';
+                    }}
+                    
+                    content.innerHTML = html;
+                }})
+                .catch(error => {{
+                    content.innerHTML = '<p style="color: #e06b6b;">Failed to load cutflow: ' + error + '</p>';
+                    console.error('Cutflow error:', error);
+                }});
+        }}
+        
+        function closeCutflow() {{
+            document.getElementById('cutflowModal').style.display = 'none';
+        }}
+        
+        // close modal if clicking outside of it
+        window.onclick = function(event) {{
+            const modal = document.getElementById('cutflowModal');
+            if (event.target === modal) {{
+                modal.style.display = 'none';
+            }}
+        }}
+        
         // initialize
         updateView();
+        loadAvailableFilters();
         
         // show instructions in console
         console.log('QC data auto-saves to server on each button click');
         console.log('Server saves to: {qc_file_str}');
         console.log('Keyboard shortcuts: g=good, r=review, b=bad, Arrow keys=navigate');
         console.log('Backup: QC data also saved to browser localStorage - safe to refresh page');
+        console.log('Dynamic filters: Use dropdown to load filter lists without restarting server');
+        console.log('Cutflow: Click 📊 Cutflow button to see dataset statistics');
     </script>
 </body>
 </html>
@@ -1023,7 +1944,9 @@ def generate_gallery(
             f.write(html_content)
 
         logger.info(f"HTML gallery saved to: {gallery_path}")
-        logger.info(f"Open in browser: file://{gallery_path.absolute()}")
+
+        if not serve:
+            logger.info(f"Open in browser: file://{gallery_path.absolute()}")
 
         if qc_file:
             logger.info(f"QC file: {qc_file.resolve()}")
@@ -1032,23 +1955,28 @@ def generate_gallery(
                 f"{len([s for s in qc_data.values() if s == 'review'])} review, "
                 f"{len([s for s in qc_data.values() if s == 'bad'])} bad"
             )
-            logger.info("=" * 60)
-            logger.info(
-                "Without --serve: QC data saved to localStorage + downloads folder"
-            )
-            logger.info(f"Move downloaded qc_status.json to: {qc_file.resolve()}")
-            logger.info(
-                "With --serve: QC data auto-saves directly to server (recommended)"
-            )
-            logger.info("=" * 60)
-            logger.info(
-                "Keyboard shortcuts: G=Good, R=Review, B=Bad, Arrow keys=Navigate"
-            )
+
+            if not serve:
+                logger.info("=" * 60)
+                logger.info(
+                    "QC data saved to localStorage + downloads folder on each click"
+                )
+                logger.info(f"Move downloaded qc_status.json to: {qc_file.resolve()}")
+                logger.info(
+                    "For auto-save to server, use --serve flag (recommended for remote work)"
+                )
+                logger.info("=" * 60)
+                logger.info(
+                    "Keyboard shortcuts: G=Good, R=Review, B=Bad, Arrow keys=Navigate"
+                )
 
     logger.info("gallery generation complete:")
     if per_view:
         logger.info(f"  individual view figures: {success_count}")
-    logger.info(f"  combined 4-view figures: {combined_figure_count}")
+    logger.info(f"  combined 4-view figures: {total_figures} total")
+    if cached_count > 0 or generated_count > 0:
+        logger.info(f"    - reused from cache: {cached_count}")
+        logger.info(f"    - newly generated: {generated_count}")
     logger.info(f"  errors: {error_count}")
     logger.info(f"  output directory: {output_dir}")
 
@@ -1065,6 +1993,21 @@ Examples:
   # then SSH port forward: ssh -L 5000:localhost:5000 user@host
   # open: http://localhost:5000/
 
+  # prioritize worst-performing exams for QC (recommended!)
+  python qc_gallery.py --serve --max-exams 100 --prioritize-errors \\
+    --pred-csv /path/to/validation_output.csv \\
+    --meta-csv /path/to/mirai_manifest.csv
+
+  # QC specific list of exams from filter test (streamlined!)
+  python test_positioning_filters.py  # generates exam lists
+  python qc_gallery.py --serve --exam-list data/filter_tests/all_flagged_exams.txt
+
+  # re-visit exams previously marked as "bad"
+  python qc_gallery.py --serve --max-exams 100 --qc-skip-status good
+
+  # only show completely unmarked exams (skip all QC'd exams)
+  python qc_gallery.py --serve --max-exams 100 --qc-skip-status good bad review
+
   # QC without server (downloads qc_status.json on each click)
   python qc_gallery.py --max-exams 10 --random
 
@@ -1079,7 +2022,8 @@ Server mode workflow:
   2. Open http://localhost:5000/ in browser
   3. Mark exams with G/R/B keys - auto-saves to server after each click
   4. Ctrl+C to stop server when done
-  5. Re-run to continue QC (already-marked "good" exams skipped)
+  5. Re-run to continue QC (by default, "good" and "bad" exams skipped)
+     To re-visit bad exams: --qc-skip-status good
 
 QC File Format:
   JSON file mapping exam_id to status: {"exam_id_1": "good", "exam_id_2": "review", ...}
@@ -1113,7 +2057,28 @@ QC File Format:
     parser.add_argument(
         "--random",
         action="store_true",
-        help="randomly sample exams (default: take first N)",
+        help="randomly sample exams (default: take first N, or worst-performing if --prioritize-errors)",
+    )
+    parser.add_argument(
+        "--prioritize-errors",
+        action="store_true",
+        help="prioritize exams with worst prediction errors for QC (requires --pred-csv and --meta-csv)",
+    )
+    parser.add_argument(
+        "--pred-csv",
+        type=Path,
+        help="path to validation_output.csv with predictions (for --prioritize-errors)",
+    )
+    parser.add_argument(
+        "--meta-csv",
+        type=Path,
+        help="path to mirai_manifest.csv with metadata/labels (for --prioritize-errors)",
+    )
+    parser.add_argument(
+        "--horizon",
+        type=int,
+        default=5,
+        help="prediction horizon (years) to use for error scoring (default: 5)",
     )
     parser.add_argument(
         "--patient",
@@ -1124,6 +2089,11 @@ QC File Format:
         "--exam",
         type=str,
         help="filter to specific exam ID",
+    )
+    parser.add_argument(
+        "--exam-list",
+        type=Path,
+        help="path to text file with exam IDs (one per line) to review",
     )
     parser.add_argument(
         "--per-view",
@@ -1139,7 +2109,14 @@ QC File Format:
         "--qc-file",
         type=Path,
         default=Path("data/qc_status.json"),
-        help="path to QC status file (default: data/qc_status.json); exams marked 'good' will be skipped",
+        help="path to QC status file (default: data/qc_status.json)",
+    )
+    parser.add_argument(
+        "--qc-skip-status",
+        nargs="*",
+        default=["good", "bad"],
+        choices=["good", "bad", "review"],
+        help="QC statuses to skip in future runs (default: good bad). Use '--qc-skip-status good' to re-visit bad exams",
     )
     parser.add_argument(
         "--serve",
@@ -1161,6 +2138,9 @@ QC File Format:
         views_path = args.raw / "sot" / "views.parquet"
         logger.info(f"using default views path: {views_path}")
 
+    # derive tags path (for cutflow)
+    tags_path = args.raw / "sot" / "dicom_tags.parquet"
+
     # validate inputs
     if not views_path.exists():
         logger.error(f"views parquet not found: {views_path}")
@@ -1169,6 +2149,18 @@ QC File Format:
     if not args.raw.exists():
         logger.error(f"raw directory not found: {args.raw}")
         return 1
+
+    # validate prioritize-errors arguments
+    if args.prioritize_errors:
+        if args.pred_csv is None or args.meta_csv is None:
+            logger.error("--prioritize-errors requires both --pred-csv and --meta-csv")
+            return 1
+        if not args.pred_csv.exists():
+            logger.error(f"prediction CSV not found: {args.pred_csv}")
+            return 1
+        if not args.meta_csv.exists():
+            logger.error(f"metadata CSV not found: {args.meta_csv}")
+            return 1
 
     # run gallery generation
     generate_gallery(
@@ -1179,16 +2171,23 @@ QC File Format:
         random_sample=args.random,
         patient_id=args.patient,
         exam_id=args.exam,
+        exam_list_path=args.exam_list,
         per_view=args.per_view,
         no_gallery=args.no_gallery,
         qc_file=args.qc_file,
+        pred_csv=args.pred_csv,
+        meta_csv=args.meta_csv,
+        prioritize_errors=args.prioritize_errors,
+        horizon=args.horizon,
+        qc_skip_status=set(args.qc_skip_status) if args.qc_skip_status else None,
+        serve=args.serve,
     )
 
     # start HTTP server if requested
     if args.serve:
         logger.info("=" * 60)
         logger.info("Starting HTTP server for QC gallery...")
-        start_qc_server(args.output, args.qc_file, args.port)
+        start_qc_server(args.output, args.qc_file, views_path, tags_path, args.port)
         # server runs until Ctrl+C
         return 0
 
