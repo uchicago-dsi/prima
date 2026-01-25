@@ -1460,37 +1460,29 @@ def discover_dicoms(
 def select_full_quad(df_views: pd.DataFrame) -> pd.DataFrame:
     """Return only rows that constitute exactly one L/R × CC/MLO per exam.
 
-    selection policy for duplicates per (exam, laterality, view):
-      - prefer not marked up
-      - prefer higher bits stored
-      - prefer later acquisition_time
+    Fails loudly if any exam has duplicate views - we expect exactly one image
+    per (exam_id, laterality, view) combination.
     """
     df = df_views.copy()
     df = df[df["for_presentation"]]
     df = df[df["laterality"].isin(["L", "R"]) & df["view"].isin(["CC", "MLO"])]
 
-    df["_rank"] = (
-        (~df["is_marked_up"]).astype(int).astype(np.int64) * 1_000_000
-        + df["bits_stored"].astype(np.int64) * 1_000
-        + pd.to_numeric(df["acquisition_time"].str.replace(":", ""), errors="coerce")
-        .fillna(0)
-        .astype(np.int64)
-    )
+    # check for duplicates - fail loudly if found
+    view_counts = df.groupby(["exam_id", "laterality", "view"]).size()
+    duplicates = view_counts[view_counts > 1]
 
-    # pick the best per exam+view key
-    df = df.sort_values(
-        ["exam_id", "laterality", "view", "_rank"], ascending=[True, True, True, False]
-    )
-    df = df.groupby(["exam_id", "laterality", "view"], as_index=False).head(1)
+    if len(duplicates) > 0:
+        dup_examples = duplicates.head(10)
+        raise RuntimeError(
+            f"found {len(duplicates)} duplicate (exam, laterality, view) combinations:\n"
+            f"{dup_examples}\n"
+            f"expected exactly one 'for_presentation' image per view position"
+        )
 
-    # keep only exams that now have all four views
+    # keep only exams that have all four views
     counts = df.groupby("exam_id").size()
     full_exams = counts[counts == 4].index
-    out = (
-        df[df["exam_id"].isin(full_exams)]
-        .drop(columns=["_rank"])
-        .reset_index(drop=True)
-    )
+    out = df[df["exam_id"].isin(full_exams)].reset_index(drop=True)
     return out
 
 

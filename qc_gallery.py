@@ -95,6 +95,7 @@ OUTPUT_DIR = None
 FILTER_DIR = None
 VIEWS_PATH = None
 TAGS_PATH = None
+LOAD_MORE_ARGS = None  # store args for dynamic loading
 
 
 class QCGalleryHandler(SimpleHTTPRequestHandler):
@@ -186,6 +187,161 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                 self.wfile.write(json.dumps({"error": str(e)}).encode())
             return
 
+        if parsed_path.path == "/preload-more":
+            # preload next batch in background (called at 80% progress)
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+            try:
+                if not LOAD_MORE_ARGS:
+                    self.wfile.write(
+                        json.dumps({"error": "Load more not configured"}).encode()
+                    )
+                    return
+
+                # check if preload already in progress
+                if (
+                    hasattr(self.server, "_preload_in_progress")
+                    and self.server._preload_in_progress
+                ):
+                    self.wfile.write(json.dumps({"status": "already_loading"}).encode())
+                    return
+
+                # double the batch size for next round
+                current_batch = LOAD_MORE_ARGS.get("max_exams", 100)
+                next_batch = current_batch * 2
+
+                logger.info(
+                    f"Preloading next batch: increasing from {current_batch} to {next_batch}"
+                )
+
+                # trigger gallery regeneration with larger batch in background
+                import threading
+
+                def preload_regenerate():
+                    try:
+                        self.server._preload_in_progress = True
+                        from copy import deepcopy
+
+                        args = deepcopy(LOAD_MORE_ARGS)
+                        args["max_exams"] = next_batch
+                        generate_gallery(**args)
+                        logger.info(f"✓ Preload complete: {next_batch} exams ready")
+                        self.server._preload_ready = True
+                    except Exception as e:
+                        logger.error(f"Failed to preload exams: {e}")
+                        import traceback
+
+                        traceback.print_exc()
+                    finally:
+                        self.server._preload_in_progress = False
+
+                thread = threading.Thread(target=preload_regenerate)
+                thread.daemon = True
+                thread.start()
+
+                self.wfile.write(
+                    json.dumps(
+                        {
+                            "status": "preloading",
+                            "message": f"Preloading {next_batch} exams in background...",
+                        }
+                    ).encode()
+                )
+
+            except Exception as e:
+                logger.error(f"error preloading: {e}")
+                import traceback
+
+                traceback.print_exc()
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
+            return
+
+        if parsed_path.path == "/load-more":
+            # load more exams dynamically (instant if preloaded)
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+            try:
+                if not LOAD_MORE_ARGS:
+                    self.wfile.write(
+                        json.dumps({"error": "Load more not configured"}).encode()
+                    )
+                    return
+
+                # check if preload is ready
+                if (
+                    hasattr(self.server, "_preload_ready")
+                    and self.server._preload_ready
+                ):
+                    logger.info("Next batch already preloaded, instant reload!")
+                    self.server._preload_ready = False
+                    # update LOAD_MORE_ARGS for next preload
+                    current_batch = LOAD_MORE_ARGS.get("max_exams", 100)
+                    LOAD_MORE_ARGS["max_exams"] = current_batch * 2
+                    self.wfile.write(
+                        json.dumps(
+                            {
+                                "status": "ok",
+                                "message": "Next batch ready!",
+                                "reload_delay_ms": 500,  # instant reload
+                            }
+                        ).encode()
+                    )
+                    return
+
+                # preload not ready, generate now
+                current_batch = LOAD_MORE_ARGS.get("max_exams", 100)
+                next_batch = current_batch * 2
+
+                logger.info(
+                    f"Loading more exams (no preload): increasing from {current_batch} to {next_batch}"
+                )
+
+                # trigger gallery regeneration with larger batch
+                import threading
+
+                def regenerate():
+                    try:
+                        from copy import deepcopy
+
+                        args = deepcopy(LOAD_MORE_ARGS)
+                        args["max_exams"] = next_batch
+                        generate_gallery(**args)
+                        logger.info(f"Successfully generated {next_batch} exams")
+                    except Exception as e:
+                        logger.error(f"Failed to generate more exams: {e}")
+                        import traceback
+
+                        traceback.print_exc()
+
+                thread = threading.Thread(target=regenerate)
+                thread.daemon = True
+                thread.start()
+
+                self.wfile.write(
+                    json.dumps(
+                        {
+                            "status": "ok",
+                            "message": f"Generating {next_batch} exams...",
+                            "next_batch": next_batch,
+                            "reload_delay_ms": 3000,  # wait 3s then reload
+                        }
+                    ).encode()
+                )
+
+            except Exception as e:
+                logger.error(f"error loading more: {e}")
+                import traceback
+
+                traceback.print_exc()
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
+            return
+
         # silently ignore favicon requests
         if parsed_path.path == "/favicon.ico":
             self.send_response(204)  # No Content
@@ -261,6 +417,7 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
             {
                 "step": "0. Total",
                 "filter": "All exams in dataset",
+                "flagged_by_filter": 0,
                 "exams_excluded_this_step": 0,
                 "total_excluded": 0,
                 "exams_remaining": total_exams,
@@ -271,13 +428,15 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
         # Apply filters
         if "has_implant" in views_df.columns:
             implant_exams = set(views_df[views_df["has_implant"]]["exam_id"].unique())
+            new_excluded = implant_exams - excluded_exams
             excluded_exams.update(implant_exams)
             filter_sets["has_implant"] = implant_exams
             cutflow.append(
                 {
                     "step": "1. Implants",
                     "filter": "has_implant == True",
-                    "exams_excluded_this_step": len(implant_exams),
+                    "flagged_by_filter": len(implant_exams),
+                    "exams_excluded_this_step": len(new_excluded),
                     "total_excluded": len(excluded_exams),
                     "exams_remaining": total_exams - len(excluded_exams),
                     "percent_remaining": (total_exams - len(excluded_exams))
@@ -286,18 +445,33 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                 }
             )
 
+        # scanned film: Secondary Capture OR R2 DigitalNow
+        film_exams = set()
         if "SOPClassUID" in merged.columns:
-            film_mask = merged["SOPClassUID"].str.contains(
-                "1.2.840.10008.5.1.4.1.1.7", na=False
+            secondary = merged[
+                merged["SOPClassUID"].str.contains(
+                    "1.2.840.10008.5.1.4.1.1.7", na=False
+                )
+            ]["exam_id"].unique()
+            film_exams.update(secondary)
+        # R2 DigitalNow film digitizer
+        r2_film = views_df[
+            views_df["device_manufacturer"].str.contains(
+                "R2 Technology", na=False, case=False
             )
-            film_exams = set(merged[film_mask]["exam_id"].unique())
+            | views_df["device_model"].str.contains("DigitalNow", na=False, case=False)
+        ]["exam_id"].unique()
+        film_exams.update(r2_film)
+
+        if len(film_exams) > 0:
             new_excluded = film_exams - excluded_exams
             excluded_exams.update(film_exams)
             filter_sets["scanned_film"] = film_exams
             cutflow.append(
                 {
                     "step": "2. Scanned Film",
-                    "filter": "Secondary Capture",
+                    "filter": "Secondary Capture + R2 DigitalNow",
+                    "flagged_by_filter": len(film_exams),
                     "exams_excluded_this_step": len(new_excluded),
                     "total_excluded": len(excluded_exams),
                     "exams_remaining": total_exams - len(excluded_exams),
@@ -308,7 +482,9 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
             )
 
         if "AcquisitionDeviceProcessingCode" in merged.columns:
-            gems_mask = merged["AcquisitionDeviceProcessingCode"] == "GEMS_FFDM_TC_1"
+            gems_mask = merged["AcquisitionDeviceProcessingCode"].str.startswith(
+                "GEMS_", na=False
+            )
             gems_exams = set(merged[gems_mask]["exam_id"].unique())
             new_excluded = gems_exams - excluded_exams
             excluded_exams.update(gems_exams)
@@ -316,7 +492,28 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
             cutflow.append(
                 {
                     "step": "3. GEMS",
-                    "filter": "GE Senograph 2000D (GEMS_FFDM_TC_1)",
+                    "filter": "All GE GEMS processing codes (GEMS_*)",
+                    "flagged_by_filter": len(gems_exams),
+                    "exams_excluded_this_step": len(new_excluded),
+                    "total_excluded": len(excluded_exams),
+                    "exams_remaining": total_exams - len(excluded_exams),
+                    "percent_remaining": (total_exams - len(excluded_exams))
+                    / total_exams
+                    * 100,
+                }
+            )
+
+        # add manually marked bad exams as final filter step
+        if qc_data:
+            bad_exams = {eid for eid, status in qc_data.items() if status == "bad"}
+            new_excluded = bad_exams - excluded_exams
+            excluded_exams.update(bad_exams)
+            filter_sets["manual_qc_bad"] = bad_exams
+            cutflow.append(
+                {
+                    "step": "4. Manual QC",
+                    "filter": "Manually marked as bad",
+                    "flagged_by_filter": len(bad_exams),
                     "exams_excluded_this_step": len(new_excluded),
                     "total_excluded": len(excluded_exams),
                     "exams_remaining": total_exams - len(excluded_exams),
@@ -382,6 +579,7 @@ def start_qc_server(
     views_path: Path,
     tags_path: Path,
     port: int = 5000,
+    load_more_args: Optional[dict] = None,
 ) -> None:
     """start HTTP server to serve gallery and handle QC saves.
 
@@ -397,13 +595,16 @@ def start_qc_server(
         path to dicom_tags.parquet (for cutflow)
     port : int
         port to listen on
+    load_more_args : Optional[dict]
+        arguments for dynamically loading more exams
     """
-    global QC_FILE_PATH, OUTPUT_DIR, FILTER_DIR, VIEWS_PATH, TAGS_PATH
+    global QC_FILE_PATH, OUTPUT_DIR, FILTER_DIR, VIEWS_PATH, TAGS_PATH, LOAD_MORE_ARGS
 
     QC_FILE_PATH = qc_file.resolve()
     OUTPUT_DIR = output_dir.resolve()
     VIEWS_PATH = views_path.resolve()
     TAGS_PATH = tags_path.resolve()
+    LOAD_MORE_ARGS = load_more_args
     # store filter directory as absolute path before changing directory
     FILTER_DIR = Path.cwd() / "data" / "filter_tests"
 
@@ -869,6 +1070,7 @@ def generate_gallery(
     horizon: int = 5,
     qc_skip_status: Optional[Set[str]] = None,
     serve: bool = False,
+    original_args: Optional[dict] = None,
 ) -> None:
     """generate interactive HTML gallery from processed views.
 
@@ -928,7 +1130,9 @@ def generate_gallery(
                     and "AcquisitionDeviceProcessingCode" in merged.columns
                 ):
                     gems_exams = merged[
-                        merged["AcquisitionDeviceProcessingCode"] == "GEMS_FFDM_TC_1"
+                        merged["AcquisitionDeviceProcessingCode"].str.startswith(
+                            "GEMS_", na=False
+                        )
                     ]["exam_id"].unique()
                     auto_excluded_exams.update(gems_exams)
                     logger.info(f"  {filter_name}: {len(gems_exams)} exams")
@@ -1267,6 +1471,29 @@ def generate_gallery(
         # prepare QC file path for saving
         qc_file_str = str(qc_file.resolve()) if qc_file else "data/qc_status.json"
 
+        # construct load more command
+        load_more_cmd = "python qc_gallery.py --serve"
+
+        if exam_list_path:
+            # if loaded from exam list, suggest switching to prioritize-errors
+            if pred_csv and meta_csv:
+                next_batch = max_exams if max_exams else 100
+                load_more_cmd += f" --max-exams {next_batch} --prioritize-errors"
+                load_more_cmd += f" --pred-csv {pred_csv} --meta-csv {meta_csv}"
+            else:
+                load_more_cmd += f" --max-exams {max_exams if max_exams else 100}"
+        else:
+            # if doing prioritize-errors, increase batch size
+            if max_exams:
+                load_more_cmd += f" --max-exams {max_exams * 2}"
+            if prioritize_errors and pred_csv and meta_csv:
+                load_more_cmd += (
+                    f" --prioritize-errors --pred-csv {pred_csv} --meta-csv {meta_csv}"
+                )
+
+        if horizon != 5 and prioritize_errors:
+            load_more_cmd += f" --horizon {horizon}"
+
         html_content = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -1536,6 +1763,47 @@ def generate_gallery(
         .cutflow-table tr:hover {{
             background-color: #2d2d30;
         }}
+        .completion-banner {{
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background-color: #252526;
+            border: 2px solid #4ec9b0;
+            border-radius: 8px;
+            padding: 30px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+            z-index: 2000;
+            text-align: center;
+            min-width: 400px;
+        }}
+        .completion-banner h2 {{
+            color: #4ec9b0;
+            margin-top: 0;
+        }}
+        .completion-banner .stats-summary {{
+            margin: 20px 0;
+            padding: 15px;
+            background-color: #1e1e1e;
+            border-radius: 4px;
+        }}
+        .completion-banner .stats-summary div {{
+            margin: 5px 0;
+        }}
+        .completion-banner button {{
+            padding: 10px 20px;
+            margin: 5px;
+            font-size: 14px;
+            border: 1px solid #3e3e42;
+            border-radius: 4px;
+            background-color: #4ec9b0;
+            color: #1e1e1e;
+            cursor: pointer;
+            font-weight: bold;
+        }}
+        .completion-banner button:hover {{
+            background-color: #6bdfcf;
+        }}
     </style>
 </head>
 <body>
@@ -1555,6 +1823,11 @@ def generate_gallery(
                 </select>
                 <button onclick="loadSelectedFilter()">Apply Filter</button>
                 <button onclick="clearExamFilter()">Clear Filter</button>
+                <label style="display: flex; align-items: center; gap: 5px; margin-left: 20px; cursor: pointer;">
+                    <input type="checkbox" id="hideReviewCheckbox" onchange="applyFilters()" 
+                           style="cursor: pointer; width: 16px; height: 16px;">
+                    <span style="font-size: 13px;">Hide "review" exams</span>
+                </label>
             </div>
             <div class="nav-buttons">
                 <button id="prevBtn" onclick="navigate(-1)">← Previous</button>
@@ -1575,6 +1848,24 @@ def generate_gallery(
             <div id="cutflowContent">
                 Loading...
             </div>
+        </div>
+    </div>
+    
+    <!-- Completion Banner -->
+    <div id="completionBanner" style="display: none;" class="completion-banner">
+        <h2>🎉 Batch Complete!</h2>
+        <div class="stats-summary" id="completionStats">
+        </div>
+        <p style="color: #9cdcfe; margin: 15px 0;">
+            You've reviewed all exams in this batch.
+        </p>
+        <div style="margin: 15px 0;">
+            <button id="loadMoreBtn" onclick="loadMore()">🔄 Load More Exams</button>
+            <button onclick="closeCompletion()">Continue Reviewing</button>
+        </div>
+        <div id="loadMoreStatus" style="display: none; margin-top: 20px; padding: 15px; background-color: #1e1e1e; border-radius: 4px;">
+            <p style="color: #4ec9b0; font-weight: bold; margin: 0;">⏳ Generating more exams...</p>
+            <p style="font-size: 12px; color: #858585; margin: 10px 0 0 0;">This may take a minute. Page will reload automatically.</p>
         </div>
     </div>
     
@@ -1606,6 +1897,7 @@ def generate_gallery(
         let filteredExams = [...allExams];
         let currentIndex = 0;
         let activeExamFilter = null; // track active exam ID filter
+        let preloadTriggered = false; // track if we've started preloading next batch
         
         // track QC decisions (exam_id -> status)
         let qcData = {{}};
@@ -1627,9 +1919,45 @@ def generate_gallery(
             }}
         }});
         
+        function checkAndPreload() {{
+            // check if we should start preloading next batch
+            if (preloadTriggered) return;
+            
+            // count how many exams in current batch have been QC'd
+            let qcdCount = 0;
+            allExams.forEach(exam => {{
+                if (qcData[exam.exam_id] && qcData[exam.exam_id] !== 'auto_excluded') {{
+                    qcdCount++;
+                }}
+            }});
+            
+            // trigger preload at 80% progress
+            const progress = qcdCount / allExams.length;
+            if (progress >= 0.80) {{
+                preloadTriggered = true;
+                console.log('🚀 Preloading next batch at ' + (progress * 100).toFixed(0) + '% progress...');
+                
+                fetch('/preload-more')
+                    .then(response => response.json())
+                    .then(data => {{
+                        if (data.status === 'preloading') {{
+                            console.log('✓ Next batch preloading in background');
+                        }} else if (data.status === 'already_loading') {{
+                            console.log('→ Preload already in progress');
+                        }}
+                    }})
+                    .catch(error => {{
+                        console.error('Preload failed:', error);
+                    }});
+            }}
+        }}
+        
         function autoSaveQCData() {{
             // save to localStorage as backup
             localStorage.setItem('qc_data', JSON.stringify(qcData));
+            
+            // check if we should preload next batch
+            checkAndPreload();
             
             // try to save to server via POST
             fetch('/save-qc', {{
@@ -1654,13 +1982,96 @@ def generate_gallery(
             exam.qc_status = status;
             autoSaveQCData();
             
-            // auto-advance to next exam (navigate will call updateView)
-            navigate(1);
+            // check if this was the last exam
+            if (currentIndex === filteredExams.length - 1) {{
+                // show completion banner
+                showCompletion();
+            }} else {{
+                // auto-advance to next exam
+                navigate(1);
+            }}
         }}
         
         function skipExam() {{
             // skip without marking - just advance
-            navigate(1);
+            if (currentIndex === filteredExams.length - 1) {{
+                showCompletion();
+            }} else {{
+                navigate(1);
+            }}
+        }}
+        
+        function showCompletion() {{
+            const banner = document.getElementById('completionBanner');
+            const statsDiv = document.getElementById('completionStats');
+            
+            // count QC statuses
+            const qcCounts = {{good: 0, review: 0, bad: 0, pending: 0}};
+            allExams.forEach(exam => {{
+                const status = qcData[exam.exam_id];
+                if (status === 'good') qcCounts.good++;
+                else if (status === 'review') qcCounts.review++;
+                else if (status === 'bad') qcCounts.bad++;
+                else qcCounts.pending++;
+            }});
+            
+            statsDiv.innerHTML = 
+                '<div><strong>Total exams in batch:</strong> ' + allExams.length + '</div>' +
+                '<div style="color: #6bcc6b;"><strong>Good:</strong> ' + qcCounts.good + '</div>' +
+                '<div style="color: #e06b6b;"><strong>Bad:</strong> ' + qcCounts.bad + '</div>' +
+                '<div style="color: #f0d060;"><strong>Review:</strong> ' + qcCounts.review + '</div>' +
+                '<div style="color: #9cdcfe;"><strong>Pending:</strong> ' + qcCounts.pending + '</div>';
+            
+            banner.style.display = 'block';
+        }}
+        
+        function closeCompletion() {{
+            document.getElementById('completionBanner').style.display = 'none';
+        }}
+        
+        function loadMore() {{
+            const loadMoreBtn = document.getElementById('loadMoreBtn');
+            const statusDiv = document.getElementById('loadMoreStatus');
+            
+            // disable button and show status
+            loadMoreBtn.disabled = true;
+            loadMoreBtn.textContent = '⏳ Loading...';
+            statusDiv.style.display = 'block';
+            
+            fetch('/load-more')
+                .then(response => response.json())
+                .then(data => {{
+                    if (data.error) {{
+                        alert('Error loading more exams: ' + data.error);
+                        loadMoreBtn.disabled = false;
+                        loadMoreBtn.textContent = '🔄 Load More Exams';
+                        statusDiv.style.display = 'none';
+                        return;
+                    }}
+                    
+                    console.log('Load more triggered:', data);
+                    
+                    // update status message based on whether preload was ready
+                    if (data.reload_delay_ms < 1000) {{
+                        statusDiv.innerHTML = '<p style="color: #4ec9b0; font-weight: bold; margin: 0;">✓ Next batch ready! (preloaded)</p>' +
+                            '<p style="font-size: 12px; color: #858585; margin: 10px 0 0 0;">Reloading now...</p>';
+                    }} else {{
+                        statusDiv.innerHTML = '<p style="color: #4ec9b0; font-weight: bold; margin: 0;">⏳ Generating more exams...</p>' +
+                            '<p style="font-size: 12px; color: #858585; margin: 10px 0 0 0;">This may take a minute. Page will reload automatically.</p>';
+                    }}
+                    
+                    // wait for server to generate, then reload
+                    setTimeout(() => {{
+                        location.reload();
+                    }}, data.reload_delay_ms || 3000);
+                }})
+                .catch(error => {{
+                    console.error('Failed to load more:', error);
+                    alert('Failed to load more exams: ' + error);
+                    loadMoreBtn.disabled = false;
+                    loadMoreBtn.textContent = '🔄 Load More Exams';
+                    statusDiv.style.display = 'none';
+                }});
         }}
         
         function loadAvailableFilters() {{
@@ -1720,6 +2131,10 @@ def generate_gallery(
         
         function applyFilters() {{
             const searchTerm = document.getElementById('searchBox').value.toLowerCase();
+            const hideReview = document.getElementById('hideReviewCheckbox').checked;
+            
+            // remember current exam before filtering
+            const currentExam = filteredExams.length > 0 ? filteredExams[currentIndex] : null;
             
             // start with all exams
             let exams = [...allExams];
@@ -1738,8 +2153,50 @@ def generate_gallery(
                 );
             }}
             
+            // hide review exams if checkbox is checked
+            if (hideReview) {{
+                exams = exams.filter(exam => {{
+                    const status = qcData[exam.exam_id];
+                    return status !== 'review';
+                }});
+            }}
+            
             filteredExams = exams;
-            currentIndex = 0;
+            
+            // try to stay on same exam, or advance to next if current got filtered out
+            if (currentExam) {{
+                // check if current exam still in filtered list
+                const sameExamIndex = filteredExams.findIndex(e => e.exam_id === currentExam.exam_id);
+                if (sameExamIndex >= 0) {{
+                    // current exam still visible, stay on it
+                    currentIndex = sameExamIndex;
+                }} else {{
+                    // current exam filtered out, find next exam from original position
+                    // look for the first exam in new filtered list that comes after the old current exam
+                    const currentExamIdxInAll = allExams.findIndex(e => e.exam_id === currentExam.exam_id);
+                    let foundNext = false;
+                    for (let i = currentExamIdxInAll + 1; i < allExams.length; i++) {{
+                        const nextExamIdx = filteredExams.findIndex(e => e.exam_id === allExams[i].exam_id);
+                        if (nextExamIdx >= 0) {{
+                            currentIndex = nextExamIdx;
+                            foundNext = true;
+                            break;
+                        }}
+                    }}
+                    if (!foundNext) {{
+                        // no exams after current position, go to first
+                        currentIndex = 0;
+                    }}
+                }}
+            }} else {{
+                currentIndex = 0;
+            }}
+            
+            // clamp to valid range
+            if (currentIndex >= filteredExams.length) {{
+                currentIndex = Math.max(0, filteredExams.length - 1);
+            }}
+            
             updateView();
         }}
         
@@ -1806,6 +2263,10 @@ def generate_gallery(
             if (activeExamFilter) {{
                 statsText += ' (filtered)';
             }}
+            const hideReview = document.getElementById('hideReviewCheckbox').checked;
+            if (hideReview && qcCounts.review > 0) {{
+                statsText += ' (' + qcCounts.review + ' review hidden)';
+            }}
             statsText += ' | ' + allExams.length + ' total | ' +
                          'QC: ' + qcCounts.good + ' good, ' + qcCounts.review + ' review, ' + 
                          qcCounts.bad + ' bad, ' + qcCounts.pending + ' pending';
@@ -1817,6 +2278,13 @@ def generate_gallery(
         
         // keyboard navigation
         document.addEventListener('keydown', (e) => {{
+            // ESC to close modals
+            if (e.key === 'Escape') {{
+                document.getElementById('cutflowModal').style.display = 'none';
+                document.getElementById('completionBanner').style.display = 'none';
+                return;
+            }}
+            
             // ignore if typing in search box
             if (e.target.id === 'searchBox') return;
             
@@ -1858,13 +2326,14 @@ def generate_gallery(
                     
                     html += '<h3>Automatic Filter Cutflow</h3>';
                     html += '<table class="cutflow-table"><thead><tr>';
-                    html += '<th>Step</th><th>Filter</th><th>Excluded</th><th>Cumulative Excluded</th><th>Remaining</th><th>% Remaining</th>';
+                    html += '<th>Step</th><th>Filter</th><th>Total Flagged</th><th>New Excluded</th><th>Cumulative Excluded</th><th>Remaining</th><th>% Remaining</th>';
                     html += '</tr></thead><tbody>';
                     
                     data.cutflow.forEach(row => {{
                         html += '<tr>';
                         html += '<td>' + row.step + '</td>';
                         html += '<td>' + row.filter + '</td>';
+                        html += '<td>' + (row.flagged_by_filter || 0).toLocaleString() + '</td>';
                         html += '<td>' + row.exams_excluded_this_step.toLocaleString() + '</td>';
                         html += '<td>' + row.total_excluded.toLocaleString() + '</td>';
                         html += '<td>' + row.exams_remaining.toLocaleString() + '</td>';
@@ -1916,11 +2385,16 @@ def generate_gallery(
             document.getElementById('cutflowModal').style.display = 'none';
         }}
         
-        // close modal if clicking outside of it
+        // close modals if clicking outside
         window.onclick = function(event) {{
-            const modal = document.getElementById('cutflowModal');
-            if (event.target === modal) {{
-                modal.style.display = 'none';
+            const cutflowModal = document.getElementById('cutflowModal');
+            const completionBanner = document.getElementById('completionBanner');
+            
+            if (event.target === cutflowModal) {{
+                cutflowModal.style.display = 'none';
+            }}
+            if (event.target === completionBanner) {{
+                completionBanner.style.display = 'none';
             }}
         }}
         
@@ -2181,13 +2655,37 @@ QC File Format:
         horizon=args.horizon,
         qc_skip_status=set(args.qc_skip_status) if args.qc_skip_status else None,
         serve=args.serve,
+        original_args=vars(args),
     )
 
     # start HTTP server if requested
     if args.serve:
         logger.info("=" * 60)
         logger.info("Starting HTTP server for QC gallery...")
-        start_qc_server(args.output, args.qc_file, views_path, tags_path, args.port)
+        # prepare args for load-more functionality
+        load_more_args = {
+            "views_parquet": views_path,
+            "raw_dir": args.raw,
+            "output_dir": args.output,
+            "max_exams": args.max_exams,
+            "random_sample": args.random,
+            "patient_id": args.patient,
+            "exam_id": args.exam,
+            "exam_list_path": args.exam_list,
+            "per_view": args.per_view,
+            "no_gallery": args.no_gallery,
+            "qc_file": args.qc_file,
+            "pred_csv": args.pred_csv,
+            "meta_csv": args.meta_csv,
+            "prioritize_errors": args.prioritize_errors,
+            "horizon": args.horizon,
+            "qc_skip_status": set(args.qc_skip_status) if args.qc_skip_status else None,
+            "serve": False,  # don't recurse when regenerating
+            "original_args": None,
+        }
+        start_qc_server(
+            args.output, args.qc_file, views_path, tags_path, args.port, load_more_args
+        )
         # server runs until Ctrl+C
         return 0
 

@@ -536,12 +536,13 @@ python test_positioning_filters.py --max-samples 20
 # - How many exams each filter catches
 # - Saves exam IDs to data/filter_tests/*.txt
 
-# Step 2: QC ALL flagged exams at once (easy!)
-python qc_gallery.py --serve --exam-list data/filter_tests/all_flagged_exams.txt
+# Step 2: QC specific filter (interactive menu - easiest!)
+./qc_filter.sh
+# Select filter from menu → loads ONLY those exams → fast!
 
-# Or QC specific filter category:
-python qc_gallery.py --serve --exam-list data/filter_tests/negative_positioner_angle_exams.txt
+# Or QC specific filter directly:
 python qc_gallery.py --serve --exam-list data/filter_tests/scanned_film_exams.txt
+python qc_gallery.py --serve --exam-list data/filter_tests/gems_ffdm_tc1_exams.txt
 
 # Step 3: After QC, analyze which filters worked
 python analyze_qc_patterns.py
