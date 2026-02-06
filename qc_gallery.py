@@ -337,15 +337,15 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                     self.wfile.write(json.dumps({"status": "already_loading"}).encode())
                     return
 
-                # double the batch size for next round
+                # keep batch size fixed across load-more cycles
                 current_batch = LOAD_MORE_ARGS.get("max_exams") or 100
-                next_batch = current_batch * 2
+                next_batch = current_batch
 
                 logger.info(
-                    f"Preloading next batch: increasing from {current_batch} to {next_batch}"
+                    f"Preloading next batch with fixed batch size: {next_batch}"
                 )
 
-                # trigger gallery regeneration with larger batch in background
+                # trigger gallery regeneration for the next fixed-size batch in background
                 import threading
 
                 def preload_regenerate():
@@ -465,7 +465,7 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                 self.server._preload_ready = False
 
                 current_batch = LOAD_MORE_ARGS.get("max_exams") or 100
-                next_batch = current_batch * 2
+                next_batch = current_batch
                 logger.info(
                     "QC DEBUG load-more: qc_file=%s, current_batch=%s, next_batch=%s, prioritize_errors=%s, random_sample=%s, qc_skip_status=%s",
                     QC_FILE_PATH,
@@ -520,10 +520,10 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                 self.server._load_more_target_batch = next_batch
 
                 logger.info(
-                    f"Loading more exams (fresh): increasing from {current_batch} to {next_batch}"
+                    f"Loading more exams (fresh): keeping fixed batch size at {next_batch}"
                 )
 
-                # trigger gallery regeneration with larger batch
+                # trigger gallery regeneration for the next fixed-size batch
                 import threading
 
                 def regenerate():
@@ -1940,9 +1940,9 @@ def generate_gallery(
             else:
                 load_more_cmd += f" --max-exams {max_exams if max_exams else 100}"
         else:
-            # if doing prioritize-errors, increase batch size
+            # keep a fixed batch size across load-more cycles
             if max_exams:
-                load_more_cmd += f" --max-exams {max_exams * 2}"
+                load_more_cmd += f" --max-exams {max_exams}"
             if prioritize_errors and pred_csv and meta_csv:
                 load_more_cmd += (
                     f" --prioritize-errors --pred-csv {pred_csv} --meta-csv {meta_csv}"
@@ -2424,14 +2424,72 @@ def generate_gallery(
         let activeExamFilter = null; // track active exam ID filter
         let preloadTriggered = false; // track if we've started preloading next batch
         
-        // session rate tracking
-        const sessionStartTime = Date.now();
-        let sessionQCCount = 0;
+        // session rate tracking (persist across load-more reloads in same tab)
+        const sessionStatsKey = 'qc_session_stats::' + qcStorageNamespace;
+        const sessionStatsVersion = 1;
+        
+        function loadSessionStats() {{
+            const fresh = {{
+                version: sessionStatsVersion,
+                startTimeMs: Date.now(),
+                qcCount: 0,
+                startingRemainingToQC: remainingToQC,
+                totalToQC: totalToQC
+            }};
+            const raw = sessionStorage.getItem(sessionStatsKey);
+            if (!raw) {{
+                return fresh;
+            }}
+            try {{
+                const parsed = JSON.parse(raw);
+                const validShape = (
+                    parsed &&
+                    typeof parsed === 'object' &&
+                    Number.isFinite(parsed.startTimeMs) &&
+                    Number.isFinite(parsed.qcCount) &&
+                    Number.isFinite(parsed.startingRemainingToQC) &&
+                    Number.isFinite(parsed.totalToQC)
+                );
+                if (!validShape) {{
+                    return fresh;
+                }}
+                // reset session stats if we switched to a different review pool
+                if (parsed.totalToQC !== totalToQC) {{
+                    return fresh;
+                }}
+                // reset if QC appears to have been globally reset mid-session
+                if (remainingToQC > parsed.startingRemainingToQC) {{
+                    return fresh;
+                }}
+                return {{
+                    version: sessionStatsVersion,
+                    startTimeMs: parsed.startTimeMs,
+                    qcCount: parsed.qcCount,
+                    startingRemainingToQC: parsed.startingRemainingToQC,
+                    totalToQC: parsed.totalToQC
+                }};
+            }} catch (e) {{
+                console.error('Failed to parse session stats:', e);
+                return fresh;
+            }}
+        }}
+        
+        let sessionStats = loadSessionStats();
+        let sessionStartTime = sessionStats.startTimeMs;
+        let sessionQCCount = sessionStats.qcCount;
+        let sessionStartRemainingToQC = sessionStats.startingRemainingToQC;
+        
+        function saveSessionStats() {{
+            sessionStorage.setItem(sessionStatsKey, JSON.stringify(sessionStats));
+        }}
+        // ensure session state is materialized for this tab
+        saveSessionStats();
         
         // track QC decisions (exam_id -> status)
         // server state is authoritative; localStorage only backfills missing entries
         let qcData = {{}};
         const validStatuses = new Set(['good', 'review', 'bad', 'auto_excluded']);
+        const doneStatuses = new Set(['good', 'review', 'bad']);
         
         // load statuses from server-rendered payload first
         allExams.forEach(exam => {{
@@ -2705,9 +2763,21 @@ def generate_gallery(
         
         function setQCStatus(status) {{
             const exam = filteredExams[currentIndex];
+            const previousStatus = getStatus(exam.exam_id);
+            const wasDone = doneStatuses.has(previousStatus);
+            const willBeDone = doneStatuses.has(status);
             qcData[exam.exam_id] = status;
             exam.qc_status = status;
-            sessionQCCount++;
+            if (!wasDone && willBeDone) {{
+                sessionQCCount++;
+                sessionStats.qcCount = sessionQCCount;
+                saveSessionStats();
+            }} else if (wasDone && !willBeDone && sessionQCCount > 0) {{
+                // keep metrics robust if statuses become non-final in future flows.
+                sessionQCCount--;
+                sessionStats.qcCount = sessionQCCount;
+                saveSessionStats();
+            }}
             autoSaveQCData();
             
             // check if this was the last exam
@@ -2720,14 +2790,12 @@ def generate_gallery(
             }}
         }}
         
-        function showAnnotationModal() {{
-            const modal = document.getElementById('annotationModal');
+        function renderAnnotationTagsList() {{
             const tagsList = document.getElementById('annotationTagsList');
+            if (!tagsList || filteredExams.length === 0) return;
             const exam = filteredExams[currentIndex];
             const examAnnotations = annotations[exam.exam_id] || [];
-            annotationHotkeys = buildAnnotationHotkeys(annotationTags);
             
-            // clear and populate tag list
             tagsList.innerHTML = '';
             annotationTags.forEach(tag => {{
                 const hotkey = annotationHotkeys.tagToKey[tag];
@@ -2766,7 +2834,12 @@ def generate_gallery(
                 }};
                 tagsList.appendChild(btn);
             }});
-            
+        }}
+
+        function showAnnotationModal() {{
+            const modal = document.getElementById('annotationModal');
+            annotationHotkeys = buildAnnotationHotkeys(annotationTags);
+            renderAnnotationTagsList();
             modal.style.display = 'block';
         }}
         
@@ -2794,7 +2867,7 @@ def generate_gallery(
             }}
             
             saveAnnotations();
-            closeAnnotationModal();
+            renderAnnotationTagsList();
             updateView();
         }}
         
@@ -2812,6 +2885,7 @@ def generate_gallery(
             // add tag to available list and persist
             annotationTags.push(newTag);
             saveAnnotationTags();
+            annotationHotkeys = buildAnnotationHotkeys(annotationTags);
             
             // toggle it on for current exam
             toggleAnnotation(newTag);
@@ -3240,7 +3314,7 @@ def generate_gallery(
             let rateText = '';
             if (sessionQCCount > 0 && elapsedMin > 0.01) {{
                 const rate = sessionQCCount / elapsedMin;
-                const remainingNow = Math.max(remainingToQC - sessionQCCount, 0);
+                const remainingNow = Math.max(sessionStartRemainingToQC - sessionQCCount, 0);
                 const etaMin = remainingNow / rate;
                 let etaStr;
                 if (etaMin < 1) etaStr = '<1 min';
@@ -3332,6 +3406,12 @@ def generate_gallery(
             localStorage.removeItem('qc_data');
             localStorage.removeItem('annotations');
             localStorage.removeItem('annotation_tags');
+            sessionStorage.removeItem(sessionStatsKey);
+            sessionStats = loadSessionStats();
+            sessionStartTime = sessionStats.startTimeMs;
+            sessionQCCount = sessionStats.qcCount;
+            sessionStartRemainingToQC = sessionStats.startingRemainingToQC;
+            saveSessionStats();
             
             // save empty data to server
             saveQCToServer({{ replace: true }}).catch(error => {{
