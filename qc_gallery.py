@@ -387,6 +387,26 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                 current_batch = LOAD_MORE_ARGS.get("max_exams") or 100
                 next_batch = current_batch * 2
 
+                if (
+                    hasattr(self.server, "_load_more_in_progress")
+                    and self.server._load_more_in_progress
+                ):
+                    self.wfile.write(
+                        json.dumps(
+                            {
+                                "status": "already_loading",
+                                "message": "Load-more generation already in progress",
+                                "next_batch": self.server._load_more_target_batch,
+                            }
+                        ).encode()
+                    )
+                    return
+
+                self.server._load_more_in_progress = True
+                self.server._load_more_ready = False
+                self.server._load_more_error = None
+                self.server._load_more_target_batch = next_batch
+
                 logger.info(
                     f"Loading more exams (fresh): increasing from {current_batch} to {next_batch}"
                 )
@@ -402,12 +422,16 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                         args["max_exams"] = next_batch
                         generate_gallery(**args)
                         LOAD_MORE_ARGS["max_exams"] = next_batch
+                        self.server._load_more_ready = True
                         logger.info(f"Successfully generated {next_batch} exams")
                     except Exception as e:
+                        self.server._load_more_error = str(e)
                         logger.error(f"Failed to generate more exams: {e}")
                         import traceback
 
                         traceback.print_exc()
+                    finally:
+                        self.server._load_more_in_progress = False
 
                 thread = threading.Thread(target=regenerate)
                 thread.daemon = True
@@ -419,17 +443,35 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                             "status": "ok",
                             "message": f"Generating {next_batch} exams...",
                             "next_batch": next_batch,
-                            "reload_delay_ms": 3000,  # wait 3s then reload
                         }
                     ).encode()
                 )
 
             except Exception as e:
+                self.server._load_more_in_progress = False
+                self.server._load_more_error = str(e)
                 logger.error(f"error loading more: {e}")
                 import traceback
 
                 traceback.print_exc()
                 self.wfile.write(json.dumps({"error": str(e)}).encode())
+            return
+
+        if parsed_path.path == "/load-more-status":
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+            status = {
+                "in_progress": bool(
+                    getattr(self.server, "_load_more_in_progress", False)
+                ),
+                "ready": bool(getattr(self.server, "_load_more_ready", False)),
+                "error": getattr(self.server, "_load_more_error", None),
+                "next_batch": getattr(self.server, "_load_more_target_batch", None),
+            }
+            self.wfile.write(json.dumps(status).encode())
             return
 
         # silently ignore favicon requests
@@ -776,6 +818,10 @@ def start_qc_server(
 
     server_address = ("", port)
     httpd = HTTPServer(server_address, QCGalleryHandler)
+    httpd._load_more_in_progress = False
+    httpd._load_more_ready = False
+    httpd._load_more_error = None
+    httpd._load_more_target_batch = None
 
     import os
     import socket
@@ -2550,6 +2596,60 @@ def generate_gallery(
                     alert('Failed to refresh batch: ' + error);
                 }});
         }}
+
+        function pollLoadMoreStatus(loadMoreBtn, statusDiv, attempt = 0) {{
+            const maxAttempts = 600;  // ~15 minutes at 1.5s
+            fetch('/load-more-status')
+                .then(response => response.json())
+                .then(status => {{
+                    if (status.error) {{
+                        alert('Failed to generate more exams: ' + status.error);
+                        loadMoreBtn.disabled = false;
+                        loadMoreBtn.textContent = '🔄 Load More Exams [l]';
+                        statusDiv.style.display = 'none';
+                        return;
+                    }}
+
+                    if (status.ready) {{
+                        statusDiv.innerHTML = '<p style="color: #4ec9b0; font-weight: bold; margin: 0;">✓ Next batch ready!</p>' +
+                            '<p style="font-size: 12px; color: #858585; margin: 10px 0 0 0;">Reloading now...</p>';
+                        setTimeout(() => {{
+                            location.reload();
+                        }}, 200);
+                        return;
+                    }}
+
+                    if (status.in_progress) {{
+                        const target = status.next_batch ? status.next_batch.toLocaleString() : 'more';
+                        statusDiv.innerHTML = '<p style="color: #4ec9b0; font-weight: bold; margin: 0;">⏳ Generating ' + target + ' exams...</p>' +
+                            '<p style="font-size: 12px; color: #858585; margin: 10px 0 0 0;">This may take a minute. Page will reload when ready.</p>';
+                    }}
+
+                    if (attempt >= maxAttempts) {{
+                        loadMoreBtn.disabled = false;
+                        loadMoreBtn.textContent = '🔄 Load More Exams [l]';
+                        statusDiv.innerHTML = '<p style="color: #f0d060; font-weight: bold; margin: 0;">Still generating in background.</p>' +
+                            '<p style="font-size: 12px; color: #858585; margin: 10px 0 0 0;">Wait a bit and click load more again to check status.</p>';
+                        return;
+                    }}
+
+                    setTimeout(() => {{
+                        pollLoadMoreStatus(loadMoreBtn, statusDiv, attempt + 1);
+                    }}, 1500);
+                }})
+                .catch(error => {{
+                    console.error('Failed to check load-more status:', error);
+                    if (attempt >= maxAttempts) {{
+                        loadMoreBtn.disabled = false;
+                        loadMoreBtn.textContent = '🔄 Load More Exams [l]';
+                        statusDiv.style.display = 'none';
+                        return;
+                    }}
+                    setTimeout(() => {{
+                        pollLoadMoreStatus(loadMoreBtn, statusDiv, attempt + 1);
+                    }}, 2000);
+                }});
+        }}
         
         function loadMore() {{
             const loadMoreBtn = document.getElementById('loadMoreBtn');
@@ -2574,20 +2674,10 @@ def generate_gallery(
                     }}
                     
                     console.log('Load more triggered:', data);
-                    
-                    // update status message based on whether preload was ready
-                    if (data.reload_delay_ms < 1000) {{
-                        statusDiv.innerHTML = '<p style="color: #4ec9b0; font-weight: bold; margin: 0;">✓ Next batch ready! (preloaded)</p>' +
-                            '<p style="font-size: 12px; color: #858585; margin: 10px 0 0 0;">Reloading now...</p>';
-                    }} else {{
-                        statusDiv.innerHTML = '<p style="color: #4ec9b0; font-weight: bold; margin: 0;">⏳ Generating more exams...</p>' +
-                            '<p style="font-size: 12px; color: #858585; margin: 10px 0 0 0;">This may take a minute. Page will reload automatically.</p>';
-                    }}
-                    
-                    // wait for server to generate, then reload
-                    setTimeout(() => {{
-                        location.reload();
-                    }}, data.reload_delay_ms || 3000);
+
+                    statusDiv.innerHTML = '<p style="color: #4ec9b0; font-weight: bold; margin: 0;">⏳ Generating more exams...</p>' +
+                        '<p style="font-size: 12px; color: #858585; margin: 10px 0 0 0;">This may take a minute. Page will reload when ready.</p>';
+                    pollLoadMoreStatus(loadMoreBtn, statusDiv);
                 }})
                 .catch(error => {{
                     console.error('Failed to load more:', error);
