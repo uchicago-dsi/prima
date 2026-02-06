@@ -540,6 +540,9 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                 qc_updates = json.loads(post_data.decode())
                 if not isinstance(qc_updates, dict):
                     raise ValueError("QC payload must be a JSON object")
+                qc_updates = {
+                    str(exam_id): status for exam_id, status in qc_updates.items()
+                }
 
                 # save to file
                 if QC_FILE_PATH:
@@ -557,7 +560,10 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                                 with open(QC_FILE_PATH) as f:
                                     existing = json.load(f)
                                 if isinstance(existing, dict):
-                                    qc_data = existing
+                                    qc_data = {
+                                        str(exam_id): status
+                                        for exam_id, status in existing.items()
+                                    }
                                 else:
                                     logger.warning(
                                         "existing QC file is not a JSON object; starting from empty map"
@@ -669,8 +675,10 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
             return {"error": "Views/tags paths not configured"}
 
         views_df = pd.read_parquet(VIEWS_PATH)
+        views_df["exam_id"] = views_df["exam_id"].astype(str)
         tags_df = pd.read_parquet(TAGS_PATH)
         merged = views_df.merge(tags_df, on="sop_instance_uid", how="left")
+        merged["exam_id"] = merged["exam_id"].astype(str)
         exam_df = merged.groupby("exam_id").first().reset_index()
 
         total_exams = len(exam_df)
@@ -680,6 +688,7 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
         if QC_FILE_PATH and QC_FILE_PATH.exists():
             with open(QC_FILE_PATH) as f:
                 qc_data = json.load(f)
+            qc_data = {str(exam_id): status for exam_id, status in qc_data.items()}
 
         cutflow = []
         excluded_exams = set()
@@ -1388,10 +1397,19 @@ def generate_gallery(
         logger.info(f"loading QC data from {qc_file}")
         with open(qc_file) as f:
             qc_data = json.load(f)
+        # exam IDs in parquet can be numeric while JSON object keys are always strings
+        # normalize early so QC skip/filter logic uses a single key type.
+        qc_data = {str(exam_id): status for exam_id, status in qc_data.items()}
         logger.info(f"loaded QC status for {len(qc_data)} exams")
 
     logger.info(f"loading views from {views_parquet}")
     views_df = pd.read_parquet(views_parquet)
+    views_df = views_df.assign(
+        exam_id=views_df["exam_id"].astype(str),
+        patient_id=views_df["patient_id"].astype(str),
+    )
+    if "accession_number" in views_df.columns:
+        views_df["accession_number"] = views_df["accession_number"].astype(str)
     logger.info(
         f"loaded {len(views_df)} views from {views_df['exam_id'].nunique()} exams"
     )
@@ -1479,18 +1497,19 @@ def generate_gallery(
 
                 # mark these in QC data as auto-excluded (for tracking)
                 for eid in auto_excluded_exams:
-                    if eid not in qc_data:  # don't override manual QC
-                        qc_data[eid] = "auto_excluded"
+                    exam_key = str(eid)
+                    if exam_key not in qc_data:  # don't override manual QC
+                        qc_data[exam_key] = "auto_excluded"
 
     # filter by patient/exam if specified
     if patient_id:
-        views_df = views_df[views_df["patient_id"] == patient_id]
+        views_df = views_df[views_df["patient_id"] == str(patient_id)]
         logger.info(
             f"filtered to patient {patient_id}: {len(views_df)} views from {views_df['exam_id'].nunique()} exams"
         )
 
     if exam_id:
-        views_df = views_df[views_df["exam_id"] == exam_id]
+        views_df = views_df[views_df["exam_id"] == str(exam_id)]
         logger.info(f"filtered to exam {exam_id}: {len(views_df)} views")
 
     # filter by exam list if provided
@@ -1687,7 +1706,7 @@ def generate_gallery(
 
     def get_qc_status(exam_id):
         """extract status string from qc_data"""
-        return qc_data.get(exam_id, "")
+        return qc_data.get(str(exam_id), "")
 
     # generate combined 4-view figures for each exam (only those needing generation)
     logger.info("processing figures...")
@@ -3544,7 +3563,7 @@ QC File Format:
             "prioritize_errors": args.prioritize_errors,
             "horizon": args.horizon,
             "qc_skip_status": set(args.qc_skip_status) if args.qc_skip_status else None,
-            "serve": False,  # don't recurse when regenerating
+            "serve": True,
             "original_args": None,
         }
         start_qc_server(
