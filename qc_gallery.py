@@ -305,7 +305,7 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
             return
 
         if parsed_path.path == "/regenerate":
-            # regenerate current batch with latest QC state
+            # refresh current batch gallery with latest QC state
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
@@ -322,7 +322,7 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                 self.server._preload_ready = False
 
                 current_batch = LOAD_MORE_ARGS.get("max_exams", 100)
-                logger.info(f"Regenerating current batch: {current_batch} exams")
+                logger.info(f"Refreshing current batch gallery: {current_batch} exams")
 
                 import threading
 
@@ -332,7 +332,9 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
 
                         args = deepcopy(LOAD_MORE_ARGS)
                         generate_gallery(**args)
-                        logger.info(f"Successfully regenerated {current_batch} exams")
+                        logger.info(
+                            f"Successfully refreshed gallery for {current_batch} exams"
+                        )
                     except Exception as e:
                         logger.error(f"Failed to regenerate exams: {e}")
                         import traceback
@@ -347,7 +349,9 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                     json.dumps(
                         {
                             "status": "ok",
-                            "message": f"Regenerating {current_batch} exams...",
+                            "message": (
+                                f"Refreshing gallery for {current_batch} exams..."
+                            ),
                             "reload_delay_ms": 3000,
                         }
                     ).encode()
@@ -1634,6 +1638,7 @@ def generate_gallery(
 
         # prepare QC file path for saving
         qc_file_str = str(qc_file.resolve()) if qc_file else "data/qc_status.json"
+        qc_storage_namespace = qc_file_str
 
         # construct load more command
         load_more_cmd = "python qc_gallery.py --serve"
@@ -2004,8 +2009,8 @@ def generate_gallery(
             </div>
             <div style="display: flex; gap: 5px;">
                 <button class="info-button" onclick="showCutflow()">📊 Cutflow</button>
-                <button class="info-button" onclick="resetAllQC()" title="Clear all QC data and annotations">🗑 Reset</button>
-                <button class="info-button" onclick="forceRegenerate()" title="Rebuild current batch with latest QC state">🔁 Force Regenerate</button>
+                <button class="info-button" onclick="resetAllQC()" title="Clear all saved QC statuses/annotations for this QC file">🗑 Reset</button>
+                <button class="info-button" onclick="refreshCurrentBatch()" title="Rebuild gallery from saved QC state (safe: does not delete QC/source data)">🔁 Refresh Batch</button>
             </div>
             <div class="filter-controls">
                 <input type="text" id="searchBox" placeholder="Filter by patient ID, exam ID, or accession..." 
@@ -2117,6 +2122,10 @@ def generate_gallery(
         ];
 
         const qcSkipStatus = {json.dumps(qc_skip_status_list)};
+        const qcStorageNamespace = {json.dumps(qc_storage_namespace)};
+        const qcStorageKey = 'qc_data::' + qcStorageNamespace;
+        const annotationsStorageKey = 'annotations::' + qcStorageNamespace;
+        const annotationTagsStorageKey = 'annotation_tags::' + qcStorageNamespace;
         const totalToQC = {total_to_qc};
         const remainingToQC = {remaining_to_qc};
         
@@ -2130,24 +2139,32 @@ def generate_gallery(
         let sessionQCCount = 0;
         
         // track QC decisions (exam_id -> status)
+        // server state is authoritative; localStorage only backfills missing entries
         let qcData = {{}};
+        const validStatuses = new Set(['good', 'review', 'bad', 'auto_excluded']);
         
-        // load from localStorage first (preserves work across page refreshes)
-        const savedQCData = localStorage.getItem('qc_data');
+        // load statuses from server-rendered payload first
+        allExams.forEach(exam => {{
+            if (validStatuses.has(exam.qc_status)) {{
+                qcData[exam.exam_id] = exam.qc_status;
+            }}
+        }});
+        
+        // only backfill from localStorage when server has no status for that exam
+        const savedQCData = localStorage.getItem(qcStorageKey);
         if (savedQCData) {{
             try {{
-                qcData = JSON.parse(savedQCData);
+                const parsed = JSON.parse(savedQCData);
+                allExams.forEach(exam => {{
+                    const savedStatus = parsed[exam.exam_id];
+                    if (!qcData[exam.exam_id] && validStatuses.has(savedStatus)) {{
+                        qcData[exam.exam_id] = savedStatus;
+                    }}
+                }});
             }} catch (e) {{
                 console.error('Failed to parse saved QC data:', e);
             }}
         }}
-        
-        // merge with existing statuses from server
-        allExams.forEach(exam => {{
-            if (exam.qc_status && !qcData[exam.exam_id]) {{
-                qcData[exam.exam_id] = exam.qc_status;
-            }}
-        }});
 
         // client-side skip of already QC'd exams (matches qcSkipStatus)
         if (qcSkipStatus.length > 0) {{
@@ -2161,7 +2178,7 @@ def generate_gallery(
         let annotations = {{}};    // exam_id -> [tag1, tag2, ...]
         
         // load annotations from localStorage first (survives page refresh)
-        const savedAnnotations = localStorage.getItem('annotations');
+        const savedAnnotations = localStorage.getItem(annotationsStorageKey);
         if (savedAnnotations) {{
             try {{
                 annotations = JSON.parse(savedAnnotations);
@@ -2169,7 +2186,7 @@ def generate_gallery(
                 console.error('failed to parse saved annotations:', e);
             }}
         }}
-        const savedAnnotationTags = localStorage.getItem('annotation_tags');
+        const savedAnnotationTags = localStorage.getItem(annotationTagsStorageKey);
         if (savedAnnotationTags) {{
             try {{
                 annotationTags = JSON.parse(savedAnnotationTags);
@@ -2211,7 +2228,7 @@ def generate_gallery(
             }});
         
         function saveAnnotationTags() {{
-            localStorage.setItem('annotation_tags', JSON.stringify(annotationTags));
+            localStorage.setItem(annotationTagsStorageKey, JSON.stringify(annotationTags));
             fetch('/save-annotation-tags', {{
                 method: 'POST',
                 headers: {{ 'Content-Type': 'application/json' }},
@@ -2220,7 +2237,7 @@ def generate_gallery(
         }}
         
         function saveAnnotations() {{
-            localStorage.setItem('annotations', JSON.stringify(annotations));
+            localStorage.setItem(annotationsStorageKey, JSON.stringify(annotations));
             fetch('/save-annotations', {{
                 method: 'POST',
                 headers: {{ 'Content-Type': 'application/json' }},
@@ -2264,7 +2281,7 @@ def generate_gallery(
         
         function autoSaveQCData() {{
             // save to localStorage as backup
-            localStorage.setItem('qc_data', JSON.stringify(qcData));
+            localStorage.setItem(qcStorageKey, JSON.stringify(qcData));
             
             // check if we should preload next batch
             checkAndPreload();
@@ -2446,22 +2463,26 @@ def generate_gallery(
             document.getElementById('completionBanner').style.display = 'none';
         }}
 
-        function forceRegenerate() {{
+        function refreshCurrentBatch() {{
+            const ok = confirm(
+                'Rebuild the current gallery from saved QC status? This is safe: it does not delete QC records or source DICOM files.'
+            );
+            if (!ok) return;
             fetch('/regenerate')
                 .then(response => response.json())
                 .then(data => {{
                     if (data.error) {{
-                        alert('Error regenerating exams: ' + data.error);
+                        alert('Error refreshing batch: ' + data.error);
                         return;
                     }}
-                    console.log('Force regenerate triggered:', data);
+                    console.log('Batch refresh triggered:', data);
                     setTimeout(() => {{
                         location.reload();
                     }}, data.reload_delay_ms || 3000);
                 }})
                 .catch(error => {{
-                    console.error('Failed to regenerate:', error);
-                    alert('Failed to regenerate: ' + error);
+                    console.error('Failed to refresh batch:', error);
+                    alert('Failed to refresh batch: ' + error);
                 }});
         }}
         
@@ -2661,13 +2682,24 @@ def generate_gallery(
             const nextBtn = document.getElementById('nextBtn');
             
             if (filteredExams.length === 0) {{
-                viewer.innerHTML = '<div style="color: #9cdcfe;">no matching exams</div>';
+                const searchTerm = document.getElementById('searchBox').value.trim();
+                const hideReview = document.getElementById('hideReviewCheckbox').checked;
+                const hasActiveFilter = searchTerm !== '' || activeExamFilter !== null || hideReview;
+                const batchFullyCompleted = (
+                    allExams.length > 0 &&
+                    qcSkipStatus.length > 0 &&
+                    allExams.every(exam => qcSkipStatus.includes(getStatus(exam.exam_id)))
+                );
+                
+                if (batchFullyCompleted && !hasActiveFilter) {{
+                    viewer.innerHTML = '<div style="color: #9cdcfe;">all exams in this batch are already QC\\'d</div>';
+                    showCompletion();
+                }} else {{
+                    viewer.innerHTML = '<div style="color: #9cdcfe;">no matching exams (clear filters to see more)</div>';
+                }}
                 stats.textContent = '0 exams';
                 prevBtn.disabled = true;
                 nextBtn.disabled = true;
-                if (allExams.length > 0 && qcSkipStatus.length > 0) {{
-                    showCompletion();
-                }}
                 return;
             }}
             
@@ -2798,7 +2830,13 @@ def generate_gallery(
         }});
         
         function resetAllQC() {{
-            if (!confirm('Clear ALL QC statuses and annotations? This cannot be undone.')) return;
+            const message =
+                'This will clear ALL saved QC statuses and annotations in:\\n' +
+                qcStorageNamespace +
+                '\\n\\nThis includes previous sessions saved to this QC file.\\n' +
+                'Source DICOM files and generated images are NOT deleted.\\n\\n' +
+                'Continue?';
+            if (!confirm(message)) return;
             
             // clear JS state
             Object.keys(qcData).forEach(k => delete qcData[k]);
@@ -2806,6 +2844,10 @@ def generate_gallery(
             allExams.forEach(exam => {{ exam.qc_status = ''; }});
             
             // clear localStorage
+            localStorage.removeItem(qcStorageKey);
+            localStorage.removeItem(annotationsStorageKey);
+            localStorage.removeItem(annotationTagsStorageKey);
+            // remove legacy keys to avoid stale state from older gallery builds
             localStorage.removeItem('qc_data');
             localStorage.removeItem('annotations');
             localStorage.removeItem('annotation_tags');
@@ -2922,7 +2964,7 @@ def generate_gallery(
         console.log('QC data auto-saves to server on each button click');
         console.log('Server saves to: {qc_file_str}');
         console.log('Keyboard shortcuts: g=good, r=review, b=bad, a=annotate (1-9 to toggle), arrows=navigate');
-        console.log('Backup: QC data also saved to browser localStorage - safe to refresh page');
+        console.log('Backup: QC data also saved to browser localStorage (scoped by QC file) - safe to refresh page');
         console.log('Dynamic filters: Use dropdown to load filter lists without restarting server');
         console.log('Cutflow: Click 📊 Cutflow button to see dataset statistics');
     </script>
