@@ -23,7 +23,7 @@ QC Workflow (fully keyboard-driven)
 2. Open gallery in browser (with SSH port forwarding if remote)
 3. Mark exams using keyboard - auto-saves to server after each action:
    - G/R/B for good/review/bad (instant)
-   - A to open annotation modal, 1-9 to toggle tags, type + Enter to add new tag
+   - A to open annotation modal, letter hotkeys toggle tags, type + Enter to add new tag
    - Arrow keys to navigate, S to skip
 4. Re-run script to continue QC on remaining exams (by default, "good" and "bad" exams skipped)
 5. To re-visit "bad" exams: use --qc-skip-status good
@@ -2057,7 +2057,7 @@ def generate_gallery(
             </div>
             <div>
                 <p style="color: #858585; font-size: 13px; margin-top: 0; margin-bottom: 15px;">
-                    Press 1-9 to toggle tags, or type new tag and press Enter. Press ESC when done.
+                    Press letter hotkeys to toggle tags, or type new tag and press Enter. Press ESC when done.
                 </p>
                 <div id="annotationTagsList" style="margin-bottom: 20px;">
                 </div>
@@ -2176,6 +2176,7 @@ def generate_gallery(
         // annotation system: tags are independent of QC status
         let annotationTags = [];  // available tag strings
         let annotations = {{}};    // exam_id -> [tag1, tag2, ...]
+        let annotationHotkeys = {{ keyToTag: {{}}, tagToKey: {{}} }};
         
         // load annotations from localStorage first (survives page refresh)
         const savedAnnotations = localStorage.getItem(annotationsStorageKey);
@@ -2243,6 +2244,42 @@ def generate_gallery(
                 headers: {{ 'Content-Type': 'application/json' }},
                 body: JSON.stringify(annotations)
             }}).catch(error => console.error('failed to save annotations:', error));
+        }}
+
+        function buildAnnotationHotkeys(tags) {{
+            const keyToTag = {{}};
+            const tagToKey = {{}};
+            const usedKeys = new Set();
+            const fallbackPool = 'abcdefghijklmnopqrstuvwxyz0123456789';
+
+            tags.forEach(tag => {{
+                const normalized = tag.toLowerCase().replace(/[^a-z0-9]/g, '');
+                let selectedKey = '';
+
+                for (const ch of normalized) {{
+                    if (!usedKeys.has(ch)) {{
+                        selectedKey = ch;
+                        break;
+                    }}
+                }}
+
+                if (!selectedKey) {{
+                    for (const ch of fallbackPool) {{
+                        if (!usedKeys.has(ch)) {{
+                            selectedKey = ch;
+                            break;
+                        }}
+                    }}
+                }}
+
+                if (selectedKey) {{
+                    usedKeys.add(selectedKey);
+                    keyToTag[selectedKey] = tag;
+                    tagToKey[tag] = selectedKey;
+                }}
+            }});
+
+            return {{ keyToTag, tagToKey }};
         }}
         
         function checkAndPreload() {{
@@ -2325,16 +2362,20 @@ def generate_gallery(
             const tagsList = document.getElementById('annotationTagsList');
             const exam = filteredExams[currentIndex];
             const examAnnotations = annotations[exam.exam_id] || [];
+            annotationHotkeys = buildAnnotationHotkeys(annotationTags);
             
             // clear and populate tag list
             tagsList.innerHTML = '';
-            annotationTags.forEach((tag, index) => {{
-                const hotkey = index + 1; // 1-9
-                if (hotkey > 9) return;
-                
+            annotationTags.forEach(tag => {{
+                const hotkey = annotationHotkeys.tagToKey[tag];
                 const isActive = examAnnotations.includes(tag);
                 const btn = document.createElement('button');
-                btn.textContent = `[${{hotkey}}] ${{tag}}`;
+                const hotkeyLabel = hotkey ? hotkey.toUpperCase() : '';
+                if (hotkeyLabel) {{
+                    btn.textContent = `[${{hotkeyLabel}}] ${{tag}}`;
+                }} else {{
+                    btn.textContent = tag;
+                }}
                 btn.dataset.tag = tag;
                 btn.style.cssText = `
                     display: block;
@@ -2351,7 +2392,11 @@ def generate_gallery(
                     transition: all 0.15s;
                 `;
                 if (isActive) {{
-                    btn.textContent = `[${{hotkey}}] ✓ ${{tag}}`;
+                    if (hotkeyLabel) {{
+                        btn.textContent = `[${{hotkeyLabel}}] ✓ ${{tag}}`;
+                    }} else {{
+                        btn.textContent = `✓ ${{tag}}`;
+                    }}
                 }}
                 btn.onclick = () => {{
                     toggleAnnotation(tag);
@@ -2797,11 +2842,13 @@ def generate_gallery(
             const annotationModal = document.getElementById('annotationModal');
             const modalIsOpen = annotationModal.style.display === 'block';
             
-            // if modal is open and user presses a number (not in input), toggle that tag
+            // if modal is open and user presses a tag hotkey (not in input), toggle that tag
             if (modalIsOpen && e.target.id !== 'newAnnotationInput') {{
-                const num = parseInt(e.key);
-                if (num >= 1 && num <= 9 && num <= annotationTags.length) {{
-                    toggleAnnotation(annotationTags[num - 1]);
+                const key = e.key.toLowerCase();
+                const taggedTag = annotationHotkeys.keyToTag[key];
+                if (taggedTag) {{
+                    e.preventDefault();
+                    toggleAnnotation(taggedTag);
                     return;
                 }}
             }}
@@ -2963,7 +3010,7 @@ def generate_gallery(
         // show instructions in console
         console.log('QC data auto-saves to server on each button click');
         console.log('Server saves to: {qc_file_str}');
-        console.log('Keyboard shortcuts: g=good, r=review, b=bad, a=annotate (1-9 to toggle), arrows=navigate');
+        console.log('Keyboard shortcuts: g=good, r=review, b=bad, a=annotate (letter hotkeys toggle tags), arrows=navigate');
         console.log('Backup: QC data also saved to browser localStorage (scoped by QC file) - safe to refresh page');
         console.log('Dynamic filters: Use dropdown to load filter lists without restarting server');
         console.log('Cutflow: Click 📊 Cutflow button to see dataset statistics');
@@ -2999,7 +3046,7 @@ def generate_gallery(
                 )
                 logger.info("=" * 60)
                 logger.info(
-                    "Keyboard shortcuts: G=Good, R=Review, B=Bad, A=Annotate (1-9 toggle), Arrow keys=Navigate"
+                    "Keyboard shortcuts: G=Good, R=Review, B=Bad, A=Annotate (letter hotkeys), Arrow keys=Navigate"
                 )
 
     logger.info("gallery generation complete:")
