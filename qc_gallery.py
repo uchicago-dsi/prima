@@ -966,8 +966,8 @@ def start_qc_server(
         LOAD_MORE_ARGS
 
     QC_FILE_PATH = qc_file.resolve()
-    ANNOTATIONS_PATH = qc_file.parent / "annotations.json"
-    ANNOTATION_TAGS_PATH = qc_file.parent / "annotation_tags.json"
+    ANNOTATIONS_PATH = QC_FILE_PATH.parent / "annotations.json"
+    ANNOTATION_TAGS_PATH = QC_FILE_PATH.parent / "annotation_tags.json"
     OUTPUT_DIR = output_dir.resolve()
     VIEWS_PATH = views_path.resolve()
     TAGS_PATH = tags_path.resolve()
@@ -1467,7 +1467,7 @@ def generate_gallery(
     if qc_skip_status is None:
         qc_skip_status = {"good", "bad"}
     logger.info(
-        "QC DEBUG generate_gallery args: max_exams=%s, random_sample=%s, prioritize_errors=%s, qc_skip_status=%s, patient_id=%s, exam_id=%s, exam_list_path=%s, serve=%s",
+        "QC DEBUG generate_gallery args: max_exams=%s, random_sample=%s, prioritize_errors=%s, qc_skip_status=%s, patient_id=%s, exam_id=%s, exam_list_path=%s, qc_file=%s, serve=%s",
         max_exams,
         random_sample,
         prioritize_errors,
@@ -1475,6 +1475,7 @@ def generate_gallery(
         patient_id,
         exam_id,
         exam_list_path,
+        qc_file,
         serve,
     )
     # load existing QC data if available
@@ -3676,21 +3677,31 @@ QC File Format:
             logger.error(f"metadata CSV not found: {args.meta_csv}")
             return 1
 
+    # resolve paths once before server changes cwd to output_dir
+    resolved_raw_dir = args.raw.resolve()
+    resolved_output_dir = args.output.resolve()
+    resolved_qc_file = args.qc_file.resolve()
+    resolved_views_path = views_path.resolve()
+    resolved_tags_path = tags_path.resolve()
+    resolved_exam_list = args.exam_list.resolve() if args.exam_list else None
+    resolved_pred_csv = args.pred_csv.resolve() if args.pred_csv else None
+    resolved_meta_csv = args.meta_csv.resolve() if args.meta_csv else None
+
     # run gallery generation
     generate_gallery(
-        views_parquet=views_path,
-        raw_dir=args.raw,
-        output_dir=args.output,
+        views_parquet=resolved_views_path,
+        raw_dir=resolved_raw_dir,
+        output_dir=resolved_output_dir,
         max_exams=args.max_exams,
         random_sample=args.random,
         patient_id=args.patient,
         exam_id=args.exam,
-        exam_list_path=args.exam_list,
+        exam_list_path=resolved_exam_list,
         per_view=args.per_view,
         no_gallery=args.no_gallery,
-        qc_file=args.qc_file,
-        pred_csv=args.pred_csv,
-        meta_csv=args.meta_csv,
+        qc_file=resolved_qc_file,
+        pred_csv=resolved_pred_csv,
+        meta_csv=resolved_meta_csv,
         prioritize_errors=args.prioritize_errors,
         horizon=args.horizon,
         qc_skip_status=set(args.qc_skip_status) if args.qc_skip_status else None,
@@ -3704,27 +3715,38 @@ QC File Format:
         logger.info("Starting HTTP server for QC gallery...")
         # prepare args for load-more functionality
         load_more_args = {
-            "views_parquet": views_path,
-            "raw_dir": args.raw,
-            "output_dir": args.output,
+            "views_parquet": resolved_views_path,
+            "raw_dir": resolved_raw_dir,
+            "output_dir": resolved_output_dir,
             "max_exams": args.max_exams,
             "random_sample": args.random,
             "patient_id": args.patient,
             "exam_id": args.exam,
-            "exam_list_path": args.exam_list,
+            "exam_list_path": resolved_exam_list,
             "per_view": args.per_view,
             "no_gallery": args.no_gallery,
-            "qc_file": args.qc_file,
-            "pred_csv": args.pred_csv,
-            "meta_csv": args.meta_csv,
+            "qc_file": resolved_qc_file,
+            "pred_csv": resolved_pred_csv,
+            "meta_csv": resolved_meta_csv,
             "prioritize_errors": args.prioritize_errors,
             "horizon": args.horizon,
             "qc_skip_status": set(args.qc_skip_status) if args.qc_skip_status else None,
             "serve": True,
             "original_args": None,
         }
+        logger.info(
+            "QC DEBUG server path binding: qc_file=%s, views=%s, output=%s",
+            resolved_qc_file,
+            resolved_views_path,
+            resolved_output_dir,
+        )
         start_qc_server(
-            args.output, args.qc_file, views_path, tags_path, args.port, load_more_args
+            resolved_output_dir,
+            resolved_qc_file,
+            resolved_views_path,
+            resolved_tags_path,
+            args.port,
+            load_more_args,
         )
         # server runs until ctrl+c
         return 0
