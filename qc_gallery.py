@@ -33,7 +33,7 @@ Data Format
 QC status stored in JSON (default: data/qc_status.json):
   - {exam_id: "good"}, {exam_id: "review"}, or {exam_id: "bad"}
 Annotations stored separately in data/annotations.json:
-  - {exam_id: ["detector artifact - vertical line", ...]}
+  - {exam_id: ["vertical line (detector artifact)", ...]}
 Available annotation tags stored in data/annotation_tags.json
 
 Server mode (recommended for remote work):
@@ -146,7 +146,10 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                     tags = json.load(f)
                 self.wfile.write(json.dumps(tags).encode())
             else:
-                default_tags = ["detector artifact - vertical line"]
+                default_tags = [
+                    "vertical line (detector artifact)",
+                    "horizontal line (detector artifact)",
+                ]
                 self.wfile.write(json.dumps(default_tags).encode())
             return
 
@@ -2211,7 +2214,10 @@ def generate_gallery(
             .catch(error => {{
                 console.error('failed to load annotation tags from server:', error);
                 if (annotationTags.length === 0) {{
-                    annotationTags = ["detector artifact - vertical line"];
+                    annotationTags = [
+                        "vertical line (detector artifact)",
+                        "horizontal line (detector artifact)"
+                    ];
                 }}
             }});
         
@@ -2252,8 +2258,21 @@ def generate_gallery(
             const tagToKey = {{}};
             const usedKeys = new Set();
             const fallbackPool = 'abcdefghijklmnopqrstuvwxyz0123456789';
+            const preferredHotkeys = {{
+                'vertical line (detector artifact)': 'v',
+                'horizontal line (detector artifact)': 'h'
+            }};
+
+            Object.entries(preferredHotkeys).forEach(([tag, preferredKey]) => {{
+                if (tags.includes(tag) && !usedKeys.has(preferredKey)) {{
+                    usedKeys.add(preferredKey);
+                    keyToTag[preferredKey] = tag;
+                    tagToKey[tag] = preferredKey;
+                }}
+            }});
 
             tags.forEach(tag => {{
+                if (tagToKey[tag]) return;
                 const normalized = tag.toLowerCase().replace(/[^a-z0-9]/g, '');
                 let selectedKey = '';
 
