@@ -24,10 +24,10 @@
 #   # export AUTO_DELETE_EMPTY_STUDY=0    # auto-delete empty studies (default 0)
 #   # export PROMPT_DELETE_EMPTY_STUDY=1  # ask to delete empty studies (default 1)
 #   # export AUTO_PROCEED=0               # ask to proceed each scan (default 0 = prompt if interactive)
-#   ./sync.sh
+#   ./scripts/sync.sh
 #
 # one-shot:
-#   export RUN_ONCE=1; ./sync.sh
+#   export RUN_ONCE=1; ./scripts/sync.sh
 
 set -euo pipefail
 

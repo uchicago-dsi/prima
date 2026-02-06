@@ -48,6 +48,14 @@ The end-to-end workflow for training/inference is:
 that exists on disk but is missing from iBroker (e.g., from earlier studies) will still
 be processed and can be used for training, as long as patients have phenotype labels.
 
+### Repository layout (high level)
+
+- Top-level `*.py`: primary CLI entrypoints and analysis scripts
+- `prima/`: lightweight Python package namespace
+- `scripts/`: operational shell helpers
+- `vendor/mirai/`: Mirai submodule
+- `data/`: local generated metadata/caches (ignored in git)
+
 ---
 
 ## Installation
