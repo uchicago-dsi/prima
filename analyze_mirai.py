@@ -18,7 +18,7 @@ Notes
 
 Usage
 -----
-python analyze_mirai.py --config /path/to/analyze_mirai_config.json
+python analyze_mirai.py /path/to/analyze_mirai_config.yaml
 
 The config controls:
 - input/output paths
@@ -1076,10 +1076,8 @@ def parse_args() -> Config:
         description="Analyze Mirai outputs using OmegaConf config"
     )
     p.add_argument(
-        "--config",
-        dest="config",
+        "config",
         type=Path,
-        required=True,
         help="OmegaConf YAML/JSON config path",
     )
     args = p.parse_args()

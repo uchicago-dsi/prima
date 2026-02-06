@@ -445,7 +445,7 @@ Compute per-horizon AUC and survival metrics (Uno's C-index, time-dependent AUC,
 cp configs/analysis.yaml /tmp/analyze_mirai.yaml
 
 # run with a single config input
-python analyze_mirai.py --config /tmp/analyze_mirai.yaml
+python analyze_mirai.py /tmp/analyze_mirai.yaml
 ```
 
 `analyze_mirai.py` is now config-only (OmegaConf YAML/JSON). The config supports:
@@ -584,7 +584,7 @@ With server running, you can also dynamically test filters:
 1. Mark exams using keyboard shortcuts: `G` = Good, `R` = Needs review, `B` = Bad, Arrow keys = Navigate
 2. QC status auto-saves to `data/qc_status.json`
 3. Re-run the script to continue — by default, exams marked "good" or "bad" are automatically skipped
-4. Apply QC filters in downstream analysis via `analyze_mirai.py --config ...` (see below)
+4. Apply QC filters in downstream analysis via `analyze_mirai.py <config.yaml>` (see below)
 
 **Default behavior**: Future QC runs skip exams marked as "good" (already approved) or "bad" (already rejected), showing only "review" and unmarked exams.
 
@@ -636,7 +636,7 @@ After QC, configure filtering in the analysis config:
 
 ```bash
 # edit config QC block (status + auto filters + annotations), then run:
-python analyze_mirai.py --config /tmp/analyze_mirai.yaml
+python analyze_mirai.py /tmp/analyze_mirai.yaml
 ```
 
 **QC filter behavior**:
@@ -646,7 +646,7 @@ In future QC runs (default: `--qc-skip-status good bad`):
 - Exams marked `"review"` or unmarked are shown (need attention)
 - To re-visit "bad" exams: `--qc-skip-status good`
 
-In downstream analysis (`analyze_mirai.py --config ...`):
+In downstream analysis (`analyze_mirai.py <config.yaml>`):
 - Status filtering is controlled by `qc_filters.include_statuses` / `qc_filters.exclude_statuses`
 - Auto filters are controlled by `qc_filters.enable_auto_filters` and `qc_filters.auto_filters`
 - Annotation filters are controlled by `qc_filters.annotation_include_*` and `qc_filters.annotation_exclude_*`
