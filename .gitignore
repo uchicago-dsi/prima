@@ -1,0 +1,37 @@
+# Editor/session state
+.cursor/
+.vscode/
+.session.vim
+
+# Python build/cache artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Logs and local runtime output
+logs/
+*.log
+notebook.out
+notebook.err
+out
+
+# Generated data and visualization outputs
+data/**
+!data/.gitkeep
+qc_output/
+debug_viz/
+
+# Local scratch artifacts
+.devcontainer/
+dev.ipynb
+foo.txt
+log.txt
+missing_mrns.txt
+screening_patients_mr.csv
+omoleye.pdf
+todo.txt
+zarr.patch
