@@ -18,7 +18,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from tqdm.auto import tqdm
 
-from filesystem_utils import build_disk_inventory
+from prima.filesystem_utils import build_disk_inventory
 
 # --- required config: fail if you forget to set these ---
 username = os.getenv("IBROKER_USERNAME")

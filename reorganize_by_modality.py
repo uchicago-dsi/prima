@@ -26,7 +26,7 @@ import pydicom
 from pydicom.dataset import FileDataset
 from pydicom.tag import Tag
 
-from metadata_utils import extract_base_modality
+from prima.metadata_utils import extract_base_modality
 
 # suppress pydicom VR UI validation warnings for non-standard UIDs
 warnings.filterwarnings("ignore", message=".*Invalid value for VR UI.*", append=True)

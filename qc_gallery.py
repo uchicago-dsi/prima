@@ -106,11 +106,11 @@ QC_FILE_PATH = None
 ANNOTATIONS_PATH = None  # exam_id -> [list of annotation tags]
 ANNOTATION_TAGS_PATH = None  # list of available annotation tag strings
 OUTPUT_DIR = None
-FILTER_DIR = None
 VIEWS_PATH = None
 TAGS_PATH = None
 LOAD_MORE_ARGS = None  # store args for dynamic loading
 ENABLE_PRELOAD = False
+_CACHED_FILTER_SETS = None  # lazily computed {filter_name: set(exam_id)}
 
 DEBUG_TRACKED_STATUSES = ("good", "review", "bad", "auto_excluded")
 
@@ -125,7 +125,7 @@ LEGACY_ANNOTATION_TAG_ALIASES = {
 }
 
 
-def _normalize_annotation_tags(tags) -> list[str]:
+def _normalize_annotation_tags(tags):
     """Normalize annotation tags to canonical labels and keep canonical tags first."""
     if not isinstance(tags, list):
         tags = []
@@ -238,53 +238,51 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
             return
 
         if parsed_path.path == "/list-filters":
-            # list available filter files
+            # list auto-computed filters (from parquet data) plus any static .txt files
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
 
             filters = []
-            if FILTER_DIR and FILTER_DIR.exists():
-                for f in FILTER_DIR.glob("*.txt"):
+
+            try:
+                fs = self._get_filter_sets()
+                for name, exam_set in fs.items():
                     filters.append(
                         {
-                            "name": f.stem.replace("_", " ").title(),
-                            "path": str(f),
-                            "filename": f.name,
+                            "name": name.replace("_", " ").title()
+                            + f" ({len(exam_set)})",
+                            "filename": name,
                         }
                     )
+            except Exception as e:
+                logger.warning(f"failed to compute auto-filter sets: {e}")
             self.wfile.write(json.dumps(filters).encode())
             return
 
         if parsed_path.path.startswith("/load-filter/"):
-            # load specific filter file
-            filename = parsed_path.path.split("/load-filter/", 1)[1]
+            filter_name = parsed_path.path.split("/load-filter/", 1)[1]
 
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
 
-            if FILTER_DIR:
-                filter_path = FILTER_DIR / filename
-
-                if filter_path.exists():
-                    with open(filter_path) as f:
-                        exam_ids = [
-                            line.strip()
-                            for line in f
-                            if line.strip() and not line.startswith("#")
-                        ]
-                    self.wfile.write(json.dumps({"exam_ids": exam_ids}).encode())
+            try:
+                fs = self._get_filter_sets()
+                key = filter_name.replace(".txt", "")
+                if key in fs:
+                    self.wfile.write(json.dumps({"exam_ids": sorted(fs[key])}).encode())
                 else:
                     self.wfile.write(
-                        json.dumps({"error": f"File not found: {filter_path}"}).encode()
+                        json.dumps({"error": f"Unknown filter: {filter_name}"}).encode()
                     )
-            else:
-                self.wfile.write(
-                    json.dumps({"error": "Filter directory not configured"}).encode()
+            except Exception as e:
+                logger.warning(
+                    f"failed to compute auto-filter set for {filter_name}: {e}"
                 )
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
             return
 
         if parsed_path.path == "/cutflow":
@@ -355,6 +353,7 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
 
                         args = deepcopy(LOAD_MORE_ARGS)
                         args["max_exams"] = next_batch
+                        args["exam_list_path"] = None  # ensure unfiltered
                         generate_gallery(**args)
                         logger.info(f"✓ Preload complete: {next_batch} exams ready")
                         self.server._preload_ready = True
@@ -414,6 +413,7 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                         from copy import deepcopy
 
                         args = deepcopy(LOAD_MORE_ARGS)
+                        args["exam_list_path"] = None  # ensure unfiltered
                         generate_gallery(**args)
                         logger.info(
                             f"Successfully refreshed gallery for {current_batch} exams"
@@ -465,37 +465,19 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                 self.server._preload_ready = False
 
                 current_batch = LOAD_MORE_ARGS.get("max_exams") or 100
-                query = parse_qs(parsed_path.query)
-                requested_batch_raw = (query.get("batch_size", [""])[0] or "").strip()
-                if requested_batch_raw:
+                # allow client to override batch size via query param
+                qs = parse_qs(parsed_path.query)
+                if "batch_size" in qs:
                     try:
-                        requested_batch = int(requested_batch_raw)
-                    except ValueError:
-                        self.wfile.write(
-                            json.dumps(
-                                {
-                                    "error": f"Invalid batch_size '{requested_batch_raw}'. Expected positive integer."
-                                }
-                            ).encode()
-                        )
-                        return
-                    if requested_batch <= 0:
-                        self.wfile.write(
-                            json.dumps(
-                                {
-                                    "error": f"Invalid batch_size '{requested_batch_raw}'. Expected positive integer."
-                                }
-                            ).encode()
-                        )
-                        return
-                    next_batch = requested_batch
+                        next_batch = max(1, int(qs["batch_size"][0]))
+                    except (ValueError, IndexError):
+                        next_batch = current_batch
                 else:
                     next_batch = current_batch
                 logger.info(
-                    "QC DEBUG load-more: qc_file=%s, current_batch=%s, requested_batch=%s, next_batch=%s, prioritize_errors=%s, random_sample=%s, qc_skip_status=%s",
+                    "QC DEBUG load-more: qc_file=%s, current_batch=%s, next_batch=%s, prioritize_errors=%s, random_sample=%s, qc_skip_status=%s",
                     QC_FILE_PATH,
                     current_batch,
-                    requested_batch_raw if requested_batch_raw else "(default)",
                     next_batch,
                     LOAD_MORE_ARGS.get("prioritize_errors"),
                     LOAD_MORE_ARGS.get("random_sample"),
@@ -558,6 +540,7 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
 
                         args = deepcopy(LOAD_MORE_ARGS)
                         args["max_exams"] = next_batch
+                        args["exam_list_path"] = None  # ensure unfiltered
                         generate_gallery(**args)
                         LOAD_MORE_ARGS["max_exams"] = next_batch
                         self.server._load_more_ready = True
@@ -592,6 +575,125 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                 import traceback
 
                 traceback.print_exc()
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
+            return
+
+        if parsed_path.path == "/load-filter-batch":
+            # regenerate gallery with exams matching a specific filter
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+            try:
+                if not LOAD_MORE_ARGS:
+                    self.wfile.write(
+                        json.dumps({"error": "Load more not configured"}).encode()
+                    )
+                    return
+
+                qs = parse_qs(parsed_path.query)
+                filter_name = qs.get("filter", [None])[0]
+                if not filter_name:
+                    self.wfile.write(
+                        json.dumps({"error": "Missing ?filter= parameter"}).encode()
+                    )
+                    return
+
+                try:
+                    batch_size = max(1, int(qs.get("batch_size", [100])[0]))
+                except (ValueError, IndexError):
+                    batch_size = 100
+
+                fs = self._get_filter_sets()
+                if filter_name not in fs:
+                    self.wfile.write(
+                        json.dumps({"error": f"Unknown filter: {filter_name}"}).encode()
+                    )
+                    return
+
+                filter_exam_ids = fs[filter_name]
+
+                if (
+                    hasattr(self.server, "_load_more_in_progress")
+                    and self.server._load_more_in_progress
+                ):
+                    self.wfile.write(
+                        json.dumps(
+                            {
+                                "status": "already_loading",
+                                "message": "Generation already in progress",
+                            }
+                        ).encode()
+                    )
+                    return
+
+                self.server._load_more_in_progress = True
+                self.server._load_more_ready = False
+                self.server._load_more_error = None
+                self.server._load_more_target_batch = batch_size
+
+                logger.info(
+                    f"Loading filter batch: filter={filter_name}, "
+                    f"matching={len(filter_exam_ids)}, batch_size={batch_size}"
+                )
+
+                import tempfile
+                import threading
+
+                # write filter exam IDs to a temp file for generate_gallery
+                tmp = tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".txt", delete=False, prefix="qc_filter_"
+                )
+                for eid in sorted(filter_exam_ids):
+                    tmp.write(eid + "\n")
+                tmp.close()
+                tmp_path = Path(tmp.name)
+
+                def regenerate():
+                    try:
+                        from copy import deepcopy
+
+                        args = deepcopy(LOAD_MORE_ARGS)
+                        args["max_exams"] = batch_size
+                        args["exam_list_path"] = tmp_path
+                        args["prioritize_errors"] = False
+                        args["random_sample"] = False
+                        generate_gallery(**args)
+                        self.server._load_more_ready = True
+                        logger.info(
+                            f"Successfully generated filter batch: "
+                            f"{filter_name} ({batch_size} exams)"
+                        )
+                    except Exception as e:
+                        self.server._load_more_error = str(e)
+                        logger.error(f"Failed to generate filter batch: {e}")
+                        import traceback
+
+                        traceback.print_exc()
+                    finally:
+                        self.server._load_more_in_progress = False
+                        tmp_path.unlink(missing_ok=True)
+
+                thread = threading.Thread(target=regenerate)
+                thread.daemon = True
+                thread.start()
+
+                self.wfile.write(
+                    json.dumps(
+                        {
+                            "status": "ok",
+                            "message": f"Loading {batch_size} {filter_name} exams...",
+                            "filter": filter_name,
+                            "matching": len(filter_exam_ids),
+                            "batch_size": batch_size,
+                        }
+                    ).encode()
+                )
+
+            except Exception as e:
+                self.server._load_more_in_progress = False
+                logger.error(f"error loading filter batch: {e}")
                 self.wfile.write(json.dumps({"error": str(e)}).encode())
             return
 
@@ -770,19 +872,35 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
+    def _get_filter_sets(self):
+        """compute or return cached auto-filter exam-id sets from parquet data."""
+        global _CACHED_FILTER_SETS
+        if _CACHED_FILTER_SETS is not None:
+            return _CACHED_FILTER_SETS
+
+        if not VIEWS_PATH or not TAGS_PATH:
+            return {}
+
+        from prima.qc_filters import compute_auto_filter_sets
+
+        fs = compute_auto_filter_sets(VIEWS_PATH, TAGS_PATH)
+        logger.info(
+            "computed auto-filter sets: %s",
+            ", ".join(f"{k}={len(v)}" for k, v in fs.items()),
+        )
+        _CACHED_FILTER_SETS = fs
+        return fs
+
     def _compute_cutflow(self):
         """compute cutflow analysis on demand"""
         if not VIEWS_PATH or not TAGS_PATH:
             return {"error": "Views/tags paths not configured"}
 
+        filter_sets = self._get_filter_sets()
+
         views_df = pd.read_parquet(VIEWS_PATH)
         views_df["exam_id"] = views_df["exam_id"].astype(str)
-        tags_df = pd.read_parquet(TAGS_PATH)
-        merged = views_df.merge(tags_df, on="sop_instance_uid", how="left")
-        merged["exam_id"] = merged["exam_id"].astype(str)
-        exam_df = merged.groupby("exam_id").first().reset_index()
-
-        total_exams = len(exam_df)
+        total_exams = views_df["exam_id"].nunique()
 
         # load QC data
         qc_data = {}
@@ -792,10 +910,8 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
             qc_data = {str(exam_id): status for exam_id, status in qc_data.items()}
 
         cutflow = []
-        excluded_exams = set()
-        filter_sets = {}
+        excluded_exams: set = set()
 
-        # Starting point
         cutflow.append(
             {
                 "step": "0. Total",
@@ -808,75 +924,29 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
             }
         )
 
-        # Apply filters
-        if "has_implant" in views_df.columns:
-            implant_exams = set(views_df[views_df["has_implant"]]["exam_id"].unique())
-            new_excluded = implant_exams - excluded_exams
-            excluded_exams.update(implant_exams)
-            filter_sets["has_implant"] = implant_exams
+        # ordered filter steps
+        filter_steps = [
+            ("1. Implants", "has_implant == True", "has_implant"),
+            ("2. Scanned Film", "DetectorType == FILM", "scanned_film"),
+            ("3. GEMS", "All GE GEMS processing codes (GEMS_*)", "gems_ffdm_tc1"),
+            (
+                "4. Duplicate Exams",
+                "Shared SOP Instance UIDs within patient",
+                "duplicate_sop_uid",
+            ),
+        ]
+
+        for step_name, filter_desc, filter_key in filter_steps:
+            if filter_key not in filter_sets:
+                continue
+            matched = filter_sets[filter_key]
+            new_excluded = matched - excluded_exams
+            excluded_exams.update(matched)
             cutflow.append(
                 {
-                    "step": "1. Implants",
-                    "filter": "has_implant == True",
-                    "flagged_by_filter": len(implant_exams),
-                    "exams_excluded_this_step": len(new_excluded),
-                    "total_excluded": len(excluded_exams),
-                    "exams_remaining": total_exams - len(excluded_exams),
-                    "percent_remaining": (total_exams - len(excluded_exams))
-                    / total_exams
-                    * 100,
-                }
-            )
-
-        # scanned film: Secondary Capture OR R2 DigitalNow
-        film_exams = set()
-        if "SOPClassUID" in merged.columns:
-            secondary = merged[
-                merged["SOPClassUID"].str.contains(
-                    "1.2.840.10008.5.1.4.1.1.7", na=False
-                )
-            ]["exam_id"].unique()
-            film_exams.update(secondary)
-        # R2 DigitalNow film digitizer
-        r2_film = views_df[
-            views_df["device_manufacturer"].str.contains(
-                "R2 Technology", na=False, case=False
-            )
-            | views_df["device_model"].str.contains("DigitalNow", na=False, case=False)
-        ]["exam_id"].unique()
-        film_exams.update(r2_film)
-
-        if len(film_exams) > 0:
-            new_excluded = film_exams - excluded_exams
-            excluded_exams.update(film_exams)
-            filter_sets["scanned_film"] = film_exams
-            cutflow.append(
-                {
-                    "step": "2. Scanned Film",
-                    "filter": "Secondary Capture + R2 DigitalNow",
-                    "flagged_by_filter": len(film_exams),
-                    "exams_excluded_this_step": len(new_excluded),
-                    "total_excluded": len(excluded_exams),
-                    "exams_remaining": total_exams - len(excluded_exams),
-                    "percent_remaining": (total_exams - len(excluded_exams))
-                    / total_exams
-                    * 100,
-                }
-            )
-
-        if "AcquisitionDeviceProcessingCode" in merged.columns:
-            gems_mask = merged["AcquisitionDeviceProcessingCode"].str.startswith(
-                "GEMS_", na=False
-            )
-            gems_exams = set(merged[gems_mask]["exam_id"].unique())
-            new_excluded = gems_exams - excluded_exams
-            excluded_exams.update(gems_exams)
-            filter_sets["gems_ffdm_tc1"] = gems_exams
-            cutflow.append(
-                {
-                    "step": "3. GEMS",
-                    "filter": "All GE GEMS processing codes (GEMS_*)",
-                    "flagged_by_filter": len(gems_exams),
+                    "step": step_name,
+                    "filter": filter_desc,
+                    "flagged_by_filter": len(matched),
                     "exams_excluded_this_step": len(new_excluded),
                     "total_excluded": len(excluded_exams),
                     "exams_remaining": total_exams - len(excluded_exams),
@@ -891,10 +961,11 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
             bad_exams = {eid for eid, status in qc_data.items() if status == "bad"}
             new_excluded = bad_exams - excluded_exams
             excluded_exams.update(bad_exams)
+            filter_sets = dict(filter_sets)  # don't mutate cache
             filter_sets["manual_qc_bad"] = bad_exams
             cutflow.append(
                 {
-                    "step": "4. Manual QC",
+                    "step": "5. Manual QC",
                     "filter": "Manually marked as bad",
                     "flagged_by_filter": len(bad_exams),
                     "exams_excluded_this_step": len(new_excluded),
@@ -986,7 +1057,6 @@ def start_qc_server(
         ANNOTATIONS_PATH, \
         ANNOTATION_TAGS_PATH, \
         OUTPUT_DIR, \
-        FILTER_DIR, \
         VIEWS_PATH, \
         TAGS_PATH, \
         LOAD_MORE_ARGS
@@ -998,8 +1068,6 @@ def start_qc_server(
     VIEWS_PATH = views_path.resolve()
     TAGS_PATH = tags_path.resolve()
     LOAD_MORE_ARGS = load_more_args
-    # store filter directory as absolute path before changing directory
-    FILTER_DIR = Path.cwd() / "data" / "filter_tests"
 
     # change to output directory so SimpleHTTPRequestHandler can serve files
     import os
@@ -1025,12 +1093,6 @@ def start_qc_server(
     logger.info("=" * 60)
     logger.info(f"QC file: {QC_FILE_PATH}")
     logger.info(f"Serving from: {OUTPUT_DIR}")
-    logger.info(f"Filter directory: {FILTER_DIR}")
-    if FILTER_DIR.exists():
-        filter_count = len(list(FILTER_DIR.glob("*.txt")))
-        logger.info(f"  → {filter_count} filter lists available in dropdown")
-    else:
-        logger.info("  → No filter lists found (run test_positioning_filters.py)")
     logger.info("")
     logger.info("FOR REMOTE ACCESS:")
     logger.info("  1. In a NEW local terminal, run:")
@@ -1491,7 +1553,7 @@ def generate_gallery(
         serve: if True, suppress non-server instructions in logging
     """
     if qc_skip_status is None:
-        qc_skip_status = {"good", "bad"}
+        qc_skip_status = {"good", "bad", "auto_excluded"}
     logger.info(
         "QC DEBUG generate_gallery args: max_exams=%s, random_sample=%s, prioritize_errors=%s, qc_skip_status=%s, patient_id=%s, exam_id=%s, exam_list_path=%s, qc_file=%s, serve=%s",
         max_exams,
@@ -1536,91 +1598,44 @@ def generate_gallery(
     )
 
     # apply auto-exclusions from config
-    auto_exclude_config = Path("data/qc_auto_exclude.json")
-    if auto_exclude_config.exists():
-        with open(auto_exclude_config) as f:
-            auto_config = json.load(f)
+    from prima.qc_filters import compute_auto_filter_sets, load_auto_filter_names
 
-        auto_filters = auto_config.get("filters", [])
-        if auto_filters:
-            logger.info(f"applying auto-exclusions: {', '.join(auto_filters)}")
+    auto_filter_names = load_auto_filter_names()
+    if auto_filter_names:
+        logger.info(f"applying auto-exclusions: {', '.join(auto_filter_names)}")
+        tags_path = raw_dir / "sot" / "dicom_tags.parquet"
+        filter_sets = compute_auto_filter_sets(
+            views_parquet, tags_path, filter_names=auto_filter_names
+        )
+        auto_excluded_exams: set = set()
+        for filter_name in auto_filter_names:
+            matched = filter_sets.get(filter_name, set())
+            if matched:
+                auto_excluded_exams.update(matched)
+                logger.info(f"  {filter_name}: {len(matched)} exams")
 
-            # load tags to apply filters
-            tags_df = pd.read_parquet(raw_dir / "sot" / "dicom_tags.parquet")
-            merged = views_df.merge(tags_df, on="sop_instance_uid", how="left")
+        if auto_excluded_exams:
+            before_count = views_df["exam_id"].nunique()
+            views_df = views_df[~views_df["exam_id"].isin(auto_excluded_exams)]
+            after_count = views_df["exam_id"].nunique()
+            logger.info(
+                f"auto-excluded {before_count - after_count} exams total via config filters"
+            )
 
-            auto_excluded_exams = set()
-            for filter_name in auto_filters:
-                if (
-                    filter_name == "gems_ffdm_tc1"
-                    and "AcquisitionDeviceProcessingCode" in merged.columns
-                ):
-                    gems_exams = merged[
-                        merged["AcquisitionDeviceProcessingCode"].str.startswith(
-                            "GEMS_", na=False
-                        )
-                    ]["exam_id"].unique()
-                    auto_excluded_exams.update(gems_exams)
-                    logger.info(f"  {filter_name}: {len(gems_exams)} exams")
-                elif filter_name == "has_implant" and "has_implant" in views_df.columns:
-                    implant_exams = views_df[views_df["has_implant"]][
-                        "exam_id"
-                    ].unique()
-                    auto_excluded_exams.update(implant_exams)
-                    logger.info(f"  {filter_name}: {len(implant_exams)} exams")
-                elif filter_name == "scanned_film":
-                    film_exams = set()
-                    if "SOPClassUID" in merged.columns:
-                        secondary = merged[
-                            merged["SOPClassUID"].str.contains(
-                                "1.2.840.10008.5.1.4.1.1.7", na=False
-                            )
-                        ]["exam_id"].unique()
-                        film_exams.update(secondary)
-                    # R2 DigitalNow film digitizer
-                    r2_film = views_df[
-                        views_df["device_manufacturer"].str.contains(
-                            "R2 Technology", na=False, case=False
-                        )
-                        | views_df["device_model"].str.contains(
-                            "DigitalNow", na=False, case=False
-                        )
-                    ]["exam_id"].unique()
-                    film_exams.update(r2_film)
-                    auto_excluded_exams.update(film_exams)
-                    logger.info(f"  {filter_name}: {len(film_exams)} exams")
-                elif (
-                    filter_name == "negative_positioner_angle"
-                    and "PositionerPrimaryAngle" in merged.columns
-                ):
-                    angle = pd.to_numeric(
-                        merged["PositionerPrimaryAngle"], errors="coerce"
-                    )
-                    neg_exams = merged[angle < 0]["exam_id"].unique()
-                    auto_excluded_exams.update(neg_exams)
-                    logger.info(f"  {filter_name}: {len(neg_exams)} exams")
-                elif (
-                    filter_name == "zero_compression"
-                    and "CompressionForce" in merged.columns
-                ):
-                    comp = pd.to_numeric(merged["CompressionForce"], errors="coerce")
-                    zero_exams = merged[comp == 0]["exam_id"].unique()
-                    auto_excluded_exams.update(zero_exams)
-                    logger.info(f"  {filter_name}: {len(zero_exams)} exams")
-
-            if auto_excluded_exams:
-                before_count = views_df["exam_id"].nunique()
-                views_df = views_df[~views_df["exam_id"].isin(auto_excluded_exams)]
-                after_count = views_df["exam_id"].nunique()
+            # mark these in QC data as auto-excluded and persist
+            new_auto = 0
+            for eid in auto_excluded_exams:
+                exam_key = str(eid)
+                if exam_key not in qc_data:  # don't override manual QC
+                    qc_data[exam_key] = "auto_excluded"
+                    new_auto += 1
+            if new_auto > 0 and qc_file:
+                qc_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(qc_file, "w") as f:
+                    json.dump(qc_data, f, indent=2)
                 logger.info(
-                    f"auto-excluded {before_count - after_count} exams total via config filters"
+                    f"persisted {new_auto} new auto_excluded entries to {qc_file}"
                 )
-
-                # mark these in QC data as auto-excluded (for tracking)
-                for eid in auto_excluded_exams:
-                    exam_key = str(eid)
-                    if exam_key not in qc_data:  # don't override manual QC
-                        qc_data[exam_key] = "auto_excluded"
 
     # filter by patient/exam if specified
     if patient_id:
@@ -2339,6 +2354,7 @@ def generate_gallery(
                 </select>
                 <button onclick="insertSelectedFilterToken()">Insert Filter</button>
                 <button onclick="clearFilterExpression()">Clear Filter</button>
+                <button onclick="loadFilterBatch()" title="Load a batch of exams matching the selected filter">Load Matching</button>
             </div>
             <div class="nav-buttons">
                 <button id="prevBtn" onclick="navigate(-1)">← Previous</button>
@@ -2400,18 +2416,10 @@ def generate_gallery(
         <p style="color: #9cdcfe; margin: 15px 0;">
             You've reviewed all exams in this batch.
         </p>
-        <div style="margin: 15px 0; display: flex; gap: 10px; justify-content: center; align-items: center; flex-wrap: wrap;">
-            <label style="display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: #9cdcfe;">
-                Next batch size:
-                <input
-                    id="loadMoreBatchSize"
-                    type="number"
-                    min="1"
-                    step="1"
-                    style="width: 90px; padding: 6px 8px; font-size: 13px; border: 1px solid #3e3e42; border-radius: 4px; background-color: #1e1e1e; color: #d4d4d4;"
-                >
-            </label>
-            <button id="loadMoreBtn" onclick="loadMore()">🔄 Load More Exams [l]</button>
+        <div style="margin: 15px 0; display: flex; align-items: center; justify-content: center; gap: 10px;">
+            <label for="nextBatchSize" style="color: #d4d4d4; font-size: 14px;">next batch:</label>
+            <input type="number" id="nextBatchSize" value="{max_exams or 100}" min="1" style="width: 70px; padding: 8px; font-size: 14px; border: 1px solid #3e3e42; border-radius: 4px; background-color: #1e1e1e; color: #d4d4d4; text-align: center;">
+            <button id="loadMoreBtn" onclick="loadMore()">🔄 Load More [l]</button>
             <button onclick="closeCompletion()">Continue Reviewing</button>
         </div>
         <div id="loadMoreStatus" style="display: none; margin-top: 20px; padding: 15px; background-color: #1e1e1e; border-radius: 4px;">
@@ -2463,14 +2471,77 @@ def generate_gallery(
         const filterTokenToFilename = {{}};
         const filterSetsByFilename = {{}};
         const unresolvedFilterWarnings = new Set();
-
+        
+        // session rate tracking (persist across load-more reloads in same tab)
+        const sessionStatsKey = 'qc_session_stats::' + qcStorageNamespace;
+        const sessionStatsVersion = 1;
+        
+        function loadSessionStats() {{
+            const fresh = {{
+                version: sessionStatsVersion,
+                startTimeMs: Date.now(),
+                qcCount: 0,
+                startingRemainingToQC: remainingToQC,
+                totalToQC: totalToQC
+            }};
+            const raw = sessionStorage.getItem(sessionStatsKey);
+            if (!raw) {{
+                return fresh;
+            }}
+            try {{
+                const parsed = JSON.parse(raw);
+                const validShape = (
+                    parsed &&
+                    typeof parsed === 'object' &&
+                    Number.isFinite(parsed.startTimeMs) &&
+                    Number.isFinite(parsed.qcCount) &&
+                    Number.isFinite(parsed.startingRemainingToQC) &&
+                    Number.isFinite(parsed.totalToQC)
+                );
+                if (!validShape) {{
+                    return fresh;
+                }}
+                // reset session stats if we switched to a different review pool
+                if (parsed.totalToQC !== totalToQC) {{
+                    return fresh;
+                }}
+                // reset if QC appears to have been globally reset mid-session
+                if (remainingToQC > parsed.startingRemainingToQC) {{
+                    return fresh;
+                }}
+                return {{
+                    version: sessionStatsVersion,
+                    startTimeMs: parsed.startTimeMs,
+                    qcCount: parsed.qcCount,
+                    startingRemainingToQC: parsed.startingRemainingToQC,
+                    totalToQC: parsed.totalToQC
+                }};
+            }} catch (e) {{
+                console.error('Failed to parse session stats:', e);
+                return fresh;
+            }}
+        }}
+        
+        let sessionStats = loadSessionStats();
+        let sessionStartTime = sessionStats.startTimeMs;
+        let sessionQCCount = sessionStats.qcCount;
+        let sessionStartRemainingToQC = sessionStats.startingRemainingToQC;
+        
+        // batch tracking: rate since this page load (not diluted by breaks)
+        const batchStartTime = Date.now();
+        let batchQCCount = 0;
+        
+        function saveSessionStats() {{
+            sessionStorage.setItem(sessionStatsKey, JSON.stringify(sessionStats));
+        }}
+        // ensure session state is materialized for this tab
+        saveSessionStats();
+        
         // track QC decisions (exam_id -> status)
         // server state is authoritative; localStorage only backfills missing entries
         let qcData = {{}};
         const validStatuses = new Set(['good', 'review', 'bad', 'auto_excluded']);
         const doneStatuses = new Set(['good', 'review', 'bad']);
-        let batchStartTime = Date.now();
-        let batchQCCount = 0;
 
         function getManualQCCount() {{
             let count = 0;
@@ -2542,11 +2613,6 @@ def generate_gallery(
             filteredExams = filteredExams.filter(exam => {{
                 return !qcSkipStatus.includes(qcData[exam.exam_id]);
             }});
-        }}
-
-        const loadMoreBatchSizeInput = document.getElementById('loadMoreBatchSize');
-        if (loadMoreBatchSizeInput && !loadMoreBatchSizeInput.value) {{
-            loadMoreBatchSizeInput.value = String(Math.max(allExams.length, 1));
         }}
         
         // annotation system: tags are independent of QC status
@@ -2775,10 +2841,15 @@ def generate_gallery(
             qcData[exam.exam_id] = status;
             exam.qc_status = status;
             if (!wasDone && willBeDone) {{
+                sessionQCCount++;
                 batchQCCount++;
-            }} else if (wasDone && !willBeDone && batchQCCount > 0) {{
-                // keep metrics robust if statuses become non-final in future flows.
-                batchQCCount--;
+                sessionStats.qcCount = sessionQCCount;
+                saveSessionStats();
+            }} else if (wasDone && !willBeDone && sessionQCCount > 0) {{
+                sessionQCCount--;
+                if (batchQCCount > 0) batchQCCount--;
+                sessionStats.qcCount = sessionQCCount;
+                saveSessionStats();
             }}
             autoSaveQCData();
             updateManualQCIndicator();
@@ -2973,7 +3044,7 @@ def generate_gallery(
                 }});
         }}
 
-        function pollLoadMoreStatus(loadMoreBtn, loadMoreBatchSizeInput, statusDiv, attempt = 0) {{
+        function pollLoadMoreStatus(loadMoreBtn, statusDiv, attempt = 0) {{
             const maxAttempts = 600;  // ~15 minutes at 1.5s
             fetch('/load-more-status')
                 .then(response => response.json())
@@ -2981,7 +3052,6 @@ def generate_gallery(
                     if (status.error) {{
                         alert('Failed to generate more exams: ' + status.error);
                         loadMoreBtn.disabled = false;
-                        if (loadMoreBatchSizeInput) loadMoreBatchSizeInput.disabled = false;
                         loadMoreBtn.textContent = '🔄 Load More Exams [l]';
                         statusDiv.style.display = 'none';
                         return;
@@ -3004,7 +3074,6 @@ def generate_gallery(
 
                     if (attempt >= maxAttempts) {{
                         loadMoreBtn.disabled = false;
-                        if (loadMoreBatchSizeInput) loadMoreBatchSizeInput.disabled = false;
                         loadMoreBtn.textContent = '🔄 Load More Exams [l]';
                         statusDiv.innerHTML = '<p style="color: #f0d060; font-weight: bold; margin: 0;">Still generating in background.</p>' +
                             '<p style="font-size: 12px; color: #858585; margin: 10px 0 0 0;">Wait a bit and click load more again to check status.</p>';
@@ -3012,55 +3081,43 @@ def generate_gallery(
                     }}
 
                     setTimeout(() => {{
-                        pollLoadMoreStatus(loadMoreBtn, loadMoreBatchSizeInput, statusDiv, attempt + 1);
+                        pollLoadMoreStatus(loadMoreBtn, statusDiv, attempt + 1);
                     }}, 1500);
                 }})
                 .catch(error => {{
                     console.error('Failed to check load-more status:', error);
                     if (attempt >= maxAttempts) {{
                         loadMoreBtn.disabled = false;
-                        if (loadMoreBatchSizeInput) loadMoreBatchSizeInput.disabled = false;
                         loadMoreBtn.textContent = '🔄 Load More Exams [l]';
                         statusDiv.style.display = 'none';
                         return;
                     }}
                     setTimeout(() => {{
-                        pollLoadMoreStatus(loadMoreBtn, loadMoreBatchSizeInput, statusDiv, attempt + 1);
+                        pollLoadMoreStatus(loadMoreBtn, statusDiv, attempt + 1);
                     }}, 2000);
                 }});
         }}
         
         async function loadMore() {{
             const loadMoreBtn = document.getElementById('loadMoreBtn');
-            const loadMoreBatchSizeInput = document.getElementById('loadMoreBatchSize');
             const statusDiv = document.getElementById('loadMoreStatus');
 
             if (loadMoreBtn.disabled) return;
-
-            let requestedBatchSize = Math.max(allExams.length, 1);
-            if (loadMoreBatchSizeInput) {{
-                const raw = String(loadMoreBatchSizeInput.value || '').trim();
-                const parsed = Number.parseInt(raw, 10);
-                if (!Number.isInteger(parsed) || parsed <= 0) {{
-                    alert('Please enter a valid positive integer for next batch size.');
-                    loadMoreBatchSizeInput.focus();
-                    return;
-                }}
-                requestedBatchSize = parsed;
-            }}
+            
+            const batchInput = document.getElementById('nextBatchSize');
+            const batchSize = batchInput ? parseInt(batchInput.value, 10) || {max_exams or 100} : {max_exams or 100};
             
             // disable button and show status
             loadMoreBtn.disabled = true;
-            if (loadMoreBatchSizeInput) loadMoreBatchSizeInput.disabled = true;
             loadMoreBtn.textContent = '⏳ Loading...';
             statusDiv.style.display = 'block';
             statusDiv.innerHTML = '<p style="color: #4ec9b0; font-weight: bold; margin: 0;">⏳ Saving latest QC decisions...</p>' +
-                '<p style="font-size: 12px; color: #858585; margin: 10px 0 0 0;">Starting load-more for ' + requestedBatchSize.toLocaleString() + ' exams right after save completes.</p>';
+                '<p style="font-size: 12px; color: #858585; margin: 10px 0 0 0;">Starting load-more right after save completes.</p>';
 
             try {{
                 await saveQCToServer();
 
-                const response = await fetch('/load-more?batch_size=' + encodeURIComponent(String(requestedBatchSize)));
+                const response = await fetch('/load-more?batch_size=' + batchSize);
                 const data = await response.json();
                 if (!response.ok || data.error) {{
                     throw new Error(data.error || ('HTTP ' + response.status));
@@ -3070,17 +3127,68 @@ def generate_gallery(
 
                 statusDiv.innerHTML = '<p style="color: #4ec9b0; font-weight: bold; margin: 0;">⏳ Generating more exams...</p>' +
                     '<p style="font-size: 12px; color: #858585; margin: 10px 0 0 0;">This may take a minute. Page will reload when ready.</p>';
-                pollLoadMoreStatus(loadMoreBtn, loadMoreBatchSizeInput, statusDiv);
+                pollLoadMoreStatus(loadMoreBtn, statusDiv);
             }} catch (error) {{
                 console.error('Failed to load more:', error);
                 alert('Failed to load more exams: ' + (error.message || error));
                 loadMoreBtn.disabled = false;
-                if (loadMoreBatchSizeInput) loadMoreBatchSizeInput.disabled = false;
                 loadMoreBtn.textContent = '🔄 Load More Exams [l]';
                 statusDiv.style.display = 'none';
             }}
         }}
         
+        async function loadFilterBatch() {{
+            const select = document.getElementById('filterSelect');
+            const filterName = select.value;
+            if (!filterName) {{
+                alert('Select a filter from the dropdown first');
+                return;
+            }}
+
+            const batchSize = prompt('How many matching exams to load?', '{max_exams or 100}');
+            if (!batchSize) return;
+
+            // immediate visual feedback
+            const btn = document.querySelector('[onclick="loadFilterBatch()"]');
+            const origText = btn ? btn.textContent : '';
+            if (btn) {{
+                btn.disabled = true;
+                btn.textContent = '⏳ Loading...';
+            }}
+            const stats = document.getElementById('stats');
+            const origStats = stats ? stats.textContent : '';
+            if (stats) stats.textContent = '⏳ Saving QC & requesting ' + batchSize + ' ' + filterName.replace(/_/g, ' ') + ' exams...';
+
+            try {{
+                await saveQCToServer();
+                const response = await fetch('/load-filter-batch?filter=' + encodeURIComponent(filterName) + '&batch_size=' + parseInt(batchSize, 10));
+                const data = await response.json();
+                if (!response.ok || data.error) {{
+                    throw new Error(data.error || ('HTTP ' + response.status));
+                }}
+                console.log('Filter batch triggered:', data);
+
+                if (stats) stats.textContent = '⏳ Generating ' + batchSize + ' ' + filterName.replace(/_/g, ' ') + ' exams... page will reload when ready';
+
+                // reuse the load-more polling UI
+                const loadMoreBtn = document.getElementById('loadMoreBtn');
+                const statusDiv = document.getElementById('loadMoreStatus');
+                if (loadMoreBtn) loadMoreBtn.disabled = true;
+                if (statusDiv) {{
+                    statusDiv.style.display = 'block';
+                    statusDiv.innerHTML = '<p style="color: #4ec9b0; font-weight: bold; margin: 0;">⏳ ' + data.message + '</p>' +
+                        '<p style="font-size: 12px; color: #858585; margin: 10px 0 0 0;">Page will reload when ready.</p>';
+                }}
+
+                pollLoadMoreStatus(loadMoreBtn || document.createElement('button'), statusDiv || document.createElement('div'));
+            }} catch (error) {{
+                console.error('Failed to load filter batch:', error);
+                alert('Failed to load filter batch: ' + (error.message || error));
+                if (btn) {{ btn.disabled = false; btn.textContent = origText; }}
+                if (stats) stats.textContent = origStats;
+            }}
+        }}
+
         function loadAvailableFilters() {{
             fetch('/list-filters')
                 .then(response => response.json())
@@ -3547,18 +3655,18 @@ def generate_gallery(
             if (document.getElementById('searchBox').value.trim() !== '') {{
                 statsText += ' (filtered)';
             }}
-            // compute batch-local rate and ETA (current loaded batch only)
-            const elapsedMin = (Date.now() - batchStartTime) / 60000;
+            // compute ETA using batch rate (since page load) and full dataset remaining
+            const batchElapsedMin = (Date.now() - batchStartTime) / 60000;
             let rateText = '';
-            if (batchQCCount > 0 && elapsedMin > 0.01) {{
-                const rate = batchQCCount / elapsedMin;
-                const remainingNow = Math.max(remainingToQC - batchQCCount, 0);
+            if (batchQCCount > 0 && batchElapsedMin > 0.01) {{
+                const rate = batchQCCount / batchElapsedMin;
+                const remainingNow = Math.max(sessionStartRemainingToQC - sessionQCCount, 0);
                 const etaMin = remainingNow / rate;
                 let etaStr;
                 if (etaMin < 1) etaStr = '<1 min';
                 else if (etaMin < 60) etaStr = Math.round(etaMin) + ' min';
                 else etaStr = (etaMin / 60).toFixed(1) + ' hr';
-                rateText = ' | ' + rate.toFixed(1) + '/min, ETA ' + etaStr + ' (' + batchQCCount + ' this batch)';
+                rateText = ' | ' + rate.toFixed(1) + '/min, ETA ' + etaStr + ' (' + remainingNow + ' remaining)';
             }}
             
             statsText += ' | ' + totalToQC + ' total | ' +
@@ -3645,8 +3753,12 @@ def generate_gallery(
             localStorage.removeItem('qc_data');
             localStorage.removeItem('annotations');
             localStorage.removeItem('annotation_tags');
-            batchStartTime = Date.now();
-            batchQCCount = 0;
+            sessionStorage.removeItem(sessionStatsKey);
+            sessionStats = loadSessionStats();
+            sessionStartTime = sessionStats.startTimeMs;
+            sessionQCCount = sessionStats.qcCount;
+            sessionStartRemainingToQC = sessionStats.startingRemainingToQC;
+            saveSessionStats();
             
             // save empty data to server
             saveQCToServer({{ replace: true }}).catch(error => {{
@@ -3944,9 +4056,9 @@ QC File Format:
     parser.add_argument(
         "--qc-skip-status",
         nargs="*",
-        default=["good", "bad"],
-        choices=["good", "bad", "review"],
-        help="QC statuses to skip in future runs (default: good bad). Use '--qc-skip-status good' to re-visit bad exams",
+        default=["good", "bad", "auto_excluded"],
+        choices=["good", "bad", "review", "auto_excluded"],
+        help="QC statuses to skip in future runs (default: good bad auto_excluded). Use '--qc-skip-status good' to re-visit bad exams",
     )
     parser.add_argument(
         "--serve",

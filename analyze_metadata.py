@@ -12,8 +12,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from filesystem_utils import update_metadata_with_disk_status_by_date
-from metadata_utils import extract_base_modality
+from prima.filesystem_utils import update_metadata_with_disk_status_by_date
+from prima.metadata_utils import extract_base_modality
 
 # argument parser
 parser = argparse.ArgumentParser(

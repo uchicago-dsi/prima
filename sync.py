@@ -14,7 +14,7 @@ from typing import Dict, Tuple
 
 from tqdm import tqdm
 
-from fingerprint_utils import ExamFingerprint
+from prima.fingerprint_utils import ExamFingerprint
 
 # suppress pydicom VR UI validation warnings for non-standard UIDs
 warnings.filterwarnings("ignore", message=".*Invalid value for VR UI.*", append=True)

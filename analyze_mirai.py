@@ -51,6 +51,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from prima.qc_filters import compute_auto_filter_sets
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -90,13 +92,7 @@ PHENOTYPE_COLUMNS = [
 POSITIVE_MARKERS = {"pos", "positive", "1", "true", "yes", "y"}
 NEGATIVE_MARKERS = {"neg", "negative", "0", "false", "no", "n"}
 OMOLEYE_TARGET_HORIZONS = [1, 2, 3, 4, 5]
-SUPPORTED_AUTO_FILTERS = {
-    "gems_ffdm_tc1",
-    "has_implant",
-    "scanned_film",
-    "negative_positioner_angle",
-    "zero_compression",
-}
+
 LEGACY_ANNOTATION_TAG_ALIASES = {
     "detector artifact - vertical line": "vertical line (detector artifact)",
     "detector artifact - horizontal line": "horizontal line (detector artifact)",
@@ -470,104 +466,12 @@ def _load_auto_filter_names(qc_cfg: QCFilterConfig) -> list[str]:
     if not qc_cfg.enable_auto_filters:
         return []
 
-    if qc_cfg.auto_filters is not None:
-        candidates = list(qc_cfg.auto_filters)
-    else:
-        auto_config_path = qc_cfg.auto_filter_config
-        if auto_config_path is None or not auto_config_path.exists():
-            return []
-        with open(auto_config_path) as f:
-            payload = json.load(f)
-        if not isinstance(payload, dict):
-            return []
-        candidates = payload.get("filters", [])
+    from prima.qc_filters import load_auto_filter_names
 
-    filters: list[str] = []
-    for raw in candidates:
-        name = str(raw).strip().lower()
-        if not name or name in filters:
-            continue
-        if name not in SUPPORTED_AUTO_FILTERS:
-            print(f"[warn] ignoring unsupported auto filter '{name}'")
-            continue
-        filters.append(name)
-    return filters
-
-
-def _compute_auto_filter_exam_ids(
-    filter_names: list[str], views_path: Path, tags_path: Path
-) -> dict[str, set[str]]:
-    """compute exam-id sets matched by each auto filter using QC gallery logic."""
-    if not filter_names:
-        return {}
-    if not views_path.exists() or not tags_path.exists():
-        print(
-            f"[warn] auto filter inputs missing: views={views_path.exists()}, tags={tags_path.exists()}; skipping auto filters"
-        )
-        return {}
-
-    views = pd.read_parquet(views_path).copy()
-    views["exam_id"] = views["exam_id"].astype(str)
-    tags = pd.read_parquet(tags_path)
-    merged = views.merge(tags, on="sop_instance_uid", how="left")
-
-    by_filter: dict[str, set[str]] = {}
-    for name in filter_names:
-        exam_ids: set[str] = set()
-
-        if (
-            name == "gems_ffdm_tc1"
-            and "AcquisitionDeviceProcessingCode" in merged.columns
-        ):
-            matches = merged[
-                merged["AcquisitionDeviceProcessingCode"]
-                .astype(str)
-                .str.startswith("GEMS_", na=False)
-            ]["exam_id"].astype(str)
-            exam_ids.update(matches.unique())
-
-        elif name == "has_implant" and "has_implant" in views.columns:
-            matches = views[views["has_implant"]]["exam_id"].astype(str)
-            exam_ids.update(matches.unique())
-
-        elif name == "scanned_film":
-            if "SOPClassUID" in merged.columns:
-                secondary = merged[
-                    merged["SOPClassUID"]
-                    .astype(str)
-                    .str.contains("1.2.840.10008.5.1.4.1.1.7", na=False)
-                ]["exam_id"].astype(str)
-                exam_ids.update(secondary.unique())
-            if (
-                "device_manufacturer" in views.columns
-                and "device_model" in views.columns
-            ):
-                r2_film = views[
-                    views["device_manufacturer"]
-                    .astype(str)
-                    .str.contains("R2 Technology", na=False, case=False)
-                    | views["device_model"]
-                    .astype(str)
-                    .str.contains("DigitalNow", na=False, case=False)
-                ]["exam_id"].astype(str)
-                exam_ids.update(r2_film.unique())
-
-        elif (
-            name == "negative_positioner_angle"
-            and "PositionerPrimaryAngle" in merged.columns
-        ):
-            angle = pd.to_numeric(merged["PositionerPrimaryAngle"], errors="coerce")
-            matches = merged[angle < 0]["exam_id"].astype(str)
-            exam_ids.update(matches.unique())
-
-        elif name == "zero_compression" and "CompressionForce" in merged.columns:
-            comp = pd.to_numeric(merged["CompressionForce"], errors="coerce")
-            matches = merged[comp == 0]["exam_id"].astype(str)
-            exam_ids.update(matches.unique())
-
-        by_filter[name] = exam_ids
-
-    return by_filter
+    return load_auto_filter_names(
+        config_path=qc_cfg.auto_filter_config,
+        explicit_filters=list(qc_cfg.auto_filters) if qc_cfg.auto_filters else None,
+    )
 
 
 def _load_qc_status_map(qc_file: Path | None) -> dict[str, str]:
@@ -661,8 +565,8 @@ def _build_exam_filter(
 
     auto_filter_names = _load_auto_filter_names(qc_cfg)
     if auto_filter_names:
-        auto_by_filter = _compute_auto_filter_exam_ids(
-            auto_filter_names, views_path, tags_path
+        auto_by_filter = compute_auto_filter_sets(
+            views_path, tags_path, filter_names=auto_filter_names
         )
         for filter_name in auto_filter_names:
             apply_exclude(

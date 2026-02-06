@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from export_utils import (
+from prima.export_utils import (
     MERGE_KEY_COLUMNS,
     PASSWORD,
     USERNAME,
@@ -24,7 +24,7 @@ from export_utils import (
     parse_wait_interval,
     save_current_state,
 )
-from filesystem_utils import update_metadata_with_disk_status_by_date
+from prima.filesystem_utils import update_metadata_with_disk_status_by_date
 
 # ChiMEC dataset configuration
 CHIMEC_PATIENTS_FILE = "/gpfs/data/phs/groups/Projects/Huo_projects/SPORE/annawoodard/List_ChiMEC_priority_2025July30.csv"

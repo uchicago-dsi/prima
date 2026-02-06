@@ -46,8 +46,8 @@ qc_filters:
   # Optional explicit list overrides auto_filter_config.filters when set.
   # Example structure (matches supported qc_auto_exclude filter names):
   auto_filters:
-    - gems_ffdm_tc1
+    # - gems_ffdm_tc1
     - has_implant
     - scanned_film
-    - negative_positioner_angle
-    - zero_compression
+    # - negative_positioner_angle
+    # - zero_compression

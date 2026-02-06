@@ -13,7 +13,7 @@ import psutil
 from tqdm import tqdm
 
 # Import the shared logic
-from fingerprint_utils import create_exam_fingerprint
+from prima.fingerprint_utils import create_exam_fingerprint
 
 # --- NEW: Checkpoint Configuration ---
 CHECKPOINT_DIR = Path("data/fingerprint_checkpoints")

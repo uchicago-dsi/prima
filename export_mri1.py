@@ -18,7 +18,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from tqdm.auto import tqdm
 
-from export_utils import (
+from prima.export_utils import (
     MERGE_KEY_COLUMNS,
     PASSWORD,
     USERNAME,
@@ -28,7 +28,7 @@ from export_utils import (
     import_scrape_ibroker,
     parse_wait_interval,
 )
-from filesystem_utils import update_metadata_with_disk_status_by_date
+from prima.filesystem_utils import update_metadata_with_disk_status_by_date
 
 # MRI1.0 dataset configuration
 MRI1_STUDY_IDS_FILE = (
@@ -218,7 +218,7 @@ def load_mri1_data(
         - 'processed': total exams processed for export
     """
     # Import scrape functions (must be done after import_scrape_ibroker is called)
-    from export_utils import (
+    from prima.export_utils import (
         bootstrap_http_session_from_driver,
         http_get_root,
         login,
@@ -1187,7 +1187,7 @@ def query_and_update_status_during_wait(
     set[str]
         Set of newly queried study IDs
     """
-    from export_utils import (
+    from prima.export_utils import (
         bootstrap_http_session_from_driver,
         http_get_root,
         login,
