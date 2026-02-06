@@ -441,31 +441,23 @@ Common bottlenecks:
 Compute per-horizon AUC and survival metrics (Uno's C-index, time-dependent AUC, integrated Brier score).
 
 ```bash
-# basic usage (expects validation_output.csv and mirai_manifest.csv in same directory)
-python analyze_mirai.py --out-dir /gpfs/data/huo-lab/Image/ChiMEC/MG/out
+# copy and edit the example config
+cp configs/analysis.yaml /tmp/analyze_mirai.yaml
 
-# custom output path
-python analyze_mirai.py \
-  --out-dir /gpfs/data/huo-lab/Image/ChiMEC/MG/out \
-  --out /path/to/custom_summary.json
-
-# override prediction column mapping
-python analyze_mirai.py \
-  --out-dir /gpfs/data/huo-lab/Image/ChiMEC/MG/out \
-  --map 1:risk_1year 5:risk_5year
-
-# filter to a specific split
-python analyze_mirai.py \
-  --out-dir /gpfs/data/huo-lab/Image/ChiMEC/MG/out \
-  --split test
-
-# k-fold cross-validation for IPCW sensitivity
-python analyze_mirai.py \
-  --out-dir /gpfs/data/huo-lab/Image/ChiMEC/MG/out \
-  --kfold 5
+# run with a single config input
+python analyze_mirai.py --config /tmp/analyze_mirai.yaml
 ```
 
-K-fold CV splits at the patient level to avoid leakage and assesses IPCW sensitivity when all data is "test".
+`analyze_mirai.py` is now config-only (OmegaConf YAML/JSON). The config supports:
+- Paths and core options (`out_dir`, `out_json`, `split`, `colmap`, `kfold`)
+- QC status filtering (`include_statuses`, `exclude_statuses`)
+- Auto-filtering aligned with QC server filters (GEMS, implant, scanned film, etc.)
+- Annotation tag filtering (`annotation_include_*`, `annotation_exclude_*`)
+
+Each run saves config snapshots alongside outputs:
+- `analyze_mirai_config.source.yaml`
+- `analyze_mirai_config.input.yaml`
+- `analyze_mirai_config.resolved.yaml`
 
 ### analyze_metadata.py
 
@@ -592,7 +584,7 @@ With server running, you can also dynamically test filters:
 1. Mark exams using keyboard shortcuts: `G` = Good, `R` = Needs review, `B` = Bad, Arrow keys = Navigate
 2. QC status auto-saves to `data/qc_status.json`
 3. Re-run the script to continue — by default, exams marked "good" or "bad" are automatically skipped
-4. Apply QC filter in downstream analysis with `--qc-file` argument (see below)
+4. Apply QC filters in downstream analysis via `analyze_mirai.py --config ...` (see below)
 
 **Default behavior**: Future QC runs skip exams marked as "good" (already approved) or "bad" (already rejected), showing only "review" and unmarked exams.
 
@@ -640,13 +632,11 @@ python qc_gallery.py --max-exams 10
 
 ### Applying QC filters to analysis
 
-After QC, exclude failed exams from downstream analysis by passing `--qc-file`:
+After QC, configure filtering in the analysis config:
 
 ```bash
-# analyze_mirai.py with QC filtering
-python analyze_mirai.py \
-  --out-dir /gpfs/data/huo-lab/Image/ChiMEC/MG/out \
-  --qc-file data/qc_status.json
+# edit config QC block (status + auto filters + annotations), then run:
+python analyze_mirai.py --config /tmp/analyze_mirai.yaml
 ```
 
 **QC filter behavior**:
@@ -656,11 +646,12 @@ In future QC runs (default: `--qc-skip-status good bad`):
 - Exams marked `"review"` or unmarked are shown (need attention)
 - To re-visit "bad" exams: `--qc-skip-status good`
 
-In downstream analysis (`analyze_mirai.py --qc-file`):
-- Exams marked `"bad"` or `"review"` are excluded from metrics
-- Exams marked `"good"` or unmarked are included
+In downstream analysis (`analyze_mirai.py --config ...`):
+- Status filtering is controlled by `qc_filters.include_statuses` / `qc_filters.exclude_statuses`
+- Auto filters are controlled by `qc_filters.enable_auto_filters` and `qc_filters.auto_filters`
+- Annotation filters are controlled by `qc_filters.annotation_include_*` and `qc_filters.annotation_exclude_*`
 - Original `validation_output.csv` remains unchanged
-- QC decisions stored separately in `qc_status.json`
+- QC decisions remain in `qc_status.json` / `annotations.json` and are applied at analysis time
 
 This design allows you to:
 - Efficiently QC by not showing already-decided exams

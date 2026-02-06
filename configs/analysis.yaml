@@ -1,0 +1,47 @@
+# Paths are resolved relative to this config file.
+out_dir: /gpfs/data/huo-lab/Image/ChiMEC/MG/out
+
+# Optional explicit input overrides; defaults shown below.
+pred_csv: ${out_dir}/validation_output.csv
+meta_csv: ${out_dir}/mirai_manifest.csv
+out_json: ${out_dir}/summary.json
+
+# Optional analysis settings.
+split: test
+colmap: null
+# colmap:
+#   "1": 1_year_risk
+#   "2": 2_year_risk
+#   "3": 3_year_risk
+#   "4": 4_year_risk
+#   "5": 5_year_risk
+cindex_col: null
+kfold: null
+
+qc_filters:
+  # QC server status map (exam_id -> status)
+  qc_file: data/qc_status.json
+  # QC server annotations map (exam_id -> [tags]); defaults to qc_file sibling annotations.json
+  annotations_file: data/annotations.json
+
+  # Status filtering:
+  # - include_statuses: keep only exams with one of these statuses (null = don't require status)
+  # - exclude_statuses: always remove exams with these statuses
+  include_statuses: null
+  exclude_statuses: [bad, review]
+
+  # Annotation filters (tag matching is case-insensitive, with legacy aliases normalized):
+  # - include_any: exam must have at least one of these tags
+  # - include_all: exam must have all of these tags
+  # - exclude_any: exam is removed if it has at least one of these tags
+  # - exclude_all: exam is removed if it has all of these tags
+  annotation_include_any: []
+  annotation_include_all: []
+  annotation_exclude_any: []
+  annotation_exclude_all: []
+
+  # Auto filters from QC pipeline (GEMS, implant, scanned film, etc.).
+  enable_auto_filters: true
+  auto_filter_config: data/qc_auto_exclude.json
+  # Optional explicit list overrides auto_filter_config.filters when set.
+  auto_filters: null

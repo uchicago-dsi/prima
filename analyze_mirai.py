@@ -3,10 +3,8 @@
 
 Quick analysis for Mirai's validation outputs.
 
-Reads Mirai's prediction CSV (e.g., demo/validation_output.csv) and the
-metadata CSV you used for validation (with years_to_cancer and years_to_last_followup),
-and prints a simple summary by horizon: cases, controls, excluded (insufficient follow-up),
-AUC (naive ROC restricted to exams with ≥h years of follow-up or an event ≤h).
+Reads Mirai's prediction CSV and metadata CSV, then computes per-horizon
+summary metrics, survival metrics, and stratified performance tables.
 
 Notes
 -----
@@ -16,24 +14,30 @@ Notes
     ctrl_h  = (years_to_cancer  > h) & (years_to_last_followup >= h)
     include = case_h | ctrl_h
   rows with insufficient follow-up are excluded from AUC_h
-- prediction columns are auto-detected via regex; override with --map if needed
+- prediction columns are auto-detected via regex; override with config `colmap` if needed
 
 Usage
 -----
-python analyze_mirai.py \
-  --out-dir /prima/mirai-prep \
-  --out /prima/mirai-prep/summary.json
+python analyze_mirai.py --config /path/to/analyze_mirai_config.json
 
-# with QC filtering (recommended)
-python analyze_mirai.py \
-  --out-dir /prima/mirai-prep \
-  --qc-file data/qc_status.json
+The config controls:
+- input/output paths
+- split/column mapping/k-fold options
+- QC status filters (e.g., include only "good" or exclude "bad")
+- automatic QC server filters (GEMS, implants, scanned film, etc.)
+- annotation-based filtering (include/exclude by tags)
 
-Expects validation_output.csv and mirai_manifest.csv in --out-dir.
+The script writes:
+- analysis outputs
+- a copy of the input config
+- a resolved config (with defaults and absolute paths)
+
+By default, config `out_dir` is expected to contain `validation_output.csv`
+and `mirai_manifest.csv` unless `pred_csv` / `meta_csv` are set explicitly.
 
 Requirements
 ------------
-  pip install pandas numpy scikit-learn pyarrow
+  pip install pandas numpy scikit-learn pyarrow omegaconf
 
 """
 
@@ -45,10 +49,12 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from omegaconf import OmegaConf
 from sklearn.metrics import (
     confusion_matrix,
     roc_auc_score,
@@ -84,6 +90,35 @@ PHENOTYPE_COLUMNS = [
 POSITIVE_MARKERS = {"pos", "positive", "1", "true", "yes", "y"}
 NEGATIVE_MARKERS = {"neg", "negative", "0", "false", "no", "n"}
 OMOLEYE_TARGET_HORIZONS = [1, 2, 3, 4, 5]
+SUPPORTED_AUTO_FILTERS = {
+    "gems_ffdm_tc1",
+    "has_implant",
+    "scanned_film",
+    "negative_positioner_angle",
+    "zero_compression",
+}
+LEGACY_ANNOTATION_TAG_ALIASES = {
+    "detector artifact - vertical line": "vertical line (detector artifact)",
+    "detector artifact - horizontal line": "horizontal line (detector artifact)",
+    "horizontal line (detector artifact": "horizontal line (detector artifact)",
+}
+
+
+@dataclass(frozen=True)
+class QCFilterConfig:
+    """QC-driven filtering configuration loaded from JSON config."""
+
+    qc_file: Path | None
+    include_statuses: tuple[str, ...] | None
+    exclude_statuses: tuple[str, ...]
+    annotations_file: Path | None
+    annotation_include_any: tuple[str, ...]
+    annotation_include_all: tuple[str, ...]
+    annotation_exclude_any: tuple[str, ...]
+    annotation_exclude_all: tuple[str, ...]
+    enable_auto_filters: bool
+    auto_filter_config: Path | None
+    auto_filters: tuple[str, ...] | None
 
 
 @dataclass(frozen=True)
@@ -97,7 +132,10 @@ class Config:
     colmap: dict[int, str] | None
     cindex_col: str | None
     kfold: int | None
-    qc_file: Path | None
+    qc_filters: QCFilterConfig
+    config_path: Path
+    raw_config: dict[str, Any]
+    resolved_config: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -110,15 +148,60 @@ class ExamData:
     meta_eval: pd.DataFrame
     pred_cols: dict[int, str]
     n_pred_rows: int
+    filter_summary: dict[str, Any]
+    exam_pairs: frozenset[tuple[str, str]]
 
 
-def _parse_map(map_kv: list[str]) -> dict[int, str]:
-    """parse --map entries like 1:pred_1year,5:pred_5yr into {1: 'pred_1year', 5: 'pred_5yr'}"""
-    m: dict[int, str] = {}
-    for kv in map_kv:
-        k, v = kv.split(":", 1)
-        m[int(k)] = v
-    return m
+def _parse_colmap(colmap_obj: Any) -> dict[int, str] | None:
+    """parse colmap object like {"1": "pred_1year"} into {1: "pred_1year"}."""
+    if colmap_obj is None:
+        return None
+    if not isinstance(colmap_obj, dict):
+        raise ValueError("config key 'colmap' must be a JSON object")
+    out: dict[int, str] = {}
+    for key, value in colmap_obj.items():
+        out[int(key)] = str(value)
+    return dict(sorted(out.items()))
+
+
+def _normalize_string_tuple(
+    values: Any, *, lowercase: bool = False
+) -> tuple[str, ...] | None:
+    """normalize config lists like ['bad', 'review'] to a deduplicated tuple."""
+    if values is None:
+        return None
+    if not isinstance(values, (list, tuple)):
+        raise ValueError("expected list/tuple")
+
+    normalized: list[str] = []
+    for value in values:
+        item = str(value).strip()
+        if not item:
+            continue
+        if lowercase:
+            item = item.lower()
+        if item not in normalized:
+            normalized.append(item)
+    return tuple(normalized)
+
+
+def _resolve_config_path(value: Any, config_dir: Path) -> Path | None:
+    """resolve config path values relative to the config file directory."""
+    if value is None:
+        return None
+    path = Path(str(value)).expanduser()
+    if not path.is_absolute():
+        path = (config_dir / path).resolve()
+    return path
+
+
+def _canonical_annotation_tag(tag: str) -> str:
+    """normalize annotation tags to canonical labels used by QC server."""
+    stripped = str(tag).strip()
+    if not stripped:
+        return ""
+    canonical = LEGACY_ANNOTATION_TAG_ALIASES.get(stripped, stripped)
+    return canonical.lower()
 
 
 def _assign_race_category(series: pd.Series | None) -> pd.Series:
@@ -382,98 +465,266 @@ def _load_enriched_manifest(cfg: Config) -> pd.DataFrame:
     return meta
 
 
-def _apply_auto_exclude_filters(
-    df: pd.DataFrame, views_path: Path, tags_path: Path
-) -> tuple[pd.DataFrame, int]:
-    """apply automatic exclusion filters from qc_auto_exclude.json
+def _load_auto_filter_names(qc_cfg: QCFilterConfig) -> list[str]:
+    """load ordered list of auto-filter names from config or qc_auto_exclude.json."""
+    if not qc_cfg.enable_auto_filters:
+        return []
 
-    Args:
-        df: dataframe with exam_id column
-        views_path: path to views.parquet
-        tags_path: path to dicom_tags.parquet
+    if qc_cfg.auto_filters is not None:
+        candidates = list(qc_cfg.auto_filters)
+    else:
+        auto_config_path = qc_cfg.auto_filter_config
+        if auto_config_path is None or not auto_config_path.exists():
+            return []
+        with open(auto_config_path) as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            return []
+        candidates = payload.get("filters", [])
 
-    Returns:
-        (filtered_df, num_excluded)
-    """
-    import json
+    filters: list[str] = []
+    for raw in candidates:
+        name = str(raw).strip().lower()
+        if not name or name in filters:
+            continue
+        if name not in SUPPORTED_AUTO_FILTERS:
+            print(f"[warn] ignoring unsupported auto filter '{name}'")
+            continue
+        filters.append(name)
+    return filters
 
-    auto_exclude_config = Path("data/qc_auto_exclude.json")
-    if not auto_exclude_config.exists():
-        return df, 0
 
-    with open(auto_exclude_config) as f:
-        config = json.load(f)
+def _compute_auto_filter_exam_ids(
+    filter_names: list[str], views_path: Path, tags_path: Path
+) -> dict[str, set[str]]:
+    """compute exam-id sets matched by each auto filter using QC gallery logic."""
+    if not filter_names:
+        return {}
+    if not views_path.exists() or not tags_path.exists():
+        print(
+            f"[warn] auto filter inputs missing: views={views_path.exists()}, tags={tags_path.exists()}; skipping auto filters"
+        )
+        return {}
 
-    auto_filters = config.get("filters", [])
-    if not auto_filters:
-        return df, 0
-
-    # load data
-    views = pd.read_parquet(views_path)
+    views = pd.read_parquet(views_path).copy()
+    views["exam_id"] = views["exam_id"].astype(str)
     tags = pd.read_parquet(tags_path)
     merged = views.merge(tags, on="sop_instance_uid", how="left")
 
-    excluded_exams = set()
+    by_filter: dict[str, set[str]] = {}
+    for name in filter_names:
+        exam_ids: set[str] = set()
 
-    for filter_name in auto_filters:
         if (
-            filter_name == "gems_ffdm_tc1"
+            name == "gems_ffdm_tc1"
             and "AcquisitionDeviceProcessingCode" in merged.columns
         ):
-            gems = merged[
-                merged["AcquisitionDeviceProcessingCode"] == "GEMS_FFDM_TC_1"
-            ]["exam_id"].unique()
-            excluded_exams.update(gems)
-        elif filter_name == "has_implant" and "has_implant" in views.columns:
-            implants = views[views["has_implant"]]["exam_id"].unique()
-            excluded_exams.update(implants)
-        elif filter_name == "scanned_film":
-            film_exams = set()
+            matches = merged[
+                merged["AcquisitionDeviceProcessingCode"]
+                .astype(str)
+                .str.startswith("GEMS_", na=False)
+            ]["exam_id"].astype(str)
+            exam_ids.update(matches.unique())
+
+        elif name == "has_implant" and "has_implant" in views.columns:
+            matches = views[views["has_implant"]]["exam_id"].astype(str)
+            exam_ids.update(matches.unique())
+
+        elif name == "scanned_film":
             if "SOPClassUID" in merged.columns:
                 secondary = merged[
-                    merged["SOPClassUID"].str.contains(
-                        "1.2.840.10008.5.1.4.1.1.7", na=False
-                    )
-                ]["exam_id"].unique()
-                film_exams.update(secondary)
-            # R2 DigitalNow film digitizer
-            r2_film = views[
-                views["device_manufacturer"].str.contains(
-                    "R2 Technology", na=False, case=False
-                )
-                | views["device_model"].str.contains("DigitalNow", na=False, case=False)
-            ]["exam_id"].unique()
-            film_exams.update(r2_film)
-            excluded_exams.update(film_exams)
+                    merged["SOPClassUID"]
+                    .astype(str)
+                    .str.contains("1.2.840.10008.5.1.4.1.1.7", na=False)
+                ]["exam_id"].astype(str)
+                exam_ids.update(secondary.unique())
+            if (
+                "device_manufacturer" in views.columns
+                and "device_model" in views.columns
+            ):
+                r2_film = views[
+                    views["device_manufacturer"]
+                    .astype(str)
+                    .str.contains("R2 Technology", na=False, case=False)
+                    | views["device_model"]
+                    .astype(str)
+                    .str.contains("DigitalNow", na=False, case=False)
+                ]["exam_id"].astype(str)
+                exam_ids.update(r2_film.unique())
 
-    if excluded_exams:
-        filtered_df = df[~df["exam_id"].isin(excluded_exams)].copy()
-        return filtered_df, len(excluded_exams)
+        elif (
+            name == "negative_positioner_angle"
+            and "PositionerPrimaryAngle" in merged.columns
+        ):
+            angle = pd.to_numeric(merged["PositionerPrimaryAngle"], errors="coerce")
+            matches = merged[angle < 0]["exam_id"].astype(str)
+            exam_ids.update(matches.unique())
 
-    return df, 0
+        elif name == "zero_compression" and "CompressionForce" in merged.columns:
+            comp = pd.to_numeric(merged["CompressionForce"], errors="coerce")
+            matches = merged[comp == 0]["exam_id"].astype(str)
+            exam_ids.update(matches.unique())
+
+        by_filter[name] = exam_ids
+
+    return by_filter
 
 
-def _load_qc_filter(qc_file: Path | None) -> set[str]:
-    """load manual QC decisions and return set of exam IDs to exclude.
-
-    Args:
-        qc_file: path to qc_status.json
-
-    Returns:
-        set of exam_id strings manually marked as "bad" or "review"
-    """
+def _load_qc_status_map(qc_file: Path | None) -> dict[str, str]:
+    """load qc_status.json as exam_id -> normalized status."""
     if qc_file is None or not qc_file.exists():
-        return set()
-
-    import json
-
+        return {}
     with open(qc_file) as f:
-        qc_data = json.load(f)
+        payload = json.load(f)
+    if not isinstance(payload, dict):
+        raise ValueError(f"QC file must contain a JSON object: {qc_file}")
 
-    # exclude exams manually marked as bad or needing review
-    # (auto_excluded is handled separately by _apply_auto_exclude_filters)
-    excluded = {eid for eid, status in qc_data.items() if status in ("bad", "review")}
-    return excluded
+    out: dict[str, str] = {}
+    for exam_id, status in payload.items():
+        out[str(exam_id)] = str(status).strip().lower()
+    return out
+
+
+def _normalize_annotation_filter(values: tuple[str, ...] | None) -> tuple[str, ...]:
+    """normalize annotation filter tag list to canonical lowercase tags."""
+    if values is None:
+        return tuple()
+    normalized: list[str] = []
+    for value in values:
+        tag = _canonical_annotation_tag(value)
+        if tag and tag not in normalized:
+            normalized.append(tag)
+    return tuple(normalized)
+
+
+def _load_annotations_map(annotations_file: Path | None) -> dict[str, set[str]]:
+    """load annotations.json as exam_id -> normalized tag set."""
+    if annotations_file is None or not annotations_file.exists():
+        return {}
+    with open(annotations_file) as f:
+        payload = json.load(f)
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"annotations file must contain a JSON object: {annotations_file}"
+        )
+
+    out: dict[str, set[str]] = {}
+    for exam_id, tags in payload.items():
+        if not isinstance(tags, list):
+            continue
+        normalized_tags = {
+            _canonical_annotation_tag(tag)
+            for tag in tags
+            if _canonical_annotation_tag(tag)
+        }
+        if normalized_tags:
+            out[str(exam_id)] = normalized_tags
+    return out
+
+
+def _build_exam_filter(
+    exam_ids: set[str], cfg: Config, views_path: Path, tags_path: Path
+) -> tuple[set[str], dict[str, Any]]:
+    """build and apply QC/auto/annotation filters on a set of exam IDs."""
+    active_exam_ids = set(str(eid) for eid in exam_ids)
+    summary: dict[str, Any] = {"initial_exams": len(active_exam_ids), "steps": []}
+
+    def apply_exclude(name: str, candidates: set[str]) -> None:
+        before = len(active_exam_ids)
+        active_exam_ids.difference_update(candidates)
+        excluded = before - len(active_exam_ids)
+        summary["steps"].append(
+            {
+                "mode": "exclude",
+                "name": name,
+                "candidate_exams": len(candidates),
+                "excluded": excluded,
+                "remaining": len(active_exam_ids),
+            }
+        )
+
+    def apply_include(name: str, candidates: set[str]) -> None:
+        before = len(active_exam_ids)
+        active_exam_ids.intersection_update(candidates)
+        excluded = before - len(active_exam_ids)
+        summary["steps"].append(
+            {
+                "mode": "include",
+                "name": name,
+                "candidate_exams": len(candidates),
+                "excluded": excluded,
+                "remaining": len(active_exam_ids),
+            }
+        )
+
+    qc_cfg = cfg.qc_filters
+
+    auto_filter_names = _load_auto_filter_names(qc_cfg)
+    if auto_filter_names:
+        auto_by_filter = _compute_auto_filter_exam_ids(
+            auto_filter_names, views_path, tags_path
+        )
+        for filter_name in auto_filter_names:
+            apply_exclude(
+                f"auto_filter:{filter_name}", auto_by_filter.get(filter_name, set())
+            )
+
+    qc_status_map = _load_qc_status_map(qc_cfg.qc_file)
+    if qc_cfg.include_statuses is not None:
+        include_set = set(qc_cfg.include_statuses)
+        included_exam_ids = {
+            eid for eid, status in qc_status_map.items() if status in include_set
+        }
+        apply_include(
+            f"qc_status:include={','.join(sorted(include_set))}", included_exam_ids
+        )
+    if qc_cfg.exclude_statuses:
+        exclude_set = set(qc_cfg.exclude_statuses)
+        excluded_exam_ids = {
+            eid for eid, status in qc_status_map.items() if status in exclude_set
+        }
+        apply_exclude(
+            f"qc_status:exclude={','.join(sorted(exclude_set))}", excluded_exam_ids
+        )
+
+    annotation_map = _load_annotations_map(qc_cfg.annotations_file)
+    include_any = set(qc_cfg.annotation_include_any)
+    include_all = set(qc_cfg.annotation_include_all)
+    exclude_any = set(qc_cfg.annotation_exclude_any)
+    exclude_all = set(qc_cfg.annotation_exclude_all)
+
+    if include_any:
+        include_any_ids = {
+            eid for eid, tags in annotation_map.items() if tags & include_any
+        }
+        apply_include(
+            f"annotations:include_any={','.join(sorted(include_any))}", include_any_ids
+        )
+    if include_all:
+        include_all_ids = {
+            eid for eid, tags in annotation_map.items() if include_all.issubset(tags)
+        }
+        apply_include(
+            f"annotations:include_all={','.join(sorted(include_all))}", include_all_ids
+        )
+    if exclude_any:
+        exclude_any_ids = {
+            eid for eid, tags in annotation_map.items() if tags & exclude_any
+        }
+        apply_exclude(
+            f"annotations:exclude_any={','.join(sorted(exclude_any))}", exclude_any_ids
+        )
+    if exclude_all:
+        exclude_all_ids = {
+            eid for eid, tags in annotation_map.items() if exclude_all.issubset(tags)
+        }
+        apply_exclude(
+            f"annotations:exclude_all={','.join(sorted(exclude_all))}", exclude_all_ids
+        )
+
+    summary["final_exams"] = len(active_exam_ids)
+    summary["total_excluded"] = summary["initial_exams"] - summary["final_exams"]
+    return active_exam_ids, summary
 
 
 def _load_exam_data(cfg: Config) -> ExamData:
@@ -531,32 +782,32 @@ def _load_exam_data(cfg: Config) -> ExamData:
 
     df_exam = df.groupby(["patient_id", "exam_id"], as_index=False).agg(agg_dict)
 
-    # always apply auto-exclude filters
+    # QC/auto/annotation filtering
     views_path = cfg.pred_csv.parent.parent / "sot" / "views.parquet"
     tags_path = cfg.pred_csv.parent.parent / "sot" / "dicom_tags.parquet"
+    base_exam_ids = set(df_exam["exam_id"].astype(str).unique())
+    kept_exam_ids, filter_summary = _build_exam_filter(
+        base_exam_ids, cfg, views_path, tags_path
+    )
 
-    if views_path.exists() and tags_path.exists():
-        df_exam, num_auto_excluded = _apply_auto_exclude_filters(
-            df_exam, views_path, tags_path
-        )
-        df, _ = _apply_auto_exclude_filters(df, views_path, tags_path)
-
-        if num_auto_excluded > 0:
-            print(f"Auto-exclude filters: excluded {num_auto_excluded} exams")
-            print("  (from data/qc_auto_exclude.json)")
-            print()
-
-    # apply manual QC filter if provided
-    qc_excluded = _load_qc_filter(cfg.qc_file)
-    if qc_excluded:
-        before_qc = len(df_exam)
-        df_exam = df_exam[~df_exam["exam_id"].isin(qc_excluded)].copy()
-        df = df[~df["exam_id"].isin(qc_excluded)].copy()
+    for step in filter_summary["steps"]:
+        if step["excluded"] > 0:
+            print(
+                f"Filter {step['name']}: excluded {step['excluded']} exams "
+                f"(remaining {step['remaining']})"
+            )
+    if filter_summary["total_excluded"] > 0:
         print(
-            f"Manual QC filter: excluded {before_qc - len(df_exam)} exams marked as 'bad' or 'review'"
+            f"Total filtered exams: {filter_summary['total_excluded']} "
+            f"(from {filter_summary['initial_exams']} to {filter_summary['final_exams']})"
         )
-        print(f"  Remaining: {len(df_exam)} exams")
         print()
+
+    df_exam = df_exam[df_exam["exam_id"].astype(str).isin(kept_exam_ids)].copy()
+    df = df[df["exam_id"].astype(str).isin(kept_exam_ids)].copy()
+    exam_pairs = frozenset(
+        zip(df_exam["patient_id"].astype(str), df_exam["exam_id"].astype(str))
+    )
 
     return ExamData(
         merged_views=df,
@@ -565,6 +816,8 @@ def _load_exam_data(cfg: Config) -> ExamData:
         meta_eval=meta_eval,
         pred_cols=pred_cols,
         n_pred_rows=len(pred),
+        filter_summary=filter_summary,
+        exam_pairs=exam_pairs,
     )
 
 
@@ -606,7 +859,7 @@ def _detect_pred_cols(df: pd.DataFrame) -> dict[int, str]:
             if df[c].dtype in (np.float64, np.float32, np.int64, np.int32)
         ]
         raise KeyError(
-            f"could not auto-detect prediction columns; pass --map 1:col,...\n"
+            f'could not auto-detect prediction columns; set config \'colmap\' (e.g., {{"1": "pred_1year"}})\n'
             f"Available numeric columns: {numeric_cols}"
         )
     return dict(sorted(cols.items()))
@@ -670,62 +923,167 @@ def summarize(cfg: Config) -> tuple[pd.DataFrame, ExamData]:
     return out, exam_data
 
 
-def parse_args() -> Config:
-    """parse CLI args"""
-    p = argparse.ArgumentParser(
-        description="Summarize Mirai validation_output.csv with simple per-horizon AUC and survival metrics"
-    )
-    p.add_argument(
-        "--out-dir",
-        dest="out_dir",
-        type=Path,
-        required=True,
-        help="directory containing validation_output.csv and mirai_manifest.csv",
-    )
-    p.add_argument("--out", dest="out_json", type=Path)
-    p.add_argument("--split", dest="split", default="test", type=str)
-    p.add_argument(
-        "--map",
-        dest="map_kv",
-        nargs="*",
-        help="override horizon→column mapping: e.g., 1:pred_1year 5:pred_5year",
-    )
-    p.add_argument(
-        "--cindex-col",
-        dest="cindex_col",
-        type=str,
-        help="column to use for Uno's C-index (default: max-horizon risk)",
-    )
-    p.add_argument(
-        "--kfold",
-        dest="kfold",
-        type=int,
-        help="k-fold CV for IPCW sensitivity analysis (e.g., 5); splits at patient level",
-    )
-    p.add_argument(
-        "--qc-file",
-        dest="qc_file",
-        type=Path,
-        help="path to qc_status.json; exams marked 'bad', 'review', or 'auto_excluded' will be excluded from analysis",
-    )
-    args = p.parse_args()
-    colmap = _parse_map(args.map_kv) if args.map_kv else None
+def _load_config(config_path: Path) -> Config:
+    """load OmegaConf config and return normalized Config dataclass."""
+    config_path = config_path.expanduser().resolve()
+    if not config_path.exists():
+        raise FileNotFoundError(f"config file not found: {config_path}")
 
-    # construct paths from output directory
-    pred_csv = args.out_dir / "validation_output.csv"
-    meta_csv = args.out_dir / "mirai_manifest.csv"
-    out_json = args.out_json or (args.out_dir / "summary.json")
+    cfg_omega = OmegaConf.load(config_path)
+    raw_config = OmegaConf.to_container(cfg_omega, resolve=False)
+    resolved_input = OmegaConf.to_container(cfg_omega, resolve=True)
+    if not isinstance(raw_config, dict) or not isinstance(resolved_input, dict):
+        raise ValueError("config root must be a mapping/object")
+
+    config_dir = config_path.parent
+    out_dir = _resolve_config_path(resolved_input.get("out_dir"), config_dir)
+    if out_dir is None:
+        raise ValueError("config key 'out_dir' is required")
+
+    pred_csv = _resolve_config_path(resolved_input.get("pred_csv"), config_dir)
+    if pred_csv is None:
+        pred_csv = out_dir / "validation_output.csv"
+    meta_csv = _resolve_config_path(resolved_input.get("meta_csv"), config_dir)
+    if meta_csv is None:
+        meta_csv = out_dir / "mirai_manifest.csv"
+    out_json = _resolve_config_path(resolved_input.get("out_json"), config_dir)
+    if out_json is None:
+        out_json = out_dir / "summary.json"
+
+    split_value = resolved_input.get("split", "test")
+    split = None if split_value is None else str(split_value)
+    colmap = _parse_colmap(resolved_input.get("colmap"))
+    cindex_col_value = resolved_input.get("cindex_col")
+    cindex_col = None if cindex_col_value is None else str(cindex_col_value)
+    kfold_value = resolved_input.get("kfold")
+    kfold = None if kfold_value is None else int(kfold_value)
+    if kfold is not None and kfold < 2:
+        raise ValueError("config key 'kfold' must be >= 2 when provided")
+
+    if not pred_csv.exists():
+        raise FileNotFoundError(f"prediction CSV not found: {pred_csv}")
+    if not meta_csv.exists():
+        raise FileNotFoundError(f"metadata CSV not found: {meta_csv}")
+
+    qc_cfg_raw = resolved_input.get("qc_filters")
+    if qc_cfg_raw is None:
+        qc_cfg_raw = {}
+    if not isinstance(qc_cfg_raw, dict):
+        raise ValueError("config key 'qc_filters' must be a mapping/object")
+
+    include_statuses = _normalize_string_tuple(
+        qc_cfg_raw.get("include_statuses"), lowercase=True
+    )
+    if include_statuses is not None and len(include_statuses) == 0:
+        include_statuses = None
+    exclude_statuses = _normalize_string_tuple(
+        qc_cfg_raw.get("exclude_statuses", ["bad", "review"]), lowercase=True
+    )
+    if exclude_statuses is None:
+        exclude_statuses = tuple()
+
+    qc_file = _resolve_config_path(qc_cfg_raw.get("qc_file"), config_dir)
+    annotations_file = _resolve_config_path(
+        qc_cfg_raw.get("annotations_file"), config_dir
+    )
+    if annotations_file is None and qc_file is not None:
+        annotations_file = qc_file.parent / "annotations.json"
+
+    include_any = _normalize_annotation_filter(
+        _normalize_string_tuple(qc_cfg_raw.get("annotation_include_any"))
+    )
+    include_all = _normalize_annotation_filter(
+        _normalize_string_tuple(qc_cfg_raw.get("annotation_include_all"))
+    )
+    exclude_any = _normalize_annotation_filter(
+        _normalize_string_tuple(qc_cfg_raw.get("annotation_exclude_any"))
+    )
+    exclude_all = _normalize_annotation_filter(
+        _normalize_string_tuple(qc_cfg_raw.get("annotation_exclude_all"))
+    )
+
+    auto_filter_config = _resolve_config_path(
+        qc_cfg_raw.get("auto_filter_config"), config_dir
+    )
+    if auto_filter_config is None:
+        auto_filter_config = (Path.cwd() / "data" / "qc_auto_exclude.json").resolve()
+
+    auto_filters = _normalize_string_tuple(
+        qc_cfg_raw.get("auto_filters"), lowercase=True
+    )
+    enable_auto_filters = bool(qc_cfg_raw.get("enable_auto_filters", True))
+
+    qc_filters = QCFilterConfig(
+        qc_file=qc_file,
+        include_statuses=include_statuses,
+        exclude_statuses=exclude_statuses,
+        annotations_file=annotations_file,
+        annotation_include_any=include_any,
+        annotation_include_all=include_all,
+        annotation_exclude_any=exclude_any,
+        annotation_exclude_all=exclude_all,
+        enable_auto_filters=enable_auto_filters,
+        auto_filter_config=auto_filter_config,
+        auto_filters=auto_filters,
+    )
+
+    resolved_config: dict[str, Any] = {
+        "out_dir": str(out_dir),
+        "pred_csv": str(pred_csv),
+        "meta_csv": str(meta_csv),
+        "out_json": str(out_json),
+        "split": split,
+        "colmap": {str(k): v for k, v in colmap.items()} if colmap else None,
+        "cindex_col": cindex_col,
+        "kfold": kfold,
+        "qc_filters": {
+            "qc_file": str(qc_file) if qc_file else None,
+            "include_statuses": list(include_statuses)
+            if include_statuses is not None
+            else None,
+            "exclude_statuses": list(exclude_statuses),
+            "annotations_file": str(annotations_file) if annotations_file else None,
+            "annotation_include_any": list(include_any),
+            "annotation_include_all": list(include_all),
+            "annotation_exclude_any": list(exclude_any),
+            "annotation_exclude_all": list(exclude_all),
+            "enable_auto_filters": enable_auto_filters,
+            "auto_filter_config": str(auto_filter_config)
+            if auto_filter_config
+            else None,
+            "auto_filters": list(auto_filters) if auto_filters is not None else None,
+        },
+    }
 
     return Config(
         pred_csv=pred_csv,
         meta_csv=meta_csv,
         out_json=out_json,
-        split=args.split,
+        split=split,
         colmap=colmap,
-        cindex_col=args.cindex_col,
-        kfold=args.kfold,
-        qc_file=args.qc_file,
+        cindex_col=cindex_col,
+        kfold=kfold,
+        qc_filters=qc_filters,
+        config_path=config_path,
+        raw_config=raw_config,
+        resolved_config=resolved_config,
     )
+
+
+def parse_args() -> Config:
+    """parse CLI args (config-only)."""
+    p = argparse.ArgumentParser(
+        description="Analyze Mirai outputs using OmegaConf config"
+    )
+    p.add_argument(
+        "--config",
+        dest="config",
+        type=Path,
+        required=True,
+        help="OmegaConf YAML/JSON config path",
+    )
+    args = p.parse_args()
+    return _load_config(args.config)
 
 
 def _build_surv_arrays(meta: pd.DataFrame) -> np.ndarray:
@@ -1602,12 +1960,22 @@ def compute_model_performance_metrics(
 
 def compute_patient_examination_characteristics(
     cfg: Config,
+    allowed_exam_pairs: frozenset[tuple[str, str]] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """compute patient- and examination-level characteristics table
 
     computes statistics from mirai_manifest.csv merged with phenotype data
     """
     meta = _load_enriched_manifest(cfg)
+    if allowed_exam_pairs is not None:
+        allowed_df = pd.DataFrame(
+            list(allowed_exam_pairs), columns=["patient_id", "exam_id"]
+        )
+        before = len(meta)
+        meta = meta.merge(allowed_df, on=["patient_id", "exam_id"], how="inner")
+        print(
+            f"Applied analysis exam-pair filter to characteristics: {before - len(meta)} rows excluded"
+        )
 
     print("\n=== Date Source Debugging ===")
     print(f"Exams in manifest (enriched): {len(meta):,}")
@@ -1826,11 +2194,35 @@ def main() -> None:
 
     checkpoint("Starting analysis")
 
-    # compute patient and examination characteristics
+    if cfg.out_json is not None:
+        cfg.out_json.parent.mkdir(parents=True, exist_ok=True)
+        (cfg.out_json.parent / "analyze_mirai_config.source.yaml").write_text(
+            cfg.config_path.read_text()
+        )
+        (cfg.out_json.parent / "analyze_mirai_config.input.yaml").write_text(
+            OmegaConf.to_yaml(OmegaConf.create(cfg.raw_config), resolve=False)
+        )
+        (cfg.out_json.parent / "analyze_mirai_config.resolved.yaml").write_text(
+            OmegaConf.to_yaml(OmegaConf.create(cfg.resolved_config), resolve=True)
+        )
+        print(f"Saved analysis config snapshots to {cfg.out_json.parent}")
+
+    checkpoint("Computing per-horizon summary...")
+    per_horizon_df, exam_data = summarize(cfg)
+    checkpoint("Computed per-horizon summary")
+    print("\n=== Per-Horizon AUC ===")
+    cols = ["horizon_years", "n", "cases", "controls", "excluded", "prevalence", "auc"]
+    print(
+        per_horizon_df[cols].to_string(index=False, float_format=lambda x: f"{x:.4f}")
+    )
+
+    # compute patient and examination characteristics (using the same filtered exam pairs)
     try:
         checkpoint("Loading patient/examination characteristics...")
         characteristics_df, meta_exam, meta_filtered_exam = (
-            compute_patient_examination_characteristics(cfg)
+            compute_patient_examination_characteristics(
+                cfg, allowed_exam_pairs=exam_data.exam_pairs
+            )
         )
         checkpoint("Computed patient/examination characteristics")
         print("\n=== Patient- and Examination-level Characteristics ===")
@@ -1844,22 +2236,13 @@ def main() -> None:
                 f"\nPatient examination characteristics saved to {characteristics_path}"
             )
 
-            # plot exam time histogram (using all exams, not just filtered)
+            # plot exam time histogram (using all exams after QC-driven filtering)
             plot_path = cfg.out_json.parent / "exam_time_histogram.png"
             plot_exam_time_histogram(meta_exam, plot_path)
             print(f"Exam time histogram saved to {plot_path}")
     except Exception as e:
         print(f"\n[warn] Could not compute patient examination characteristics: {e}")
         meta_exam = None
-
-    checkpoint("Computing per-horizon summary...")
-    per_horizon_df, exam_data = summarize(cfg)
-    checkpoint("Computed per-horizon summary")
-    print("\n=== Per-Horizon AUC ===")
-    cols = ["horizon_years", "n", "cases", "controls", "excluded", "prevalence", "auc"]
-    print(
-        per_horizon_df[cols].to_string(index=False, float_format=lambda x: f"{x:.4f}")
-    )
 
     surv = None
     if cfg.kfold is not None:
@@ -2151,7 +2534,11 @@ def main() -> None:
 
     if cfg.out_json is not None:
         payload = per_horizon_df.to_dict(orient="records")
-        out = {"per_horizon": payload}
+        out = {
+            "per_horizon": payload,
+            "filter_summary": exam_data.filter_summary,
+            "resolved_config": cfg.resolved_config,
+        }
         if surv is not None:
             out["survival_metrics"] = surv
         cfg.out_json.parent.mkdir(parents=True, exist_ok=True)
