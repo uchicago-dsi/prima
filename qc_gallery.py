@@ -465,11 +465,37 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                 self.server._preload_ready = False
 
                 current_batch = LOAD_MORE_ARGS.get("max_exams") or 100
-                next_batch = current_batch
+                query = parse_qs(parsed_path.query)
+                requested_batch_raw = (query.get("batch_size", [""])[0] or "").strip()
+                if requested_batch_raw:
+                    try:
+                        requested_batch = int(requested_batch_raw)
+                    except ValueError:
+                        self.wfile.write(
+                            json.dumps(
+                                {
+                                    "error": f"Invalid batch_size '{requested_batch_raw}'. Expected positive integer."
+                                }
+                            ).encode()
+                        )
+                        return
+                    if requested_batch <= 0:
+                        self.wfile.write(
+                            json.dumps(
+                                {
+                                    "error": f"Invalid batch_size '{requested_batch_raw}'. Expected positive integer."
+                                }
+                            ).encode()
+                        )
+                        return
+                    next_batch = requested_batch
+                else:
+                    next_batch = current_batch
                 logger.info(
-                    "QC DEBUG load-more: qc_file=%s, current_batch=%s, next_batch=%s, prioritize_errors=%s, random_sample=%s, qc_skip_status=%s",
+                    "QC DEBUG load-more: qc_file=%s, current_batch=%s, requested_batch=%s, next_batch=%s, prioritize_errors=%s, random_sample=%s, qc_skip_status=%s",
                     QC_FILE_PATH,
                     current_batch,
+                    requested_batch_raw if requested_batch_raw else "(default)",
                     next_batch,
                     LOAD_MORE_ARGS.get("prioritize_errors"),
                     LOAD_MORE_ARGS.get("random_sample"),
@@ -2374,7 +2400,17 @@ def generate_gallery(
         <p style="color: #9cdcfe; margin: 15px 0;">
             You've reviewed all exams in this batch.
         </p>
-        <div style="margin: 15px 0;">
+        <div style="margin: 15px 0; display: flex; gap: 10px; justify-content: center; align-items: center; flex-wrap: wrap;">
+            <label style="display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: #9cdcfe;">
+                Next batch size:
+                <input
+                    id="loadMoreBatchSize"
+                    type="number"
+                    min="1"
+                    step="1"
+                    style="width: 90px; padding: 6px 8px; font-size: 13px; border: 1px solid #3e3e42; border-radius: 4px; background-color: #1e1e1e; color: #d4d4d4;"
+                >
+            </label>
             <button id="loadMoreBtn" onclick="loadMore()">🔄 Load More Exams [l]</button>
             <button onclick="closeCompletion()">Continue Reviewing</button>
         </div>
@@ -2427,73 +2463,14 @@ def generate_gallery(
         const filterTokenToFilename = {{}};
         const filterSetsByFilename = {{}};
         const unresolvedFilterWarnings = new Set();
-        
-        // session rate tracking (persist across load-more reloads in same tab)
-        const sessionStatsKey = 'qc_session_stats::' + qcStorageNamespace;
-        const sessionStatsVersion = 1;
-        
-        function loadSessionStats() {{
-            const fresh = {{
-                version: sessionStatsVersion,
-                startTimeMs: Date.now(),
-                qcCount: 0,
-                startingRemainingToQC: remainingToQC,
-                totalToQC: totalToQC
-            }};
-            const raw = sessionStorage.getItem(sessionStatsKey);
-            if (!raw) {{
-                return fresh;
-            }}
-            try {{
-                const parsed = JSON.parse(raw);
-                const validShape = (
-                    parsed &&
-                    typeof parsed === 'object' &&
-                    Number.isFinite(parsed.startTimeMs) &&
-                    Number.isFinite(parsed.qcCount) &&
-                    Number.isFinite(parsed.startingRemainingToQC) &&
-                    Number.isFinite(parsed.totalToQC)
-                );
-                if (!validShape) {{
-                    return fresh;
-                }}
-                // reset session stats if we switched to a different review pool
-                if (parsed.totalToQC !== totalToQC) {{
-                    return fresh;
-                }}
-                // reset if QC appears to have been globally reset mid-session
-                if (remainingToQC > parsed.startingRemainingToQC) {{
-                    return fresh;
-                }}
-                return {{
-                    version: sessionStatsVersion,
-                    startTimeMs: parsed.startTimeMs,
-                    qcCount: parsed.qcCount,
-                    startingRemainingToQC: parsed.startingRemainingToQC,
-                    totalToQC: parsed.totalToQC
-                }};
-            }} catch (e) {{
-                console.error('Failed to parse session stats:', e);
-                return fresh;
-            }}
-        }}
-        
-        let sessionStats = loadSessionStats();
-        let sessionStartTime = sessionStats.startTimeMs;
-        let sessionQCCount = sessionStats.qcCount;
-        let sessionStartRemainingToQC = sessionStats.startingRemainingToQC;
-        
-        function saveSessionStats() {{
-            sessionStorage.setItem(sessionStatsKey, JSON.stringify(sessionStats));
-        }}
-        // ensure session state is materialized for this tab
-        saveSessionStats();
-        
+
         // track QC decisions (exam_id -> status)
         // server state is authoritative; localStorage only backfills missing entries
         let qcData = {{}};
         const validStatuses = new Set(['good', 'review', 'bad', 'auto_excluded']);
         const doneStatuses = new Set(['good', 'review', 'bad']);
+        let batchStartTime = Date.now();
+        let batchQCCount = 0;
 
         function getManualQCCount() {{
             let count = 0;
@@ -2565,6 +2542,11 @@ def generate_gallery(
             filteredExams = filteredExams.filter(exam => {{
                 return !qcSkipStatus.includes(qcData[exam.exam_id]);
             }});
+        }}
+
+        const loadMoreBatchSizeInput = document.getElementById('loadMoreBatchSize');
+        if (loadMoreBatchSizeInput && !loadMoreBatchSizeInput.value) {{
+            loadMoreBatchSizeInput.value = String(Math.max(allExams.length, 1));
         }}
         
         // annotation system: tags are independent of QC status
@@ -2793,14 +2775,10 @@ def generate_gallery(
             qcData[exam.exam_id] = status;
             exam.qc_status = status;
             if (!wasDone && willBeDone) {{
-                sessionQCCount++;
-                sessionStats.qcCount = sessionQCCount;
-                saveSessionStats();
-            }} else if (wasDone && !willBeDone && sessionQCCount > 0) {{
+                batchQCCount++;
+            }} else if (wasDone && !willBeDone && batchQCCount > 0) {{
                 // keep metrics robust if statuses become non-final in future flows.
-                sessionQCCount--;
-                sessionStats.qcCount = sessionQCCount;
-                saveSessionStats();
+                batchQCCount--;
             }}
             autoSaveQCData();
             updateManualQCIndicator();
@@ -2995,7 +2973,7 @@ def generate_gallery(
                 }});
         }}
 
-        function pollLoadMoreStatus(loadMoreBtn, statusDiv, attempt = 0) {{
+        function pollLoadMoreStatus(loadMoreBtn, loadMoreBatchSizeInput, statusDiv, attempt = 0) {{
             const maxAttempts = 600;  // ~15 minutes at 1.5s
             fetch('/load-more-status')
                 .then(response => response.json())
@@ -3003,6 +2981,7 @@ def generate_gallery(
                     if (status.error) {{
                         alert('Failed to generate more exams: ' + status.error);
                         loadMoreBtn.disabled = false;
+                        if (loadMoreBatchSizeInput) loadMoreBatchSizeInput.disabled = false;
                         loadMoreBtn.textContent = '🔄 Load More Exams [l]';
                         statusDiv.style.display = 'none';
                         return;
@@ -3025,6 +3004,7 @@ def generate_gallery(
 
                     if (attempt >= maxAttempts) {{
                         loadMoreBtn.disabled = false;
+                        if (loadMoreBatchSizeInput) loadMoreBatchSizeInput.disabled = false;
                         loadMoreBtn.textContent = '🔄 Load More Exams [l]';
                         statusDiv.innerHTML = '<p style="color: #f0d060; font-weight: bold; margin: 0;">Still generating in background.</p>' +
                             '<p style="font-size: 12px; color: #858585; margin: 10px 0 0 0;">Wait a bit and click load more again to check status.</p>';
@@ -3032,40 +3012,55 @@ def generate_gallery(
                     }}
 
                     setTimeout(() => {{
-                        pollLoadMoreStatus(loadMoreBtn, statusDiv, attempt + 1);
+                        pollLoadMoreStatus(loadMoreBtn, loadMoreBatchSizeInput, statusDiv, attempt + 1);
                     }}, 1500);
                 }})
                 .catch(error => {{
                     console.error('Failed to check load-more status:', error);
                     if (attempt >= maxAttempts) {{
                         loadMoreBtn.disabled = false;
+                        if (loadMoreBatchSizeInput) loadMoreBatchSizeInput.disabled = false;
                         loadMoreBtn.textContent = '🔄 Load More Exams [l]';
                         statusDiv.style.display = 'none';
                         return;
                     }}
                     setTimeout(() => {{
-                        pollLoadMoreStatus(loadMoreBtn, statusDiv, attempt + 1);
+                        pollLoadMoreStatus(loadMoreBtn, loadMoreBatchSizeInput, statusDiv, attempt + 1);
                     }}, 2000);
                 }});
         }}
         
         async function loadMore() {{
             const loadMoreBtn = document.getElementById('loadMoreBtn');
+            const loadMoreBatchSizeInput = document.getElementById('loadMoreBatchSize');
             const statusDiv = document.getElementById('loadMoreStatus');
 
             if (loadMoreBtn.disabled) return;
+
+            let requestedBatchSize = Math.max(allExams.length, 1);
+            if (loadMoreBatchSizeInput) {{
+                const raw = String(loadMoreBatchSizeInput.value || '').trim();
+                const parsed = Number.parseInt(raw, 10);
+                if (!Number.isInteger(parsed) || parsed <= 0) {{
+                    alert('Please enter a valid positive integer for next batch size.');
+                    loadMoreBatchSizeInput.focus();
+                    return;
+                }}
+                requestedBatchSize = parsed;
+            }}
             
             // disable button and show status
             loadMoreBtn.disabled = true;
+            if (loadMoreBatchSizeInput) loadMoreBatchSizeInput.disabled = true;
             loadMoreBtn.textContent = '⏳ Loading...';
             statusDiv.style.display = 'block';
             statusDiv.innerHTML = '<p style="color: #4ec9b0; font-weight: bold; margin: 0;">⏳ Saving latest QC decisions...</p>' +
-                '<p style="font-size: 12px; color: #858585; margin: 10px 0 0 0;">Starting load-more right after save completes.</p>';
+                '<p style="font-size: 12px; color: #858585; margin: 10px 0 0 0;">Starting load-more for ' + requestedBatchSize.toLocaleString() + ' exams right after save completes.</p>';
 
             try {{
                 await saveQCToServer();
 
-                const response = await fetch('/load-more');
+                const response = await fetch('/load-more?batch_size=' + encodeURIComponent(String(requestedBatchSize)));
                 const data = await response.json();
                 if (!response.ok || data.error) {{
                     throw new Error(data.error || ('HTTP ' + response.status));
@@ -3075,11 +3070,12 @@ def generate_gallery(
 
                 statusDiv.innerHTML = '<p style="color: #4ec9b0; font-weight: bold; margin: 0;">⏳ Generating more exams...</p>' +
                     '<p style="font-size: 12px; color: #858585; margin: 10px 0 0 0;">This may take a minute. Page will reload when ready.</p>';
-                pollLoadMoreStatus(loadMoreBtn, statusDiv);
+                pollLoadMoreStatus(loadMoreBtn, loadMoreBatchSizeInput, statusDiv);
             }} catch (error) {{
                 console.error('Failed to load more:', error);
                 alert('Failed to load more exams: ' + (error.message || error));
                 loadMoreBtn.disabled = false;
+                if (loadMoreBatchSizeInput) loadMoreBatchSizeInput.disabled = false;
                 loadMoreBtn.textContent = '🔄 Load More Exams [l]';
                 statusDiv.style.display = 'none';
             }}
@@ -3551,18 +3547,18 @@ def generate_gallery(
             if (document.getElementById('searchBox').value.trim() !== '') {{
                 statsText += ' (filtered)';
             }}
-            // compute session rate and ETA
-            const elapsedMin = (Date.now() - sessionStartTime) / 60000;
+            // compute batch-local rate and ETA (current loaded batch only)
+            const elapsedMin = (Date.now() - batchStartTime) / 60000;
             let rateText = '';
-            if (sessionQCCount > 0 && elapsedMin > 0.01) {{
-                const rate = sessionQCCount / elapsedMin;
-                const remainingNow = Math.max(sessionStartRemainingToQC - sessionQCCount, 0);
+            if (batchQCCount > 0 && elapsedMin > 0.01) {{
+                const rate = batchQCCount / elapsedMin;
+                const remainingNow = qcCounts.pending;
                 const etaMin = remainingNow / rate;
                 let etaStr;
                 if (etaMin < 1) etaStr = '<1 min';
                 else if (etaMin < 60) etaStr = Math.round(etaMin) + ' min';
                 else etaStr = (etaMin / 60).toFixed(1) + ' hr';
-                rateText = ' | ' + rate.toFixed(1) + '/min, ETA ' + etaStr + ' (' + sessionQCCount + ' this session)';
+                rateText = ' | ' + rate.toFixed(1) + '/min, ETA ' + etaStr + ' (' + batchQCCount + ' this batch)';
             }}
             
             statsText += ' | ' + totalToQC + ' total | ' +
@@ -3649,12 +3645,8 @@ def generate_gallery(
             localStorage.removeItem('qc_data');
             localStorage.removeItem('annotations');
             localStorage.removeItem('annotation_tags');
-            sessionStorage.removeItem(sessionStatsKey);
-            sessionStats = loadSessionStats();
-            sessionStartTime = sessionStats.startTimeMs;
-            sessionQCCount = sessionStats.qcCount;
-            sessionStartRemainingToQC = sessionStats.startingRemainingToQC;
-            saveSessionStats();
+            batchStartTime = Date.now();
+            batchQCCount = 0;
             
             // save empty data to server
             saveQCToServer({{ replace: true }}).catch(error => {{
