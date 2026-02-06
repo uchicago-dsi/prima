@@ -111,6 +111,34 @@ VIEWS_PATH = None
 TAGS_PATH = None
 LOAD_MORE_ARGS = None  # store args for dynamic loading
 
+DEFAULT_ANNOTATION_TAGS = [
+    "vertical line (detector artifact)",
+    "horizontal line (detector artifact)",
+]
+LEGACY_ANNOTATION_TAG_ALIASES = {
+    "detector artifact - vertical line": "vertical line (detector artifact)",
+    "detector artifact - horizontal line": "horizontal line (detector artifact)",
+    "horizontal line (detector artifact": "horizontal line (detector artifact)",
+}
+
+
+def _normalize_annotation_tags(tags) -> list[str]:
+    """Normalize annotation tags to canonical labels and keep canonical tags first."""
+    if not isinstance(tags, list):
+        tags = []
+
+    normalized: list[str] = []
+    for raw_tag in tags:
+        tag = str(raw_tag).strip()
+        if not tag:
+            continue
+        canonical = LEGACY_ANNOTATION_TAG_ALIASES.get(tag, tag)
+        if canonical not in normalized:
+            normalized.append(canonical)
+
+    extra_tags = [tag for tag in normalized if tag not in DEFAULT_ANNOTATION_TAGS]
+    return DEFAULT_ANNOTATION_TAGS + extra_tags
+
 
 class QCGalleryHandler(SimpleHTTPRequestHandler):
     """HTTP request handler for serving gallery and handling QC saves."""
@@ -144,12 +172,14 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
             if ANNOTATION_TAGS_PATH and ANNOTATION_TAGS_PATH.exists():
                 with open(ANNOTATION_TAGS_PATH) as f:
                     tags = json.load(f)
+                normalized_tags = _normalize_annotation_tags(tags)
+                if normalized_tags != tags:
+                    with open(ANNOTATION_TAGS_PATH, "w") as f:
+                        json.dump(normalized_tags, f, indent=2)
+                    tags = normalized_tags
                 self.wfile.write(json.dumps(tags).encode())
             else:
-                default_tags = [
-                    "vertical line (detector artifact)",
-                    "horizontal line (detector artifact)",
-                ]
+                default_tags = DEFAULT_ANNOTATION_TAGS
                 self.wfile.write(json.dumps(default_tags).encode())
             return
 
@@ -2227,6 +2257,30 @@ def generate_gallery(
         let annotationTags = [];  // available tag strings
         let annotations = {{}};    // exam_id -> [tag1, tag2, ...]
         let annotationHotkeys = {{ keyToTag: {{}}, tagToKey: {{}} }};
+        const defaultAnnotationTags = [
+            "vertical line (detector artifact)",
+            "horizontal line (detector artifact)"
+        ];
+        const legacyAnnotationTagAliases = {{
+            "detector artifact - vertical line": "vertical line (detector artifact)",
+            "detector artifact - horizontal line": "horizontal line (detector artifact)",
+            "horizontal line (detector artifact": "horizontal line (detector artifact)"
+        }};
+
+        function normalizeAnnotationTags(tags) {{
+            const normalized = [];
+            tags.forEach(tag => {{
+                const raw = String(tag || '').trim();
+                if (raw === '') return;
+                const canonical = legacyAnnotationTagAliases[raw] || raw;
+                if (!normalized.includes(canonical)) {{
+                    normalized.push(canonical);
+                }}
+            }});
+
+            const extras = normalized.filter(tag => !defaultAnnotationTags.includes(tag));
+            return [...defaultAnnotationTags, ...extras];
+        }}
         
         // load annotations from localStorage first (survives page refresh)
         const savedAnnotations = localStorage.getItem(annotationsStorageKey);
@@ -2240,7 +2294,7 @@ def generate_gallery(
         const savedAnnotationTags = localStorage.getItem(annotationTagsStorageKey);
         if (savedAnnotationTags) {{
             try {{
-                annotationTags = JSON.parse(savedAnnotationTags);
+                annotationTags = normalizeAnnotationTags(JSON.parse(savedAnnotationTags));
             }} catch (e) {{
                 console.error('failed to parse saved annotation tags:', e);
             }}
@@ -2252,18 +2306,15 @@ def generate_gallery(
             .then(tags => {{
                 if (tags.length > 0) {{
                     // merge: keep any localStorage tags not on server, add server tags
-                    const merged = [...new Set([...annotationTags, ...tags])];
-                    annotationTags = merged;
+                    annotationTags = normalizeAnnotationTags([...tags, ...annotationTags]);
+                    localStorage.setItem(annotationTagsStorageKey, JSON.stringify(annotationTags));
                 }}
                 console.log('loaded annotation tags:', annotationTags);
             }})
             .catch(error => {{
                 console.error('failed to load annotation tags from server:', error);
                 if (annotationTags.length === 0) {{
-                    annotationTags = [
-                        "vertical line (detector artifact)",
-                        "horizontal line (detector artifact)"
-                    ];
+                    annotationTags = [...defaultAnnotationTags];
                 }}
             }});
         
