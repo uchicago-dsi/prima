@@ -10,11 +10,11 @@ This script reads from views.parquet (output from preprocessing) and generates:
 
 The gallery features:
 - Single-image viewer with Previous/Next buttons (faster than scrolling)
-- Keyboard navigation (left/right arrows, g/r/b for QC, a to annotate, s to skip, l to load more)
+- Keyboard navigation (left/right arrows, g for good, a to annotate, s to skip, l to load more)
 - Search/filter by patient ID, exam ID, or accession number
-- QC buttons to mark exams as "good", "needs review", or "bad"
+- QC button to mark exams as "good" (no findings)
 - Independent annotation system: tag exams with categories (e.g., artifact types)
-- QC status persistence: saves to JSON file, skips "good" exams on next run
+- QC status persistence: saves to JSON file, skips QC'd exams on next run
 - Real-time QC statistics in the status bar
 
 QC Workflow (fully keyboard-driven)
@@ -22,16 +22,17 @@ QC Workflow (fully keyboard-driven)
 1. Run script with --serve flag to generate gallery and start HTTP server
 2. Open gallery in browser (with SSH port forwarding if remote)
 3. Mark exams using keyboard - auto-saves to server after each action:
-   - g/r/b for good/review/bad (instant)
-   - a to open annotation modal, letter hotkeys toggle tags, type + enter to add new tag
+   - g for good (means reviewed with no issues)
+   - a to annotate issues, then esc to close modal and move to next exam
+   - in annotation modal, letter hotkeys toggle tags, type + enter to add new tag
    - arrow keys to navigate, s to skip, l to load more
-4. Re-run script to continue QC on remaining exams (by default, "good" and "bad" exams skipped)
-5. To re-visit "bad" exams: use --qc-skip-status good
+4. Re-run script to continue QC on remaining exams (by default, "good" and annotated exams skipped)
+5. To re-visit annotated exams: use --qc-skip-status good auto_excluded
 
 Data Format
 -----------
 QC status stored in JSON (default: data/qc_status.json):
-  - {exam_id: "good"}, {exam_id: "review"}, or {exam_id: "bad"}
+  - {exam_id: "good"}
 Annotations stored separately in data/annotations.json:
   - {exam_id: ["vertical line (detector artifact)", ...]}
 Available annotation tags stored in data/annotation_tags.json
@@ -55,11 +56,11 @@ python qc_gallery.py --serve --max-exams 100 --prioritize-errors \
   --pred-csv /path/to/validation_output.csv \
   --meta-csv /path/to/mirai_manifest.csv
 
-# re-visit exams previously marked as "bad"
-python qc_gallery.py --serve --max-exams 100 --qc-skip-status good
+# re-visit annotated exams
+python qc_gallery.py --serve --max-exams 100 --qc-skip-status good auto_excluded
 
 # only show completely unmarked exams (skip all QC'd exams)
-python qc_gallery.py --serve --max-exams 100 --qc-skip-status good bad review
+python qc_gallery.py --serve --max-exams 100 --qc-skip-status good annotated auto_excluded
 
 # QC without server (downloads file on each click)
 python qc_gallery.py --max-exams 10 --random
@@ -112,7 +113,7 @@ LOAD_MORE_ARGS = None  # store args for dynamic loading
 ENABLE_PRELOAD = False
 _CACHED_FILTER_SETS = None  # lazily computed {filter_name: set(exam_id)}
 
-DEBUG_TRACKED_STATUSES = ("good", "review", "bad", "auto_excluded")
+DEBUG_TRACKED_STATUSES = ("good", "auto_excluded")
 
 DEFAULT_ANNOTATION_TAGS = [
     "vertical line (detector artifact)",
@@ -908,6 +909,17 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
             with open(QC_FILE_PATH) as f:
                 qc_data = json.load(f)
             qc_data = {str(exam_id): status for exam_id, status in qc_data.items()}
+        # load annotations (exam_id -> list of tags)
+        annotations_data = {}
+        if ANNOTATIONS_PATH and ANNOTATIONS_PATH.exists():
+            with open(ANNOTATIONS_PATH) as f:
+                annotations_data = json.load(f)
+            if isinstance(annotations_data, dict):
+                annotations_data = {
+                    str(exam_id): tags for exam_id, tags in annotations_data.items()
+                }
+            else:
+                annotations_data = {}
 
         cutflow = []
         excluded_exams: set = set()
@@ -956,18 +968,22 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                 }
             )
 
-        # add manually marked bad exams as final filter step
-        if qc_data:
-            bad_exams = {eid for eid, status in qc_data.items() if status == "bad"}
-            new_excluded = bad_exams - excluded_exams
-            excluded_exams.update(bad_exams)
+        # add manually annotated exams as final filter step
+        annotated_exams = {
+            eid
+            for eid, tags in annotations_data.items()
+            if isinstance(tags, list) and len(tags) > 0
+        }
+        if annotated_exams:
+            new_excluded = annotated_exams - excluded_exams
+            excluded_exams.update(annotated_exams)
             filter_sets = dict(filter_sets)  # don't mutate cache
-            filter_sets["manual_qc_bad"] = bad_exams
+            filter_sets["manual_qc_annotated"] = annotated_exams
             cutflow.append(
                 {
                     "step": "5. Manual QC",
-                    "filter": "Manually marked as bad",
-                    "flagged_by_filter": len(bad_exams),
+                    "filter": "Manually annotated with findings",
+                    "flagged_by_filter": len(annotated_exams),
                     "exams_excluded_this_step": len(new_excluded),
                     "total_excluded": len(excluded_exams),
                     "exams_remaining": total_exams - len(excluded_exams),
@@ -977,38 +993,45 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                 }
             )
 
-        # Compute filter effectiveness if we have QC data
+        # Compute filter effectiveness if we have manual annotation data.
         filter_effectiveness = None
         summary = None
 
-        if qc_data:
-            bad_exams = {eid for eid, status in qc_data.items() if status == "bad"}
+        if annotations_data:
+            annotated_exams = {
+                eid
+                for eid, tags in annotations_data.items()
+                if isinstance(tags, list) and len(tags) > 0
+            }
             good_exams = {eid for eid, status in qc_data.items() if status == "good"}
+            good_exams -= annotated_exams
 
             effectiveness = []
             total_caught = set()
 
             for filter_name, filter_exams in filter_sets.items():
-                caught_bad = bad_exams & filter_exams
+                caught_annotated = annotated_exams & filter_exams
                 caught_good = good_exams & filter_exams
-                total_caught.update(caught_bad)
+                total_caught.update(caught_annotated)
 
-                if len(caught_bad) > 0 or len(caught_good) > 0:
-                    precision = len(caught_bad) / (len(caught_bad) + len(caught_good))
+                if len(caught_annotated) > 0 or len(caught_good) > 0:
+                    precision = len(caught_annotated) / (
+                        len(caught_annotated) + len(caught_good)
+                    )
                     effectiveness.append(
                         {
                             "filter": filter_name,
-                            "bad_caught": len(caught_bad),
+                            "annotated_caught": len(caught_annotated),
                             "good_caught": len(caught_good),
                             "precision": precision,
                         }
                     )
 
             filter_effectiveness = sorted(
-                effectiveness, key=lambda x: x["bad_caught"], reverse=True
+                effectiveness, key=lambda x: x["annotated_caught"], reverse=True
             )
             summary = {
-                "total_bad": len(bad_exams),
+                "total_annotated": len(annotated_exams),
                 "caught_by_filters": len(total_caught),
             }
 
@@ -1101,7 +1124,7 @@ def start_qc_server(
     logger.info(f"     http://localhost:{port}/")
     logger.info("")
     logger.info("QC workflow:")
-    logger.info("  • Mark exams with g/r/b keys or arrow keys for navigation")
+    logger.info("  • Mark exams with g (good) or use a to annotate findings")
     logger.info("  • Use dropdown to load filter lists (no restart needed!)")
     logger.info("  • QC data auto-saves to server on each click")
     logger.info("  • Press ctrl+c to stop server when done")
@@ -1549,11 +1572,11 @@ def generate_gallery(
         meta_csv: path to mirai_manifest.csv with labels (for error prioritization)
         prioritize_errors: if True, sort by prediction error (worst first)
         horizon: which prediction horizon to use for error scoring (default: 5 years)
-        qc_skip_status: set of QC statuses to skip (default: {"good", "bad"})
+        qc_skip_status: set of QC statuses to skip (default: {"good", "annotated", "auto_excluded"})
         serve: if True, suppress non-server instructions in logging
     """
     if qc_skip_status is None:
-        qc_skip_status = {"good", "bad", "auto_excluded"}
+        qc_skip_status = {"good", "annotated", "auto_excluded"}
     logger.info(
         "QC DEBUG generate_gallery args: max_exams=%s, random_sample=%s, prioritize_errors=%s, qc_skip_status=%s, patient_id=%s, exam_id=%s, exam_list_path=%s, qc_file=%s, serve=%s",
         max_exams,
@@ -1584,6 +1607,32 @@ def generate_gallery(
         )
     else:
         logger.info("QC DEBUG loaded QC map: empty")
+
+    # load annotation data for done/skip accounting
+    annotations_data = {}
+    annotations_path = qc_file.parent / "annotations.json" if qc_file else None
+    if annotations_path and annotations_path.exists():
+        try:
+            with open(annotations_path) as f:
+                raw_annotations = json.load(f)
+            if isinstance(raw_annotations, dict):
+                annotations_data = {
+                    str(exam_id): tags
+                    for exam_id, tags in raw_annotations.items()
+                    if isinstance(tags, list) and len(tags) > 0
+                }
+                logger.info(
+                    "loaded annotation findings for %d exams from %s",
+                    len(annotations_data),
+                    annotations_path,
+                )
+            else:
+                logger.warning(
+                    "annotation file is not a JSON object (%s); ignoring",
+                    type(raw_annotations).__name__,
+                )
+        except Exception as e:
+            logger.warning("failed to load annotations from %s: %s", annotations_path, e)
 
     logger.info(f"loading views from {views_parquet}")
     views_df = pd.read_parquet(views_parquet)
@@ -1671,8 +1720,10 @@ def generate_gallery(
     # track total pool for QC metrics (before skipping completed exams)
     total_to_qc = views_df["exam_id"].nunique()
     eligible_exam_ids = set(views_df["exam_id"].unique())
-    done_statuses = {"good", "review", "bad"}
+    done_statuses = {"good"}
     done_exams = {eid for eid, status in qc_data.items() if status in done_statuses}
+    annotated_exams = set(annotations_data.keys())
+    done_exams |= annotated_exams
     done_count = len(done_exams & eligible_exam_ids)
     remaining_to_qc = max(total_to_qc - done_count, 0)
     logger.info(
@@ -1683,15 +1734,27 @@ def generate_gallery(
     )
 
     # filter out exams with specified QC statuses
-    if qc_data and qc_skip_status:
-        skip_exams = {
-            eid for eid, status in qc_data.items() if status in qc_skip_status
-        }
+    if qc_skip_status:
+        status_skip_statuses = {status for status in qc_skip_status if status != "annotated"}
+        skip_exams = set()
+        if qc_data and status_skip_statuses:
+            skip_exams |= {
+                eid for eid, status in qc_data.items() if status in status_skip_statuses
+            }
+        if "annotated" in qc_skip_status:
+            skip_exams |= annotated_exams
         skip_in_pool = set(views_df["exam_id"].unique()) & skip_exams
         logger.info(
-            "QC DEBUG skip filter: skip_status=%s, skip_map_entries=%d, skip_in_current_pool=%d",
+            "QC DEBUG skip filter: skip_status=%s, status_skip_entries=%d, annotated_skip_entries=%d, skip_in_current_pool=%d",
             sorted(qc_skip_status),
-            len(skip_exams),
+            len(
+                {
+                    eid
+                    for eid, status in qc_data.items()
+                    if status in status_skip_statuses
+                }
+            ),
+            len(annotated_exams) if "annotated" in qc_skip_status else 0,
             len(skip_in_pool),
         )
         if skip_in_pool:
@@ -1705,7 +1768,7 @@ def generate_gallery(
             after_count = views_df["exam_id"].nunique()
             status_str = ", ".join(f"'{s}'" for s in sorted(qc_skip_status))
             logger.info(
-                f"filtered out {before_count - after_count} exams marked as {status_str} in QC"
+                f"filtered out {before_count - after_count} exams based on skip buckets: {status_str}"
             )
 
     if len(views_df) == 0:
@@ -1764,19 +1827,21 @@ def generate_gallery(
             f"will visualize {len(views_df)} views from {views_df['exam_id'].nunique()} exams"
         )
     selected_counts = {status: 0 for status in DEBUG_TRACKED_STATUSES}
+    selected_annotated = 0
     pending_count = 0
     for exam_key in selected_exam_ids:
         status = qc_data.get(str(exam_key), "")
         if status in selected_counts:
             selected_counts[status] += 1
+        elif str(exam_key) in annotated_exams:
+            selected_annotated += 1
         else:
             pending_count += 1
     logger.info(
-        "QC DEBUG selected batch: exams=%d, statuses=(good=%d, review=%d, bad=%d, auto_excluded=%d, pending=%d)",
+        "QC DEBUG selected batch: exams=%d, statuses=(good=%d, annotated=%d, auto_excluded=%d, pending=%d)",
         len(selected_exam_ids),
         selected_counts["good"],
-        selected_counts["review"],
-        selected_counts["bad"],
+        selected_annotated,
         selected_counts["auto_excluded"],
         pending_count,
     )
@@ -2145,34 +2210,6 @@ def generate_gallery(
             border-color: #8fdf8f;
             box-shadow: 0 0 10px #6bcc6b;
         }}
-        .qc-button.review {{
-            background-color: #3a3a1e;
-            color: #f0d060;
-            border-color: #8a8a4a;
-        }}
-        .qc-button.review:hover {{
-            background-color: #5a5a2d;
-            border-color: #f0d060;
-        }}
-        .qc-button.review.active {{
-            background-color: #8a8a4a;
-            border-color: #f0e080;
-            box-shadow: 0 0 10px #f0d060;
-        }}
-        .qc-button.bad {{
-            background-color: #3a1e1e;
-            color: #e06b6b;
-            border-color: #8a4a4a;
-        }}
-        .qc-button.bad:hover {{
-            background-color: #5a2d2d;
-            border-color: #e06b6b;
-        }}
-        .qc-button.bad.active {{
-            background-color: #8a4a4a;
-            border-color: #e08f8f;
-            box-shadow: 0 0 10px #e06b6b;
-        }}
         .qc-button.annotate {{
             background-color: #1e2e3a;
             color: #9cdcfe;
@@ -2387,7 +2424,7 @@ def generate_gallery(
             </div>
             <div>
                 <p style="color: #858585; font-size: 13px; margin-top: 0; margin-bottom: 15px;">
-                    Press letter hotkeys to toggle tags, or type new tag and press enter. Press esc when done.
+                    Press letter hotkeys to toggle tags, or type new tag and press enter. Press esc to save/close and move to the next exam.
                 </p>
                 <div id="annotationTagsList" style="margin-bottom: 20px;">
                 </div>
@@ -2501,7 +2538,7 @@ def generate_gallery(
                 if (!validShape) {{
                     return fresh;
                 }}
-                // reset session stats if we switched to a different review pool
+                // reset session stats if we switched to a different QC pool
                 if (parsed.totalToQC !== totalToQC) {{
                     return fresh;
                 }}
@@ -2540,17 +2577,68 @@ def generate_gallery(
         // track QC decisions (exam_id -> status)
         // server state is authoritative; localStorage only backfills missing entries
         let qcData = {{}};
-        const validStatuses = new Set(['good', 'review', 'bad', 'auto_excluded']);
-        const doneStatuses = new Set(['good', 'review', 'bad']);
+        // annotation system: tags are independent of QC status
+        let annotationTags = [];  // available tag strings
+        let annotations = {{}};    // exam_id -> [tag1, tag2, ...]
+        let annotationHotkeys = {{ keyToTag: {{}}, tagToKey: {{}} }};
+        const validStatuses = new Set(['good', 'auto_excluded']);
+        const doneStatuses = new Set(['good']);
+        const skipAnnotatedExams = qcSkipStatus.includes('annotated');
+
+        function getStatus(examId) {{
+            return qcData[examId] || '';
+        }}
+
+        function getExamAnnotations(examId) {{
+            const tags = annotations[examId];
+            return Array.isArray(tags) ? tags : [];
+        }}
+
+        function hasAnnotationFindings(examId) {{
+            return getExamAnnotations(examId).length > 0;
+        }}
+
+        function isDoneExam(examId) {{
+            return doneStatuses.has(getStatus(examId)) || hasAnnotationFindings(examId);
+        }}
+
+        function shouldSkipExam(examId) {{
+            if (qcSkipStatus.includes(getStatus(examId))) {{
+                return true;
+            }}
+            if (skipAnnotatedExams && hasAnnotationFindings(examId)) {{
+                return true;
+            }}
+            return false;
+        }}
+
+        function updateDoneCounters(wasDone, willBeDone) {{
+            if (!wasDone && willBeDone) {{
+                sessionQCCount++;
+                batchQCCount++;
+                sessionStats.qcCount = sessionQCCount;
+                saveSessionStats();
+            }} else if (wasDone && !willBeDone && sessionQCCount > 0) {{
+                sessionQCCount--;
+                if (batchQCCount > 0) batchQCCount--;
+                sessionStats.qcCount = sessionQCCount;
+                saveSessionStats();
+            }}
+        }}
 
         function getManualQCCount() {{
-            let count = 0;
+            const doneExamIds = new Set();
             Object.keys(qcData).forEach(examId => {{
                 if (doneStatuses.has(qcData[examId])) {{
-                    count++;
+                    doneExamIds.add(examId);
                 }}
             }});
-            return count;
+            Object.keys(annotations).forEach(examId => {{
+                if (hasAnnotationFindings(examId)) {{
+                    doneExamIds.add(examId);
+                }}
+            }});
+            return doneExamIds.size;
         }}
 
         function updateManualQCIndicator() {{
@@ -2608,17 +2696,6 @@ def generate_gallery(
             }}
         }}
 
-        // client-side skip of already QC'd exams (matches qcSkipStatus)
-        if (qcSkipStatus.length > 0) {{
-            filteredExams = filteredExams.filter(exam => {{
-                return !qcSkipStatus.includes(qcData[exam.exam_id]);
-            }});
-        }}
-        
-        // annotation system: tags are independent of QC status
-        let annotationTags = [];  // available tag strings
-        let annotations = {{}};    // exam_id -> [tag1, tag2, ...]
-        let annotationHotkeys = {{ keyToTag: {{}}, tagToKey: {{}} }};
         const defaultAnnotationTags = [
             "vertical line (detector artifact)",
             "horizontal line (detector artifact)"
@@ -2688,7 +2765,8 @@ def generate_gallery(
                     annotations[examId] = data[examId];
                 }});
                 console.log('loaded annotations for', Object.keys(annotations).length, 'exams');
-                updateView();
+                updateManualQCIndicator();
+                applyFilters();
             }})
             .catch(error => {{
                 console.error('failed to load annotations from server:', error);
@@ -2769,8 +2847,7 @@ def generate_gallery(
             // count how many exams in current batch have been QC'd
             let qcdCount = 0;
             allExams.forEach(exam => {{
-                const status = getStatus(exam.exam_id);
-                if (status && status !== 'auto_excluded') {{
+                if (isDoneExam(exam.exam_id)) {{
                     qcdCount++;
                 }}
             }});
@@ -2833,35 +2910,37 @@ def generate_gallery(
             }});
         }}
         
-        function setQCStatus(status) {{
-            const exam = filteredExams[currentIndex];
-            const previousStatus = getStatus(exam.exam_id);
-            const wasDone = doneStatuses.has(previousStatus);
-            const willBeDone = doneStatuses.has(status);
-            qcData[exam.exam_id] = status;
-            exam.qc_status = status;
-            if (!wasDone && willBeDone) {{
-                sessionQCCount++;
-                batchQCCount++;
-                sessionStats.qcCount = sessionQCCount;
-                saveSessionStats();
-            }} else if (wasDone && !willBeDone && sessionQCCount > 0) {{
-                sessionQCCount--;
-                if (batchQCCount > 0) batchQCCount--;
-                sessionStats.qcCount = sessionQCCount;
-                saveSessionStats();
-            }}
-            autoSaveQCData();
-            updateManualQCIndicator();
-            
-            // check if this was the last exam
+        function advanceAfterQCAction() {{
             if (currentIndex === filteredExams.length - 1) {{
-                // show completion banner
                 showCompletion();
             }} else {{
-                // auto-advance to next exam
                 navigate(1);
             }}
+        }}
+
+        function setQCStatus(status) {{
+            if (filteredExams.length === 0) return;
+            if (status !== 'good') return;
+            const exam = filteredExams[currentIndex];
+            const examAnnotations = getExamAnnotations(exam.exam_id);
+            if (status === 'good' && examAnnotations.length > 0) {{
+                const clearAnnotations = confirm(
+                    'This exam has annotation tags. Marking it good means no findings and will remove those tags. Continue?'
+                );
+                if (!clearAnnotations) {{
+                    return;
+                }}
+                delete annotations[exam.exam_id];
+                saveAnnotations();
+            }}
+            const wasDone = isDoneExam(exam.exam_id);
+            qcData[exam.exam_id] = status;
+            exam.qc_status = status;
+            const willBeDone = isDoneExam(exam.exam_id);
+            updateDoneCounters(wasDone, willBeDone);
+            autoSaveQCData();
+            updateManualQCIndicator();
+            advanceAfterQCAction();
         }}
         
         function renderAnnotationTagsList() {{
@@ -2923,9 +3002,19 @@ def generate_gallery(
             modal.style.display = 'none';
             input.value = '';
         }}
+
+        function closeAnnotationModalAndAdvance() {{
+            if (filteredExams.length === 0) {{
+                closeAnnotationModal();
+                return;
+            }}
+            closeAnnotationModal();
+            advanceAfterQCAction();
+        }}
         
         function toggleAnnotation(tag) {{
             const exam = filteredExams[currentIndex];
+            const wasDone = isDoneExam(exam.exam_id);
             if (!annotations[exam.exam_id]) {{
                 annotations[exam.exam_id] = [];
             }}
@@ -2939,8 +3028,12 @@ def generate_gallery(
             }} else {{
                 annotations[exam.exam_id].push(tag);
             }}
+            const willBeDone = isDoneExam(exam.exam_id);
+            updateDoneCounters(wasDone, willBeDone);
             
             saveAnnotations();
+            updateManualQCIndicator();
+            checkAndPreload();
             renderAnnotationTagsList();
             updateView();
         }}
@@ -2978,17 +3071,9 @@ def generate_gallery(
             }}
         }});
         
-        function getStatus(examId) {{
-            return qcData[examId] || '';
-        }}
-        
         function skipExam() {{
             // skip without marking - just advance
-            if (currentIndex === filteredExams.length - 1) {{
-                showCompletion();
-            }} else {{
-                navigate(1);
-            }}
+            advanceAfterQCAction();
         }}
         
         function showCompletion() {{
@@ -2996,20 +3081,19 @@ def generate_gallery(
             const statsDiv = document.getElementById('completionStats');
             
             // count QC statuses
-            const qcCounts = {{good: 0, review: 0, bad: 0, pending: 0}};
+            const qcCounts = {{good: 0, pending: 0}};
             allExams.forEach(exam => {{
-                const status = getStatus(exam.exam_id);
-                if (status === 'good') qcCounts.good++;
-                else if (status === 'review') qcCounts.review++;
-                else if (status === 'bad') qcCounts.bad++;
-                else qcCounts.pending++;
+                if (getStatus(exam.exam_id) === 'good') qcCounts.good++;
+                else if (!hasAnnotationFindings(exam.exam_id)) qcCounts.pending++;
             }});
+            const annotatedCount = allExams.filter(exam => {{
+                return hasAnnotationFindings(exam.exam_id);
+            }}).length;
             
             statsDiv.innerHTML = 
                 '<div><strong>Total exams in batch:</strong> ' + allExams.length + '</div>' +
                 '<div style="color: #6bcc6b;"><strong>Good:</strong> ' + qcCounts.good + '</div>' +
-                '<div style="color: #e06b6b;"><strong>Bad:</strong> ' + qcCounts.bad + '</div>' +
-                '<div style="color: #f0d060;"><strong>Review:</strong> ' + qcCounts.review + '</div>' +
+                '<div style="color: #4ec9b0;"><strong>Annotated:</strong> ' + annotatedCount + '</div>' +
                 '<div style="color: #9cdcfe;"><strong>Pending:</strong> ' + qcCounts.pending + '</div>';
             
             banner.style.display = 'block';
@@ -3498,12 +3582,10 @@ def generate_gallery(
                 }}
             }}
 
-            // skip already QC'd exams (matches qcSkipStatus)
-            if (qcSkipStatus.length > 0) {{
-                exams = exams.filter(exam => {{
-                    return !qcSkipStatus.includes(getStatus(exam.exam_id));
-                }});
-            }}
+            // skip already-reviewed exams (good / annotated / auto_excluded based on qcSkipStatus)
+            exams = exams.filter(exam => {{
+                return !shouldSkipExam(exam.exam_id);
+            }});
             
             filteredExams = exams;
             
@@ -3566,16 +3648,14 @@ def generate_gallery(
                 const hasActiveFilter = filterExpr !== '';
                 const batchFullyCompleted = (
                     allExams.length > 0 &&
-                    qcSkipStatus.length > 0 &&
-                    allExams.every(exam => qcSkipStatus.includes(getStatus(exam.exam_id)))
+                    allExams.every(exam => shouldSkipExam(exam.exam_id))
                 );
-                const debugCounts = {{good: 0, review: 0, bad: 0, auto_excluded: 0, pending: 0}};
+                const debugCounts = {{good: 0, annotated: 0, auto_excluded: 0, pending: 0}};
                 allExams.forEach(exam => {{
                     const status = getStatus(exam.exam_id);
                     if (status === 'good') debugCounts.good++;
-                    else if (status === 'review') debugCounts.review++;
-                    else if (status === 'bad') debugCounts.bad++;
                     else if (status === 'auto_excluded') debugCounts.auto_excluded++;
+                    else if (hasAnnotationFindings(exam.exam_id)) debugCounts.annotated++;
                     else debugCounts.pending++;
                 }});
                 const debugExamples = allExams.slice(0, 10).map(exam => {{
@@ -3604,18 +3684,20 @@ def generate_gallery(
             
             const exam = filteredExams[currentIndex];
             const currentStatus = getStatus(exam.exam_id);
+            const filteredRemaining = filteredExams.filter(item => {{
+                return !isDoneExam(item.exam_id);
+            }}).length;
             
             // count QC statuses for exams in current gallery
-            const qcCounts = {{good: 0, review: 0, bad: 0, pending: 0}};
+            const qcCounts = {{good: 0, annotated: 0, pending: 0}};
             allExams.forEach(exam => {{
                 const status = getStatus(exam.exam_id);
                 if (status === 'good') qcCounts.good++;
-                else if (status === 'review') qcCounts.review++;
-                else if (status === 'bad') qcCounts.bad++;
+                else if (hasAnnotationFindings(exam.exam_id)) qcCounts.annotated++;
                 else qcCounts.pending++;
             }});
             
-            const examAnnotations = annotations[exam.exam_id] || [];
+            const examAnnotations = getExamAnnotations(exam.exam_id);
             const hasAnnotations = examAnnotations.length > 0;
             
             let annotationPills = '';
@@ -3638,10 +3720,6 @@ def generate_gallery(
                 '<div class="qc-controls">' +
                     '<button class="qc-button good' + (currentStatus === 'good' ? ' active' : '') + '" ' +
                         'onclick="setQCStatus(\\'good\\')" title="Mark as good">✓ Good [g]</button>' +
-                    '<button class="qc-button review' + (currentStatus === 'review' ? ' active' : '') + '" ' +
-                        'onclick="setQCStatus(\\'review\\')" title="Needs review">? Review [r]</button>' +
-                    '<button class="qc-button bad' + (currentStatus === 'bad' ? ' active' : '') + '" ' +
-                        'onclick="setQCStatus(\\'bad\\')" title="Mark as bad">✗ Bad [b]</button>' +
                     '<button class="qc-button annotate' + (hasAnnotations ? ' has-tags' : '') + '" ' +
                         'onclick="showAnnotationModal()" title="Annotate this exam">🏷 Annotate [a]</button>' +
                     '<button class="qc-button skip" ' +
@@ -3655,12 +3733,12 @@ def generate_gallery(
             if (document.getElementById('searchBox').value.trim() !== '') {{
                 statsText += ' (filtered)';
             }}
-            // compute ETA using batch rate (since page load) and full dataset remaining
+            // compute ETA using batch rate (since page load) and filtered remaining work
             const batchElapsedMin = (Date.now() - batchStartTime) / 60000;
             let rateText = '';
             if (batchQCCount > 0 && batchElapsedMin > 0.01) {{
                 const rate = batchQCCount / batchElapsedMin;
-                const remainingNow = Math.max(sessionStartRemainingToQC - sessionQCCount, 0);
+                const remainingNow = filteredRemaining;
                 const etaMin = remainingNow / rate;
                 let etaStr;
                 if (etaMin < 1) etaStr = '<1 min';
@@ -3669,9 +3747,9 @@ def generate_gallery(
                 rateText = ' | ' + rate.toFixed(1) + '/min, ETA ' + etaStr + ' (' + remainingNow + ' remaining)';
             }}
             
-            statsText += ' | ' + totalToQC + ' total | ' +
-                         'QC: ' + qcCounts.good + ' good, ' + qcCounts.review + ' review, ' + 
-                         qcCounts.bad + ' bad, ' + qcCounts.pending + ' pending' + rateText;
+            statsText += ' | ' + filteredRemaining + ' remaining (filtered) | ' +
+                         'QC: ' + qcCounts.good + ' good, ' + qcCounts.annotated + ' annotated, ' + 
+                         qcCounts.pending + ' pending' + rateText;
             stats.textContent = statsText;
             
             prevBtn.disabled = currentIndex === 0;
@@ -3680,17 +3758,21 @@ def generate_gallery(
         
         // keyboard navigation
         document.addEventListener('keydown', (e) => {{
-            // esc to close modals
-            if (e.key === 'Escape') {{
-                document.getElementById('cutflowModal').style.display = 'none';
-                document.getElementById('completionBanner').style.display = 'none';
-                closeAnnotationModal();
-                return;
-            }}
-            
             // check if annotation modal is open
             const annotationModal = document.getElementById('annotationModal');
             const modalIsOpen = annotationModal.style.display === 'block';
+
+            // esc closes modal overlays; for annotation modal, also advances to next exam
+            if (e.key === 'Escape') {{
+                if (modalIsOpen) {{
+                    e.preventDefault();
+                    closeAnnotationModalAndAdvance();
+                    return;
+                }}
+                document.getElementById('cutflowModal').style.display = 'none';
+                document.getElementById('completionBanner').style.display = 'none';
+                return;
+            }}
             
             // if modal is open and user presses a tag hotkey (not in input), toggle that tag
             if (modalIsOpen && e.target.id !== 'newAnnotationInput') {{
@@ -3717,10 +3799,6 @@ def generate_gallery(
                 navigate(1);
             }} else if (key === 'g') {{
                 setQCStatus('good');
-            }} else if (key === 'r') {{
-                setQCStatus('review');
-            }} else if (key === 'b') {{
-                setQCStatus('bad');
             }} else if (key === 'a') {{
                 showAnnotationModal();
             }} else if (key === 's') {{
@@ -3789,7 +3867,7 @@ def generate_gallery(
                     let html = '<h3>Dataset Overview</h3>';
                     html += '<p>Total exams in dataset: <strong>' + data.total_exams.toLocaleString() + '</strong></p>';
                     html += '<p>Currently loaded in gallery: <strong>' + allExams.length + '</strong></p>';
-                    html += '<p>Manually QC\\'d so far: <strong>' + Object.keys(qcData).length + '</strong></p>';
+                    html += '<p>Manually QC\\'d so far: <strong>' + getManualQCCount() + '</strong></p>';
                     html += '<hr style="border-color: #3e3e42; margin: 20px 0;">';
                     
                     html += '<h3>Automatic Filter Cutflow</h3>';
@@ -3812,9 +3890,9 @@ def generate_gallery(
                     
                     if (data.filter_effectiveness) {{
                         html += '<hr style="border-color: #3e3e42; margin: 20px 0;">';
-                        html += '<h3>Filter Effectiveness (Based on Manual QC)</h3>';
+                        html += '<h3>Filter Effectiveness (Based on Manual Annotations)</h3>';
                         html += '<table class="cutflow-table"><thead><tr>';
-                        html += '<th>Filter</th><th>Bad Caught</th><th>Good Caught</th><th>Precision</th><th>Recommendation</th>';
+                        html += '<th>Filter</th><th>Annotated Caught</th><th>Good Caught</th><th>Precision</th><th>Recommendation</th>';
                         html += '</tr></thead><tbody>';
                         
                         data.filter_effectiveness.forEach(f => {{
@@ -3826,7 +3904,7 @@ def generate_gallery(
                             
                             html += '<tr>';
                             html += '<td>' + f.filter + '</td>';
-                            html += '<td>' + f.bad_caught + '</td>';
+                            html += '<td>' + f.annotated_caught + '</td>';
                             html += '<td style="color: ' + (f.good_caught > 0 ? '#e06b6b' : '#6bcc6b') + '">' + f.good_caught + '</td>';
                             html += '<td>' + (f.precision * 100).toFixed(1) + '%</td>';
                             html += '<td>' + rec + '</td>';
@@ -3835,9 +3913,12 @@ def generate_gallery(
                         html += '</tbody></table>';
                         
                         html += '<p style="margin-top: 20px; color: #9cdcfe;">';
-                        html += '<strong>Summary:</strong> ' + data.summary.total_bad + ' manually marked bad, ';
-                        html += data.summary.caught_by_filters + ' caught by filters ';
-                        html += '(' + (data.summary.caught_by_filters / data.summary.total_bad * 100).toFixed(1) + '%)';
+                        const totalAnnotated = data.summary.total_annotated || 0;
+                        const caught = data.summary.caught_by_filters || 0;
+                        const pct = totalAnnotated > 0 ? ((caught / totalAnnotated) * 100).toFixed(1) + '%' : 'n/a';
+                        html += '<strong>Summary:</strong> ' + totalAnnotated + ' manually annotated exams, ';
+                        html += caught + ' caught by filters ';
+                        html += '(' + pct + ')';
                         html += '</p>';
                     }}
                     
@@ -3873,7 +3954,7 @@ def generate_gallery(
         // show instructions in console
         console.log('QC data auto-saves to server on each button click');
         console.log('Server saves to: {qc_file_str}');
-        console.log('Keyboard shortcuts: g=good, r=review, b=bad, a=annotate (letter hotkeys toggle tags), s=skip, l=load more, arrows=navigate');
+        console.log('Keyboard shortcuts: g=good, a=annotate (letter hotkeys toggle tags), s=skip, l=load more, arrows=navigate');
         console.log('Backup: QC data also saved to browser localStorage (scoped by QC file) - safe to refresh page');
         console.log('Dynamic filters: insert filter tokens from dropdown, then combine with &, |, ~ in the filter box');
         console.log('Cutflow: Click 📊 Cutflow button to see dataset statistics');
@@ -3892,10 +3973,10 @@ def generate_gallery(
 
         if qc_file:
             logger.info(f"QC file: {qc_file.resolve()}")
+            annotated_count = len(annotations_data)
             logger.info(
                 f"QC status: {len([s for s in qc_data.values() if s == 'good'])} good, "
-                f"{len([s for s in qc_data.values() if s == 'review'])} review, "
-                f"{len([s for s in qc_data.values() if s == 'bad'])} bad"
+                f"{annotated_count} annotated"
             )
 
             if not serve:
@@ -3909,7 +3990,7 @@ def generate_gallery(
                 )
                 logger.info("=" * 60)
                 logger.info(
-                    "Keyboard shortcuts: g=good, r=review, b=bad, a=annotate (letter hotkeys), s=skip, l=load more, arrow keys=navigate"
+                    "Keyboard shortcuts: g=good, a=annotate (letter hotkeys), s=skip, l=load more, arrow keys=navigate"
                 )
 
     logger.info("gallery generation complete:")
@@ -3944,11 +4025,11 @@ Examples:
   python test_positioning_filters.py  # generates exam lists
   python qc_gallery.py --serve --exam-list data/filter_tests/all_flagged_exams.txt
 
-  # re-visit exams previously marked as "bad"
-  python qc_gallery.py --serve --max-exams 100 --qc-skip-status good
+  # re-visit annotated exams
+  python qc_gallery.py --serve --max-exams 100 --qc-skip-status good auto_excluded
 
   # only show completely unmarked exams (skip all QC'd exams)
-  python qc_gallery.py --serve --max-exams 100 --qc-skip-status good bad review
+  python qc_gallery.py --serve --max-exams 100 --qc-skip-status good annotated auto_excluded
 
   # QC without server (downloads qc_status.json on each click)
   python qc_gallery.py --max-exams 10 --random
@@ -3962,14 +4043,14 @@ Examples:
 Server mode workflow:
   1. Run with --serve, forwards port 5000 to your local machine
   2. Open http://localhost:5000/ in browser
-  3. Mark exams with g/r/b keys - auto-saves to server after each click
+  3. Mark exams with g or annotate with a - auto-saves to server after each click
   4. ctrl+c to stop server when done
-  5. Re-run to continue QC (by default, "good" and "bad" exams skipped)
-     To re-visit bad exams: --qc-skip-status good
+  5. Re-run to continue QC (by default, "good" and annotated exams skipped)
+     To re-visit annotated findings: --qc-skip-status good auto_excluded
 
 QC File Format:
-  JSON file mapping exam_id to status: {"exam_id_1": "good", "exam_id_2": "review", ...}
-  Valid statuses: "good", "review", "bad"
+  JSON file mapping exam_id to status: {"exam_id_1": "good", ...}
+  Valid statuses: "good"
         """,
     )
 
@@ -4056,9 +4137,9 @@ QC File Format:
     parser.add_argument(
         "--qc-skip-status",
         nargs="*",
-        default=["good", "bad", "auto_excluded"],
-        choices=["good", "bad", "review", "auto_excluded"],
-        help="QC statuses to skip in future runs (default: good bad auto_excluded). Use '--qc-skip-status good' to re-visit bad exams",
+        default=["good", "annotated", "auto_excluded"],
+        choices=["good", "annotated", "auto_excluded"],
+        help="QC buckets to skip in future runs (default: good annotated auto_excluded). Use '--qc-skip-status good auto_excluded' to re-visit annotated findings",
     )
     parser.add_argument(
         "--serve",
