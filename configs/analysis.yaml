@@ -42,6 +42,12 @@ qc_filters:
 
   # Auto filters from QC pipeline (GEMS, implant, scanned film, etc.).
   enable_auto_filters: true
-  auto_filter_config: data/qc_auto_exclude.json
+  # auto_filter_config: data/qc_auto_exclude.json
   # Optional explicit list overrides auto_filter_config.filters when set.
-  auto_filters: null
+  # Example structure (matches supported qc_auto_exclude filter names):
+  auto_filters:
+    - gems_ffdm_tc1
+    - has_implant
+    - scanned_film
+    - negative_positioner_angle
+    - zero_compression

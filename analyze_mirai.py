@@ -790,8 +790,27 @@ def _load_exam_data(cfg: Config) -> ExamData:
         base_exam_ids, cfg, views_path, tags_path
     )
 
+    auto_steps = [
+        step
+        for step in filter_summary["steps"]
+        if step["name"].startswith("auto_filter:")
+    ]
+    if auto_steps:
+        print("Auto-filter cutflow:")
+        for idx, step in enumerate(auto_steps, start=1):
+            filter_name = step["name"].split(":", 1)[1]
+            print(
+                f"  {idx}. {filter_name}: matched {step['candidate_exams']} exams, "
+                f"excluded {step['excluded']} new, remaining {step['remaining']}"
+            )
+        auto_total_excluded = sum(step["excluded"] for step in auto_steps)
+        print(f"  total newly excluded by auto filters: {auto_total_excluded}")
+        print()
+
     for step in filter_summary["steps"]:
-        if step["excluded"] > 0:
+        if step["name"].startswith("auto_filter:"):
+            continue
+        if step["excluded"] > 0 or step["mode"] == "include":
             print(
                 f"Filter {step['name']}: excluded {step['excluded']} exams "
                 f"(remaining {step['remaining']})"
