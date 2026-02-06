@@ -3552,7 +3552,7 @@ def generate_gallery(
             let rateText = '';
             if (batchQCCount > 0 && elapsedMin > 0.01) {{
                 const rate = batchQCCount / elapsedMin;
-                const remainingNow = qcCounts.pending;
+                const remainingNow = Math.max(remainingToQC - batchQCCount, 0);
                 const etaMin = remainingNow / rate;
                 let etaStr;
                 if (etaMin < 1) etaStr = '<1 min';
