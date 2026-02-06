@@ -120,8 +120,6 @@ def load_chimec_data():
                 state_col = f"{col}_state"
                 if state_col in metadata.columns:
                     mask = metadata[state_col].notna()
-                    if col == "is_exported":
-                        mask = mask | metadata[state_col].fillna(False).astype(bool)
                     metadata.loc[mask, col] = metadata.loc[mask, state_col]
                     metadata.drop(columns=[state_col], inplace=True)
     except FileNotFoundError as e:
@@ -476,6 +474,7 @@ def main():
     parser.add_argument(
         "--auto-confirm",
         action="store_true",
+        default=True,
         help="Proceed without interactive confirmation prompts.",
     )
     parser.add_argument(

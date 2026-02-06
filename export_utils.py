@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -716,7 +717,34 @@ def execute_downloads(
 
     try:
         driver = make_driver()
-        login(driver, USERNAME, PASSWORD)
+        try:
+            login(driver, USERNAME, PASSWORD)
+        except Exception as login_error:
+            # save page HTML for debugging
+            try:
+                page_source = driver.page_source
+                Path("data").mkdir(exist_ok=True)
+                debug_file = Path("data/debug_login_failure.html")
+                with open(debug_file, "w", encoding="utf-8") as f:
+                    f.write(page_source)
+                print(
+                    f"Saved page HTML to {debug_file} for debugging",
+                    file=sys.stderr,
+                )
+                # check what's actually on the page
+                if "tbxUsername" in page_source or "tbxPassword" in page_source:
+                    print(
+                        "Page still shows login form - login may have failed",
+                        file=sys.stderr,
+                    )
+                elif "lbUser" in page_source:
+                    print(
+                        "Page contains 'lbUser' element but Selenium couldn't find it - timing issue?",
+                        file=sys.stderr,
+                    )
+            except Exception as debug_error:
+                print(f"Could not save debug HTML: {debug_error}", file=sys.stderr)
+            raise login_error
 
         for study_id in tqdm(unique_patients, desc="Processing Patients"):
             if successfully_exported_counter >= batch_size:

@@ -10,19 +10,31 @@ This script reads from views.parquet (output from preprocessing) and generates:
 
 The gallery features:
 - Single-image viewer with Previous/Next buttons (faster than scrolling)
-- Keyboard navigation (left/right arrows, G/R/B for QC, S to save)
+- Keyboard navigation (left/right arrows, G/R/B for QC, A to annotate, S to skip)
 - Search/filter by patient ID, exam ID, or accession number
 - QC buttons to mark exams as "good", "needs review", or "bad"
+- Independent annotation system: tag exams with categories (e.g., artifact types)
 - QC status persistence: saves to JSON file, skips "good" exams on next run
 - Real-time QC statistics in the status bar
 
-QC Workflow
------------
+QC Workflow (fully keyboard-driven)
+------------------------------------
 1. Run script with --serve flag to generate gallery and start HTTP server
 2. Open gallery in browser (with SSH port forwarding if remote)
-3. Mark exams using keyboard (G/R/B) or buttons - auto-saves to server after each click
+3. Mark exams using keyboard - auto-saves to server after each action:
+   - G/R/B for good/review/bad (instant)
+   - A to open annotation modal, 1-9 to toggle tags, type + Enter to add new tag
+   - Arrow keys to navigate, S to skip
 4. Re-run script to continue QC on remaining exams (by default, "good" and "bad" exams skipped)
 5. To re-visit "bad" exams: use --qc-skip-status good
+
+Data Format
+-----------
+QC status stored in JSON (default: data/qc_status.json):
+  - {exam_id: "good"}, {exam_id: "review"}, or {exam_id: "bad"}
+Annotations stored separately in data/annotations.json:
+  - {exam_id: ["detector artifact - vertical line", ...]}
+Available annotation tags stored in data/annotation_tags.json
 
 Server mode (recommended for remote work):
   python qc_gallery.py --serve --max-exams 100 --random
@@ -91,6 +103,8 @@ logger = logging.getLogger(__name__)
 
 # global variables for HTTP server
 QC_FILE_PATH = None
+ANNOTATIONS_PATH = None  # exam_id -> [list of annotation tags]
+ANNOTATION_TAGS_PATH = None  # list of available annotation tag strings
 OUTPUT_DIR = None
 FILTER_DIR = None
 VIEWS_PATH = None
@@ -116,6 +130,37 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                 with open(QC_FILE_PATH) as f:
                     qc_data = json.load(f)
                 self.wfile.write(json.dumps(qc_data).encode())
+            else:
+                self.wfile.write(b"{}")
+            return
+
+        if parsed_path.path == "/load-annotation-tags":
+            # return available annotation tag strings
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+            if ANNOTATION_TAGS_PATH and ANNOTATION_TAGS_PATH.exists():
+                with open(ANNOTATION_TAGS_PATH) as f:
+                    tags = json.load(f)
+                self.wfile.write(json.dumps(tags).encode())
+            else:
+                default_tags = ["detector artifact - vertical line"]
+                self.wfile.write(json.dumps(default_tags).encode())
+            return
+
+        if parsed_path.path == "/load-annotations":
+            # return per-exam annotations (exam_id -> [tags])
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+            if ANNOTATIONS_PATH and ANNOTATIONS_PATH.exists():
+                with open(ANNOTATIONS_PATH) as f:
+                    annotations = json.load(f)
+                self.wfile.write(json.dumps(annotations).encode())
             else:
                 self.wfile.write(b"{}")
             return
@@ -259,8 +304,64 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                 self.wfile.write(json.dumps({"error": str(e)}).encode())
             return
 
+        if parsed_path.path == "/regenerate":
+            # regenerate current batch with latest QC state
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+            try:
+                if not LOAD_MORE_ARGS:
+                    self.wfile.write(
+                        json.dumps({"error": "Regenerate not configured"}).encode()
+                    )
+                    return
+
+                # discard any stale preload
+                self.server._preload_ready = False
+
+                current_batch = LOAD_MORE_ARGS.get("max_exams", 100)
+                logger.info(f"Regenerating current batch: {current_batch} exams")
+
+                import threading
+
+                def regenerate():
+                    try:
+                        from copy import deepcopy
+
+                        args = deepcopy(LOAD_MORE_ARGS)
+                        generate_gallery(**args)
+                        logger.info(f"Successfully regenerated {current_batch} exams")
+                    except Exception as e:
+                        logger.error(f"Failed to regenerate exams: {e}")
+                        import traceback
+
+                        traceback.print_exc()
+
+                thread = threading.Thread(target=regenerate)
+                thread.daemon = True
+                thread.start()
+
+                self.wfile.write(
+                    json.dumps(
+                        {
+                            "status": "ok",
+                            "message": f"Regenerating {current_batch} exams...",
+                            "reload_delay_ms": 3000,
+                        }
+                    ).encode()
+                )
+            except Exception as e:
+                logger.error(f"error regenerating: {e}")
+                import traceback
+
+                traceback.print_exc()
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
+            return
+
         if parsed_path.path == "/load-more":
-            # load more exams dynamically (instant if preloaded)
+            # always regenerate fresh to pick up latest QC state
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
@@ -273,33 +374,14 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                     )
                     return
 
-                # check if preload is ready
-                if (
-                    hasattr(self.server, "_preload_ready")
-                    and self.server._preload_ready
-                ):
-                    logger.info("Next batch already preloaded, instant reload!")
-                    self.server._preload_ready = False
-                    # update LOAD_MORE_ARGS for next preload
-                    current_batch = LOAD_MORE_ARGS.get("max_exams", 100)
-                    LOAD_MORE_ARGS["max_exams"] = current_batch * 2
-                    self.wfile.write(
-                        json.dumps(
-                            {
-                                "status": "ok",
-                                "message": "Next batch ready!",
-                                "reload_delay_ms": 500,  # instant reload
-                            }
-                        ).encode()
-                    )
-                    return
+                # discard any stale preload (QC state has changed since preload started)
+                self.server._preload_ready = False
 
-                # preload not ready, generate now
                 current_batch = LOAD_MORE_ARGS.get("max_exams", 100)
                 next_batch = current_batch * 2
 
                 logger.info(
-                    f"Loading more exams (no preload): increasing from {current_batch} to {next_batch}"
+                    f"Loading more exams (fresh): increasing from {current_batch} to {next_batch}"
                 )
 
                 # trigger gallery regeneration with larger batch
@@ -382,6 +464,66 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                     self.wfile.write(b'{"error": "QC file path not configured"}')
             except Exception as e:
                 logger.error(f"error saving QC data: {e}")
+                self.send_response(500)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
+        elif self.path == "/save-annotation-tags":
+            content_length = int(self.headers["Content-Length"])
+            post_data = self.rfile.read(content_length)
+
+            try:
+                tags = json.loads(post_data.decode())
+
+                if ANNOTATION_TAGS_PATH:
+                    ANNOTATION_TAGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+                    with open(ANNOTATION_TAGS_PATH, "w") as f:
+                        json.dump(tags, f, indent=2)
+
+                    logger.info(f"saved annotation tags: {len(tags)} categories")
+
+                    self.send_response(200)
+                    self.send_header("Content-type", "application/json")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(b'{"status": "ok"}')
+                else:
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(
+                        b'{"error": "Annotation tags path not configured"}'
+                    )
+            except Exception as e:
+                logger.error(f"error saving annotation tags: {e}")
+                self.send_response(500)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
+        elif self.path == "/save-annotations":
+            content_length = int(self.headers["Content-Length"])
+            post_data = self.rfile.read(content_length)
+
+            try:
+                annotations = json.loads(post_data.decode())
+
+                if ANNOTATIONS_PATH:
+                    ANNOTATIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+                    with open(ANNOTATIONS_PATH, "w") as f:
+                        json.dump(annotations, f, indent=2)
+
+                    logger.info(f"saved annotations: {len(annotations)} exams")
+
+                    self.send_response(200)
+                    self.send_header("Content-type", "application/json")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(b'{"status": "ok"}')
+                else:
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(b'{"error": "Annotations path not configured"}')
+            except Exception as e:
+                logger.error(f"error saving annotations: {e}")
                 self.send_response(500)
                 self.send_header("Content-type", "application/json")
                 self.end_headers()
@@ -598,9 +740,19 @@ def start_qc_server(
     load_more_args : Optional[dict]
         arguments for dynamically loading more exams
     """
-    global QC_FILE_PATH, OUTPUT_DIR, FILTER_DIR, VIEWS_PATH, TAGS_PATH, LOAD_MORE_ARGS
+    global \
+        QC_FILE_PATH, \
+        ANNOTATIONS_PATH, \
+        ANNOTATION_TAGS_PATH, \
+        OUTPUT_DIR, \
+        FILTER_DIR, \
+        VIEWS_PATH, \
+        TAGS_PATH, \
+        LOAD_MORE_ARGS
 
     QC_FILE_PATH = qc_file.resolve()
+    ANNOTATIONS_PATH = qc_file.parent / "annotations.json"
+    ANNOTATION_TAGS_PATH = qc_file.parent / "annotation_tags.json"
     OUTPUT_DIR = output_dir.resolve()
     VIEWS_PATH = views_path.resolve()
     TAGS_PATH = tags_path.resolve()
@@ -1226,6 +1378,14 @@ def generate_gallery(
             logger.error(f"exam list file not found: {exam_list_path}")
             return
 
+    # track total pool for QC metrics (before skipping completed exams)
+    total_to_qc = views_df["exam_id"].nunique()
+    eligible_exam_ids = set(views_df["exam_id"].unique())
+    done_statuses = {"good", "review", "bad"}
+    done_exams = {eid for eid, status in qc_data.items() if status in done_statuses}
+    done_count = len(done_exams & eligible_exam_ids)
+    remaining_to_qc = max(total_to_qc - done_count, 0)
+
     # filter out exams with specified QC statuses
     if qc_data and qc_skip_status:
         skip_exams = {
@@ -1390,6 +1550,10 @@ def generate_gallery(
     else:
         logger.info("all figures cached, skipping DICOM loading")
 
+    def get_qc_status(exam_id):
+        """extract status string from qc_data"""
+        return qc_data.get(exam_id, "")
+
     # generate combined 4-view figures for each exam (only those needing generation)
     logger.info("processing figures...")
     combined_images = []  # track for HTML gallery
@@ -1418,7 +1582,7 @@ def generate_gallery(
                 "exam_id": exam_id,
                 "accession": accession,
                 "num_views": len(exam_views),
-                "qc_status": qc_data.get(exam_id, ""),
+                "qc_status": get_qc_status(exam_id),
             }
         )
 
@@ -1453,7 +1617,7 @@ def generate_gallery(
                         "exam_id": exam_key,
                         "accession": exam_data["accession_number"],
                         "num_views": len(exam_data["views"]),
-                        "qc_status": qc_data.get(exam_key, ""),
+                        "qc_status": get_qc_status(exam_key),
                     }
                 )
 
@@ -1493,6 +1657,8 @@ def generate_gallery(
 
         if horizon != 5 and prioritize_errors:
             load_more_cmd += f" --horizon {horizon}"
+
+        qc_skip_status_list = sorted(qc_skip_status) if qc_skip_status else []
 
         html_content = f"""<!DOCTYPE html>
 <html>
@@ -1673,6 +1839,30 @@ def generate_gallery(
             border-color: #e08f8f;
             box-shadow: 0 0 10px #e06b6b;
         }}
+        .qc-button.annotate {{
+            background-color: #1e2e3a;
+            color: #9cdcfe;
+            border-color: #4a6a8a;
+        }}
+        .qc-button.annotate:hover {{
+            background-color: #2d4a5a;
+            border-color: #9cdcfe;
+        }}
+        .qc-button.annotate.has-tags {{
+            background-color: #2a4a5a;
+            border-color: #4ec9b0;
+            color: #4ec9b0;
+            box-shadow: 0 0 8px rgba(78, 201, 176, 0.3);
+        }}
+        .qc-button.skip {{
+            background-color: #252526;
+            color: #858585;
+            border-color: #3e3e42;
+        }}
+        .qc-button.skip:hover {{
+            background-color: #3e3e42;
+            border-color: #858585;
+        }}
         .qc-status-indicator {{
             padding: 4px 12px;
             border-radius: 4px;
@@ -1814,6 +2004,8 @@ def generate_gallery(
             </div>
             <div style="display: flex; gap: 5px;">
                 <button class="info-button" onclick="showCutflow()">📊 Cutflow</button>
+                <button class="info-button" onclick="resetAllQC()" title="Clear all QC data and annotations">🗑 Reset</button>
+                <button class="info-button" onclick="forceRegenerate()" title="Rebuild current batch with latest QC state">🔁 Force Regenerate</button>
             </div>
             <div class="filter-controls">
                 <input type="text" id="searchBox" placeholder="Filter by patient ID, exam ID, or accession..." 
@@ -1847,6 +2039,36 @@ def generate_gallery(
             </div>
             <div id="cutflowContent">
                 Loading...
+            </div>
+        </div>
+    </div>
+    
+    <!-- Annotation Modal -->
+    <div id="annotationModal" class="modal">
+        <div class="modal-content" style="max-width: 600px;">
+            <div class="modal-header">
+                <h2>annotate exam</h2>
+                <span class="close" onclick="closeAnnotationModal()">&times;</span>
+            </div>
+            <div>
+                <p style="color: #858585; font-size: 13px; margin-top: 0; margin-bottom: 15px;">
+                    Press 1-9 to toggle tags, or type new tag and press Enter. Press ESC when done.
+                </p>
+                <div id="annotationTagsList" style="margin-bottom: 20px;">
+                </div>
+                <div style="border-top: 1px solid #3e3e42; padding-top: 20px;">
+                    <div style="display: flex; gap: 10px; align-items: center;">
+                        <input type="text" id="newAnnotationInput" placeholder="add new tag and press Enter..." 
+                               style="flex: 1; padding: 8px 12px; font-size: 14px; border: 1px solid #3e3e42; 
+                                      border-radius: 4px; background-color: #1e1e1e; color: #d4d4d4;">
+                        <button onclick="addNewAnnotationTag()" 
+                                style="padding: 8px 20px; font-size: 14px; border: 1px solid #3e3e42; 
+                                       border-radius: 4px; background-color: #4ec9b0; color: #1e1e1e; 
+                                       cursor: pointer; font-weight: bold;">
+                            add
+                        </button>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
@@ -1893,11 +2115,19 @@ def generate_gallery(
 
         html_content += f"""
         ];
+
+        const qcSkipStatus = {json.dumps(qc_skip_status_list)};
+        const totalToQC = {total_to_qc};
+        const remainingToQC = {remaining_to_qc};
         
         let filteredExams = [...allExams];
         let currentIndex = 0;
         let activeExamFilter = null; // track active exam ID filter
         let preloadTriggered = false; // track if we've started preloading next batch
+        
+        // session rate tracking
+        const sessionStartTime = Date.now();
+        let sessionQCCount = 0;
         
         // track QC decisions (exam_id -> status)
         let qcData = {{}};
@@ -1918,6 +2148,85 @@ def generate_gallery(
                 qcData[exam.exam_id] = exam.qc_status;
             }}
         }});
+
+        // client-side skip of already QC'd exams (matches qcSkipStatus)
+        if (qcSkipStatus.length > 0) {{
+            filteredExams = filteredExams.filter(exam => {{
+                return !qcSkipStatus.includes(qcData[exam.exam_id]);
+            }});
+        }}
+        
+        // annotation system: tags are independent of QC status
+        let annotationTags = [];  // available tag strings
+        let annotations = {{}};    // exam_id -> [tag1, tag2, ...]
+        
+        // load annotations from localStorage first (survives page refresh)
+        const savedAnnotations = localStorage.getItem('annotations');
+        if (savedAnnotations) {{
+            try {{
+                annotations = JSON.parse(savedAnnotations);
+            }} catch (e) {{
+                console.error('failed to parse saved annotations:', e);
+            }}
+        }}
+        const savedAnnotationTags = localStorage.getItem('annotation_tags');
+        if (savedAnnotationTags) {{
+            try {{
+                annotationTags = JSON.parse(savedAnnotationTags);
+            }} catch (e) {{
+                console.error('failed to parse saved annotation tags:', e);
+            }}
+        }}
+        
+        // then merge with server data (server wins for tags, merge for annotations)
+        fetch('/load-annotation-tags')
+            .then(response => response.json())
+            .then(tags => {{
+                if (tags.length > 0) {{
+                    // merge: keep any localStorage tags not on server, add server tags
+                    const merged = [...new Set([...annotationTags, ...tags])];
+                    annotationTags = merged;
+                }}
+                console.log('loaded annotation tags:', annotationTags);
+            }})
+            .catch(error => {{
+                console.error('failed to load annotation tags from server:', error);
+                if (annotationTags.length === 0) {{
+                    annotationTags = ["detector artifact - vertical line"];
+                }}
+            }});
+        
+        fetch('/load-annotations')
+            .then(response => response.json())
+            .then(data => {{
+                // merge server annotations with localStorage
+                Object.keys(data).forEach(examId => {{
+                    annotations[examId] = data[examId];
+                }});
+                console.log('loaded annotations for', Object.keys(annotations).length, 'exams');
+                updateView();
+            }})
+            .catch(error => {{
+                console.error('failed to load annotations from server:', error);
+            }});
+        
+        function saveAnnotationTags() {{
+            localStorage.setItem('annotation_tags', JSON.stringify(annotationTags));
+            fetch('/save-annotation-tags', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify(annotationTags)
+            }}).catch(error => console.error('failed to save annotation tags:', error));
+        }}
+        
+        function saveAnnotations() {{
+            localStorage.setItem('annotations', JSON.stringify(annotations));
+            fetch('/save-annotations', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify(annotations)
+            }}).catch(error => console.error('failed to save annotations:', error));
+        }}
         
         function checkAndPreload() {{
             // check if we should start preloading next batch
@@ -1926,7 +2235,8 @@ def generate_gallery(
             // count how many exams in current batch have been QC'd
             let qcdCount = 0;
             allExams.forEach(exam => {{
-                if (qcData[exam.exam_id] && qcData[exam.exam_id] !== 'auto_excluded') {{
+                const status = getStatus(exam.exam_id);
+                if (status && status !== 'auto_excluded') {{
                     qcdCount++;
                 }}
             }});
@@ -1980,6 +2290,7 @@ def generate_gallery(
             const exam = filteredExams[currentIndex];
             qcData[exam.exam_id] = status;
             exam.qc_status = status;
+            sessionQCCount++;
             autoSaveQCData();
             
             // check if this was the last exam
@@ -1990,6 +2301,112 @@ def generate_gallery(
                 // auto-advance to next exam
                 navigate(1);
             }}
+        }}
+        
+        function showAnnotationModal() {{
+            const modal = document.getElementById('annotationModal');
+            const tagsList = document.getElementById('annotationTagsList');
+            const exam = filteredExams[currentIndex];
+            const examAnnotations = annotations[exam.exam_id] || [];
+            
+            // clear and populate tag list
+            tagsList.innerHTML = '';
+            annotationTags.forEach((tag, index) => {{
+                const hotkey = index + 1; // 1-9
+                if (hotkey > 9) return;
+                
+                const isActive = examAnnotations.includes(tag);
+                const btn = document.createElement('button');
+                btn.textContent = `[${{hotkey}}] ${{tag}}`;
+                btn.dataset.tag = tag;
+                btn.style.cssText = `
+                    display: block;
+                    width: 100%;
+                    padding: 12px 16px;
+                    margin-bottom: 10px;
+                    font-size: 14px;
+                    text-align: left;
+                    border: 1px solid ${{isActive ? '#4ec9b0' : '#3e3e42'}};
+                    border-radius: 4px;
+                    background-color: ${{isActive ? '#2d4a44' : '#1e1e1e'}};
+                    color: ${{isActive ? '#4ec9b0' : '#d4d4d4'}};
+                    cursor: pointer;
+                    transition: all 0.15s;
+                `;
+                if (isActive) {{
+                    btn.textContent = `[${{hotkey}}] ✓ ${{tag}}`;
+                }}
+                btn.onclick = () => {{
+                    toggleAnnotation(tag);
+                }};
+                tagsList.appendChild(btn);
+            }});
+            
+            modal.style.display = 'block';
+        }}
+        
+        function closeAnnotationModal() {{
+            const modal = document.getElementById('annotationModal');
+            const input = document.getElementById('newAnnotationInput');
+            modal.style.display = 'none';
+            input.value = '';
+        }}
+        
+        function toggleAnnotation(tag) {{
+            const exam = filteredExams[currentIndex];
+            if (!annotations[exam.exam_id]) {{
+                annotations[exam.exam_id] = [];
+            }}
+            
+            const idx = annotations[exam.exam_id].indexOf(tag);
+            if (idx >= 0) {{
+                annotations[exam.exam_id].splice(idx, 1);
+                if (annotations[exam.exam_id].length === 0) {{
+                    delete annotations[exam.exam_id];
+                }}
+            }} else {{
+                annotations[exam.exam_id].push(tag);
+            }}
+            
+            saveAnnotations();
+            closeAnnotationModal();
+            updateView();
+        }}
+        
+        function addNewAnnotationTag() {{
+            const input = document.getElementById('newAnnotationInput');
+            const newTag = input.value.trim();
+            
+            if (newTag === '') return;
+            
+            if (annotationTags.includes(newTag)) {{
+                alert('this tag already exists');
+                return;
+            }}
+            
+            // add tag to available list and persist
+            annotationTags.push(newTag);
+            saveAnnotationTags();
+            
+            // toggle it on for current exam
+            toggleAnnotation(newTag);
+            input.value = '';
+        }}
+        
+        // allow Enter key in annotation input
+        document.addEventListener('DOMContentLoaded', () => {{
+            const input = document.getElementById('newAnnotationInput');
+            if (input) {{
+                input.addEventListener('keypress', (e) => {{
+                    if (e.key === 'Enter') {{
+                        addNewAnnotationTag();
+                    }}
+                }});
+            }}
+        }});
+        
+        function getStatus(examId) {{
+            return qcData[examId] || '';
         }}
         
         function skipExam() {{
@@ -2008,7 +2425,7 @@ def generate_gallery(
             // count QC statuses
             const qcCounts = {{good: 0, review: 0, bad: 0, pending: 0}};
             allExams.forEach(exam => {{
-                const status = qcData[exam.exam_id];
+                const status = getStatus(exam.exam_id);
                 if (status === 'good') qcCounts.good++;
                 else if (status === 'review') qcCounts.review++;
                 else if (status === 'bad') qcCounts.bad++;
@@ -2027,6 +2444,25 @@ def generate_gallery(
         
         function closeCompletion() {{
             document.getElementById('completionBanner').style.display = 'none';
+        }}
+
+        function forceRegenerate() {{
+            fetch('/regenerate')
+                .then(response => response.json())
+                .then(data => {{
+                    if (data.error) {{
+                        alert('Error regenerating exams: ' + data.error);
+                        return;
+                    }}
+                    console.log('Force regenerate triggered:', data);
+                    setTimeout(() => {{
+                        location.reload();
+                    }}, data.reload_delay_ms || 3000);
+                }})
+                .catch(error => {{
+                    console.error('Failed to regenerate:', error);
+                    alert('Failed to regenerate: ' + error);
+                }});
         }}
         
         function loadMore() {{
@@ -2156,8 +2592,15 @@ def generate_gallery(
             // hide review exams if checkbox is checked
             if (hideReview) {{
                 exams = exams.filter(exam => {{
-                    const status = qcData[exam.exam_id];
+                    const status = getStatus(exam.exam_id);
                     return status !== 'review';
+                }});
+            }}
+
+            // skip already QC'd exams (matches qcSkipStatus)
+            if (qcSkipStatus.length > 0) {{
+                exams = exams.filter(exam => {{
+                    return !qcSkipStatus.includes(getStatus(exam.exam_id));
                 }});
             }}
             
@@ -2222,28 +2665,44 @@ def generate_gallery(
                 stats.textContent = '0 exams';
                 prevBtn.disabled = true;
                 nextBtn.disabled = true;
+                if (allExams.length > 0 && qcSkipStatus.length > 0) {{
+                    showCompletion();
+                }}
                 return;
             }}
             
             const exam = filteredExams[currentIndex];
-            const currentStatus = qcData[exam.exam_id] || '';
+            const currentStatus = getStatus(exam.exam_id);
             
             // count QC statuses for exams in current gallery
             const qcCounts = {{good: 0, review: 0, bad: 0, pending: 0}};
             allExams.forEach(exam => {{
-                const status = qcData[exam.exam_id];
+                const status = getStatus(exam.exam_id);
                 if (status === 'good') qcCounts.good++;
                 else if (status === 'review') qcCounts.review++;
                 else if (status === 'bad') qcCounts.bad++;
                 else qcCounts.pending++;
             }});
             
+            const examAnnotations = annotations[exam.exam_id] || [];
+            const hasAnnotations = examAnnotations.length > 0;
+            
+            let annotationPills = '';
+            if (hasAnnotations) {{
+                annotationPills = ' | ';
+                examAnnotations.forEach(tag => {{
+                    annotationPills += '<span style="display: inline-block; padding: 1px 8px; margin: 0 3px; ' +
+                        'background-color: #1e1e1e; border: 1px solid #4ec9b0; border-radius: 12px; ' +
+                        'font-size: 12px; color: #4ec9b0;">' + tag + '</span>';
+                }});
+            }}
+            
             viewer.innerHTML = 
                 '<div class="exam-info">' +
                     '<strong>Patient:</strong> ' + exam.patient_id + ' | ' +
                     '<strong>Exam:</strong> ' + exam.exam_id + ' | ' +
-                    '<strong>Accession:</strong> ' + exam.accession + ' | ' +
-                    '<strong>Views:</strong> ' + exam.num_views + '/4' +
+                    '<strong>Accession:</strong> ' + exam.accession +
+                    annotationPills +
                 '</div>' +
                 '<div class="qc-controls">' +
                     '<button class="qc-button good' + (currentStatus === 'good' ? ' active' : '') + '" ' +
@@ -2252,7 +2711,9 @@ def generate_gallery(
                         'onclick="setQCStatus(\\'review\\')" title="Needs review">? Review [r]</button>' +
                     '<button class="qc-button bad' + (currentStatus === 'bad' ? ' active' : '') + '" ' +
                         'onclick="setQCStatus(\\'bad\\')" title="Mark as bad">✗ Bad [b]</button>' +
-                    '<button class="nav-buttons button" style="margin-left: 20px;" ' +
+                    '<button class="qc-button annotate' + (hasAnnotations ? ' has-tags' : '') + '" ' +
+                        'onclick="showAnnotationModal()" title="Annotate this exam">🏷 Annotate [a]</button>' +
+                    '<button class="qc-button skip" ' +
                         'onclick="skipExam()" title="Skip without marking">⏭ Skip [s]</button>' +
                 '</div>' +
                 '<div class="image-container">' +
@@ -2267,9 +2728,23 @@ def generate_gallery(
             if (hideReview && qcCounts.review > 0) {{
                 statsText += ' (' + qcCounts.review + ' review hidden)';
             }}
-            statsText += ' | ' + allExams.length + ' total | ' +
+            // compute session rate and ETA
+            const elapsedMin = (Date.now() - sessionStartTime) / 60000;
+            let rateText = '';
+            if (sessionQCCount > 0 && elapsedMin > 0.01) {{
+                const rate = sessionQCCount / elapsedMin;
+                const remainingNow = Math.max(remainingToQC - sessionQCCount, 0);
+                const etaMin = remainingNow / rate;
+                let etaStr;
+                if (etaMin < 1) etaStr = '<1 min';
+                else if (etaMin < 60) etaStr = Math.round(etaMin) + ' min';
+                else etaStr = (etaMin / 60).toFixed(1) + ' hr';
+                rateText = ' | ' + rate.toFixed(1) + '/min, ETA ' + etaStr + ' (' + sessionQCCount + ' this session)';
+            }}
+            
+            statsText += ' | ' + totalToQC + ' total | ' +
                          'QC: ' + qcCounts.good + ' good, ' + qcCounts.review + ' review, ' + 
-                         qcCounts.bad + ' bad, ' + qcCounts.pending + ' pending';
+                         qcCounts.bad + ' bad, ' + qcCounts.pending + ' pending' + rateText;
             stats.textContent = statsText;
             
             prevBtn.disabled = currentIndex === 0;
@@ -2282,11 +2757,28 @@ def generate_gallery(
             if (e.key === 'Escape') {{
                 document.getElementById('cutflowModal').style.display = 'none';
                 document.getElementById('completionBanner').style.display = 'none';
+                closeAnnotationModal();
                 return;
             }}
             
-            // ignore if typing in search box
-            if (e.target.id === 'searchBox') return;
+            // check if annotation modal is open
+            const annotationModal = document.getElementById('annotationModal');
+            const modalIsOpen = annotationModal.style.display === 'block';
+            
+            // if modal is open and user presses a number (not in input), toggle that tag
+            if (modalIsOpen && e.target.id !== 'newAnnotationInput') {{
+                const num = parseInt(e.key);
+                if (num >= 1 && num <= 9 && num <= annotationTags.length) {{
+                    toggleAnnotation(annotationTags[num - 1]);
+                    return;
+                }}
+            }}
+            
+            // ignore if typing in search box or annotation input
+            if (e.target.id === 'searchBox' || e.target.id === 'newAnnotationInput') return;
+            
+            // don't process main shortcuts if modal is open
+            if (modalIsOpen) return;
             
             if (e.key === 'ArrowLeft') {{
                 navigate(-1);
@@ -2298,10 +2790,34 @@ def generate_gallery(
                 setQCStatus('review');
             }} else if (e.key === 'b') {{
                 setQCStatus('bad');
+            }} else if (e.key === 'a') {{
+                showAnnotationModal();
             }} else if (e.key === 's') {{
                 skipExam();
             }}
         }});
+        
+        function resetAllQC() {{
+            if (!confirm('Clear ALL QC statuses and annotations? This cannot be undone.')) return;
+            
+            // clear JS state
+            Object.keys(qcData).forEach(k => delete qcData[k]);
+            Object.keys(annotations).forEach(k => delete annotations[k]);
+            allExams.forEach(exam => {{ exam.qc_status = ''; }});
+            
+            // clear localStorage
+            localStorage.removeItem('qc_data');
+            localStorage.removeItem('annotations');
+            localStorage.removeItem('annotation_tags');
+            
+            // save empty data to server
+            autoSaveQCData();
+            saveAnnotations();
+            
+            // re-render
+            currentIndex = 0;
+            updateView();
+        }}
         
         function showCutflow() {{
             const modal = document.getElementById('cutflowModal');
@@ -2405,7 +2921,7 @@ def generate_gallery(
         // show instructions in console
         console.log('QC data auto-saves to server on each button click');
         console.log('Server saves to: {qc_file_str}');
-        console.log('Keyboard shortcuts: g=good, r=review, b=bad, Arrow keys=navigate');
+        console.log('Keyboard shortcuts: g=good, r=review, b=bad, a=annotate (1-9 to toggle), arrows=navigate');
         console.log('Backup: QC data also saved to browser localStorage - safe to refresh page');
         console.log('Dynamic filters: Use dropdown to load filter lists without restarting server');
         console.log('Cutflow: Click 📊 Cutflow button to see dataset statistics');
@@ -2441,7 +2957,7 @@ def generate_gallery(
                 )
                 logger.info("=" * 60)
                 logger.info(
-                    "Keyboard shortcuts: G=Good, R=Review, B=Bad, Arrow keys=Navigate"
+                    "Keyboard shortcuts: G=Good, R=Review, B=Bad, A=Annotate (1-9 toggle), Arrow keys=Navigate"
                 )
 
     logger.info("gallery generation complete:")
