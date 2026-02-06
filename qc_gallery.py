@@ -112,6 +112,8 @@ TAGS_PATH = None
 LOAD_MORE_ARGS = None  # store args for dynamic loading
 ENABLE_PRELOAD = False
 
+DEBUG_TRACKED_STATUSES = ("good", "review", "bad", "auto_excluded")
+
 DEFAULT_ANNOTATION_TAGS = [
     "vertical line (detector artifact)",
     "horizontal line (detector artifact)",
@@ -141,6 +143,28 @@ def _normalize_annotation_tags(tags) -> list[str]:
     return DEFAULT_ANNOTATION_TAGS + extra_tags
 
 
+def _status_counts(status_map: Dict[str, str]) -> Dict[str, int]:
+    """Count known QC statuses and group unknown labels into 'other'."""
+    counts = {status: 0 for status in DEBUG_TRACKED_STATUSES}
+    other_count = 0
+    for status in status_map.values():
+        if status in counts:
+            counts[status] += 1
+        else:
+            other_count += 1
+    if other_count:
+        counts["other"] = other_count
+    return counts
+
+
+def _format_status_counts(counts: Dict[str, int]) -> str:
+    """Render status counts in a compact stable order for logs."""
+    parts = [f"{status}={counts.get(status, 0)}" for status in DEBUG_TRACKED_STATUSES]
+    if counts.get("other", 0):
+        parts.append(f"other={counts['other']}")
+    return ", ".join(parts)
+
+
 class QCGalleryHandler(SimpleHTTPRequestHandler):
     """HTTP request handler for serving gallery and handling QC saves."""
 
@@ -158,8 +182,22 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
             if QC_FILE_PATH and QC_FILE_PATH.exists():
                 with open(QC_FILE_PATH) as f:
                     qc_data = json.load(f)
+                if isinstance(qc_data, dict):
+                    qc_data = {
+                        str(exam_id): status for exam_id, status in qc_data.items()
+                    }
+                    logger.info(
+                        "QC DEBUG load-qc: file=%s, entries=%d, statuses=(%s)",
+                        QC_FILE_PATH,
+                        len(qc_data),
+                        _format_status_counts(_status_counts(qc_data)),
+                    )
                 self.wfile.write(json.dumps(qc_data).encode())
             else:
+                logger.info(
+                    "QC DEBUG load-qc: file missing (%s), returning empty map",
+                    QC_FILE_PATH,
+                )
                 self.wfile.write(b"{}")
             return
 
@@ -428,6 +466,38 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
 
                 current_batch = LOAD_MORE_ARGS.get("max_exams") or 100
                 next_batch = current_batch * 2
+                logger.info(
+                    "QC DEBUG load-more: qc_file=%s, current_batch=%s, next_batch=%s, prioritize_errors=%s, random_sample=%s, qc_skip_status=%s",
+                    QC_FILE_PATH,
+                    current_batch,
+                    next_batch,
+                    LOAD_MORE_ARGS.get("prioritize_errors"),
+                    LOAD_MORE_ARGS.get("random_sample"),
+                    sorted(LOAD_MORE_ARGS.get("qc_skip_status") or []),
+                )
+                if QC_FILE_PATH and QC_FILE_PATH.exists():
+                    try:
+                        with open(QC_FILE_PATH) as f:
+                            qc_snapshot = json.load(f)
+                        if isinstance(qc_snapshot, dict):
+                            qc_snapshot = {
+                                str(exam_id): status
+                                for exam_id, status in qc_snapshot.items()
+                            }
+                            logger.info(
+                                "QC DEBUG load-more: qc file has %d entries (%s)",
+                                len(qc_snapshot),
+                                _format_status_counts(_status_counts(qc_snapshot)),
+                            )
+                        else:
+                            logger.warning(
+                                "QC DEBUG load-more: qc file is not a JSON object (%s)",
+                                type(qc_snapshot).__name__,
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "QC DEBUG load-more: failed to read qc file: %s", e
+                        )
 
                 if (
                     hasattr(self.server, "_load_more_in_progress")
@@ -579,6 +649,11 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
 
                     logger.info(
                         f"saved QC data: {len(qc_updates)} updates ({len(qc_data)} total, replace={replace_mode})"
+                    )
+                    logger.info(
+                        "QC DEBUG save-qc: file=%s, statuses=(%s)",
+                        QC_FILE_PATH,
+                        _format_status_counts(_status_counts(qc_data)),
                     )
 
                     self.send_response(200)
@@ -1391,6 +1466,17 @@ def generate_gallery(
     """
     if qc_skip_status is None:
         qc_skip_status = {"good", "bad"}
+    logger.info(
+        "QC DEBUG generate_gallery args: max_exams=%s, random_sample=%s, prioritize_errors=%s, qc_skip_status=%s, patient_id=%s, exam_id=%s, exam_list_path=%s, serve=%s",
+        max_exams,
+        random_sample,
+        prioritize_errors,
+        sorted(qc_skip_status),
+        patient_id,
+        exam_id,
+        exam_list_path,
+        serve,
+    )
     # load existing QC data if available
     qc_data = {}
     if qc_file and qc_file.exists():
@@ -1401,6 +1487,14 @@ def generate_gallery(
         # normalize early so QC skip/filter logic uses a single key type.
         qc_data = {str(exam_id): status for exam_id, status in qc_data.items()}
         logger.info(f"loaded QC status for {len(qc_data)} exams")
+    if qc_data:
+        logger.info(
+            "QC DEBUG loaded QC map: %d entries (%s)",
+            len(qc_data),
+            _format_status_counts(_status_counts(qc_data)),
+        )
+    else:
+        logger.info("QC DEBUG loaded QC map: empty")
 
     logger.info(f"loading views from {views_parquet}")
     views_df = pd.read_parquet(views_parquet)
@@ -1539,12 +1633,30 @@ def generate_gallery(
     done_exams = {eid for eid, status in qc_data.items() if status in done_statuses}
     done_count = len(done_exams & eligible_exam_ids)
     remaining_to_qc = max(total_to_qc - done_count, 0)
+    logger.info(
+        "QC DEBUG pool before skip: exams=%d, done_in_pool=%d, remaining_to_qc=%d",
+        total_to_qc,
+        done_count,
+        remaining_to_qc,
+    )
 
     # filter out exams with specified QC statuses
     if qc_data and qc_skip_status:
         skip_exams = {
             eid for eid, status in qc_data.items() if status in qc_skip_status
         }
+        skip_in_pool = set(views_df["exam_id"].unique()) & skip_exams
+        logger.info(
+            "QC DEBUG skip filter: skip_status=%s, skip_map_entries=%d, skip_in_current_pool=%d",
+            sorted(qc_skip_status),
+            len(skip_exams),
+            len(skip_in_pool),
+        )
+        if skip_in_pool:
+            logger.info(
+                "QC DEBUG skip filter sample exam_ids: %s",
+                sorted(skip_in_pool)[:10],
+            )
         if skip_exams:
             before_count = views_df["exam_id"].nunique()
             views_df = views_df[~views_df["exam_id"].isin(skip_exams)]
@@ -1581,8 +1693,10 @@ def generate_gallery(
             )
 
     # sample exams if requested
+    selected_exam_ids = [str(eid) for eid in views_df["exam_id"].unique().tolist()]
     if max_exams:
         unique_exams = views_df["exam_id"].unique()
+        selected_exams = unique_exams
         if len(unique_exams) > max_exams:
             if prioritize_errors and len(error_scores) > 0:
                 # sort by error score (highest first), only from exams available in views
@@ -1603,9 +1717,32 @@ def generate_gallery(
                 selected_exams = unique_exams[:max_exams]
                 logger.info(f"taking first {max_exams} exams from {len(unique_exams)}")
             views_df = views_df[views_df["exam_id"].isin(selected_exams)]
+        selected_exam_ids = [str(eid) for eid in selected_exams]
         logger.info(
             f"will visualize {len(views_df)} views from {views_df['exam_id'].nunique()} exams"
         )
+    selected_counts = {status: 0 for status in DEBUG_TRACKED_STATUSES}
+    pending_count = 0
+    for exam_key in selected_exam_ids:
+        status = qc_data.get(str(exam_key), "")
+        if status in selected_counts:
+            selected_counts[status] += 1
+        else:
+            pending_count += 1
+    logger.info(
+        "QC DEBUG selected batch: exams=%d, statuses=(good=%d, review=%d, bad=%d, auto_excluded=%d, pending=%d)",
+        len(selected_exam_ids),
+        selected_counts["good"],
+        selected_counts["review"],
+        selected_counts["bad"],
+        selected_counts["auto_excluded"],
+        pending_count,
+    )
+    logger.info(
+        "QC DEBUG selected batch exam_ids (first %d): %s",
+        min(10, len(selected_exam_ids)),
+        selected_exam_ids[:10],
+    )
 
     # create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -3007,6 +3144,26 @@ def generate_gallery(
                     qcSkipStatus.length > 0 &&
                     allExams.every(exam => qcSkipStatus.includes(getStatus(exam.exam_id)))
                 );
+                const debugCounts = {{good: 0, review: 0, bad: 0, auto_excluded: 0, pending: 0}};
+                allExams.forEach(exam => {{
+                    const status = getStatus(exam.exam_id);
+                    if (status === 'good') debugCounts.good++;
+                    else if (status === 'review') debugCounts.review++;
+                    else if (status === 'bad') debugCounts.bad++;
+                    else if (status === 'auto_excluded') debugCounts.auto_excluded++;
+                    else debugCounts.pending++;
+                }});
+                const debugExamples = allExams.slice(0, 10).map(exam => {{
+                    return {{ exam_id: exam.exam_id, status: getStatus(exam.exam_id) || '(pending)' }};
+                }});
+                console.log('QC DEBUG empty view state', {{
+                    hasActiveFilter,
+                    batchFullyCompleted,
+                    qcSkipStatus,
+                    totalAllExams: allExams.length,
+                    debugCounts,
+                    debugExamples
+                }});
                 
                 if (batchFullyCompleted && !hasActiveFilter) {{
                     viewer.innerHTML = '<div style="color: #9cdcfe;">all exams in this batch are already QC\\'d</div>';
