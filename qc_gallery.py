@@ -110,6 +110,7 @@ FILTER_DIR = None
 VIEWS_PATH = None
 TAGS_PATH = None
 LOAD_MORE_ARGS = None  # store args for dynamic loading
+ENABLE_PRELOAD = False
 
 DEFAULT_ANNOTATION_TAGS = [
     "vertical line (detector artifact)",
@@ -273,6 +274,17 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
             self.end_headers()
 
             try:
+                if not ENABLE_PRELOAD:
+                    self.wfile.write(
+                        json.dumps(
+                            {
+                                "status": "disabled",
+                                "message": "Preloading is disabled",
+                            }
+                        ).encode()
+                    )
+                    return
+
                 if not LOAD_MORE_ARGS:
                     self.wfile.write(
                         json.dumps({"error": "Load more not configured"}).encode()
@@ -436,6 +448,12 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                 self.server._load_more_ready = False
                 self.server._load_more_error = None
                 self.server._load_more_target_batch = next_batch
+                gallery_path = OUTPUT_DIR / "gallery.html" if OUTPUT_DIR else None
+                before_gallery_mtime_ns = (
+                    gallery_path.stat().st_mtime_ns
+                    if gallery_path and gallery_path.exists()
+                    else None
+                )
 
                 logger.info(
                     f"Loading more exams (fresh): increasing from {current_batch} to {next_batch}"
@@ -451,6 +469,19 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                         args = deepcopy(LOAD_MORE_ARGS)
                         args["max_exams"] = next_batch
                         generate_gallery(**args)
+                        after_gallery_mtime_ns = (
+                            gallery_path.stat().st_mtime_ns
+                            if gallery_path and gallery_path.exists()
+                            else None
+                        )
+                        if after_gallery_mtime_ns == before_gallery_mtime_ns:
+                            self.server._load_more_error = (
+                                "No new gallery output produced during load more. "
+                                "Try refreshing batch or restarting the server."
+                            )
+                            logger.error(self.server._load_more_error)
+                            return
+
                         LOAD_MORE_ARGS["max_exams"] = next_batch
                         self.server._load_more_ready = True
                         logger.info(f"Successfully generated {next_batch} exams")
@@ -2206,6 +2237,7 @@ def generate_gallery(
         const qcStorageKey = 'qc_data::' + qcStorageNamespace;
         const annotationsStorageKey = 'annotations::' + qcStorageNamespace;
         const annotationTagsStorageKey = 'annotation_tags::' + qcStorageNamespace;
+        const enablePreload = {str(ENABLE_PRELOAD).lower()};
         const totalToQC = {total_to_qc};
         const remainingToQC = {remaining_to_qc};
         
@@ -2401,6 +2433,7 @@ def generate_gallery(
         
         function checkAndPreload() {{
             // check if we should start preloading next batch
+            if (!enablePreload) return;
             if (preloadTriggered) return;
             
             // count how many exams in current batch have been QC'd
