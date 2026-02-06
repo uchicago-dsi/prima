@@ -81,7 +81,7 @@ import logging
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from typing import Dict, Optional, Set, Tuple
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -530,26 +530,65 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         """handle POST requests for saving QC data."""
-        if self.path == "/save-qc":
+        parsed_path = urlparse(self.path)
+
+        if parsed_path.path == "/save-qc":
             content_length = int(self.headers["Content-Length"])
             post_data = self.rfile.read(content_length)
 
             try:
-                qc_data = json.loads(post_data.decode())
+                qc_updates = json.loads(post_data.decode())
+                if not isinstance(qc_updates, dict):
+                    raise ValueError("QC payload must be a JSON object")
 
                 # save to file
                 if QC_FILE_PATH:
+                    replace_mode = parse_qs(parsed_path.query).get("replace", ["0"])[
+                        0
+                    ].lower() in {"1", "true", "yes"}
                     QC_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+                    if replace_mode:
+                        qc_data = qc_updates
+                    else:
+                        qc_data = {}
+                        if QC_FILE_PATH.exists():
+                            try:
+                                with open(QC_FILE_PATH) as f:
+                                    existing = json.load(f)
+                                if isinstance(existing, dict):
+                                    qc_data = existing
+                                else:
+                                    logger.warning(
+                                        "existing QC file is not a JSON object; starting from empty map"
+                                    )
+                            except Exception as e:
+                                logger.warning(
+                                    f"failed to read existing QC file for merge: {e}"
+                                )
+                        qc_data.update(qc_updates)
+
                     with open(QC_FILE_PATH, "w") as f:
                         json.dump(qc_data, f, indent=2)
 
-                    logger.info(f"saved QC data: {len(qc_data)} exams")
+                    logger.info(
+                        f"saved QC data: {len(qc_updates)} updates ({len(qc_data)} total, replace={replace_mode})"
+                    )
 
                     self.send_response(200)
                     self.send_header("Content-type", "application/json")
                     self.send_header("Access-Control-Allow-Origin", "*")
                     self.end_headers()
-                    self.wfile.write(b'{"status": "ok"}')
+                    self.wfile.write(
+                        json.dumps(
+                            {
+                                "status": "ok",
+                                "saved_updates": len(qc_updates),
+                                "total_entries": len(qc_data),
+                                "replace": replace_mode,
+                            }
+                        ).encode()
+                    )
                 else:
                     self.send_response(500)
                     self.end_headers()
@@ -560,7 +599,7 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                 self.send_header("Content-type", "application/json")
                 self.end_headers()
                 self.wfile.write(json.dumps({"error": str(e)}).encode())
-        elif self.path == "/save-annotation-tags":
+        elif parsed_path.path == "/save-annotation-tags":
             content_length = int(self.headers["Content-Length"])
             post_data = self.rfile.read(content_length)
 
@@ -591,7 +630,7 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                 self.send_header("Content-type", "application/json")
                 self.end_headers()
                 self.wfile.write(json.dumps({"error": str(e)}).encode())
-        elif self.path == "/save-annotations":
+        elif parsed_path.path == "/save-annotations":
             content_length = int(self.headers["Content-Length"])
             post_data = self.rfile.read(content_length)
 
@@ -2244,9 +2283,26 @@ def generate_gallery(
             }}
         }});
 
-        // for --serve, trust server state to avoid stale localStorage creating false "batch complete"
+        // for --serve, hydrate full QC map from server to preserve status history
         if (serverMode) {{
-            localStorage.setItem(qcStorageKey, JSON.stringify(qcData));
+            fetch('/load-qc')
+                .then(response => response.json())
+                .then(serverQCData => {{
+                    const qcFromServer = (serverQCData && typeof serverQCData === 'object') ? serverQCData : {{}};
+                    Object.keys(qcFromServer).forEach(examId => {{
+                        const serverStatus = qcFromServer[examId];
+                        if (validStatuses.has(serverStatus)) {{
+                            qcData[examId] = serverStatus;
+                        }}
+                    }});
+                    localStorage.setItem(qcStorageKey, JSON.stringify(qcData));
+                    applyFilters();
+                    console.log('loaded full QC map from server for', Object.keys(qcData).length, 'exams');
+                }})
+                .catch(error => {{
+                    console.error('failed to load full QC map from server:', error);
+                    localStorage.setItem(qcStorageKey, JSON.stringify(qcData));
+                }});
         }} else {{
             // in local file mode, backfill from localStorage
             const savedQCData = localStorage.getItem(qcStorageKey);
@@ -2452,27 +2508,40 @@ def generate_gallery(
                     }});
             }}
         }}
-        
-        function autoSaveQCData() {{
-            // save to localStorage as backup
+
+        function saveQCToServer(options = {{}}) {{
+            const replace = options.replace === true;
             localStorage.setItem(qcStorageKey, JSON.stringify(qcData));
-            
-            // check if we should preload next batch
-            checkAndPreload();
-            
-            // try to save to server via POST
-            fetch('/save-qc', {{
+            const saveUrl = replace ? '/save-qc?replace=1' : '/save-qc';
+
+            return fetch(saveUrl, {{
                 method: 'POST',
                 headers: {{
                     'Content-Type': 'application/json',
                 }},
                 body: JSON.stringify(qcData)
             }})
-            .then(response => response.json())
-            .then(data => {{
+            .then(async response => {{
+                let data = {{}};
+                try {{
+                    data = await response.json();
+                }} catch (e) {{
+                    data = {{}};
+                }}
+                if (!response.ok || data.error) {{
+                    const message = data.error || ('HTTP ' + response.status);
+                    throw new Error(message);
+                }}
                 console.log('QC data saved to server:', data);
-            }})
-            .catch(error => {{
+                return data;
+            }});
+        }}
+        
+        function autoSaveQCData() {{
+            // check if we should preload next batch
+            checkAndPreload();
+
+            saveQCToServer().catch(error => {{
                 console.error('Failed to save to server:', error);
             }});
         }}
@@ -2650,7 +2719,9 @@ def generate_gallery(
                 'Rebuild the current gallery from saved QC status? This is safe: it does not delete QC records or source DICOM files.'
             );
             if (!ok) return;
-            fetch('/regenerate')
+
+            saveQCToServer()
+                .then(() => fetch('/regenerate'))
                 .then(response => response.json())
                 .then(data => {{
                     if (data.error) {{
@@ -2664,7 +2735,7 @@ def generate_gallery(
                 }})
                 .catch(error => {{
                     console.error('Failed to refresh batch:', error);
-                    alert('Failed to refresh batch: ' + error);
+                    alert('Failed to refresh batch: ' + (error.message || error));
                 }});
         }}
 
@@ -2722,7 +2793,7 @@ def generate_gallery(
                 }});
         }}
         
-        function loadMore() {{
+        async function loadMore() {{
             const loadMoreBtn = document.getElementById('loadMoreBtn');
             const statusDiv = document.getElementById('loadMoreStatus');
 
@@ -2732,31 +2803,30 @@ def generate_gallery(
             loadMoreBtn.disabled = true;
             loadMoreBtn.textContent = '⏳ Loading...';
             statusDiv.style.display = 'block';
-            
-            fetch('/load-more')
-                .then(response => response.json())
-                .then(data => {{
-                    if (data.error) {{
-                        alert('Error loading more exams: ' + data.error);
-                        loadMoreBtn.disabled = false;
-                        loadMoreBtn.textContent = '🔄 Load More Exams [l]';
-                        statusDiv.style.display = 'none';
-                        return;
-                    }}
-                    
-                    console.log('Load more triggered:', data);
+            statusDiv.innerHTML = '<p style="color: #4ec9b0; font-weight: bold; margin: 0;">⏳ Saving latest QC decisions...</p>' +
+                '<p style="font-size: 12px; color: #858585; margin: 10px 0 0 0;">Starting load-more right after save completes.</p>';
 
-                    statusDiv.innerHTML = '<p style="color: #4ec9b0; font-weight: bold; margin: 0;">⏳ Generating more exams...</p>' +
-                        '<p style="font-size: 12px; color: #858585; margin: 10px 0 0 0;">This may take a minute. Page will reload when ready.</p>';
-                    pollLoadMoreStatus(loadMoreBtn, statusDiv);
-                }})
-                .catch(error => {{
-                    console.error('Failed to load more:', error);
-                    alert('Failed to load more exams: ' + error);
-                    loadMoreBtn.disabled = false;
-                    loadMoreBtn.textContent = '🔄 Load More Exams [l]';
-                    statusDiv.style.display = 'none';
-                }});
+            try {{
+                await saveQCToServer();
+
+                const response = await fetch('/load-more');
+                const data = await response.json();
+                if (!response.ok || data.error) {{
+                    throw new Error(data.error || ('HTTP ' + response.status));
+                }}
+                
+                console.log('Load more triggered:', data);
+
+                statusDiv.innerHTML = '<p style="color: #4ec9b0; font-weight: bold; margin: 0;">⏳ Generating more exams...</p>' +
+                    '<p style="font-size: 12px; color: #858585; margin: 10px 0 0 0;">This may take a minute. Page will reload when ready.</p>';
+                pollLoadMoreStatus(loadMoreBtn, statusDiv);
+            }} catch (error) {{
+                console.error('Failed to load more:', error);
+                alert('Failed to load more exams: ' + (error.message || error));
+                loadMoreBtn.disabled = false;
+                loadMoreBtn.textContent = '🔄 Load More Exams [l]';
+                statusDiv.style.display = 'none';
+            }}
         }}
         
         function loadAvailableFilters() {{
@@ -3087,7 +3157,9 @@ def generate_gallery(
             localStorage.removeItem('annotation_tags');
             
             // save empty data to server
-            autoSaveQCData();
+            saveQCToServer({{ replace: true }}).catch(error => {{
+                console.error('Failed to reset QC on server:', error);
+            }});
             saveAnnotations();
             
             // re-render
