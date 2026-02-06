@@ -2290,10 +2290,15 @@ def generate_gallery(
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="controls">
-            <div class="stats" id="stats">
-                {total_figures} exams
+        <div class="container">
+            <div class="controls">
+            <div style="display: flex; flex-direction: column; gap: 4px;">
+                <div class="stats" id="stats">
+                    {total_figures} exams
+                </div>
+                <div class="stats" id="manualQcIndicator">
+                    Manually QC'd so far: 0
+                </div>
             </div>
             <div style="display: flex; gap: 5px;">
                 <button class="info-button" onclick="showCutflow()">📊 Cutflow</button>
@@ -2301,18 +2306,13 @@ def generate_gallery(
                 <button class="info-button" onclick="refreshCurrentBatch()" title="Rebuild gallery from saved QC state (safe: does not delete QC/source data)">🔁 Refresh Batch</button>
             </div>
             <div class="filter-controls">
-                <input type="text" id="searchBox" placeholder="Filter by patient ID, exam ID, or accession..." 
+                <input type="text" id="searchBox" placeholder="Filter expression: text or @filter with &, |, ~ (e.g., @gems_ffdm_tc1 & ~12345)" 
                        onkeyup="filterGallery()">
-                <select id="filterSelect" onfocus="loadAvailableFilters()">
+                <select id="filterSelect" onfocus="loadAvailableFilters()" onchange="insertSelectedFilterToken()">
                     <option value="">Load filter list...</option>
                 </select>
-                <button onclick="loadSelectedFilter()">Apply Filter</button>
-                <button onclick="clearExamFilter()">Clear Filter</button>
-                <label style="display: flex; align-items: center; gap: 5px; margin-left: 20px; cursor: pointer;">
-                    <input type="checkbox" id="hideReviewCheckbox" onchange="applyFilters()" 
-                           style="cursor: pointer; width: 16px; height: 16px;">
-                    <span style="font-size: 13px;">Hide "review" exams</span>
-                </label>
+                <button onclick="insertSelectedFilterToken()">Insert Filter</button>
+                <button onclick="clearFilterExpression()">Clear Filter</button>
             </div>
             <div class="nav-buttons">
                 <button id="prevBtn" onclick="navigate(-1)">← Previous</button>
@@ -2421,8 +2421,12 @@ def generate_gallery(
         
         let filteredExams = [...allExams];
         let currentIndex = 0;
-        let activeExamFilter = null; // track active exam ID filter
         let preloadTriggered = false; // track if we've started preloading next batch
+        let availableFilters = [];
+        let filtersLoaded = false;
+        const filterTokenToFilename = {{}};
+        const filterSetsByFilename = {{}};
+        const unresolvedFilterWarnings = new Set();
         
         // session rate tracking (persist across load-more reloads in same tab)
         const sessionStatsKey = 'qc_session_stats::' + qcStorageNamespace;
@@ -2490,6 +2494,23 @@ def generate_gallery(
         let qcData = {{}};
         const validStatuses = new Set(['good', 'review', 'bad', 'auto_excluded']);
         const doneStatuses = new Set(['good', 'review', 'bad']);
+
+        function getManualQCCount() {{
+            let count = 0;
+            Object.keys(qcData).forEach(examId => {{
+                if (doneStatuses.has(qcData[examId])) {{
+                    count++;
+                }}
+            }});
+            return count;
+        }}
+
+        function updateManualQCIndicator() {{
+            const el = document.getElementById('manualQcIndicator');
+            if (!el) return;
+            const manualCount = getManualQCCount();
+            el.textContent = "Manually QC'd so far: " + manualCount.toLocaleString();
+        }}
         
         // load statuses from server-rendered payload first
         allExams.forEach(exam => {{
@@ -2497,6 +2518,7 @@ def generate_gallery(
                 qcData[exam.exam_id] = exam.qc_status;
             }}
         }});
+        updateManualQCIndicator();
 
         // for --serve, hydrate full QC map from server to preserve status history
         if (serverMode) {{
@@ -2511,6 +2533,7 @@ def generate_gallery(
                         }}
                     }});
                     localStorage.setItem(qcStorageKey, JSON.stringify(qcData));
+                    updateManualQCIndicator();
                     applyFilters();
                     console.log('loaded full QC map from server for', Object.keys(qcData).length, 'exams');
                 }})
@@ -2530,6 +2553,7 @@ def generate_gallery(
                             qcData[exam.exam_id] = savedStatus;
                         }}
                     }});
+                    updateManualQCIndicator();
                 }} catch (e) {{
                     console.error('Failed to parse saved QC data:', e);
                 }}
@@ -2779,6 +2803,7 @@ def generate_gallery(
                 saveSessionStats();
             }}
             autoSaveQCData();
+            updateManualQCIndicator();
             
             // check if this was the last exam
             if (currentIndex === filteredExams.length - 1) {{
@@ -3065,86 +3090,308 @@ def generate_gallery(
                 .then(response => response.json())
                 .then(filters => {{
                     const select = document.getElementById('filterSelect');
+                    availableFilters = Array.isArray(filters) ? filters : [];
+                    filtersLoaded = true;
+
+                    // reset alias maps when reloading list
+                    Object.keys(filterTokenToFilename).forEach(token => delete filterTokenToFilename[token]);
+
                     // keep the default option
                     select.innerHTML = '<option value="">Load filter list...</option>';
-                    filters.forEach(filter => {{
+                    availableFilters.forEach(filter => {{
                         const option = document.createElement('option');
                         option.value = filter.filename;
                         option.textContent = filter.name;
                         select.appendChild(option);
+                        registerFilterAliases(filter);
                     }});
-                    console.log(`Loaded ${{filters.length}} filter options`);
+                    console.log(`Loaded ${{availableFilters.length}} filter options`);
                 }})
                 .catch(error => {{
                     console.error('Failed to load filter list:', error);
                 }});
         }}
-        
-        function loadSelectedFilter() {{
+
+        function normalizeFilterToken(token) {{
+            return String(token || '').trim().toLowerCase();
+        }}
+
+        function filterTokenFromFilename(filename) {{
+            return String(filename || '').replace(/\\.txt$/i, '').toLowerCase();
+        }}
+
+        function filterTokenFromName(name) {{
+            return String(name || '')
+                .trim()
+                .toLowerCase()
+                .replace(/[^a-z0-9]+/g, '_')
+                .replace(/^_+|_+$/g, '');
+        }}
+
+        function registerFilterAliases(filter) {{
+            const aliases = new Set();
+            const stem = filterTokenFromFilename(filter.filename);
+            if (stem) {{
+                aliases.add(stem);
+                aliases.add('@' + stem);
+            }}
+            aliases.add(normalizeFilterToken(filter.filename));
+            const nameToken = filterTokenFromName(filter.name);
+            if (nameToken) {{
+                aliases.add(nameToken);
+                aliases.add('@' + nameToken);
+            }}
+            aliases.forEach(alias => {{
+                const key = normalizeFilterToken(alias);
+                if (key) {{
+                    filterTokenToFilename[key] = filter.filename;
+                }}
+            }});
+        }}
+
+        function resolveFilterFilenameFromToken(token) {{
+            const normalized = normalizeFilterToken(token);
+            if (!normalized) return null;
+            const direct = filterTokenToFilename[normalized];
+            if (direct) return direct;
+            if (normalized.startsWith('@')) {{
+                return filterTokenToFilename[normalized.slice(1)] || null;
+            }}
+            return filterTokenToFilename['@' + normalized] || null;
+        }}
+
+        async function ensureFilterSetLoaded(filename) {{
+            if (filterSetsByFilename[filename]) {{
+                return filterSetsByFilename[filename];
+            }}
+            const response = await fetch('/load-filter/' + encodeURIComponent(filename));
+            const data = await response.json();
+            if (!response.ok || data.error) {{
+                throw new Error(data.error || ('HTTP ' + response.status));
+            }}
+            const examIds = Array.isArray(data.exam_ids) ? data.exam_ids : [];
+            const examSet = new Set(examIds.map(examId => String(examId)));
+            filterSetsByFilename[filename] = examSet;
+            return examSet;
+        }}
+
+        function appendTokenToFilterBox(token) {{
+            const input = document.getElementById('searchBox');
+            const existing = input.value.trim();
+            if (existing === '') {{
+                input.value = token;
+            }} else if (/[\s&|~(]$/.test(input.value)) {{
+                input.value += token;
+            }} else {{
+                input.value += ' & ' + token;
+            }}
+            input.focus();
+        }}
+
+        async function insertSelectedFilterToken() {{
             const select = document.getElementById('filterSelect');
             const filename = select.value;
-            
+
             if (!filename) {{
                 alert('Please select a filter from the dropdown');
                 return;
             }}
-            
-            fetch('/load-filter/' + filename)
-                .then(response => response.json())
-                .then(data => {{
-                    if (data.error) {{
-                        alert('Error loading filter: ' + data.error);
-                        return;
-                    }}
-                    
-                    const examIds = new Set(data.exam_ids);
-                    activeExamFilter = examIds;
-                    applyFilters();
-                    console.log(`Loaded filter with ${{examIds.size}} exam IDs`);
-                }})
-                .catch(error => {{
-                    alert('Failed to load filter: ' + error);
-                    console.error('Filter load error:', error);
-                }});
+
+            try {{
+                const examSet = await ensureFilterSetLoaded(filename);
+                const token = '@' + filterTokenFromFilename(filename);
+                appendTokenToFilterBox(token);
+                applyFilters();
+                console.log(`Loaded filter '${{filename}}' with ${{examSet.size}} exam IDs and inserted token '${{token}}'`);
+            }} catch (error) {{
+                alert('Failed to load filter: ' + (error.message || error));
+                console.error('Filter load error:', error);
+            }}
         }}
-        
-        function clearExamFilter() {{
-            activeExamFilter = null;
-            document.getElementById('filterSelect').value = '';
+
+        function clearFilterExpression() {{
+            const input = document.getElementById('searchBox');
+            const select = document.getElementById('filterSelect');
+            input.value = '';
+            select.value = '';
             applyFilters();
-            console.log('Cleared exam ID filter');
+            input.focus();
+            console.log('Cleared filter expression');
         }}
-        
+
+        function examMatchesTextTerm(exam, term) {{
+            const q = term.toLowerCase();
+            return (
+                exam.patient_id.toLowerCase().includes(q) ||
+                exam.exam_id.toLowerCase().includes(q) ||
+                exam.accession.toLowerCase().includes(q)
+            );
+        }}
+
+        function tokenizeFilterExpression(expression) {{
+            const tokens = [];
+            let i = 0;
+            while (i < expression.length) {{
+                const ch = expression[i];
+                if (/\\s/.test(ch)) {{
+                    i++;
+                    continue;
+                }}
+                if (ch === '&' || ch === '|' || ch === '~' || ch === '(' || ch === ')') {{
+                    tokens.push({{ type: ch }});
+                    i++;
+                    continue;
+                }}
+                if (ch === '"' || ch === "'") {{
+                    const quote = ch;
+                    i++;
+                    const start = i;
+                    while (i < expression.length && expression[i] !== quote) {{
+                        i++;
+                    }}
+                    if (i >= expression.length) {{
+                        throw new Error('Unterminated quoted term in filter expression');
+                    }}
+                    tokens.push({{ type: 'TERM', value: expression.slice(start, i) }});
+                    i++;
+                    continue;
+                }}
+                const start = i;
+                while (
+                    i < expression.length &&
+                    !/\\s/.test(expression[i]) &&
+                    !['&', '|', '~', '(', ')'].includes(expression[i])
+                ) {{
+                    i++;
+                }}
+                tokens.push({{ type: 'TERM', value: expression.slice(start, i) }});
+            }}
+            return tokens;
+        }}
+
+        function parseFilterExpression(expression) {{
+            const tokens = tokenizeFilterExpression(expression);
+            let index = 0;
+
+            function peek() {{
+                return tokens[index] || null;
+            }}
+
+            function consume(expectedType) {{
+                const token = peek();
+                if (!token || token.type !== expectedType) {{
+                    throw new Error(`Expected '${{expectedType}}' in filter expression`);
+                }}
+                index++;
+                return token;
+            }}
+
+            function parsePrimary() {{
+                const token = peek();
+                if (!token) {{
+                    throw new Error('Unexpected end of filter expression');
+                }}
+                if (token.type === 'TERM') {{
+                    index++;
+                    return {{ type: 'TERM', value: token.value }};
+                }}
+                if (token.type === '(') {{
+                    consume('(');
+                    const expr = parseOr();
+                    consume(')');
+                    return expr;
+                }}
+                throw new Error(`Unexpected token '${{token.type}}' in filter expression`);
+            }}
+
+            function parseUnary() {{
+                const token = peek();
+                if (token && token.type === '~') {{
+                    consume('~');
+                    return {{ type: 'NOT', value: parseUnary() }};
+                }}
+                return parsePrimary();
+            }}
+
+            function parseAnd() {{
+                let node = parseUnary();
+                while (peek() && peek().type === '&') {{
+                    consume('&');
+                    node = {{ type: 'AND', left: node, right: parseUnary() }};
+                }}
+                return node;
+            }}
+
+            function parseOr() {{
+                let node = parseAnd();
+                while (peek() && peek().type === '|') {{
+                    consume('|');
+                    node = {{ type: 'OR', left: node, right: parseAnd() }};
+                }}
+                return node;
+            }}
+
+            const root = parseOr();
+            if (index < tokens.length) {{
+                throw new Error(`Unexpected token '${{tokens[index].type}}' in filter expression`);
+            }}
+            return root;
+        }}
+
+        function evalFilterNode(node, exam) {{
+            if (node.type === 'TERM') {{
+                const filename = resolveFilterFilenameFromToken(node.value);
+                if (filename) {{
+                    const filterSet = filterSetsByFilename[filename];
+                    if (!filterSet) {{
+                        if (!unresolvedFilterWarnings.has(filename)) {{
+                            unresolvedFilterWarnings.add(filename);
+                            console.warn(
+                                `Filter token '${{node.value}}' maps to '${{filename}}' but list is not loaded yet. Select it once from the dropdown to load.`
+                            );
+                        }}
+                        return false;
+                    }}
+                    return filterSet.has(exam.exam_id);
+                }}
+                return examMatchesTextTerm(exam, node.value);
+            }}
+            if (node.type === 'NOT') {{
+                return !evalFilterNode(node.value, exam);
+            }}
+            if (node.type === 'AND') {{
+                return evalFilterNode(node.left, exam) && evalFilterNode(node.right, exam);
+            }}
+            if (node.type === 'OR') {{
+                return evalFilterNode(node.left, exam) || evalFilterNode(node.right, exam);
+            }}
+            return false;
+        }}
+
         function applyFilters() {{
-            const searchTerm = document.getElementById('searchBox').value.toLowerCase();
-            const hideReview = document.getElementById('hideReviewCheckbox').checked;
+            const filterExpr = document.getElementById('searchBox').value.trim();
             
             // remember current exam before filtering
             const currentExam = filteredExams.length > 0 ? filteredExams[currentIndex] : null;
             
             // start with all exams
             let exams = [...allExams];
-            
-            // apply exam ID filter if active
-            if (activeExamFilter) {{
-                exams = exams.filter(exam => activeExamFilter.has(exam.exam_id));
-            }}
-            
-            // apply text search filter
-            if (searchTerm !== '') {{
-                exams = exams.filter(exam => 
-                    exam.patient_id.toLowerCase().includes(searchTerm) ||
-                    exam.exam_id.toLowerCase().includes(searchTerm) ||
-                    exam.accession.toLowerCase().includes(searchTerm)
-                );
-            }}
-            
-            // hide review exams if checkbox is checked
-            if (hideReview) {{
-                exams = exams.filter(exam => {{
-                    const status = getStatus(exam.exam_id);
-                    return status !== 'review';
-                }});
+
+            // apply expression filter (supports &, |, ~; plain text still works)
+            if (filterExpr !== '') {{
+                const hasOperators = /[&|~()]/.test(filterExpr);
+                const hasFilterToken = filterExpr.includes('@');
+                if (hasOperators || hasFilterToken) {{
+                    try {{
+                        const ast = parseFilterExpression(filterExpr);
+                        exams = exams.filter(exam => evalFilterNode(ast, exam));
+                    }} catch (error) {{
+                        console.error('Invalid filter expression, falling back to plain text matching:', error);
+                        exams = exams.filter(exam => examMatchesTextTerm(exam, filterExpr));
+                    }}
+                }} else {{
+                    exams = exams.filter(exam => examMatchesTextTerm(exam, filterExpr));
+                }}
             }}
 
             // skip already QC'd exams (matches qcSkipStatus)
@@ -3211,9 +3458,8 @@ def generate_gallery(
             const nextBtn = document.getElementById('nextBtn');
             
             if (filteredExams.length === 0) {{
-                const searchTerm = document.getElementById('searchBox').value.trim();
-                const hideReview = document.getElementById('hideReviewCheckbox').checked;
-                const hasActiveFilter = searchTerm !== '' || activeExamFilter !== null || hideReview;
+                const filterExpr = document.getElementById('searchBox').value.trim();
+                const hasActiveFilter = filterExpr !== '';
                 const batchFullyCompleted = (
                     allExams.length > 0 &&
                     qcSkipStatus.length > 0 &&
@@ -3302,12 +3548,8 @@ def generate_gallery(
                 '</div>';
             
             let statsText = (currentIndex + 1) + '/' + filteredExams.length;
-            if (activeExamFilter) {{
+            if (document.getElementById('searchBox').value.trim() !== '') {{
                 statsText += ' (filtered)';
-            }}
-            const hideReview = document.getElementById('hideReviewCheckbox').checked;
-            if (hideReview && qcCounts.review > 0) {{
-                statsText += ' (' + qcCounts.review + ' review hidden)';
             }}
             // compute session rate and ETA
             const elapsedMin = (Date.now() - sessionStartTime) / 60000;
@@ -3397,6 +3639,7 @@ def generate_gallery(
             Object.keys(qcData).forEach(k => delete qcData[k]);
             Object.keys(annotations).forEach(k => delete annotations[k]);
             allExams.forEach(exam => {{ exam.qc_status = ''; }});
+            updateManualQCIndicator();
             
             // clear localStorage
             localStorage.removeItem(qcStorageKey);
@@ -3528,7 +3771,7 @@ def generate_gallery(
         console.log('Server saves to: {qc_file_str}');
         console.log('Keyboard shortcuts: g=good, r=review, b=bad, a=annotate (letter hotkeys toggle tags), s=skip, l=load more, arrows=navigate');
         console.log('Backup: QC data also saved to browser localStorage (scoped by QC file) - safe to refresh page');
-        console.log('Dynamic filters: Use dropdown to load filter lists without restarting server');
+        console.log('Dynamic filters: insert filter tokens from dropdown, then combine with &, |, ~ in the filter box');
         console.log('Cutflow: Click 📊 Cutflow button to see dataset statistics');
     </script>
 </body>
