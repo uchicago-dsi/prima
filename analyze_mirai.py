@@ -2465,6 +2465,8 @@ def main() -> None:
                 "  td { padding: 6px 8px; white-space: nowrap; }",
                 "  .row-group-0 { background-color: #ffffff; }",
                 "  .row-group-1 { background-color: #d4e4f7; }",
+                "  tr td { transition: background-color 120ms ease-in-out; }",
+                "  tr.row-group-0:hover td, tr.row-group-1:hover td { background-color: #fff3bf; }",
                 "</style>",
                 "</head>",
                 "<body>",
