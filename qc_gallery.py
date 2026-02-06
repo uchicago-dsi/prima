@@ -10,7 +10,7 @@ This script reads from views.parquet (output from preprocessing) and generates:
 
 The gallery features:
 - Single-image viewer with Previous/Next buttons (faster than scrolling)
-- Keyboard navigation (left/right arrows, G/R/B for QC, A to annotate, S to skip)
+- Keyboard navigation (left/right arrows, g/r/b for QC, a to annotate, s to skip, l to load more)
 - Search/filter by patient ID, exam ID, or accession number
 - QC buttons to mark exams as "good", "needs review", or "bad"
 - Independent annotation system: tag exams with categories (e.g., artifact types)
@@ -22,9 +22,9 @@ QC Workflow (fully keyboard-driven)
 1. Run script with --serve flag to generate gallery and start HTTP server
 2. Open gallery in browser (with SSH port forwarding if remote)
 3. Mark exams using keyboard - auto-saves to server after each action:
-   - G/R/B for good/review/bad (instant)
-   - A to open annotation modal, letter hotkeys toggle tags, type + Enter to add new tag
-   - Arrow keys to navigate, S to skip
+   - g/r/b for good/review/bad (instant)
+   - a to open annotation modal, letter hotkeys toggle tags, type + enter to add new tag
+   - arrow keys to navigate, s to skip, l to load more
 4. Re-run script to continue QC on remaining exams (by default, "good" and "bad" exams skipped)
 5. To re-visit "bad" exams: use --qc-skip-status good
 
@@ -255,7 +255,7 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                     return
 
                 # double the batch size for next round
-                current_batch = LOAD_MORE_ARGS.get("max_exams", 100)
+                current_batch = LOAD_MORE_ARGS.get("max_exams") or 100
                 next_batch = current_batch * 2
 
                 logger.info(
@@ -321,7 +321,7 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                 # discard any stale preload
                 self.server._preload_ready = False
 
-                current_batch = LOAD_MORE_ARGS.get("max_exams", 100)
+                current_batch = LOAD_MORE_ARGS.get("max_exams") or 100
                 logger.info(f"Refreshing current batch gallery: {current_batch} exams")
 
                 import threading
@@ -381,7 +381,7 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                 # discard any stale preload (QC state has changed since preload started)
                 self.server._preload_ready = False
 
-                current_batch = LOAD_MORE_ARGS.get("max_exams", 100)
+                current_batch = LOAD_MORE_ARGS.get("max_exams") or 100
                 next_batch = current_batch * 2
 
                 logger.info(
@@ -398,6 +398,7 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                         args = deepcopy(LOAD_MORE_ARGS)
                         args["max_exams"] = next_batch
                         generate_gallery(**args)
+                        LOAD_MORE_ARGS["max_exams"] = next_batch
                         logger.info(f"Successfully generated {next_batch} exams")
                     except Exception as e:
                         logger.error(f"Failed to generate more exams: {e}")
@@ -798,10 +799,10 @@ def start_qc_server(
     logger.info(f"     http://localhost:{port}/")
     logger.info("")
     logger.info("QC workflow:")
-    logger.info("  • Mark exams with G/R/B keys or arrow keys for navigation")
+    logger.info("  • Mark exams with g/r/b keys or arrow keys for navigation")
     logger.info("  • Use dropdown to load filter lists (no restart needed!)")
     logger.info("  • QC data auto-saves to server on each click")
-    logger.info("  • Press Ctrl+C to stop server when done")
+    logger.info("  • Press ctrl+c to stop server when done")
     logger.info("=" * 60)
 
     if not (OUTPUT_DIR / "gallery.html").exists():
@@ -2057,13 +2058,13 @@ def generate_gallery(
             </div>
             <div>
                 <p style="color: #858585; font-size: 13px; margin-top: 0; margin-bottom: 15px;">
-                    Press letter hotkeys to toggle tags, or type new tag and press Enter. Press ESC when done.
+                    Press letter hotkeys to toggle tags, or type new tag and press enter. Press esc when done.
                 </p>
                 <div id="annotationTagsList" style="margin-bottom: 20px;">
                 </div>
                 <div style="border-top: 1px solid #3e3e42; padding-top: 20px;">
                     <div style="display: flex; gap: 10px; align-items: center;">
-                        <input type="text" id="newAnnotationInput" placeholder="add new tag and press Enter..." 
+                        <input type="text" id="newAnnotationInput" placeholder="add new tag and press enter..." 
                                style="flex: 1; padding: 8px 12px; font-size: 14px; border: 1px solid #3e3e42; 
                                       border-radius: 4px; background-color: #1e1e1e; color: #d4d4d4;">
                         <button onclick="addNewAnnotationTag()" 
@@ -2087,7 +2088,7 @@ def generate_gallery(
             You've reviewed all exams in this batch.
         </p>
         <div style="margin: 15px 0;">
-            <button id="loadMoreBtn" onclick="loadMore()">🔄 Load More Exams</button>
+            <button id="loadMoreBtn" onclick="loadMore()">🔄 Load More Exams [l]</button>
             <button onclick="closeCompletion()">Continue Reviewing</button>
         </div>
         <div id="loadMoreStatus" style="display: none; margin-top: 20px; padding: 15px; background-color: #1e1e1e; border-radius: 4px;">
@@ -2370,7 +2371,7 @@ def generate_gallery(
                 const hotkey = annotationHotkeys.tagToKey[tag];
                 const isActive = examAnnotations.includes(tag);
                 const btn = document.createElement('button');
-                const hotkeyLabel = hotkey ? hotkey.toUpperCase() : '';
+                const hotkeyLabel = hotkey || '';
                 if (hotkeyLabel) {{
                     btn.textContent = `[${{hotkeyLabel}}] ${{tag}}`;
                 }} else {{
@@ -2534,6 +2535,8 @@ def generate_gallery(
         function loadMore() {{
             const loadMoreBtn = document.getElementById('loadMoreBtn');
             const statusDiv = document.getElementById('loadMoreStatus');
+
+            if (loadMoreBtn.disabled) return;
             
             // disable button and show status
             loadMoreBtn.disabled = true;
@@ -2546,7 +2549,7 @@ def generate_gallery(
                     if (data.error) {{
                         alert('Error loading more exams: ' + data.error);
                         loadMoreBtn.disabled = false;
-                        loadMoreBtn.textContent = '🔄 Load More Exams';
+                        loadMoreBtn.textContent = '🔄 Load More Exams [l]';
                         statusDiv.style.display = 'none';
                         return;
                     }}
@@ -2571,7 +2574,7 @@ def generate_gallery(
                     console.error('Failed to load more:', error);
                     alert('Failed to load more exams: ' + error);
                     loadMoreBtn.disabled = false;
-                    loadMoreBtn.textContent = '🔄 Load More Exams';
+                    loadMoreBtn.textContent = '🔄 Load More Exams [l]';
                     statusDiv.style.display = 'none';
                 }});
         }}
@@ -2830,7 +2833,7 @@ def generate_gallery(
         
         // keyboard navigation
         document.addEventListener('keydown', (e) => {{
-            // ESC to close modals
+            // esc to close modals
             if (e.key === 'Escape') {{
                 document.getElementById('cutflowModal').style.display = 'none';
                 document.getElementById('completionBanner').style.display = 'none';
@@ -2858,21 +2861,25 @@ def generate_gallery(
             
             // don't process main shortcuts if modal is open
             if (modalIsOpen) return;
+
+            const key = e.key.toLowerCase();
             
             if (e.key === 'ArrowLeft') {{
                 navigate(-1);
             }} else if (e.key === 'ArrowRight') {{
                 navigate(1);
-            }} else if (e.key === 'g') {{
+            }} else if (key === 'g') {{
                 setQCStatus('good');
-            }} else if (e.key === 'r') {{
+            }} else if (key === 'r') {{
                 setQCStatus('review');
-            }} else if (e.key === 'b') {{
+            }} else if (key === 'b') {{
                 setQCStatus('bad');
-            }} else if (e.key === 'a') {{
+            }} else if (key === 'a') {{
                 showAnnotationModal();
-            }} else if (e.key === 's') {{
+            }} else if (key === 's') {{
                 skipExam();
+            }} else if (key === 'l') {{
+                loadMore();
             }}
         }});
         
@@ -3010,7 +3017,7 @@ def generate_gallery(
         // show instructions in console
         console.log('QC data auto-saves to server on each button click');
         console.log('Server saves to: {qc_file_str}');
-        console.log('Keyboard shortcuts: g=good, r=review, b=bad, a=annotate (letter hotkeys toggle tags), arrows=navigate');
+        console.log('Keyboard shortcuts: g=good, r=review, b=bad, a=annotate (letter hotkeys toggle tags), s=skip, l=load more, arrows=navigate');
         console.log('Backup: QC data also saved to browser localStorage (scoped by QC file) - safe to refresh page');
         console.log('Dynamic filters: Use dropdown to load filter lists without restarting server');
         console.log('Cutflow: Click 📊 Cutflow button to see dataset statistics');
@@ -3046,7 +3053,7 @@ def generate_gallery(
                 )
                 logger.info("=" * 60)
                 logger.info(
-                    "Keyboard shortcuts: G=Good, R=Review, B=Bad, A=Annotate (letter hotkeys), Arrow keys=Navigate"
+                    "Keyboard shortcuts: g=good, r=review, b=bad, a=annotate (letter hotkeys), s=skip, l=load more, arrow keys=navigate"
                 )
 
     logger.info("gallery generation complete:")
@@ -3099,8 +3106,8 @@ Examples:
 Server mode workflow:
   1. Run with --serve, forwards port 5000 to your local machine
   2. Open http://localhost:5000/ in browser
-  3. Mark exams with G/R/B keys - auto-saves to server after each click
-  4. Ctrl+C to stop server when done
+  3. Mark exams with g/r/b keys - auto-saves to server after each click
+  4. ctrl+c to stop server when done
   5. Re-run to continue QC (by default, "good" and "bad" exams skipped)
      To re-visit bad exams: --qc-skip-status good
 
@@ -3291,7 +3298,7 @@ QC File Format:
         start_qc_server(
             args.output, args.qc_file, views_path, tags_path, args.port, load_more_args
         )
-        # server runs until Ctrl+C
+        # server runs until ctrl+c
         return 0
 
     return 0
