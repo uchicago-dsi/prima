@@ -1632,7 +1632,9 @@ def generate_gallery(
                     type(raw_annotations).__name__,
                 )
         except Exception as e:
-            logger.warning("failed to load annotations from %s: %s", annotations_path, e)
+            logger.warning(
+                "failed to load annotations from %s: %s", annotations_path, e
+            )
 
     logger.info(f"loading views from {views_parquet}")
     views_df = pd.read_parquet(views_parquet)
@@ -1735,7 +1737,9 @@ def generate_gallery(
 
     # filter out exams with specified QC statuses
     if qc_skip_status:
-        status_skip_statuses = {status for status in qc_skip_status if status != "annotated"}
+        status_skip_statuses = {
+            status for status in qc_skip_status if status != "annotated"
+        }
         skip_exams = set()
         if qc_data and status_skip_statuses:
             skip_exams |= {
@@ -2100,12 +2104,12 @@ def generate_gallery(
         }}
         .filter-controls input {{
             padding: 6px 12px;
-            font-size: 14px;
+            font-size: 13px;
             border: 1px solid #3e3e42;
             border-radius: 4px;
             background-color: #1e1e1e;
             color: #d4d4d4;
-            width: 250px;
+            width: 170px;
         }}
         .filter-controls input:focus {{
             outline: none;
@@ -2254,14 +2258,18 @@ def generate_gallery(
             object-fit: contain;
         }}
         .info-button {{
-            padding: 6px 12px;
-            font-size: 13px;
+            padding: 4px 8px;
+            font-size: 11px;
             border: 1px solid #3e3e42;
             border-radius: 4px;
             background-color: #252526;
             color: #9cdcfe;
             cursor: pointer;
             transition: all 0.2s;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            line-height: 1.3;
         }}
         .info-button:hover {{
             background-color: #3e3e42;
@@ -2370,32 +2378,33 @@ def generate_gallery(
 <body>
         <div class="container">
             <div class="controls">
-            <div style="display: flex; flex-direction: column; gap: 4px;">
+            <div style="display: flex; gap: 8px; align-items: center;">
                 <div class="stats" id="stats">
                     {total_figures} exams
                 </div>
+                <span class="stats">|</span>
                 <div class="stats" id="manualQcIndicator">
-                    Manually QC'd so far: 0
+                    qc'd so far: 0
                 </div>
             </div>
             <div style="display: flex; gap: 5px;">
-                <button class="info-button" onclick="showCutflow()">📊 Cutflow</button>
-                <button class="info-button" onclick="resetAllQC()" title="Clear all saved QC statuses/annotations for this QC file">🗑 Reset</button>
-                <button class="info-button" onclick="refreshCurrentBatch()" title="Rebuild gallery from saved QC state (safe: does not delete QC/source data)">🔁 Refresh Batch</button>
+                <button class="info-button" onclick="showCutflow()"><span>📊</span><span>cutflow</span></button>
+                <button class="info-button" onclick="resetAllQC()" title="Clear all saved QC statuses/annotations for this QC file"><span>🗑</span><span>reset</span></button>
+                <button class="info-button" onclick="refreshCurrentBatch()" title="Rebuild gallery from saved QC state (safe: does not delete QC/source data)"><span>🔁</span><span>refresh</span></button>
             </div>
             <div class="filter-controls">
-                <input type="text" id="searchBox" placeholder="Filter expression: text or @filter with &, |, ~ (e.g., @gems_ffdm_tc1 & ~12345)" 
+                <input type="text" id="searchBox" placeholder="filter: text or @filter with &, |, ~" 
                        onkeyup="filterGallery()">
                 <select id="filterSelect" onfocus="loadAvailableFilters()" onchange="insertSelectedFilterToken()">
-                    <option value="">Load filter list...</option>
+                    <option value="">load filter list...</option>
                 </select>
-                <button onclick="insertSelectedFilterToken()">Insert Filter</button>
-                <button onclick="clearFilterExpression()">Clear Filter</button>
-                <button onclick="loadFilterBatch()" title="Load a batch of exams matching the selected filter">Load Matching</button>
+                <button onclick="insertSelectedFilterToken()">insert filter</button>
+                <button onclick="clearFilterExpression()">clear filter</button>
+                <button onclick="loadFilterBatch()" title="load a batch of exams matching the selected filter">load matching</button>
             </div>
             <div class="nav-buttons">
-                <button id="prevBtn" onclick="navigate(-1)">← Previous</button>
-                <button id="nextBtn" onclick="navigate(1)">Next →</button>
+                <button id="prevBtn" onclick="navigate(-1)">← prev</button>
+                <button id="nextBtn" onclick="navigate(1)">next →</button>
             </div>
         </div>
         <div class="viewer" id="viewer">
@@ -2645,7 +2654,7 @@ def generate_gallery(
             const el = document.getElementById('manualQcIndicator');
             if (!el) return;
             const manualCount = getManualQCCount();
-            el.textContent = "Manually QC'd so far: " + manualCount.toLocaleString();
+            el.textContent = "qc'd so far: " + manualCount.toLocaleString();
         }}
         
         // load statuses from server-rendered payload first
@@ -3091,10 +3100,10 @@ def generate_gallery(
             }}).length;
             
             statsDiv.innerHTML = 
-                '<div><strong>Total exams in batch:</strong> ' + allExams.length + '</div>' +
-                '<div style="color: #6bcc6b;"><strong>Good:</strong> ' + qcCounts.good + '</div>' +
-                '<div style="color: #4ec9b0;"><strong>Annotated:</strong> ' + annotatedCount + '</div>' +
-                '<div style="color: #9cdcfe;"><strong>Pending:</strong> ' + qcCounts.pending + '</div>';
+                '<div><strong>total exams in batch:</strong> ' + allExams.length + '</div>' +
+                '<div style="color: #6bcc6b;"><strong>good:</strong> ' + qcCounts.good + '</div>' +
+                '<div style="color: #4ec9b0;"><strong>annotated:</strong> ' + annotatedCount + '</div>' +
+                '<div style="color: #9cdcfe;"><strong>pending:</strong> ' + qcCounts.pending + '</div>';
             
             banner.style.display = 'block';
         }}
@@ -3684,9 +3693,7 @@ def generate_gallery(
             
             const exam = filteredExams[currentIndex];
             const currentStatus = getStatus(exam.exam_id);
-            const filteredRemaining = filteredExams.filter(item => {{
-                return !isDoneExam(item.exam_id);
-            }}).length;
+            const totalRemaining = remainingToQC - batchQCCount;
             
             // count QC statuses for exams in current gallery
             const qcCounts = {{good: 0, annotated: 0, pending: 0}};
@@ -3712,18 +3719,18 @@ def generate_gallery(
             
             viewer.innerHTML = 
                 '<div class="exam-info">' +
-                    '<strong>Patient:</strong> ' + exam.patient_id + ' | ' +
-                    '<strong>Exam:</strong> ' + exam.exam_id + ' | ' +
-                    '<strong>Accession:</strong> ' + exam.accession +
+                    '<strong>patient:</strong> ' + exam.patient_id + ' | ' +
+                    '<strong>exam:</strong> ' + exam.exam_id + ' | ' +
+                    '<strong>accession:</strong> ' + exam.accession +
                     annotationPills +
                 '</div>' +
                 '<div class="qc-controls">' +
                     '<button class="qc-button good' + (currentStatus === 'good' ? ' active' : '') + '" ' +
-                        'onclick="setQCStatus(\\'good\\')" title="Mark as good">✓ Good [g]</button>' +
+                        'onclick="setQCStatus(\\'good\\')" title="mark as good">✓ good [g]</button>' +
                     '<button class="qc-button annotate' + (hasAnnotations ? ' has-tags' : '') + '" ' +
-                        'onclick="showAnnotationModal()" title="Annotate this exam">🏷 Annotate [a]</button>' +
+                        'onclick="showAnnotationModal()" title="annotate this exam">🏷 annotate [a]</button>' +
                     '<button class="qc-button skip" ' +
-                        'onclick="skipExam()" title="Skip without marking">⏭ Skip [s]</button>' +
+                        'onclick="skipExam()" title="skip without marking">⏭ skip [s]</button>' +
                 '</div>' +
                 '<div class="image-container">' +
                     '<img src="' + exam.path + '" alt="Exam ' + exam.exam_id + '">' +
@@ -3738,7 +3745,7 @@ def generate_gallery(
             let rateText = '';
             if (batchQCCount > 0 && batchElapsedMin > 0.01) {{
                 const rate = batchQCCount / batchElapsedMin;
-                const remainingNow = filteredRemaining;
+                const remainingNow = totalRemaining;
                 const etaMin = remainingNow / rate;
                 let etaStr;
                 if (etaMin < 1) etaStr = '<1 min';
@@ -3747,8 +3754,8 @@ def generate_gallery(
                 rateText = ' | ' + rate.toFixed(1) + '/min, ETA ' + etaStr + ' (' + remainingNow + ' remaining)';
             }}
             
-            statsText += ' | ' + filteredRemaining + ' remaining (filtered) | ' +
-                         'QC: ' + qcCounts.good + ' good, ' + qcCounts.annotated + ' annotated, ' + 
+            statsText += ' | ' + totalRemaining + ' remaining | ' +
+                         'qc: ' + qcCounts.good + ' good, ' + qcCounts.annotated + ' annotated, ' + 
                          qcCounts.pending + ' pending' + rateText;
             stats.textContent = statsText;
             
@@ -3864,10 +3871,10 @@ def generate_gallery(
                         return;
                     }}
                     
-                    let html = '<h3>Dataset Overview</h3>';
-                    html += '<p>Total exams in dataset: <strong>' + data.total_exams.toLocaleString() + '</strong></p>';
-                    html += '<p>Currently loaded in gallery: <strong>' + allExams.length + '</strong></p>';
-                    html += '<p>Manually QC\\'d so far: <strong>' + getManualQCCount() + '</strong></p>';
+                    let html = '<h3>dataset overview</h3>';
+                    html += '<p>total exams in dataset: <strong>' + data.total_exams.toLocaleString() + '</strong></p>';
+                    html += '<p>currently loaded in gallery: <strong>' + allExams.length + '</strong></p>';
+                    html += '<p>qc\\'d so far: <strong>' + getManualQCCount() + '</strong></p>';
                     html += '<hr style="border-color: #3e3e42; margin: 20px 0;">';
                     
                     html += '<h3>Automatic Filter Cutflow</h3>';
