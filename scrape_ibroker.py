@@ -101,22 +101,50 @@ def bootstrap_http_session_from_driver(driver) -> requests.Session:
 
 
 def extract_webforms_state(page_html: str) -> dict:
-    """extract viewstate/eventvalidation/clientstate for the next postback"""
+    """Extract all form fields from the page for the next postback.
+
+    ASP.NET WebForms validates that submitted fields match what the server
+    expects. Sending only a subset of fields (viewstate + a few others) can
+    cause the server to silently ignore the postback. This extracts every
+    <input>, <select>, and <textarea> so the POST matches a real browser
+    submission.
+    """
     doc = lxml_html.fromstring(page_html)
+    state = {}
 
-    def val(i):
-        v = doc.xpath(f"//input[@id='{i}']/@value")
-        return v[0] if v else ""
+    # hidden and text inputs
+    for inp in doc.xpath("//input[@name]"):
+        name = inp.get("name", "")
+        itype = (inp.get("type") or "text").lower()
+        if itype == "checkbox":
+            # only include checked checkboxes (browser behavior)
+            if inp.get("checked") is not None:
+                state[name] = inp.get("value", "on")
+        elif itype == "radio":
+            if inp.get("checked") is not None:
+                state[name] = inp.get("value", "")
+        elif itype == "submit":
+            # don't include submit buttons by default; caller sets the one they want
+            continue
+        else:
+            state[name] = inp.get("value", "")
 
-    return {
-        "__VIEWSTATE": val("__VIEWSTATE"),
-        "__VIEWSTATEGENERATOR": val("__VIEWSTATEGENERATOR"),
-        "__EVENTVALIDATION": val("__EVENTVALIDATION"),
-        "TabContainer1_ClientState": val("TabContainer1_ClientState"),
-        "__EVENTTARGET": "",
-        " __EVENTARGUMENT": "",
-        "__LASTFOCUS": "",
-    }
+    # selects
+    for sel in doc.xpath("//select[@name]"):
+        name = sel.get("name", "")
+        selected = sel.xpath(".//option[@selected]/@value")
+        state[name] = selected[0] if selected else ""
+
+    # textareas
+    for ta in doc.xpath("//textarea[@name]"):
+        name = ta.get("name", "")
+        state[name] = ta.text or ""
+
+    # ensure critical ASP.NET fields default to empty string if missing
+    for key in ("__EVENTTARGET", "__EVENTARGUMENT", "__LASTFOCUS"):
+        state.setdefault(key, "")
+
+    return state
 
 
 def http_get_root(session: requests.Session) -> tuple[str, dict]:
@@ -147,12 +175,31 @@ def post_link_event(
 
 
 def post_fetch_grid(
-    session: requests.Session, state: dict, study_id: str
+    session: requests.Session,
+    state: dict,
+    study_id: str,
+    study_number: str | None = None,
 ) -> tuple[str, dict]:
-    """submit the 'Query Exams' action for study_id and return response + next state"""
+    """Submit the 'Query Exams' action for study_id and return response + next state.
+
+    Parameters
+    ----------
+    session : requests.Session
+        Authenticated HTTP session
+    state : dict
+        Current ASP.NET form state (all fields from previous page)
+    study_id : str
+        Patient anonymous ID to query
+    study_number : str | None
+        IRB study number to scope the query. If provided, overrides
+        tbxStudyNumber in the form state. Use this when querying patients
+        from a different IRB study than the one loaded at login.
+    """
     data = dict(state)
     data["tbxAssignedID"] = study_id
     data["btnFetch"] = "Query Exams"
+    if study_number is not None:
+        data["tbxStudyNumber"] = study_number
     r = session.post(f"{BASE}/ibroker/iBroker.aspx", data=data, timeout=30)
     r.raise_for_status()
     return r.text, extract_webforms_state(r.text)
