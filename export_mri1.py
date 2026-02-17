@@ -11,6 +11,7 @@ import warnings
 from datetime import datetime
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import pandas as pd
 import pydicom
 from selenium.webdriver.common.by import By
@@ -1156,6 +1157,145 @@ def update_status_csv(
     print(f"  ✓ Updated status CSV: {len(final_status):,} exams")
 
 
+def show_status_from_csv(
+    status_file: Path, fingerprint_cache: Path | None = None
+) -> None:
+    """Show status summary from CSV and save histogram of exam dates.
+
+    Parameters
+    ----------
+    status_file : Path
+        Path to status CSV file
+    fingerprint_cache : Path | None
+        Optional path to fingerprint cache for disk status comparison
+    """
+    if not status_file.exists():
+        print(f"Status CSV does not exist: {status_file}")
+        return
+
+    print(f"\n=== Status Summary from {status_file.name} ===")
+    print(
+        f"Last updated: {datetime.fromtimestamp(status_file.stat().st_mtime):%Y-%m-%d %H:%M:%S}"
+    )
+
+    status_df = pd.read_csv(status_file)
+    status_df["Study DateTime"] = pd.to_datetime(
+        status_df["Study DateTime"], errors="coerce"
+    )
+    status_df["is_on_disk"] = (
+        status_df.get("is_on_disk", False).fillna(False).astype(bool)
+    )
+    status_df["Exported On"] = pd.to_datetime(
+        status_df.get("Exported On", pd.NaT), errors="coerce"
+    )
+
+    # Classify each exam by status
+    status_lower = status_df["Status"].fillna("").astype(str).str.strip().str.lower()
+    has_accession = (
+        status_df["Accession"].notna()
+        if "Accession" in status_df.columns
+        else pd.Series(False, index=status_df.index)
+    )
+    is_on_disk = status_df["is_on_disk"]
+
+    is_requested = status_lower.isin(
+        {"requested", "request submitted", "start cmove", "study retrieved"}
+    )
+    is_completed = status_lower.isin({"completed", "already exported", "exported"}) | (
+        has_accession & ~is_requested
+    )
+
+    total = len(status_df)
+    on_disk = is_on_disk.sum()
+    completed_not_on_disk = (is_completed & ~is_on_disk).sum()
+    requested_not_on_disk = (is_requested & ~is_on_disk).sum()
+    not_exported = (~is_completed & ~is_requested & ~is_on_disk).sum()
+
+    print(f"\nTotal MR+BREAST exams: {total:,}")
+    print(f"  - On disk: {on_disk:,} ({on_disk / total * 100:.1f}%)")
+    print(
+        f"  - Completed but not on disk (MISSING): {completed_not_on_disk:,} ({completed_not_on_disk / total * 100:.1f}%)"
+    )
+    print(
+        f"  - Requested, waiting on iBroker: {requested_not_on_disk:,} ({requested_not_on_disk / total * 100:.1f}%)"
+    )
+    print(f"  - Not yet exported: {not_exported:,} ({not_exported / total * 100:.1f}%)")
+
+    # Show which study IDs have unexported exams
+    export_requested = _calculate_export_requested(status_df)
+    if not_exported > 0:
+        unexported_exams = status_df[(~export_requested) & (~is_on_disk)]
+        unexported_study_ids = unexported_exams["study_id"].unique()
+        print(f"\n  → {len(unexported_study_ids):,} study IDs have unexported exams")
+
+    # Show disk status comparison if fingerprint cache is available
+    if fingerprint_cache is not None and fingerprint_cache.exists():
+        from prima.filesystem_utils import load_disk_dates_from_fingerprints
+
+        disk_dates = load_disk_dates_from_fingerprints(fingerprint_cache)
+        if disk_dates:
+            total_disk_pairs = sum(len(dates) for dates in disk_dates.values())
+            total_disk_patients = len(disk_dates)
+
+            status_df["_study_date_str"] = status_df["Study DateTime"].dt.strftime(
+                "%Y-%m-%d"
+            )
+            status_pairs = set(
+                (str(int(row["study_id"])), row["_study_date_str"])
+                for _, row in status_df.iterrows()
+                if pd.notna(row["Study DateTime"]) and pd.notna(row["study_id"])
+            )
+            status_df.drop(columns=["_study_date_str"], inplace=True)
+
+            matched_pairs = sum(
+                1
+                for pid, date_str in status_pairs
+                if pid in disk_dates and date_str in disk_dates[pid]
+            )
+
+            print("\n--- Disk Status Comparison ---")
+            print(
+                f"  - Unique (patient, date) pairs in status CSV: {len(status_pairs):,}"
+            )
+            print(
+                f"  - Unique (patient, date) pairs on disk: {total_disk_pairs:,} ({total_disk_patients:,} patients)"
+            )
+            print(f"  - Matched pairs: {matched_pairs:,}")
+            print(f"  - Disk-only pairs: {total_disk_pairs - matched_pairs:,}")
+
+    # Create histogram of exam dates
+    valid_dates = status_df["Study DateTime"].dropna()
+    if len(valid_dates) > 0:
+        # Count exams from 2018 or newer
+        exams_2018_or_newer = (valid_dates >= pd.Timestamp("2018-01-01")).sum()
+        print(f"\nExams from 2018 or newer: {exams_2018_or_newer:,}")
+
+        # Count unique patients from exams 2018 or newer
+        exams_2018_df = status_df[
+            status_df["Study DateTime"] >= pd.Timestamp("2018-01-01")
+        ]
+        unique_patients_2018 = exams_2018_df["study_id"].nunique()
+        print(f"Unique patients from exams 2018 or newer: {unique_patients_2018:,}")
+
+        plots_dir = Path("plots")
+        plots_dir.mkdir(exist_ok=True)
+
+        fig, ax = plt.subplots(figsize=(12, 6))
+        ax.hist(valid_dates, bins=50, edgecolor="black", alpha=0.7)
+        ax.set_xlabel("exam date")
+        ax.set_ylabel("number of exams")
+        ax.tick_params(axis="x", rotation=45)
+
+        hist_path = plots_dir / "mri1_exam_dates_histogram.png"
+        plt.tight_layout()
+        plt.savefig(hist_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+        print(f"\n✓ Saved exam date histogram to: {hist_path}")
+        print(f"  Date range: {valid_dates.min().date()} to {valid_dates.max().date()}")
+        print(f"  Total exams with valid dates: {len(valid_dates):,}")
+
+
 def print_status_summary(
     status_file: Path, fingerprint_cache: Path | None = None
 ) -> None:
@@ -1192,13 +1332,15 @@ def print_status_summary(
     )
     is_on_disk = status_df["is_on_disk"]
 
-    # "completed" in iBroker means the export finished on their side
-    is_completed = (
-        status_lower.isin({"completed", "already exported", "exported"}) | has_accession
-    )
     # "requested" means we asked but iBroker hasn't finished
+    # Status is authoritative - if it says "Requested", it's requested even if it has Accession
     is_requested = status_lower.isin(
         {"requested", "request submitted", "start cmove", "study retrieved"}
+    )
+    # "completed" in iBroker means the export finished on their side
+    # Only mark as completed if Status explicitly says so, OR has Accession but NOT requested
+    is_completed = status_lower.isin({"completed", "already exported", "exported"}) | (
+        has_accession & ~is_requested
     )
 
     total = len(status_df)
@@ -1217,6 +1359,75 @@ def print_status_summary(
         f"  - Requested, waiting on iBroker: {requested_not_on_disk:,} ({requested_not_on_disk / total * 100:.1f}%)"
     )
     print(f"  - Not yet exported: {not_exported:,} ({not_exported / total * 100:.1f}%)")
+
+    # Detailed diagnostics for missing exams
+    if completed_not_on_disk > 0:
+        missing_exams = status_df[is_completed & ~is_on_disk].copy()
+        print("\n--- Missing Exams Analysis (Completed but not on disk) ---")
+        print(f"Total missing: {len(missing_exams):,} exams")
+
+        # Export date distribution
+        if "Exported On" in missing_exams.columns:
+            exported_dates = missing_exams["Exported On"].dropna()
+            if len(exported_dates) > 0:
+                print("\nExport date distribution:")
+                print(f"  - With export date: {len(exported_dates):,}")
+                print(
+                    f"  - Without export date: {len(missing_exams) - len(exported_dates):,}"
+                )
+                if len(exported_dates) > 0:
+                    print(f"  - Oldest export: {exported_dates.min()}")
+                    print(f"  - Newest export: {exported_dates.max()}")
+                    # Group by export date (year-month)
+                    exported_dates_ym = exported_dates.dt.to_period("M")
+                    print("\n  Export date by month (top 10):")
+                    for period, count in (
+                        exported_dates_ym.value_counts().head(10).items()
+                    ):
+                        print(f"    {period}: {count:,} exams")
+
+        # Study ID distribution
+        study_id_counts = missing_exams["study_id"].value_counts()
+        print("\nStudy ID distribution:")
+        print(f"  - Affects {len(study_id_counts):,} unique study IDs")
+        print("  - Top 10 study IDs with most missing exams:")
+        for sid, count in study_id_counts.head(10).items():
+            print(f"    {sid}: {count:,} missing")
+
+        # Accession numbers
+        if "Accession" in missing_exams.columns:
+            has_accession = missing_exams["Accession"].notna()
+            print("\nAccession numbers:")
+            print(f"  - With accession: {has_accession.sum():,}")
+            print(f"  - Without accession: {(~has_accession).sum():,}")
+
+        # Sample missing exams
+        print("\nSample missing exams (first 20):")
+        sample_cols = [
+            "study_id",
+            "Study DateTime",
+            "StudyDescription",
+            "Status",
+            "Accession",
+        ]
+        if "Exported On" in missing_exams.columns:
+            sample_cols.append("Exported On")
+        sample = missing_exams[sample_cols].head(20)
+        for idx, row in sample.iterrows():
+            exported_str = (
+                f", exported: {row['Exported On']}"
+                if "Exported On" in row and pd.notna(row.get("Exported On"))
+                else ""
+            )
+            accession_str = (
+                f", accession: {row['Accession']}"
+                if pd.notna(row.get("Accession"))
+                else ", no accession"
+            )
+            print(
+                f"  {row['study_id']} | {row['Study DateTime']} | {row['StudyDescription'][:40]} | "
+                f"status: {row['Status']}{accession_str}{exported_str}"
+            )
 
     # Show which study IDs have unexported exams
     export_requested = _calculate_export_requested(status_df)
@@ -1762,8 +1973,21 @@ def main():
         action="store_true",
         help="Include exams with 'biopsy' in study description (default: exclude biopsy exams).",
     )
+    parser.add_argument(
+        "--show-status",
+        action="store_true",
+        help="Show status summary from CSV and save histogram of exam dates, then exit (no iBroker query).",
+    )
 
     args = parser.parse_args()
+
+    # show-status mode: just read CSV and print summary (no iBroker query needed)
+    if args.show_status:
+        print("Running in --show-status mode (no iBroker query will be performed)\n")
+        mri1_cache = Path("data/destination_fingerprints_mri1.json")
+        fingerprint_cache = mri1_cache if mri1_cache.exists() else None
+        show_status_from_csv(MRI1_STATUS_FILE, fingerprint_cache=fingerprint_cache)
+        sys.exit(0)
 
     # MRI1.0 dataset requires credentials even for status-only mode (needs to query iBroker)
     if not all([USERNAME, PASSWORD]):
