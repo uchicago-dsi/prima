@@ -12,6 +12,7 @@ import threading
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from time import monotonic
 from typing import Tuple
@@ -119,7 +120,10 @@ def _format_rsync_line_with_gb(line: str) -> str:
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler("sync.log"), logging.StreamHandler()],
+    handlers=[
+        RotatingFileHandler("sync.log", maxBytes=100 * 1024 * 1024, backupCount=5),
+        logging.StreamHandler(),
+    ],
 )
 
 # Global flag for graceful shutdown

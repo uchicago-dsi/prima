@@ -37,6 +37,9 @@ MRI1_STUDY_IDS_FILE = (
 )
 MRI1_BASE_DOWNLOAD_DIR = "/gpfs/data/karczmar-lab/CAPS/MRI1.0/"
 MRI1_STATUS_FILE = Path(MRI1_BASE_DOWNLOAD_DIR) / "export_status.csv"
+MRI1_CANCER_CASES_FILE = (
+    Path(MRI1_BASE_DOWNLOAD_DIR) / "cancer_cases_mri1.0_13Feb2026.csv"
+)
 # IRB study number for MRI1.0 in iBroker (distinct from ChiMEC's 16352A).
 # The login session defaults to 16352A; this override is required for
 # post_fetch_grid to find MRI1.0 patients.
@@ -1157,6 +1160,315 @@ def update_status_csv(
     print(f"  ✓ Updated status CSV: {len(final_status):,} exams")
 
 
+def _format_time_before_dx(days: float) -> str:
+    """Format days as human-readable time before diagnosis.
+
+    Parameters
+    ----------
+    days : float
+        Number of days before diagnosis
+
+    Returns
+    -------
+    str
+        Formatted string like "11 days", "6 months", "1.5 years", etc.
+    """
+    if days < 30:
+        return f"{days:.0f} days"
+    elif days < 365:
+        months = days / 30.44
+        if months < 1.5:
+            return f"{months:.1f} months"
+        else:
+            return f"{months:.0f} months"
+    else:
+        years = days / 365.25
+        if years < 2:
+            return f"{years:.1f} years"
+        else:
+            return f"{years:.1f} years"
+
+
+def analyze_exams_before_cancer(
+    status_file: Path, cancer_cases_file: Path | None = None
+) -> None:
+    """Analyze exams available before each cancer diagnosis.
+
+    Parameters
+    ----------
+    status_file : Path
+        Path to status CSV file with exam data
+    cancer_cases_file : Path | None
+        Path to cancer cases CSV file. If None, uses MRI1_CANCER_CASES_FILE.
+    """
+    if cancer_cases_file is None:
+        cancer_cases_file = MRI1_CANCER_CASES_FILE
+
+    if not cancer_cases_file.exists():
+        print(f"\nCancer cases file not found: {cancer_cases_file}")
+        print("Skipping cancer analysis.")
+        return
+
+    if not status_file.exists():
+        print(f"\nStatus CSV does not exist: {status_file}")
+        print("Skipping cancer analysis.")
+        return
+
+    print("\n=== Exams Before Cancer Diagnosis Analysis ===")
+
+    # Load cancer cases
+    cancer_df = pd.read_csv(cancer_cases_file)
+    cancer_df["AnonymousID"] = cancer_df["AnonymousID"].astype(str)
+
+    # Load status CSV
+    status_df = pd.read_csv(status_file)
+    status_df["study_id"] = status_df["study_id"].astype(str)
+    status_df["Study DateTime"] = pd.to_datetime(
+        status_df["Study DateTime"], errors="coerce"
+    )
+    status_df["is_on_disk"] = (
+        status_df.get("is_on_disk", False).fillna(False).astype(bool)
+    )
+
+    # Extract all cancer incidences (treat each independently)
+    cancer_incidences = []
+
+    for _, row in cancer_df.iterrows():
+        patient_id = str(row["AnonymousID"])
+
+        # First cancer (datedx)
+        if pd.notna(row.get("datedx")):
+            try:
+                dx_date = pd.to_datetime(row["datedx"])
+                cancer_incidences.append(
+                    {
+                        "patient_id": patient_id,
+                        "diagnosis_date": dx_date,
+                        "laterality": row.get("laterality", ""),
+                        "source": "datedx",
+                    }
+                )
+            except Exception:
+                pass
+
+        # Second primary (datedx_new)
+        if pd.notna(row.get("datedx_new")):
+            try:
+                dx_date = pd.to_datetime(row["datedx_new"])
+                cancer_incidences.append(
+                    {
+                        "patient_id": patient_id,
+                        "diagnosis_date": dx_date,
+                        "laterality": row.get("laterality_new", ""),
+                        "source": "datedx_new",
+                    }
+                )
+            except Exception:
+                pass
+
+        # Previous cancer (preCa_datedx) - also include as separate incidence
+        if pd.notna(row.get("preCa_datedx")):
+            try:
+                dx_date = pd.to_datetime(row["preCa_datedx"])
+                cancer_incidences.append(
+                    {
+                        "patient_id": patient_id,
+                        "diagnosis_date": dx_date,
+                        "laterality": row.get("preCa_laterality", ""),
+                        "source": "preCa_datedx",
+                    }
+                )
+            except Exception:
+                pass
+
+        # Diagnosis during MRI1.0 study
+        if pd.notna(row.get("diagnosis_date_during_mri1_study")):
+            try:
+                dx_date = pd.to_datetime(row["diagnosis_date_during_mri1_study"])
+                cancer_incidences.append(
+                    {
+                        "patient_id": patient_id,
+                        "diagnosis_date": dx_date,
+                        "laterality": row.get("laterality_during_mri1_study", ""),
+                        "source": "diagnosis_date_during_mri1_study",
+                    }
+                )
+            except Exception:
+                pass
+
+    if not cancer_incidences:
+        print("No valid cancer diagnosis dates found in cancer cases file.")
+        return
+
+    # Sort by patient and diagnosis date
+    cancer_incidences_df = pd.DataFrame(cancer_incidences)
+    cancer_incidences_df = cancer_incidences_df.sort_values(
+        ["patient_id", "diagnosis_date"]
+    )
+
+    print(f"\nTotal cancer incidences: {len(cancer_incidences_df):,}")
+    print(
+        f"Unique patients with cancer: {cancer_incidences_df['patient_id'].nunique():,}"
+    )
+
+    # For each cancer incidence, find exams before that date
+    results = []
+    for _, cancer_row in cancer_incidences_df.iterrows():
+        patient_id = cancer_row["patient_id"]
+        dx_date = cancer_row["diagnosis_date"]
+        laterality = cancer_row["laterality"]
+        source = cancer_row["source"]
+
+        # Find exams for this patient before diagnosis date
+        patient_exams = status_df[
+            (status_df["study_id"] == patient_id)
+            & (status_df["Study DateTime"] < dx_date)
+            & (status_df["Study DateTime"].notna())
+        ].copy()
+
+        # Count exams by status
+        total_exams = len(patient_exams)
+        exams_on_disk = patient_exams["is_on_disk"].sum()
+
+        # Check if exported (has Accession or Status indicates exported)
+        has_accession = patient_exams.get(
+            "Accession", pd.Series([pd.NA] * len(patient_exams))
+        ).notna()
+        status_exported = (
+            patient_exams.get("Status", pd.Series([""] * len(patient_exams)))
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .isin({"already exported", "exported", "completed"})
+        )
+        exams_exported = (has_accession | status_exported).sum()
+
+        # Find earliest and latest exam dates, and all exam dates
+        if total_exams > 0:
+            earliest_exam = patient_exams["Study DateTime"].min()
+            latest_exam = patient_exams["Study DateTime"].max()
+            days_before_dx = (dx_date - latest_exam).days
+            # Get all exam dates sorted (most recent first)
+            exam_dates = sorted(patient_exams["Study DateTime"].tolist(), reverse=True)
+        else:
+            earliest_exam = pd.NaT
+            latest_exam = pd.NaT
+            days_before_dx = None
+            exam_dates = []
+
+        results.append(
+            {
+                "patient_id": patient_id,
+                "diagnosis_date": dx_date,
+                "laterality": laterality,
+                "source": source,
+                "total_exams": total_exams,
+                "exams_on_disk": exams_on_disk,
+                "exams_exported": exams_exported,
+                "earliest_exam": earliest_exam,
+                "latest_exam": latest_exam,
+                "days_before_dx": days_before_dx,
+                "exam_dates": exam_dates,
+            }
+        )
+
+    results_df = pd.DataFrame(results)
+
+    # Summary statistics
+    print("\n--- Summary Statistics ---")
+    print(
+        f"Cancer incidences with exams before diagnosis: {(results_df['total_exams'] > 0).sum():,} / {len(results_df):,}"
+    )
+    print(
+        f"Cancer incidences with exams on disk: {(results_df['exams_on_disk'] > 0).sum():,} / {len(results_df):,}"
+    )
+    print(
+        f"Cancer incidences with no exams before diagnosis: {(results_df['total_exams'] == 0).sum():,} / {len(results_df):,}"
+    )
+
+    if results_df["total_exams"].sum() > 0:
+        print(
+            f"\nTotal exams before cancer diagnoses: {results_df['total_exams'].sum():,}"
+        )
+        print(f"  - On disk: {results_df['exams_on_disk'].sum():,}")
+        print(f"  - Exported: {results_df['exams_exported'].sum():,}")
+
+        # Days before diagnosis statistics (exclusive buckets)
+        valid_days = results_df["days_before_dx"].dropna()
+        if len(valid_days) > 0:
+            print("\nTime between last exam and diagnosis (exclusive ranges):")
+            print(f"  - Median: {valid_days.median():.1f} days")
+            print(f"  - Mean: {valid_days.mean():.1f} days")
+            print(f"  - Min: {valid_days.min():.0f} days")
+            print(f"  - Max: {valid_days.max():.0f} days")
+            print(f"  - < 1 year: {(valid_days < 365).sum():,} incidences")
+            print(
+                f"  - 1-2 years: {((valid_days >= 365) & (valid_days < 730)).sum():,} incidences"
+            )
+            print(
+                f"  - 2-5 years: {((valid_days >= 730) & (valid_days < 1825)).sum():,} incidences"
+            )
+            print(f"  - >= 5 years: {(valid_days >= 1825).sum():,} incidences")
+
+    # Calculate column widths for consistent formatting (before both sections)
+    max_patient_id_len = max(
+        len(str(row["patient_id"])) for _, row in results_df.iterrows()
+    )
+    max_source_len = max(len(str(row["source"])) for _, row in results_df.iterrows())
+    patient_id_width = max(12, max_patient_id_len)
+    source_width = max(30, max_source_len)
+
+    # Show detailed breakdown by patient (all incidences, sorted by exam count)
+    print("\n--- Detailed Breakdown (All Cancer Incidences, Ordered by Exam Count) ---")
+    detailed = results_df.sort_values("total_exams", ascending=False)
+
+    for _, row in detailed.iterrows():
+        patient_id = str(row["patient_id"])
+        dx_date = row["diagnosis_date"]
+        source = str(row["source"])
+        total_exams = row["total_exams"]
+        exams_on_disk = row["exams_on_disk"]
+        exam_dates = row["exam_dates"]
+
+        if total_exams > 0:
+            # Calculate prefix width for alignment of exam times (everything before "exams before dx:")
+            prefix_before_col = f"  {patient_id:<{patient_id_width}} | {dx_date.date()} | {source:<{source_width}} | {total_exams:>2} exams ({exams_on_disk:>2} on disk) | "
+            prefix_width = len(prefix_before_col)
+
+            # Create blank prefix for continuation lines (same width, but empty)
+            blank_prefix = " " * prefix_width
+
+            # Print header line with "exams before dx:" column
+            print(f"{prefix_before_col}exams before dx:")
+
+            # Format and print each exam time on its own line, aligned in the column
+            for exam_date in exam_dates:
+                days = (dx_date - exam_date).days
+                time_str = _format_time_before_dx(days)
+                # Use blank prefix for continuation lines
+                print(f"{blank_prefix}{time_str}")
+        else:
+            print(
+                f"  {patient_id:<{patient_id_width}} | {dx_date.date()} | {source:<{source_width}} | "
+                f" 0 exams before diagnosis"
+            )
+
+    # Show incidences with no exams
+    no_exams = results_df[results_df["total_exams"] == 0]
+    if len(no_exams) > 0:
+        print(
+            f"\n--- Cancer Incidences with No Exams Before Diagnosis ({len(no_exams):,}) ---"
+        )
+        for _, row in no_exams.iterrows():
+            patient_id = str(row["patient_id"])
+            dx_date = row["diagnosis_date"]
+            source = str(row["source"])
+            print(
+                f"  {patient_id:<{patient_id_width}} | {dx_date.date()} | {source:<{source_width}}"
+            )
+
+
 def show_status_from_csv(
     status_file: Path, fingerprint_cache: Path | None = None
 ) -> None:
@@ -1294,6 +1606,9 @@ def show_status_from_csv(
         print(f"\n✓ Saved exam date histogram to: {hist_path}")
         print(f"  Date range: {valid_dates.min().date()} to {valid_dates.max().date()}")
         print(f"  Total exams with valid dates: {len(valid_dates):,}")
+
+    # Analyze exams before cancer diagnoses
+    analyze_exams_before_cancer(status_file)
 
 
 def print_status_summary(
@@ -1476,6 +1791,9 @@ def print_status_summary(
             )
             print(f"  - Matched pairs: {matched_pairs:,}")
             print(f"  - Disk-only pairs: {total_disk_pairs - matched_pairs:,}")
+
+    # Analyze exams before cancer diagnoses
+    analyze_exams_before_cancer(status_file)
 
 
 def query_and_update_status_during_wait(
@@ -1978,15 +2296,113 @@ def main():
         action="store_true",
         help="Show status summary from CSV and save histogram of exam dates, then exit (no iBroker query).",
     )
+    parser.add_argument(
+        "--update",
+        action="store_true",
+        help="When used with --show-status, refresh all statuses from iBroker and disk before showing summary.",
+    )
 
     args = parser.parse_args()
 
     # show-status mode: just read CSV and print summary (no iBroker query needed)
     if args.show_status:
-        print("Running in --show-status mode (no iBroker query will be performed)\n")
-        mri1_cache = Path("data/destination_fingerprints_mri1.json")
-        fingerprint_cache = mri1_cache if mri1_cache.exists() else None
-        show_status_from_csv(MRI1_STATUS_FILE, fingerprint_cache=fingerprint_cache)
+        if args.update:
+            # Update mode: refresh everything from iBroker and disk, then show status
+            print(
+                "Running in --show-status --update mode (will refresh all statuses from iBroker and disk)\n"
+            )
+
+            # Check credentials are available
+            if not all([USERNAME, PASSWORD]):
+                print(
+                    "ERROR: IBROKER_USERNAME and IBROKER_PASSWORD must be set for --update mode.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+            # Import scrape functions (must be done after import_scrape_ibroker is called)
+            import_scrape_ibroker()
+
+            # Load all study IDs
+            study_ids_df = pd.read_excel(MRI1_STUDY_IDS_FILE)
+            study_ids = study_ids_df["AnonymousID"].astype(str).tolist()
+            print(f"Loaded {len(study_ids):,} study IDs from MRI1.0 file.")
+
+            # Rebuild fingerprint cache to reflect current disk state
+            print(
+                "\n[Step 1/3] Rebuilding MRI1.0 fingerprint cache to reflect current disk state..."
+            )
+            mri1_cache = Path("data/destination_fingerprints_mri1.json")
+            fingerprint_cache = build_mri1_disk_cache_simple(
+                mri1_cache, MRI1_BASE_DOWNLOAD_DIR
+            )
+            if fingerprint_cache:
+                print(f"✓ Updated MRI1.0 fingerprint cache: {fingerprint_cache}")
+            else:
+                print("WARNING: Failed to build fingerprint cache")
+                fingerprint_cache = mri1_cache if mri1_cache.exists() else None
+
+            # Query all study IDs and update status CSV
+            print(
+                "\n[Step 2/4] Querying all study IDs from iBroker to update status CSV..."
+            )
+            newly_queried = query_and_update_status_during_wait(
+                study_ids=study_ids,
+                already_queried=set(),
+                status_file=MRI1_STATUS_FILE,
+                fingerprint_cache=fingerprint_cache,
+                wait_seconds=float("inf"),  # No time limit for update mode
+                include_biopsy=args.include_biopsy,
+            )
+            print(
+                f"\n✓ Queried {len(newly_queried):,} study IDs and updated status CSV."
+            )
+
+            # Update disk status for ALL existing rows in status CSV (not just newly queried)
+            print("\n[Step 3/4] Updating disk status for all exams in status CSV...")
+            if MRI1_STATUS_FILE.exists() and fingerprint_cache:
+                import io
+                from contextlib import redirect_stdout
+
+                status_df = pd.read_csv(MRI1_STATUS_FILE)
+                status_df["Study DateTime"] = pd.to_datetime(
+                    status_df["Study DateTime"], errors="coerce"
+                )
+
+                # Suppress verbose output
+                f = io.StringIO()
+                with redirect_stdout(f):
+                    status_df = update_metadata_with_disk_status_by_date(
+                        status_df,
+                        conservative=True,
+                        fingerprint_cache=fingerprint_cache,
+                    )
+
+                # Save updated status CSV
+                status_df.to_csv(MRI1_STATUS_FILE, index=False)
+                if "is_on_disk" in status_df.columns:
+                    on_disk_count = (
+                        status_df["is_on_disk"].fillna(False).astype(bool).sum()
+                    )
+                else:
+                    on_disk_count = 0
+                print(
+                    f"✓ Updated disk status for {len(status_df):,} exams ({on_disk_count:,} on disk)."
+                )
+            else:
+                print("  Skipping (status CSV or fingerprint cache not available).")
+
+            # Show fresh status summary
+            print("\n[Step 4/4] Showing fresh status summary...")
+            print_status_summary(MRI1_STATUS_FILE, fingerprint_cache=fingerprint_cache)
+        else:
+            # Regular show-status mode: just read CSV and print summary
+            print(
+                "Running in --show-status mode (no iBroker query will be performed)\n"
+            )
+            mri1_cache = Path("data/destination_fingerprints_mri1.json")
+            fingerprint_cache = mri1_cache if mri1_cache.exists() else None
+            show_status_from_csv(MRI1_STATUS_FILE, fingerprint_cache=fingerprint_cache)
         sys.exit(0)
 
     # MRI1.0 dataset requires credentials even for status-only mode (needs to query iBroker)
