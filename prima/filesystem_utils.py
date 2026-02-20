@@ -715,12 +715,16 @@ def reconcile_disk_ibroker_accessions(
     modality: str = "MG",
     output_csv: Path | None = None,
     fingerprint_cache: Path | None = None,
+    key_file: Path | str | None = None,
 ) -> dict[str, int]:
     """Reconcile disk exams vs iBroker metadata and classify mismatch reasons.
 
     When fingerprint_cache is provided and exists, disk dates are taken from DICOM
     metadata in the fingerprint (never from filename). Otherwise falls back to
     scanning disk and inferring date from filename or DICOM.
+
+    When key_file is provided (MRN-to-study_id map with AnonymousID column),
+    computes overlap between disk study IDs and key study IDs.
     """
     modality_upper = modality.upper()
     subset_all = metadata_df[metadata_df["base_modality"] == modality_upper].copy()
@@ -876,10 +880,22 @@ def reconcile_disk_ibroker_accessions(
             "disk_only_with_date_study_id_not_in_ibroker": 0,
             "disk_only_with_date_study_id_in_ibroker_but_date_not": 0,
             "study_ids_on_disk_not_in_ibroker": 0,
+            "key_study_ids_count": 0,
+            "disk_study_ids_in_key": 0,
+            "disk_study_ids_not_in_key": 0,
+            "key_study_ids_not_on_disk": 0,
         }
 
     disk_study_ids = set(disk_df["study_id"].astype(str))
     study_ids_on_disk_not_in_ibroker = len(disk_study_ids - ib_all_ids)
+
+    key_study_ids: Set[str] = set()
+    if key_file is not None:
+        key_path = Path(key_file)
+        if key_path.exists():
+            key_df = pd.read_csv(key_path)
+            if "AnonymousID" in key_df.columns:
+                key_study_ids = set(key_df["AnonymousID"].dropna().astype(str))
 
     disk_df["match_type"] = "disk_only"
     disk_df["ib_accession_norm"] = pd.NA
@@ -992,4 +1008,14 @@ def reconcile_disk_ibroker_accessions(
             (sid_in_any & ~pair_in_any_series).sum()
         )
     summary["study_ids_on_disk_not_in_ibroker"] = int(study_ids_on_disk_not_in_ibroker)
+    if key_study_ids:
+        summary["key_study_ids_count"] = int(len(key_study_ids))
+        summary["disk_study_ids_in_key"] = int(len(disk_study_ids & key_study_ids))
+        summary["disk_study_ids_not_in_key"] = int(len(disk_study_ids - key_study_ids))
+        summary["key_study_ids_not_on_disk"] = int(len(key_study_ids - disk_study_ids))
+    else:
+        summary["key_study_ids_count"] = 0
+        summary["disk_study_ids_in_key"] = 0
+        summary["disk_study_ids_not_in_key"] = 0
+        summary["key_study_ids_not_on_disk"] = 0
     return summary

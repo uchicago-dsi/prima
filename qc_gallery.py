@@ -90,6 +90,7 @@ import pandas as pd
 import pydicom
 from pydicom.dataset import FileDataset
 from pydicom.tag import Tag
+from prima.view_selection import view_selection_key_from_dataset
 from sklearn.metrics import roc_curve
 from tqdm import tqdm
 
@@ -1939,10 +1940,19 @@ def generate_gallery(
                         "patient_id": row["patient_id"],
                         "accession_number": row.get("accession_number", "unknown"),
                         "views": {},
+                        "view_selection_keys": {},
                     }
 
                 view_key = f"{row['laterality']}_{row['view']}"
-                exam_view_cache[exam_key]["views"][view_key] = (ds, dicom_path)
+                candidate_key = view_selection_key_from_dataset(ds, dicom_path)
+                current_key = exam_view_cache[exam_key]["view_selection_keys"].get(
+                    view_key
+                )
+                if current_key is None or candidate_key < current_key:
+                    exam_view_cache[exam_key]["view_selection_keys"][view_key] = (
+                        candidate_key
+                    )
+                    exam_view_cache[exam_key]["views"][view_key] = (ds, dicom_path)
 
             except Exception as e:
                 logger.error(

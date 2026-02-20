@@ -356,6 +356,7 @@ def run_reconciliation_if_enabled(args, db: pd.DataFrame, cycle_number: int) -> 
         fingerprint_cache=CHIMEC_FINGERPRINT_CACHE
         if CHIMEC_FINGERPRINT_CACHE.exists()
         else None,
+        key_file=CHIMEC_KEY_FILE,
     )
     print("\n=== disk-vs-ibroker reconciliation ===")
     print(f"modality: {CHIMEC_MODALITY}")
@@ -411,6 +412,21 @@ def run_reconciliation_if_enabled(args, db: pd.DataFrame, cycle_number: int) -> 
         "study IDs on disk but not in iBroker: "
         f"{summary['study_ids_on_disk_not_in_ibroker']:,}"
     )
+    if summary.get("key_study_ids_count", 0) > 0:
+        print("--- MRN-to-study_id key file overlap ---")
+        print(f"study IDs in key file: {summary['key_study_ids_count']:,}")
+        print(
+            "study IDs on disk that are in key (overlap): "
+            f"{summary['disk_study_ids_in_key']:,}"
+        )
+        print(
+            "study IDs on disk but not in key: "
+            f"{summary['disk_study_ids_not_in_key']:,}"
+        )
+        print(
+            "study IDs in key but not on disk: "
+            f"{summary['key_study_ids_not_on_disk']:,}"
+        )
     print(f"wrote reconciliation CSV: {output_path}")
     if output_path.exists():
         reconciled_df = pd.read_csv(output_path)

@@ -2413,7 +2413,7 @@ def main():
         )
         sys.exit(1)
 
-    # import scrape_ibroker now that we know we need it (triggers credential check)
+    # import iBroker browser/http helpers only when live queries are needed
     import_scrape_ibroker()
 
     # status-only mode: do full refresh of all study IDs

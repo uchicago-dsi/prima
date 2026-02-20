@@ -13,8 +13,8 @@ from pathlib import Path
 import pandas as pd
 from tqdm.auto import tqdm
 
-# scrape_ibroker imports are deferred to avoid credential check at import time
-# when running in --status-only mode
+# iBroker imports are deferred to avoid credential check at import time
+# when running in read-only status mode
 login = None
 make_driver = None
 wait_aspnet_idle = None
@@ -26,18 +26,20 @@ parse_all_tables_from_page = None
 
 
 def import_scrape_ibroker():
-    """Import scrape_ibroker functions (triggers credential check)."""
+    """Import shared iBroker functions used by export scripts."""
     global login, make_driver, wait_aspnet_idle
     global bootstrap_http_session_from_driver, http_get_root
     global post_link_event, post_fetch_grid, parse_all_tables_from_page
-    from scrape_ibroker import bootstrap_http_session_from_driver as _bootstrap
-    from scrape_ibroker import http_get_root as _http_get_root
-    from scrape_ibroker import login as _login
-    from scrape_ibroker import make_driver as _make_driver
-    from scrape_ibroker import parse_all_tables_from_page as _parse_all_tables
-    from scrape_ibroker import post_fetch_grid as _post_fetch_grid
-    from scrape_ibroker import post_link_event as _post_link_event
-    from scrape_ibroker import wait_aspnet_idle as _wait_aspnet_idle
+    from prima.ibroker_refresh import (
+        bootstrap_http_session_from_driver as _bootstrap,
+    )
+    from prima.ibroker_refresh import http_get_root as _http_get_root
+    from prima.ibroker_refresh import login as _login
+    from prima.ibroker_refresh import make_driver as _make_driver
+    from prima.ibroker_refresh import parse_all_tables_from_page as _parse_all_tables
+    from prima.ibroker_refresh import post_fetch_grid as _post_fetch_grid
+    from prima.ibroker_refresh import post_link_event as _post_link_event
+    from prima.ibroker_refresh import wait_aspnet_idle as _wait_aspnet_idle
 
     login = _login
     make_driver = _make_driver
@@ -53,6 +55,7 @@ def import_scrape_ibroker():
 MERGE_KEY_COLUMNS = ["study_id", "Study DateTime", "StudyDescription"]
 EXPORT_STATE_COLUMNS = MERGE_KEY_COLUMNS + [
     "is_exported",
+    "is_requested",
     "download_attempt_outcome",
     "export_requested_on",
 ]
@@ -469,6 +472,7 @@ def save_current_state(
     """
     export_state_columns = merge_key_columns + [
         "is_exported",
+        "is_requested",
         "download_attempt_outcome",
         "export_requested_on",
     ]
@@ -477,8 +481,12 @@ def save_current_state(
     export_state = db[available_cols].copy()
 
     # only keep rows that have meaningful export state
+    requested_series = export_state.get(
+        "is_requested", pd.Series(False, index=export_state.index)
+    )
     has_state = (
         export_state["is_exported"].fillna(False)
+        | requested_series.fillna(False)
         | export_state["download_attempt_outcome"].notna()
         | export_state["export_requested_on"].notna()
     )
@@ -542,6 +550,10 @@ def identify_download_targets(
         df["is_exported"] = df["is_exported"].fillna(False).astype(bool)
     else:
         df["is_exported"] = False
+    if "is_requested" in df.columns:
+        df["is_requested"] = df["is_requested"].fillna(False).astype(bool)
+    else:
+        df["is_requested"] = False
 
     # filter to modality first for summary
     modality_mask = df["base_modality"] == modality
@@ -557,18 +569,30 @@ def identify_download_targets(
     exported_not_on_disk = (
         (modality_df["is_exported"]) & (~modality_df["is_on_disk"])
     ).sum()
-    not_exported = ((~modality_df["is_exported"]) & (~modality_df["is_on_disk"])).sum()
+    requested_not_on_disk = (
+        modality_df["is_requested"]
+        & (~modality_df["is_exported"])
+        & (~modality_df["is_on_disk"])
+    ).sum()
+    not_exported = (
+        (~modality_df["is_exported"])
+        & (~modality_df["is_requested"])
+        & (~modality_df["is_on_disk"])
+    ).sum()
 
     if verbose:
         print(f"  Total {modality} exams in iBroker:     {total_modality:>8,}")
         print(f"  Already on disk (done):              {on_disk:>8,}")
         print(f"  Exported but not on disk (sync?):    {exported_not_on_disk:>8,}")
+        print(f"  Requested and waiting:               {requested_not_on_disk:>8,}")
         print(f"  Not yet exported (REMAINING):        {not_exported:>8,}")
 
         # check phenotype coverage for remaining
         if "chip" in modality_df.columns:
-            remaining_mask = (~modality_df["is_on_disk"]) & (
-                ~modality_df["is_exported"]
+            remaining_mask = (
+                (~modality_df["is_on_disk"])
+                & (~modality_df["is_exported"])
+                & (~modality_df["is_requested"])
             )
             remaining_df = modality_df[remaining_mask]
             with_genotype = remaining_df["chip"].notna().sum()
@@ -592,6 +616,14 @@ def identify_download_targets(
     targets = targets[~mask_on_disk]
     if verbose:
         print(f"  - Rejected {mask_on_disk.sum():,} because they are already on disk.")
+
+    requested_mask = targets["is_requested"]
+    targets.loc[requested_mask, "rejection_reason"] = "Already requested in iBroker"
+    targets = targets[~requested_mask]
+    if verbose:
+        print(
+            f"  - Rejected {requested_mask.sum():,} because request is already in flight."
+        )
 
     # We still check if it's exported, but now it's a secondary check.
     # An exam could be exported but the sync failed, so it's not on disk.
@@ -817,6 +849,7 @@ def execute_downloads(
                         full_db.loc[index, "download_attempt_outcome"] = (
                             "Request Submitted"
                         )
+                        full_db.loc[index, "is_requested"] = True
                         if "Status" in full_db.columns:
                             full_db.loc[index, "Status"] = "Request Submitted"
                 else:
@@ -829,6 +862,7 @@ def execute_downloads(
                     # Mark as exported in the full database if provided
                     if full_db is not None:
                         full_db.loc[index, "is_exported"] = True
+                        full_db.loc[index, "is_requested"] = False
                         full_db.loc[index, "download_attempt_outcome"] = (
                             "Already Exported"
                         )
@@ -964,6 +998,7 @@ def audit_remote_export_status(
                 if target_key in available_on_page:
                     still_available += 1
                     if full_db is not None:
+                        full_db.loc[index, "is_requested"] = True
                         full_db.loc[index, "download_attempt_outcome"] = (
                             "Audit: Available"
                         )
@@ -971,6 +1006,7 @@ def audit_remote_export_status(
                     marked_exported += 1
                     if full_db is not None:
                         full_db.loc[index, "is_exported"] = True
+                        full_db.loc[index, "is_requested"] = False
                         full_db.loc[index, "download_attempt_outcome"] = (
                             "Audit: Already Exported"
                         )

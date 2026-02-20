@@ -86,6 +86,11 @@ from numcodecs import Blosc
 from pydicom import config
 from pydicom.dataset import FileDataset
 from pydicom.pixel_data_handlers import gdcm_handler, numpy_handler, pillow_handler
+from prima.view_selection import (
+    estimate_magnification_factor,
+    estimate_pixel_spacing_mm,
+    view_selection_key,
+)
 
 try:
     from pydicom.pixel_data_handlers import pylibjpeg_handler
@@ -783,6 +788,12 @@ def _process_exam_dir(
                     "device_model": str(ds.get("ManufacturerModelName", "")),
                     "study_date": get_tag(ds, (0x0008, 0x0020), ""),
                     "accession_number": get_tag(ds, (0x0008, 0x0050), ""),
+                    "estimated_magnification_factor": estimate_magnification_factor(
+                        ds.get("EstimatedRadiographicMagnificationFactor")
+                    ),
+                    "pixel_spacing_mm": estimate_pixel_spacing_mm(
+                        ds.get("PixelSpacing")
+                    ),
                 }
 
                 rows.append(row_data)
@@ -1467,17 +1478,35 @@ def select_full_quad(df_views: pd.DataFrame) -> pd.DataFrame:
     df = df[df["for_presentation"]]
     df = df[df["laterality"].isin(["L", "R"]) & df["view"].isin(["CC", "MLO"])]
 
-    # check for duplicates - fail loudly if found
+    # select exactly one canonical image per (exam_id, laterality, view) with shared policy
+    df["_view_selection_key"] = [
+        view_selection_key(
+            for_presentation=bool(for_presentation),
+            estimated_magnification_factor=mag,
+            pixel_spacing_mm=pixel_spacing_mm,
+            dicom_path=dicom_path,
+        )
+        for for_presentation, mag, pixel_spacing_mm, dicom_path in zip(
+            df["for_presentation"],
+            df["estimated_magnification_factor"],
+            df["pixel_spacing_mm"],
+            df["dicom_path"],
+        )
+    ]
     view_counts = df.groupby(["exam_id", "laterality", "view"]).size()
     duplicates = view_counts[view_counts > 1]
-
     if len(duplicates) > 0:
-        dup_examples = duplicates.head(10)
-        raise RuntimeError(
-            f"found {len(duplicates)} duplicate (exam, laterality, view) combinations:\n"
-            f"{dup_examples}\n"
-            f"expected exactly one 'for_presentation' image per view position"
+        logger.warning(
+            f"resolving {len(duplicates)} duplicate (exam, laterality, view) groups via shared view selection key"
         )
+    df = (
+        df.sort_values(
+            by=["exam_id", "laterality", "view", "_view_selection_key"],
+            kind="stable",
+        )
+        .drop_duplicates(subset=["exam_id", "laterality", "view"], keep="first")
+        .drop(columns=["_view_selection_key"])
+    )
 
     # keep only exams that have all four views
     counts = df.groupby("exam_id").size()
@@ -2959,6 +2988,13 @@ def parse_args():
     p.add_argument("--workers", dest="workers", type=int, default=32)
     p.add_argument("--summary", dest="summary", action="store_true")
     p.add_argument(
+        "--debug-dir",
+        dest="debug_dir",
+        type=Path,
+        default=None,
+        help="optional directory for per-dicom debug figures/logging",
+    )
+    p.add_argument(
         "--max-exams",
         dest="max_exams",
         type=int,
@@ -3133,6 +3169,13 @@ def parse_args():
         dest="raw_dir",
         type=Path,
         default=Path("/gpfs/data/huo-lab/Image/ChiMEC/MG"),
+    )
+    dv.add_argument(
+        "--debug-dir",
+        dest="debug_dir",
+        type=Path,
+        default=Path("debug_output"),
+        help="output directory for debug figures",
     )
     dv.add_argument(
         "--max-exams",
