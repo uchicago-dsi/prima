@@ -4,13 +4,22 @@ Shared filesystem utilities for ChiMEC imaging data management.
 Contains functions for scanning and inventorying downloaded imaging data.
 """
 
+from __future__ import annotations
+
 import json
 import os
+import re
+import tempfile
+import warnings
 from pathlib import Path
 from typing import Dict, Optional, Set
 
 import pandas as pd
+import pydicom
 from tqdm.auto import tqdm
+
+# suppress pydicom VR UI validation warnings for non-standard UIDs
+warnings.filterwarnings("ignore", message=".*Invalid value for VR UI.*", append=True)
 
 # default fingerprint cache location
 DEFAULT_FINGERPRINT_CACHE = Path("data/destination_fingerprints.json")
@@ -505,3 +514,482 @@ def check_disk_for_downloads(
         )
 
     return df
+
+
+def _normalize_accession(accession: str) -> str:
+    """Normalize accession string for robust matching."""
+    return re.sub(r"[^A-Za-z0-9]", "", str(accession).upper())
+
+
+def _extract_date_from_entry_name(entry_name: str) -> str | None:
+    """Extract YYYY-MM-DD date suffix from disk entry name when present."""
+    match = re.search(r"(\d{4})-(\d{2})-(\d{2})$", entry_name)
+    if match is None:
+        return None
+    return f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
+
+
+def _read_study_date_from_exam_dir(exam_dir: Path) -> str | None:
+    """Read StudyDate from the first parseable DICOM file in an exam directory."""
+    if not exam_dir.exists() or not exam_dir.is_dir():
+        return None
+    try:
+        for candidate in exam_dir.rglob("*"):
+            try:
+                if not candidate.is_file():
+                    continue
+            except OSError:
+                continue
+            try:
+                dcm = pydicom.dcmread(str(candidate), stop_before_pixels=True)
+                study_date = str(dcm.get("StudyDate", "")).strip()
+                if len(study_date) >= 8 and study_date[:8].isdigit():
+                    return f"{study_date[:4]}-{study_date[4:6]}-{study_date[6:8]}"
+            except Exception:
+                continue
+    except OSError:
+        return None
+    return None
+
+
+def _read_light_fingerprint_from_exam_dir(exam_dir: Path) -> dict | None:
+    """
+    Read StudyInstanceUID, StudyDate, StudyTime from the first DICOM in an exam dir.
+    Never uses filename; always from DICOM metadata.
+    Returns dict with keys: study_uid, study_date (YYYYMMDD), study_time, or None if unreadable.
+    """
+    if not exam_dir.exists() or not exam_dir.is_dir():
+        return None
+    try:
+        for candidate in exam_dir.rglob("*"):
+            try:
+                if not candidate.is_file():
+                    continue
+            except OSError:
+                continue
+            try:
+                dcm = pydicom.dcmread(str(candidate), stop_before_pixels=True)
+                study_uid = str(dcm.get("StudyInstanceUID", "")).strip()
+                if not study_uid:
+                    continue
+                study_date = str(dcm.get("StudyDate", "")).strip()
+                study_date = (
+                    study_date[:8]
+                    if len(study_date) >= 8 and study_date[:8].isdigit()
+                    else None
+                )
+                study_time = (
+                    str(dcm.get("StudyTime", "")).strip()
+                    if dcm.get("StudyTime")
+                    else None
+                )
+                return {
+                    "study_uid": study_uid,
+                    "study_date": study_date,
+                    "study_time": study_time,
+                }
+            except Exception:
+                continue
+    except OSError:
+        return None
+    return None
+
+
+def build_chimec_disk_fingerprints(
+    basedir: str,
+    output_dir: Path | str = "fingerprints/chimec",
+    modality: str = "MG",
+) -> tuple[Path, Path]:
+    """
+    Build light fingerprints for ChiMEC disk exams: study_id, study_date, study_uid.
+    Always reads from DICOM metadata; never uses filename for date.
+
+    Parameters
+    ----------
+    basedir : str
+        Base directory (e.g. /gpfs/data/huo-lab/Image/ChiMEC/MG or
+        /gpfs/data/huo-lab/Image/ChiMEC for modality subdirs)
+    output_dir : Path | str
+        Directory for output files (default: fingerprints/chimec)
+    modality : str
+        Modality code (e.g. MG). If basedir contains modality subdirs, scans that subdir.
+
+    Returns
+    -------
+    tuple[Path, Path]
+        (json_path, csv_path)
+    """
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    json_path = output_path / "disk_fingerprints.json"
+    csv_path = output_path / "disk_fingerprints.csv"
+
+    base_path = Path(basedir)
+    if not base_path.exists():
+        raise RuntimeError(f"disk path does not exist: {basedir}")
+
+    modality_upper = modality.upper()
+    modality_subdir = base_path / modality_upper
+    if modality_subdir.exists() and modality_subdir.is_dir():
+        scan_root = modality_subdir
+    else:
+        scan_root = base_path
+
+    patient_dirs = [d for d in os.scandir(scan_root) if d.is_dir() and d.name.isdigit()]
+    print(
+        f"Building ChiMEC fingerprints from {scan_root} ({len(patient_dirs):,} patient dirs)"
+    )
+
+    disk_inventory: Dict[str, Dict[str, tuple]] = {}
+    csv_rows: list[dict] = []
+
+    for patient_dir in tqdm(patient_dirs, desc="fingerprinting"):
+        patient_id = patient_dir.name
+        exams: Dict[str, tuple] = {}
+
+        try:
+            for item in os.scandir(patient_dir.path):
+                entry_name = item.name
+                accession = None
+                if item.is_dir():
+                    accession = item.name.split("-")[0]
+                    exam_path = Path(item.path)
+                elif item.is_file() and item.name.endswith(".tar.xz"):
+                    accession = item.name[:-7]
+                    continue
+                else:
+                    continue
+                if not accession:
+                    continue
+
+                fp = _read_light_fingerprint_from_exam_dir(exam_path)
+                if fp is None:
+                    continue
+
+                study_uid = fp["study_uid"]
+                study_date = fp["study_date"]
+                study_time = fp.get("study_time")
+
+                exams[entry_name] = (study_uid, [], study_date, study_time)
+
+                study_date_iso = study_date
+                if study_date and len(study_date) >= 8:
+                    study_date_iso = (
+                        f"{study_date[:4]}-{study_date[4:6]}-{study_date[6:8]}"
+                    )
+                csv_rows.append(
+                    {
+                        "patient_id": patient_id,
+                        "entry_name": entry_name,
+                        "study_uid": study_uid,
+                        "study_date": study_date,
+                        "study_date_iso": study_date_iso or "",
+                        "study_time": study_time or "",
+                        "accession": accession,
+                    }
+                )
+        except (PermissionError, FileNotFoundError, OSError):
+            continue
+
+        if exams:
+            disk_inventory[patient_id] = exams
+
+    with open(json_path, "w") as f:
+        json.dump(disk_inventory, f, indent=2)
+
+    csv_df = pd.DataFrame(csv_rows)
+    csv_df.to_csv(csv_path, index=False)
+
+    total_exams = sum(len(e) for e in disk_inventory.values())
+    print(
+        f"  Wrote {json_path} ({len(disk_inventory):,} patients, {total_exams:,} exams) "
+        f"and {csv_path}"
+    )
+    return json_path, csv_path
+
+
+def reconcile_disk_ibroker_accessions(
+    metadata_df: pd.DataFrame,
+    basedir: str,
+    *,
+    modality: str = "MG",
+    output_csv: Path | None = None,
+    fingerprint_cache: Path | None = None,
+) -> dict[str, int]:
+    """Reconcile disk exams vs iBroker metadata and classify mismatch reasons.
+
+    When fingerprint_cache is provided and exists, disk dates are taken from DICOM
+    metadata in the fingerprint (never from filename). Otherwise falls back to
+    scanning disk and inferring date from filename or DICOM.
+    """
+    modality_upper = modality.upper()
+    subset_all = metadata_df[metadata_df["base_modality"] == modality_upper].copy()
+    subset_all["study_id"] = subset_all["study_id"].astype("string")
+    subset_all["Study DateTime"] = pd.to_datetime(
+        subset_all["Study DateTime"], errors="coerce"
+    )
+    subset_all["study_date"] = subset_all["Study DateTime"].dt.strftime("%Y-%m-%d")
+    ib_all_ids = set(subset_all["study_id"].dropna().astype(str))
+    ib_all_date_pairs = set(
+        zip(
+            subset_all["study_id"].dropna().astype(str),
+            subset_all["study_date"].fillna("").astype(str),
+        )
+    )
+
+    subset = subset_all.copy()
+    subset["ib_accession"] = subset["Accession"].astype("string")
+    subset = subset.dropna(subset=["study_id", "ib_accession"])
+    subset["ib_accession_norm"] = subset["ib_accession"].map(_normalize_accession)
+
+    ib_key_set = set(zip(subset["study_id"], subset["ib_accession_norm"]))
+    ib_date_groups = (
+        subset.groupby(["study_id", "study_date"], dropna=True)["ib_accession_norm"]
+        .agg(list)
+        .to_dict()
+    )
+    ib_date_pairs = set(ib_date_groups.keys())
+    ib_date_multiplicity = (
+        subset.groupby(["study_id", "study_date"], dropna=True)["ib_accession_norm"]
+        .size()
+        .to_dict()
+    )
+
+    disk_records = []
+    inferred_dates_from_dicom = 0
+    tar_xz_entries = 0
+    partial_output_csv = None
+    if output_csv is not None:
+        partial_output_csv = output_csv.with_name(
+            f"{output_csv.stem}_partial{output_csv.suffix}"
+        )
+
+    if fingerprint_cache is not None and Path(fingerprint_cache).exists():
+        print(
+            f"Using fingerprint cache for disk dates (DICOM-only): {fingerprint_cache}"
+        )
+        with open(fingerprint_cache) as f:
+            raw = json.load(f)
+        for patient_id, exams in tqdm(
+            raw.items(), desc="reconciling from fingerprints"
+        ):
+            for entry_name, data in exams.items():
+                uid, hashes, study_date, study_time = data
+                accession = entry_name.split("-")[0]
+                accession_norm = _normalize_accession(accession)
+                disk_date = None
+                if study_date and len(study_date) >= 8:
+                    disk_date = f"{study_date[:4]}-{study_date[4:6]}-{study_date[6:8]}"
+                    inferred_dates_from_dicom += 1
+                disk_records.append(
+                    {
+                        "study_id": patient_id,
+                        "disk_accession": accession,
+                        "disk_accession_norm": accession_norm,
+                        "disk_date": disk_date,
+                        "disk_entry_name": entry_name,
+                        "study_uid": uid,
+                    }
+                )
+    else:
+        base_path = Path(basedir)
+        if not base_path.exists():
+            raise RuntimeError(f"disk path does not exist: {basedir}")
+
+        patient_dirs = [
+            d for d in os.scandir(base_path) if d.is_dir() and d.name.isdigit()
+        ]
+        for patient_idx, patient_dir in enumerate(
+            tqdm(patient_dirs, desc="reconciling disk exams"), start=1
+        ):
+            patient_id = patient_dir.name
+            try:
+                for item in os.scandir(patient_dir.path):
+                    accession = None
+                    if item.is_dir():
+                        accession = item.name.split("-")[0]
+                        entry_name = item.name
+                        disk_date = _extract_date_from_entry_name(entry_name)
+                        if disk_date is None:
+                            disk_date = _read_study_date_from_exam_dir(Path(item.path))
+                            if disk_date is not None:
+                                inferred_dates_from_dicom += 1
+                    elif item.is_file() and item.name.endswith(".tar.xz"):
+                        accession = item.name[:-7]
+                        entry_name = item.name
+                        disk_date = _extract_date_from_entry_name(entry_name)
+                        tar_xz_entries += 1
+                    else:
+                        continue
+                    if not accession:
+                        continue
+                    accession_norm = _normalize_accession(accession)
+                    disk_records.append(
+                        {
+                            "study_id": patient_id,
+                            "disk_accession": accession,
+                            "disk_accession_norm": accession_norm,
+                            "disk_date": disk_date,
+                            "disk_entry_name": entry_name,
+                            "study_uid": None,
+                        }
+                    )
+            except (PermissionError, FileNotFoundError, OSError):
+                continue
+
+            if partial_output_csv is not None and patient_idx % 250 == 0:
+                partial_df = pd.DataFrame(disk_records)
+                partial_output_csv.parent.mkdir(parents=True, exist_ok=True)
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    suffix=".tmp",
+                    prefix=f".{partial_output_csv.name}.",
+                    dir=partial_output_csv.parent,
+                    delete=False,
+                    encoding="utf-8",
+                    newline="",
+                ) as tmp_file:
+                    tmp_path = Path(tmp_file.name)
+                    partial_df.to_csv(tmp_file, index=False)
+                os.replace(tmp_path, partial_output_csv)
+
+    disk_df = pd.DataFrame(disk_records)
+    if disk_df.empty:
+        return {
+            "disk_total": 0,
+            "ib_total": len(subset),
+            "exact_match": 0,
+            "accession_changed_unambiguous": 0,
+            "accession_changed_ambiguous": 0,
+            "disk_only": 0,
+            "disk_no_date": 0,
+            "disk_with_date": 0,
+            "disk_tar_xz_entries": 0,
+            "ib_multi_patient_date": 0,
+            "disk_multi_patient_date": 0,
+            "ib_patient_date_pairs": len(ib_date_pairs),
+            "disk_patient_date_pairs": 0,
+            "shared_patient_date_pairs": 0,
+            "disk_rows_with_shared_patient_date": 0,
+            "disk_dates_inferred_from_dicom": 0,
+            "disk_only_with_date_pair_in_any_ibroker": 0,
+            "disk_only_with_date_study_id_not_in_ibroker": 0,
+            "disk_only_with_date_study_id_in_ibroker_but_date_not": 0,
+            "study_ids_on_disk_not_in_ibroker": 0,
+        }
+
+    disk_study_ids = set(disk_df["study_id"].astype(str))
+    study_ids_on_disk_not_in_ibroker = len(disk_study_ids - ib_all_ids)
+
+    disk_df["match_type"] = "disk_only"
+    disk_df["ib_accession_norm"] = pd.NA
+    disk_df["ib_patient_date_count"] = 0
+    disk_df["disk_patient_date_count"] = 0
+
+    exact_mask = [
+        (sid, acc_norm) in ib_key_set
+        for sid, acc_norm in zip(disk_df["study_id"], disk_df["disk_accession_norm"])
+    ]
+    disk_df.loc[exact_mask, "match_type"] = "exact_patient_accession"
+
+    unresolved = disk_df["match_type"] == "disk_only"
+    unresolved_with_date = unresolved & disk_df["disk_date"].notna()
+    for idx, row in disk_df[unresolved_with_date].iterrows():
+        key = (row["study_id"], row["disk_date"])
+        ib_accessions = ib_date_groups.get(key)
+        if not ib_accessions:
+            continue
+        date_count = len(ib_accessions)
+        disk_df.loc[idx, "ib_patient_date_count"] = date_count
+        if date_count == 1:
+            disk_df.loc[idx, "match_type"] = "accession_changed_unambiguous"
+            disk_df.loc[idx, "ib_accession_norm"] = ib_accessions[0]
+        else:
+            disk_df.loc[idx, "match_type"] = "accession_changed_ambiguous"
+
+    disk_known_date = disk_df[disk_df["disk_date"].notna()].copy()
+    disk_date_pair_set = set(
+        zip(disk_known_date["study_id"], disk_known_date["disk_date"])
+    )
+    shared_date_pairs = disk_date_pair_set & ib_date_pairs
+    disk_rows_with_shared_date = int(
+        (
+            disk_df["disk_date"].notna()
+            & [
+                (sid, d) in shared_date_pairs
+                for sid, d in zip(disk_df["study_id"], disk_df["disk_date"])
+            ]
+        ).sum()
+    )
+    if not disk_known_date.empty:
+        disk_date_mult = (
+            disk_known_date.groupby(["study_id", "disk_date"])["disk_accession_norm"]
+            .size()
+            .to_dict()
+        )
+        for idx, row in disk_known_date.iterrows():
+            disk_df.loc[idx, "disk_patient_date_count"] = disk_date_mult.get(
+                (row["study_id"], row["disk_date"]), 0
+            )
+    else:
+        disk_date_mult = {}
+
+    if output_csv is not None:
+        output_csv.parent.mkdir(parents=True, exist_ok=True)
+        disk_df.to_csv(output_csv, index=False)
+        if partial_output_csv is not None and partial_output_csv.exists():
+            partial_output_csv.unlink()
+
+    summary = {
+        "disk_total": len(disk_df),
+        "ib_total": len(subset),
+        "exact_match": int((disk_df["match_type"] == "exact_patient_accession").sum()),
+        "accession_changed_unambiguous": int(
+            (disk_df["match_type"] == "accession_changed_unambiguous").sum()
+        ),
+        "accession_changed_ambiguous": int(
+            (disk_df["match_type"] == "accession_changed_ambiguous").sum()
+        ),
+        "disk_only": int((disk_df["match_type"] == "disk_only").sum()),
+        "disk_no_date": int(disk_df["disk_date"].isna().sum()),
+        "disk_with_date": int(disk_df["disk_date"].notna().sum()),
+        "ib_patient_date_pairs": int(len(ib_date_pairs)),
+        "disk_patient_date_pairs": int(len(disk_date_pair_set)),
+        "shared_patient_date_pairs": int(len(shared_date_pairs)),
+        "disk_rows_with_shared_patient_date": int(disk_rows_with_shared_date),
+        "ib_multi_patient_date": int(
+            sum(1 for count in ib_date_multiplicity.values() if count > 1)
+        ),
+        "disk_multi_patient_date": int(
+            sum(1 for count in disk_date_mult.values() if count > 1)
+        ),
+        "disk_dates_inferred_from_dicom": int(inferred_dates_from_dicom),
+        "disk_tar_xz_entries": int(tar_xz_entries),
+    }
+    disk_only_df = disk_df[disk_df["match_type"] == "disk_only"].copy()
+    disk_only_with_date = disk_only_df[disk_only_df["disk_date"].notna()].copy()
+    if disk_only_with_date.empty:
+        summary["disk_only_with_date_pair_in_any_ibroker"] = 0
+        summary["disk_only_with_date_study_id_not_in_ibroker"] = 0
+        summary["disk_only_with_date_study_id_in_ibroker_but_date_not"] = 0
+    else:
+        pair_in_any = [
+            (sid, date) in ib_all_date_pairs
+            for sid, date in zip(
+                disk_only_with_date["study_id"].astype(str),
+                disk_only_with_date["disk_date"].astype(str),
+            )
+        ]
+        sid_in_any = disk_only_with_date["study_id"].astype(str).isin(ib_all_ids)
+        pair_in_any_series = pd.Series(pair_in_any, index=disk_only_with_date.index)
+        summary["disk_only_with_date_pair_in_any_ibroker"] = int(
+            pair_in_any_series.sum()
+        )
+        summary["disk_only_with_date_study_id_not_in_ibroker"] = int(
+            (~sid_in_any).sum()
+        )
+        summary["disk_only_with_date_study_id_in_ibroker_but_date_not"] = int(
+            (sid_in_any & ~pair_in_any_series).sum()
+        )
+    summary["study_ids_on_disk_not_in_ibroker"] = int(study_ids_on_disk_not_in_ibroker)
+    return summary

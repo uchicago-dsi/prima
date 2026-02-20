@@ -24,15 +24,39 @@ from prima.export_utils import (
     parse_wait_interval,
     save_current_state,
 )
-from prima.filesystem_utils import update_metadata_with_disk_status_by_date
+from prima.filesystem_utils import (
+    build_chimec_disk_fingerprints,
+    check_disk_for_downloads,
+    reconcile_disk_ibroker_accessions,
+)
+from prima.ibroker_refresh import add_ibroker_state_columns, refresh_metadata_snapshot
 
 # ChiMEC dataset configuration
 CHIMEC_PATIENTS_FILE = "/gpfs/data/phs/groups/Projects/Huo_projects/SPORE/annawoodard/List_ChiMEC_priority_2025July30.csv"
 CHIMEC_KEY_FILE = "/gpfs/data/huo-lab/Image/ChiMEC/study-16352a.csv"
 CHIMEC_METADATA_FILE = "data/imaging_metadata.csv"
 CHIMEC_EXPORT_STATE_FILE = Path("data/export_state_chimec.csv")
-CHIMEC_FINGERPRINT_CACHE = Path("data/destination_fingerprints_chimec.json")
+CHIMEC_FINGERPRINT_DIR = Path("fingerprints/chimec")
+CHIMEC_FINGERPRINT_CACHE = CHIMEC_FINGERPRINT_DIR / "disk_fingerprints.json"
 CHIMEC_BASE_DOWNLOAD_DIR = "/gpfs/data/huo-lab/Image/ChiMEC/"
+CHIMEC_IBROKER_STUDY_NUMBER = "16352A"
+CHIMEC_MODALITY = "MG"  # ChiMEC fingerprint/reconciliation are MG-only
+
+
+REQUESTED_OUTCOME_VALUES = {
+    "request submitted",
+    "requested",
+    "start cmove",
+    "study retrieved",
+    "audit: available",
+}
+
+REQUESTED_STATUS_VALUES = {
+    "request submitted",
+    "requested",
+    "start cmove",
+    "study retrieved",
+}
 
 
 def load_chimec_data():
@@ -42,7 +66,7 @@ def load_chimec_data():
         print(f"Loaded {len(patients):,} rows from patient info file.")
         key = pd.read_csv(CHIMEC_KEY_FILE)
         print(f"Loaded {len(key):,} rows from study_id-MRN key file.")
-        metadata = pd.read_csv(CHIMEC_METADATA_FILE)
+        metadata = pd.read_csv(CHIMEC_METADATA_FILE, low_memory=False)
         print(f"Loaded {len(metadata):,} exam records from raw metadata file.")
 
         # A small fix: The Accession number is often what we care about, not the old exam_id
@@ -62,26 +86,7 @@ def load_chimec_data():
                 metadata["Exported On"], errors="coerce"
             )
 
-        # initialize export state columns from scraper metadata where available
-        if "is_exported" not in metadata.columns:
-            metadata["is_exported"] = False
-
-        status_series = metadata.get("Status")
-        if status_series is not None:
-            exported_status_mask = (
-                status_series.fillna("")
-                .astype(str)
-                .str.strip()
-                .str.lower()
-                .isin({"already exported", "exported"})
-            )
-            metadata.loc[exported_status_mask, "is_exported"] = True
-
-        if "Exported On" in metadata.columns:
-            exported_on_mask = metadata["Exported On"].notna()
-            metadata.loc[exported_on_mask, "is_exported"] = True
-
-        metadata["is_exported"] = metadata["is_exported"].fillna(False).astype(bool)
+        metadata = add_ibroker_state_columns(metadata)
         metadata["download_attempt_outcome"] = pd.NA
         metadata["download_attempt_outcome"] = metadata[
             "download_attempt_outcome"
@@ -101,6 +106,10 @@ def load_chimec_data():
             export_state["is_exported"] = (
                 export_state["is_exported"].fillna(False).astype(bool)
             )
+            if "is_requested" in export_state.columns:
+                export_state["is_requested"] = (
+                    export_state["is_requested"].fillna(False).astype(bool)
+                )
             export_state["download_attempt_outcome"] = export_state[
                 "download_attempt_outcome"
             ].astype("string")
@@ -114,13 +123,22 @@ def load_chimec_data():
             # prefer values from export state file
             for col in [
                 "is_exported",
+                "is_requested",
                 "download_attempt_outcome",
                 "export_requested_on",
             ]:
                 state_col = f"{col}_state"
                 if state_col in metadata.columns:
                     mask = metadata[state_col].notna()
-                    metadata.loc[mask, col] = metadata.loc[mask, state_col]
+                    if col in {"is_exported", "is_requested"}:
+                        metadata[col] = metadata[col].astype("boolean")
+                        metadata[state_col] = metadata[state_col].astype("boolean")
+                        metadata.loc[mask, col] = metadata.loc[mask, state_col].astype(
+                            "boolean"
+                        )
+                        metadata[col] = metadata[col].fillna(False).astype(bool)
+                    else:
+                        metadata.loc[mask, col] = metadata.loc[mask, state_col]
                     metadata.drop(columns=[state_col], inplace=True)
     except FileNotFoundError as e:
         print(f"ERROR: Input file not found - {e}", file=sys.stderr)
@@ -179,8 +197,36 @@ def load_chimec_data():
 
     has_accession = db["Accession"].notna()
     db.loc[has_accession, "is_exported"] = True
+    db.loc[has_accession, "is_requested"] = False
 
-    db["is_exported"] = db["is_exported"].fillna(False).astype(bool)
+    db["is_exported"] = db["is_exported"].astype("boolean").fillna(False).astype(bool)
+    if "is_requested" not in db.columns:
+        db["is_requested"] = False
+    db["is_requested"] = db["is_requested"].astype("boolean").fillna(False).astype(bool)
+
+    outcome_requested = (
+        db["download_attempt_outcome"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .isin(REQUESTED_OUTCOME_VALUES)
+    )
+    status_requested = (
+        db.get("Status", pd.Series("", index=db.index))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .isin(REQUESTED_STATUS_VALUES)
+    )
+    requested_by_timestamp = db["export_requested_on"].notna()
+    db["is_requested"] = (~db["is_exported"]) & (
+        db["is_requested"]
+        | outcome_requested
+        | status_requested
+        | requested_by_timestamp
+    )
 
     modality_counts = (
         db.loc[db["is_exported"], "base_modality"].fillna("<missing>").value_counts()
@@ -218,6 +264,181 @@ def load_chimec_data():
     return db
 
 
+def print_cycle_status_snapshot(
+    db: pd.DataFrame,
+    modality: str,
+    refresh_summary: dict[str, int | bool] | None,
+) -> None:
+    """Print a concise per-cycle status snapshot for export decisions."""
+    modality_mask = db["base_modality"] == modality
+    subset = db[modality_mask]
+    total = len(subset)
+    on_disk = subset["is_on_disk"].fillna(False).astype(bool).sum()
+    exported_not_on_disk = (
+        subset["is_exported"].fillna(False).astype(bool)
+        & ~subset["is_on_disk"].fillna(False).astype(bool)
+    ).sum()
+    requested_not_on_disk = (
+        subset["is_requested"].fillna(False).astype(bool)
+        & ~subset["is_exported"].fillna(False).astype(bool)
+        & ~subset["is_on_disk"].fillna(False).astype(bool)
+    ).sum()
+    remaining = (
+        ~subset["is_exported"].fillna(False).astype(bool)
+        & ~subset["is_requested"].fillna(False).astype(bool)
+        & ~subset["is_on_disk"].fillna(False).astype(bool)
+    ).sum()
+    print("\n=== Cycle status snapshot ===")
+    print(f"modality: {modality}")
+    print(f"known exams in metadata: {total:,}")
+    print(f"on disk: {on_disk:,}")
+    print(f"exported not on disk: {exported_not_on_disk:,}")
+    print(f"requested not on disk: {requested_not_on_disk:,}")
+    print(f"eligible to request now: {remaining:,}")
+    if refresh_summary is not None:
+        if bool(refresh_summary["is_complete"]):
+            print("metadata refresh: complete")
+        else:
+            print(
+                "metadata refresh: in progress "
+                f"({refresh_summary['completed_batches']}/{refresh_summary['total_batches']} batches)"
+            )
+
+
+def apply_disk_status_for_modality(db: pd.DataFrame, modality: str) -> pd.DataFrame:
+    """Apply disk status check only for the requested modality subset."""
+    modality_upper = modality.upper()
+    modality_dir = Path(CHIMEC_BASE_DOWNLOAD_DIR) / modality_upper
+    if modality_dir.exists() and modality_dir.is_dir():
+        disk_check_dir = str(modality_dir)
+    else:
+        disk_check_dir = CHIMEC_BASE_DOWNLOAD_DIR
+
+    modality_mask = db["base_modality"] == modality_upper
+    subset = db[modality_mask].copy()
+    if subset.empty:
+        db["is_on_disk"] = False
+        return db
+
+    subset = check_disk_for_downloads(
+        subset,
+        basedir=disk_check_dir,
+        fingerprint_cache=CHIMEC_FINGERPRINT_CACHE,
+    )
+    db["is_on_disk"] = False
+    db.loc[subset.index, "is_on_disk"] = subset["is_on_disk"].fillna(False).astype(bool)
+    return db
+
+
+def get_modality_disk_dir(modality: str) -> str:
+    """Resolve modality-specific disk directory, falling back to dataset root."""
+    modality_upper = modality.upper()
+    modality_dir = Path(CHIMEC_BASE_DOWNLOAD_DIR) / modality_upper
+    if modality_dir.exists() and modality_dir.is_dir():
+        return str(modality_dir)
+    return CHIMEC_BASE_DOWNLOAD_DIR
+
+
+def run_reconciliation_if_enabled(args, db: pd.DataFrame, cycle_number: int) -> None:
+    """Run disk-vs-iBroker reconciliation and print ambiguity-focused summary."""
+    if not args.reconcile_disk_ibroker:
+        return
+    output_path = Path(args.reconcile_output_csv)
+    if args.max_cycles != 1 and not args.status_only:
+        output_path = output_path.with_name(
+            f"{output_path.stem}_cycle{cycle_number}{output_path.suffix}"
+        )
+    summary = reconcile_disk_ibroker_accessions(
+        db,
+        basedir=get_modality_disk_dir(CHIMEC_MODALITY),
+        modality=CHIMEC_MODALITY,
+        output_csv=output_path,
+        fingerprint_cache=CHIMEC_FINGERPRINT_CACHE
+        if CHIMEC_FINGERPRINT_CACHE.exists()
+        else None,
+    )
+    print("\n=== disk-vs-ibroker reconciliation ===")
+    print(f"modality: {CHIMEC_MODALITY}")
+    print(f"disk exams scanned: {summary['disk_total']:,}")
+    print(f"ibroker exams with accession: {summary['ib_total']:,}")
+    print(f"exact patient+accession matches: {summary['exact_match']:,}")
+    print(
+        "accession-changed candidates (unambiguous date): "
+        f"{summary['accession_changed_unambiguous']:,}"
+    )
+    print(
+        "accession-changed candidates (ambiguous date): "
+        f"{summary['accession_changed_ambiguous']:,}"
+    )
+    print(f"disk-only after reconciliation: {summary['disk_only']:,}")
+    print(f"disk rows without date suffix: {summary['disk_no_date']:,}")
+    print(f"disk rows with date suffix: {summary['disk_with_date']:,}")
+    print(
+        "disk rows where date was inferred from DICOM metadata: "
+        f"{summary['disk_dates_inferred_from_dicom']:,}"
+    )
+    print(f"disk .tar.xz entries: {summary['disk_tar_xz_entries']:,}")
+    print(f"ibroker (study_id, study_date) pairs: {summary['ib_patient_date_pairs']:,}")
+    print(f"disk (study_id, study_date) pairs: {summary['disk_patient_date_pairs']:,}")
+    print(
+        f"shared (study_id, study_date) pairs: {summary['shared_patient_date_pairs']:,}"
+    )
+    print(
+        "disk rows whose (study_id, study_date) exists in iBroker: "
+        f"{summary['disk_rows_with_shared_patient_date']:,}"
+    )
+    print(
+        "ibroker (study_id, study_date) pairs with multiple exams: "
+        f"{summary['ib_multi_patient_date']:,}"
+    )
+    print(
+        "disk (study_id, study_date) pairs with multiple exams: "
+        f"{summary['disk_multi_patient_date']:,}"
+    )
+    print(
+        "disk-only rows (with date) whose pair exists in any iBroker row: "
+        f"{summary['disk_only_with_date_pair_in_any_ibroker']:,}"
+    )
+    print(
+        "disk-only rows (with date) whose study_id is absent from iBroker: "
+        f"{summary['disk_only_with_date_study_id_not_in_ibroker']:,}"
+    )
+    print(
+        "disk-only rows (with date) whose study_id exists but date does not: "
+        f"{summary['disk_only_with_date_study_id_in_ibroker_but_date_not']:,}"
+    )
+    print(
+        "study IDs on disk but not in iBroker: "
+        f"{summary['study_ids_on_disk_not_in_ibroker']:,}"
+    )
+    print(f"wrote reconciliation CSV: {output_path}")
+    if output_path.exists():
+        reconciled_df = pd.read_csv(output_path)
+        drift_df = reconciled_df[
+            reconciled_df["match_type"].isin(
+                ["accession_changed_unambiguous", "accession_changed_ambiguous"]
+            )
+        ].copy()
+        if not drift_df.empty:
+            print(
+                "sample accession-drift candidates (study_id, disk_date, disk_accession -> ib_accession):"
+            )
+            preview_cols = [
+                "study_id",
+                "disk_date",
+                "disk_accession",
+                "ib_accession_norm",
+                "match_type",
+            ]
+            for _, row in drift_df[preview_cols].head(10).iterrows():
+                print(
+                    "  "
+                    f"{row['study_id']}, {row['disk_date']}, "
+                    f"{row['disk_accession']} -> {row.get('ib_accession_norm', '<ambiguous>')} "
+                    f"({row['match_type']})"
+                )
+
+
 def run_export_cycle(args, cycle_number: int):
     """Run a single export pass and return summary stats.
 
@@ -234,10 +455,39 @@ def run_export_cycle(args, cycle_number: int):
     )
     print(cycle_banner)
 
+    refresh_summary = getattr(args, "_last_refresh_summary", None)
+    if args.refresh_metadata and not getattr(args, "_refresh_finished", False):
+        _, refresh_summary = refresh_chimec_metadata(
+            args.refresh_workers,
+            args.refresh_mode,
+            args.refresh_checkpoint_batch_size,
+            args.refresh_max_new_batches_per_cycle,
+        )
+        args._last_refresh_summary = refresh_summary
+        if (
+            args.refresh_max_new_batches_per_cycle > 0
+            and cycle_number == 1
+            and args.refresh_mode == "fresh"
+        ):
+            args.refresh_mode = "resume"
+            print("Refresh mode switched to resume for subsequent cycles.")
+        if not refresh_summary["is_complete"]:
+            print(
+                "Metadata refresh is still in progress: "
+                f"{refresh_summary['completed_batches']}/{refresh_summary['total_batches']} batches complete."
+            )
+        elif args.refresh_max_new_batches_per_cycle > 0:
+            args._refresh_finished = True
+            print(
+                "Metadata refresh reached full coverage; skipping refresh in future cycles."
+            )
+    elif args.refresh_metadata and getattr(args, "_refresh_finished", False):
+        print("Metadata refresh already complete in this run; skipping refresh step.")
+
     db = load_chimec_data()
-    db = update_metadata_with_disk_status_by_date(
-        db, conservative=True, fingerprint_cache=CHIMEC_FINGERPRINT_CACHE
-    )
+    db = apply_disk_status_for_modality(db, args.modality)
+    print_cycle_status_snapshot(db, args.modality.upper(), refresh_summary)
+    run_reconciliation_if_enabled(args, db, cycle_number)
 
     filter_by_genotyping = not args.no_genotyping_filter
     targets = identify_download_targets(
@@ -263,6 +513,13 @@ def run_export_cycle(args, cycle_number: int):
     if targets.empty:
         print("\n⚠ No new exams to download based on the current criteria.")
         print("   All exams may already be exported, on disk, or filtered out.")
+        refresh_summary = getattr(args, "_last_refresh_summary", None)
+        if refresh_summary is not None and not bool(refresh_summary["is_complete"]):
+            print(
+                "   Note: metadata refresh is partial "
+                f"({refresh_summary['completed_batches']}/{refresh_summary['total_batches']} batches). "
+                "Zero targets can occur before full coverage is reached."
+            )
     else:
         print("\n--- Summary of Exams to Download ---")
         print(f"Total potential targets: {len(targets)}")
@@ -282,11 +539,19 @@ def run_export_cycle(args, cycle_number: int):
                 .strip()
             )
 
-        if proceed == "y":
+        effective_batch_size = args.batch_size
+        if args.max_exports_per_hour > 0:
+            effective_batch_size = min(args.batch_size, int(args._export_tokens))
+            print(
+                f"Rate limit budget currently allows {effective_batch_size} exports this cycle "
+                f"(tokens={args._export_tokens:.1f}/{args.max_exports_per_hour:.1f})."
+            )
+
+        if proceed == "y" and effective_batch_size > 0:
             outcomes, already_exported_count, successfully_exported_count = (
                 execute_downloads(
                     targets,
-                    args.batch_size,
+                    effective_batch_size,
                     full_db=db,
                     export_state_file=CHIMEC_EXPORT_STATE_FILE,
                     merge_key_columns=MERGE_KEY_COLUMNS,
@@ -300,8 +565,10 @@ def run_export_cycle(args, cycle_number: int):
                         db.loc[index, "Status"] = outcome
                     if outcome == "Request Submitted":
                         db.loc[index, "export_requested_on"] = pd.Timestamp.now()
+                        db.loc[index, "is_requested"] = True
                     elif outcome == "Already Exported":
                         db.loc[index, "is_exported"] = True
+                        db.loc[index, "is_requested"] = False
                         if "Exported On" in db.columns and pd.isna(
                             db.loc[index, "Exported On"]
                         ):
@@ -319,6 +586,10 @@ def run_export_cycle(args, cycle_number: int):
                     f"  Discovered to be already exported: {already_exported_count} exam(s)"
                 )
             print(f"  Total exams processed: {len(outcomes)} exam(s)")
+            if args.max_exports_per_hour > 0:
+                args._export_tokens -= successfully_exported_count
+        elif proceed == "y":
+            print("✗ Cycle skipped - rate limit budget currently allows 0 exports.")
         else:
             print("✗ Cycle cancelled by user - no exports were requested.")
 
@@ -357,9 +628,7 @@ def refresh_export_status(
     )
 
     refresh_db = load_chimec_data()
-    refresh_db = update_metadata_with_disk_status_by_date(
-        refresh_db, conservative=True, fingerprint_cache=CHIMEC_FINGERPRINT_CACHE
-    )
+    refresh_db = apply_disk_status_for_modality(refresh_db, args.modality)
 
     modality = args.modality.upper()
     base_modality = refresh_db.get("base_modality")
@@ -433,6 +702,40 @@ def refresh_export_status(
     print(f"Audit state persisted to '{CHIMEC_EXPORT_STATE_FILE}'.")
 
 
+def refresh_chimec_metadata(
+    max_workers: int,
+    refresh_mode: str,
+    checkpoint_batch_size: int,
+    max_new_batches: int,
+) -> tuple[pd.DataFrame, dict[str, int | bool]]:
+    """Refresh ChiMEC metadata with explicit fresh/resume mode."""
+    study_ids = pd.read_csv(CHIMEC_KEY_FILE)["AnonymousID"].astype(str).tolist()
+    print(
+        f"\nRefreshing ChiMEC metadata from iBroker for {len(study_ids):,} study IDs "
+        f"(mode={refresh_mode}, workers={max_workers}, batch_size={checkpoint_batch_size})..."
+    )
+    refresh_limit = max_new_batches if max_new_batches > 0 else None
+    refreshed, summary = refresh_metadata_snapshot(
+        study_ids,
+        CHIMEC_METADATA_FILE,
+        study_number=CHIMEC_IBROKER_STUDY_NUMBER,
+        max_workers=max_workers,
+        refresh_mode=refresh_mode,
+        checkpoint_batch_size=checkpoint_batch_size,
+        max_new_batches=refresh_limit,
+    )
+    print(
+        f"Metadata refresh complete: wrote {len(refreshed):,} rows to "
+        f"'{CHIMEC_METADATA_FILE}'."
+    )
+    if not summary["is_complete"]:
+        print(
+            "Refresh checkpoint saved for resume: "
+            f"{summary['completed_batches']}/{summary['total_batches']} batches complete."
+        )
+    return refreshed, summary
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Identify and download ChiMEC imaging exams from iBroker."
@@ -496,16 +799,115 @@ def main():
         action="store_true",
         help="Show export status summary and exit without exporting anything.",
     )
+    parser.add_argument(
+        "--refresh-metadata",
+        action="store_true",
+        help=(
+            "Query iBroker for all ChiMEC study IDs and overwrite "
+            "data/imaging_metadata.csv before proceeding."
+        ),
+    )
+    parser.add_argument(
+        "--refresh-workers",
+        type=int,
+        default=4,
+        help="Number of parallel iBroker workers for --refresh-metadata.",
+    )
+    parser.add_argument(
+        "--refresh-mode",
+        type=str,
+        choices=["fresh", "resume"],
+        default="fresh",
+        help=(
+            "Mode for metadata refresh: fresh deletes refresh checkpoints and starts "
+            "from scratch; resume continues an interrupted refresh."
+        ),
+    )
+    parser.add_argument(
+        "--refresh-checkpoint-batch-size",
+        type=int,
+        default=500,
+        help=(
+            "Study IDs per checkpoint batch for --refresh-metadata. "
+            "Smaller values checkpoint more frequently."
+        ),
+    )
+    parser.add_argument(
+        "--refresh-max-new-batches-per-cycle",
+        type=int,
+        default=0,
+        help=(
+            "When >0, process at most this many new refresh batches per cycle. "
+            "Use with --refresh-mode resume to interleave refresh with exports."
+        ),
+    )
+    parser.add_argument(
+        "--max-exports-per-hour",
+        type=float,
+        default=0,
+        help=(
+            "Rate limit for submitted export requests. "
+            "Set to 0 to disable rate limiting."
+        ),
+    )
+    parser.add_argument(
+        "--build-fingerprints",
+        action="store_true",
+        help=(
+            "Build light fingerprints (study_id, study_date, study_uid from DICOM) "
+            "in fingerprints/chimec/ for disk-vs-iBroker cross-check. "
+            "Dates are always from DICOM metadata, never from filename."
+        ),
+    )
+    parser.add_argument(
+        "--reconcile-disk-ibroker",
+        action="store_true",
+        help=(
+            "Run disk-vs-iBroker accession reconciliation and report "
+            "accession-drift/ambiguity buckets."
+        ),
+    )
+    parser.add_argument(
+        "--reconcile-output-csv",
+        type=str,
+        default="data/chimec_disk_ibroker_reconciliation.csv",
+        help="Output CSV path for disk-vs-iBroker reconciliation details.",
+    )
 
     args = parser.parse_args()
+
+    # build-fingerprints: scan disk, read DICOM metadata, write to fingerprints/chimec/
+    if args.build_fingerprints:
+        build_chimec_disk_fingerprints(
+            basedir=CHIMEC_BASE_DOWNLOAD_DIR,
+            output_dir=CHIMEC_FINGERPRINT_DIR,
+            modality=CHIMEC_MODALITY,
+        )
+        if not args.status_only and not args.reconcile_disk_ibroker:
+            print(
+                "Fingerprints built. Run with --status-only --reconcile-disk-ibroker "
+                "to cross-check with iBroker dates."
+            )
+            sys.exit(0)
 
     # status-only mode doesn't need credentials (uses existing metadata file)
     if args.status_only:
         print("Running in --status-only mode (no exports will be performed)\n")
+        if args.refresh_metadata:
+            if not all([USERNAME, PASSWORD]):
+                print(
+                    "ERROR: IBROKER_USERNAME and IBROKER_PASSWORD must be set for --refresh-metadata.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            refresh_chimec_metadata(
+                args.refresh_workers,
+                args.refresh_mode,
+                args.refresh_checkpoint_batch_size,
+                args.refresh_max_new_batches_per_cycle,
+            )
         db = load_chimec_data()
-        db = update_metadata_with_disk_status_by_date(
-            db, conservative=True, fingerprint_cache=CHIMEC_FINGERPRINT_CACHE
-        )
+        db = apply_disk_status_for_modality(db, args.modality)
         filter_by_genotyping = not args.no_genotyping_filter
         identify_download_targets(
             db,
@@ -514,6 +916,7 @@ def main():
             base_download_dir=CHIMEC_BASE_DOWNLOAD_DIR,
             dataset="chimec",
         )
+        run_reconciliation_if_enabled(args, db, cycle_number=1)
         sys.exit(0)
 
     if not all([USERNAME, PASSWORD]):
@@ -522,13 +925,24 @@ def main():
         )
         sys.exit(1)
 
-    # import scrape_ibroker now that we know we need it (triggers credential check)
+    # import iBroker browser/http helpers only when exports are needed
     import_scrape_ibroker()
 
     cycles_run = 0
+    args._export_tokens = 0.0 if args.max_exports_per_hour > 0 else 0.0
+    args._refresh_finished = False
+    last_rate_update = time.monotonic()
     last_target_indices: list[int] | None = None
     try:
         while True:
+            if args.max_exports_per_hour > 0:
+                now = time.monotonic()
+                elapsed_seconds = now - last_rate_update
+                last_rate_update = now
+                refill = args.max_exports_per_hour * (elapsed_seconds / 3600.0)
+                args._export_tokens = min(
+                    float(args.max_exports_per_hour), args._export_tokens + refill
+                )
             cycles_run += 1
             cycle_result = run_export_cycle(args, cycles_run)
             last_target_indices = cycle_result.get("target_indices")

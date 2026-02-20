@@ -9,9 +9,9 @@ The end-to-end workflow for training/inference is:
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │ DATA ACQUISITION                                                            │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│ 1. scrape_ibroker.py  → scrapes iBroker for study metadata                  │
-│ 2. export.py          → requests exports from iBroker based on metadata     │
-│ 3. sync_local.py      → syncs exported DICOMs to GPFS (from HIRO share)     │
+│ 1. export_chimec.py --status-only --refresh-metadata → refreshes metadata    │
+│ 2. export.py          → requests exports from iBroker based on metadata      │
+│ 3. sync_local.py      → syncs exported DICOMs to GPFS (from HIRO share)      │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
@@ -98,7 +98,7 @@ export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 # echo 'export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH' >> ~/.bashrc
 ```
 
-### Selenium environment (for export.py and scrape_ibroker.py)
+### Selenium environment (for iBroker export/status refresh scripts)
 
 The main `prima` environment has dependency conflicts with selenium/geckodriver. Use a separate environment:
 
@@ -124,27 +124,45 @@ ruff check --fix .
 
 Data acquisition involves scraping metadata from iBroker, requesting exports, and syncing files to GPFS. These steps use the `selenium-ff` environment.
 
-### scrape_ibroker.py
+### metadata refresh
 
-Scrapes the iBroker web interface to build a catalog of all imaging studies for ChiMEC patients. For each patient, it extracts both "Exported" studies (already requested) and "Available" studies (not yet exported), collecting metadata like study date, description, modality, accession number, and export status.
+Refreshes the iBroker metadata snapshot for all ChiMEC study IDs and overwrites `data/imaging_metadata.csv`.
 
 ```bash
 micromamba activate selenium-ff
 export IBROKER_USERNAME=your_username
 export IBROKER_PASSWORD=your_password
-python scrape_ibroker.py
+python export_chimec.py --status-only --refresh-metadata
+# start from scratch (ignore old checkpoints)
+python export_chimec.py --status-only --refresh-metadata --refresh-mode fresh
+# continue an interrupted refresh
+python export_chimec.py --status-only --refresh-metadata --refresh-mode resume
 ```
 
-Output: `data/imaging_metadata.csv` — the complete catalog of studies in iBroker.
+Output: `data/imaging_metadata.csv` — the complete refreshed catalog of studies in iBroker.
 
-The script:
-- Uses Selenium for login, then switches to fast HTTP requests for scraping
-- Resumes from where it left off if interrupted
-- Records which studies are already on disk
+### disk fingerprints (ChiMEC)
+
+Light fingerprints (study_id, study_date, study_uid from DICOM) enable robust disk-vs-iBroker cross-check. Dates are always from DICOM metadata, never from filename.
+
+```bash
+python export_chimec.py --build-fingerprints
+```
+
+Outputs:
+- `fingerprints/chimec/disk_fingerprints.json` — compatible with disk status checks
+- `fingerprints/chimec/disk_fingerprints.csv` — flat table for iteration/cross-check
+
+When fingerprints exist, reconciliation uses them for disk dates (see `--reconcile-disk-ibroker`).
+
+The command:
+- uses Selenium for login, then HTTP requests for study queries
+- performs a full refresh of all configured study IDs
+- records current iBroker status fields for downstream export decisions
 
 ### export.py
 
-Uses the metadata from `scrape_ibroker.py` to request exports from iBroker. It identifies studies that need to be downloaded (matching modality, not already exported, not already on disk) and submits export requests via the web interface.
+Uses refreshed metadata to request exports from iBroker. It identifies studies that need to be downloaded (matching modality, not already exported/requested, not already on disk) and submits export requests via the web interface.
 
 ```bash
 micromamba activate selenium-ff
@@ -365,6 +383,12 @@ python scripts/main.py \
 ```
 
 ### Sharded parallel processing (recommended for large datasets)
+
+Important partition behavior:
+- `run_mirai_sharded.py` is a launcher that submits one SLURM job per shard
+- the launcher can run on a CPU partition (`tier1q`)
+- shard inference jobs run on the partition passed via `--partition` (use `gpuq`)
+- so GPU placement is controlled by `run_mirai_sharded.py --partition gpuq`, not by where the launcher itself runs
 
 ```bash
 python run_mirai_sharded.py \
