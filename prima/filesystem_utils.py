@@ -251,16 +251,19 @@ def update_metadata_with_disk_status_by_date(
         return metadata_df
 
     # load raw fingerprints to count exams per (patient_id, date)
+    unique_patient_studyuid_pairs: set[tuple[str, str]] = set()
     if fingerprint_cache.exists():
         with open(fingerprint_cache) as f:
             raw_fingerprints = json.load(f)
         total_disk_exams = sum(len(exams) for exams in raw_fingerprints.values())
 
-        # count exams per (patient_id, date) on disk
+        # count exams per (patient_id, date) on disk; collect (patient, study_uid) pairs
         disk_exam_counts = {}  # (patient_id, date) -> count of exams
         for patient_id, exams in raw_fingerprints.items():
             for exam_name, data in exams.items():
                 uid, hashes, study_date, study_time = data
+                if uid:
+                    unique_patient_studyuid_pairs.add((patient_id, uid))
                 if study_date and len(study_date) >= 8:
                     date_str = f"{study_date[:4]}-{study_date[4:6]}-{study_date[6:8]}"
                     key = (patient_id, date_str)
@@ -345,20 +348,58 @@ def update_metadata_with_disk_status_by_date(
 
     on_disk_count = metadata_df["is_on_disk"].sum()
     total_count = len(metadata_df)
+    disk_dupes_by_date = total_disk_exams - len(disk_exam_keys)
 
     print("\n  SUMMARY:")
-    print(f"  - unique (patient, date) pairs in ibroker: {len(ibroker_exam_keys):,}")
+    print(f"  - unique (patient, date) pairs in iBroker: {len(ibroker_exam_keys):,}")
     print(f"  - unique (patient, date) pairs on disk:    {len(disk_exam_keys):,}")
-    print(f"  - matched (patient, date) pairs:           {len(matched_keys):,}")
+    print(
+        f"  - matched (patient, date) pairs "
+        f"(in both iBroker and on disk): {len(matched_keys):,}"
+    )
     print(f"  - ambiguous matches (>1 exam same date):   {len(ambiguous_keys):,}")
     print(
         f"  - disk-only (patient, date) pairs:         {len(disk_only_keys):,} ({len(disk_only_patients):,} patients)"
     )
     print("")
+    print("  Disk exam counts:")
+    print(f"    - total exam folders on disk:        {total_disk_exams:,}")
+    print(f"    - unique (patient, date) pairs:       {len(disk_exam_keys):,}")
     print(
-        f"  - ibroker rows marked is_on_disk=True: {on_disk_count:,} / {total_count:,}"
+        f"    - unique (patient, StudyInstanceUID) pairs: {len(unique_patient_studyuid_pairs):,}"
     )
-    print(f"  - total individual exams on disk:      {total_disk_exams:,}")
+    if disk_dupes_by_date > 0:
+        print(f"    - extra exams (same patient+date):   {disk_dupes_by_date:,}")
+    print("")
+
+    # When metadata has chip column, report counts filtered to patients with genomic data
+    if "chip" in metadata_df.columns:
+        try:
+            genotyped_ids = set(
+                str(int(x))
+                for x in metadata_df[metadata_df["chip"].notna()]["study_id"].dropna()
+            )
+        except (ValueError, TypeError):
+            genotyped_ids = set()
+        if genotyped_ids:
+            disk_date_pairs_genotyped = {
+                k for k in disk_exam_keys if k[0] in genotyped_ids
+            }
+            patient_studyuid_genotyped = {
+                (p, u) for p, u in unique_patient_studyuid_pairs if p in genotyped_ids
+            }
+            print("  After filtering for patients with genomic data:")
+            print(
+                f"    - unique (patient, date) pairs on disk:    {len(disk_date_pairs_genotyped):,}"
+            )
+            print(
+                f"    - unique (patient, StudyInstanceUID) pairs: {len(patient_studyuid_genotyped):,}"
+            )
+            print("")
+
+    print(
+        f"  - iBroker rows marked is_on_disk=True: {on_disk_count:,} / {total_count:,}"
+    )
 
     return metadata_df
 
@@ -521,6 +562,14 @@ def _normalize_accession(accession: str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "", str(accession).upper())
 
 
+def _get_dir_size(path: Path) -> int:
+    """Return total size in bytes of directory (recursive). Returns 0 if missing/inaccessible."""
+    try:
+        return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+    except (PermissionError, FileNotFoundError, OSError):
+        return 0
+
+
 def _extract_date_from_entry_name(entry_name: str) -> str | None:
     """Extract YYYY-MM-DD date suffix from disk entry name when present."""
     match = re.search(r"(\d{4})-(\d{2})-(\d{2})$", entry_name)
@@ -554,18 +603,25 @@ def _read_study_date_from_exam_dir(exam_dir: Path) -> str | None:
 
 def _read_light_fingerprint_from_exam_dir(exam_dir: Path) -> dict | None:
     """
-    Read StudyInstanceUID, StudyDate, StudyTime from the first DICOM in an exam dir.
+    Read StudyInstanceUID, StudyDate, StudyTime, file_count from an exam dir.
     Never uses filename; always from DICOM metadata.
-    Returns dict with keys: study_uid, study_date (YYYYMMDD), study_time, or None if unreadable.
+    Returns dict with keys: study_uid, study_date (YYYYMMDD), study_time, file_count.
     """
     if not exam_dir.exists() or not exam_dir.is_dir():
         return None
+    file_count = 0
+    study_uid = None
+    study_date = None
+    study_time = None
     try:
         for candidate in exam_dir.rglob("*"):
             try:
                 if not candidate.is_file():
                     continue
             except OSError:
+                continue
+            file_count += 1
+            if study_uid is not None:
                 continue
             try:
                 dcm = pydicom.dcmread(str(candidate), stop_before_pixels=True)
@@ -583,16 +639,18 @@ def _read_light_fingerprint_from_exam_dir(exam_dir: Path) -> dict | None:
                     if dcm.get("StudyTime")
                     else None
                 )
-                return {
-                    "study_uid": study_uid,
-                    "study_date": study_date,
-                    "study_time": study_time,
-                }
             except Exception:
                 continue
     except OSError:
         return None
-    return None
+    if study_uid is None:
+        return None
+    return {
+        "study_uid": study_uid,
+        "study_date": study_date,
+        "study_time": study_time,
+        "file_count": file_count,
+    }
 
 
 def build_chimec_disk_fingerprints(
@@ -669,6 +727,7 @@ def build_chimec_disk_fingerprints(
                 study_uid = fp["study_uid"]
                 study_date = fp["study_date"]
                 study_time = fp.get("study_time")
+                file_count = fp.get("file_count", 0)
 
                 exams[entry_name] = (study_uid, [], study_date, study_time)
 
@@ -685,6 +744,7 @@ def build_chimec_disk_fingerprints(
                         "study_date": study_date,
                         "study_date_iso": study_date_iso or "",
                         "study_time": study_time or "",
+                        "file_count": file_count,
                         "accession": accession,
                     }
                 )
@@ -880,14 +940,43 @@ def reconcile_disk_ibroker_accessions(
             "disk_only_with_date_study_id_not_in_ibroker": 0,
             "disk_only_with_date_study_id_in_ibroker_but_date_not": 0,
             "study_ids_on_disk_not_in_ibroker": 0,
+            "study_ids_on_disk": 0,
             "key_study_ids_count": 0,
             "disk_study_ids_in_key": 0,
             "disk_study_ids_not_in_key": 0,
             "key_study_ids_not_on_disk": 0,
+            "study_ids_on_disk_not_in_ibroker_in_key": 0,
+            "study_ids_on_disk_not_in_ibroker_not_in_key": 0,
+            "unique_study_uids": 0,
+            "study_uids_with_duplicates": 0,
+            "total_duplicate_exams": 0,
+            "duplicate_disk_usage_bytes": 0,
         }
 
     disk_study_ids = set(disk_df["study_id"].astype(str))
     study_ids_on_disk_not_in_ibroker = len(disk_study_ids - ib_all_ids)
+
+    # Duplicate analysis: same StudyInstanceUID = same exam (true duplicates)
+    unique_study_uids = 0
+    study_uids_with_duplicates = 0
+    total_duplicate_exams = 0
+    duplicate_disk_usage_bytes = 0
+    if "study_uid" in disk_df.columns and disk_df["study_uid"].notna().any():
+        uid_counts = disk_df[disk_df["study_uid"].notna()].groupby("study_uid").size()
+        unique_study_uids = int(len(uid_counts))
+        study_uids_with_duplicates = int((uid_counts > 1).sum())
+        total_duplicate_exams = int((uid_counts - 1).clip(lower=0).sum())
+        # Disk usage of duplicate exam dirs (N-1 per group, the ones we'd remove)
+        base_path = Path(basedir)
+        for uid, count in uid_counts.items():
+            if count <= 1:
+                continue
+            rows = disk_df[disk_df["study_uid"] == uid]
+            for _, row in rows.iloc[1:].iterrows():
+                exam_path = (
+                    base_path / str(row["study_id"]) / str(row["disk_entry_name"])
+                )
+                duplicate_disk_usage_bytes += _get_dir_size(exam_path)
 
     key_study_ids: Set[str] = set()
     if key_file is not None:
@@ -958,6 +1047,7 @@ def reconcile_disk_ibroker_accessions(
 
     summary = {
         "disk_total": len(disk_df),
+        "study_ids_on_disk": len(disk_study_ids),
         "ib_total": len(subset),
         "exact_match": int((disk_df["match_type"] == "exact_patient_accession").sum()),
         "accession_changed_unambiguous": int(
@@ -1008,14 +1098,27 @@ def reconcile_disk_ibroker_accessions(
             (sid_in_any & ~pair_in_any_series).sum()
         )
     summary["study_ids_on_disk_not_in_ibroker"] = int(study_ids_on_disk_not_in_ibroker)
+    summary["unique_study_uids"] = int(unique_study_uids)
+    summary["study_uids_with_duplicates"] = int(study_uids_with_duplicates)
+    summary["total_duplicate_exams"] = int(total_duplicate_exams)
+    summary["duplicate_disk_usage_bytes"] = int(duplicate_disk_usage_bytes)
+    disk_not_in_ib = disk_study_ids - ib_all_ids
     if key_study_ids:
         summary["key_study_ids_count"] = int(len(key_study_ids))
         summary["disk_study_ids_in_key"] = int(len(disk_study_ids & key_study_ids))
         summary["disk_study_ids_not_in_key"] = int(len(disk_study_ids - key_study_ids))
         summary["key_study_ids_not_on_disk"] = int(len(key_study_ids - disk_study_ids))
+        summary["study_ids_on_disk_not_in_ibroker_in_key"] = int(
+            len(disk_not_in_ib & key_study_ids)
+        )
+        summary["study_ids_on_disk_not_in_ibroker_not_in_key"] = int(
+            len(disk_not_in_ib - key_study_ids)
+        )
     else:
         summary["key_study_ids_count"] = 0
         summary["disk_study_ids_in_key"] = 0
         summary["disk_study_ids_not_in_key"] = 0
         summary["key_study_ids_not_on_disk"] = 0
+        summary["study_ids_on_disk_not_in_ibroker_in_key"] = 0
+        summary["study_ids_on_disk_not_in_ibroker_not_in_key"] = 0
     return summary

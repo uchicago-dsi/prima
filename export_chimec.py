@@ -264,47 +264,6 @@ def load_chimec_data():
     return db
 
 
-def print_cycle_status_snapshot(
-    db: pd.DataFrame,
-    modality: str,
-    refresh_summary: dict[str, int | bool] | None,
-) -> None:
-    """Print a concise per-cycle status snapshot for export decisions."""
-    modality_mask = db["base_modality"] == modality
-    subset = db[modality_mask]
-    total = len(subset)
-    on_disk = subset["is_on_disk"].fillna(False).astype(bool).sum()
-    exported_not_on_disk = (
-        subset["is_exported"].fillna(False).astype(bool)
-        & ~subset["is_on_disk"].fillna(False).astype(bool)
-    ).sum()
-    requested_not_on_disk = (
-        subset["is_requested"].fillna(False).astype(bool)
-        & ~subset["is_exported"].fillna(False).astype(bool)
-        & ~subset["is_on_disk"].fillna(False).astype(bool)
-    ).sum()
-    remaining = (
-        ~subset["is_exported"].fillna(False).astype(bool)
-        & ~subset["is_requested"].fillna(False).astype(bool)
-        & ~subset["is_on_disk"].fillna(False).astype(bool)
-    ).sum()
-    print("\n=== Cycle status snapshot ===")
-    print(f"modality: {modality}")
-    print(f"known exams in metadata: {total:,}")
-    print(f"on disk: {on_disk:,}")
-    print(f"exported not on disk: {exported_not_on_disk:,}")
-    print(f"requested not on disk: {requested_not_on_disk:,}")
-    print(f"eligible to request now: {remaining:,}")
-    if refresh_summary is not None:
-        if bool(refresh_summary["is_complete"]):
-            print("metadata refresh: complete")
-        else:
-            print(
-                "metadata refresh: in progress "
-                f"({refresh_summary['completed_batches']}/{refresh_summary['total_batches']} batches)"
-            )
-
-
 def apply_disk_status_for_modality(db: pd.DataFrame, modality: str) -> pd.DataFrame:
     """Apply disk status check only for the requested modality subset."""
     modality_upper = modality.upper()
@@ -358,76 +317,64 @@ def run_reconciliation_if_enabled(args, db: pd.DataFrame, cycle_number: int) -> 
         else None,
         key_file=CHIMEC_KEY_FILE,
     )
-    print("\n=== disk-vs-ibroker reconciliation ===")
-    print(f"modality: {CHIMEC_MODALITY}")
-    print(f"disk exams scanned: {summary['disk_total']:,}")
-    print(f"ibroker exams with accession: {summary['ib_total']:,}")
-    print(f"exact patient+accession matches: {summary['exact_match']:,}")
+    print("\n=== disk-vs-ibroker reconciliation (MG) ===\n")
     print(
-        "accession-changed candidates (unambiguous date): "
-        f"{summary['accession_changed_unambiguous']:,}"
+        "Disk:  {:>8,} exams, {:>6,} study IDs".format(
+            summary["disk_total"], summary["study_ids_on_disk"]
+        )
+    )
+    if summary.get("unique_study_uids", 0) > 0:
+        dup = summary.get("total_duplicate_exams", 0)
+        uid_dup = summary.get("study_uids_with_duplicates", 0)
+        print(
+            "       {:>8,} unique StudyInstanceUIDs, {:>6,} duplicate exams "
+            "({} study UIDs with >1 copy)".format(
+                summary["unique_study_uids"], dup, uid_dup
+            )
+        )
+        dupe_bytes = summary.get("duplicate_disk_usage_bytes", 0)
+        if dupe_bytes > 0:
+            dupe_gb = dupe_bytes / (1024**3)
+            print("       disk usage of dupes: {:.2f} GB".format(dupe_gb))
+    print("iBroker: {:>7,} exams with accession\n".format(summary["ib_total"]))
+    print("Match breakdown:")
+    print("  exact match: {:>8,}".format(summary["exact_match"]))
+    print(
+        "  accession-changed (unambiguous): {:>8,}".format(
+            summary["accession_changed_unambiguous"]
+        )
     )
     print(
-        "accession-changed candidates (ambiguous date): "
-        f"{summary['accession_changed_ambiguous']:,}"
+        "  accession-changed (ambiguous):   {:>8,}".format(
+            summary["accession_changed_ambiguous"]
+        )
     )
-    print(f"disk-only after reconciliation: {summary['disk_only']:,}")
-    print(f"disk rows without date suffix: {summary['disk_no_date']:,}")
-    print(f"disk rows with date suffix: {summary['disk_with_date']:,}")
-    print(
-        "disk rows where date was inferred from DICOM metadata: "
-        f"{summary['disk_dates_inferred_from_dicom']:,}"
-    )
-    print(f"disk .tar.xz entries: {summary['disk_tar_xz_entries']:,}")
-    print(f"ibroker (study_id, study_date) pairs: {summary['ib_patient_date_pairs']:,}")
-    print(f"disk (study_id, study_date) pairs: {summary['disk_patient_date_pairs']:,}")
-    print(
-        f"shared (study_id, study_date) pairs: {summary['shared_patient_date_pairs']:,}"
-    )
-    print(
-        "disk rows whose (study_id, study_date) exists in iBroker: "
-        f"{summary['disk_rows_with_shared_patient_date']:,}"
-    )
-    print(
-        "ibroker (study_id, study_date) pairs with multiple exams: "
-        f"{summary['ib_multi_patient_date']:,}"
-    )
-    print(
-        "disk (study_id, study_date) pairs with multiple exams: "
-        f"{summary['disk_multi_patient_date']:,}"
-    )
-    print(
-        "disk-only rows (with date) whose pair exists in any iBroker row: "
-        f"{summary['disk_only_with_date_pair_in_any_ibroker']:,}"
-    )
-    print(
-        "disk-only rows (with date) whose study_id is absent from iBroker: "
-        f"{summary['disk_only_with_date_study_id_not_in_ibroker']:,}"
-    )
-    print(
-        "disk-only rows (with date) whose study_id exists but date does not: "
-        f"{summary['disk_only_with_date_study_id_in_ibroker_but_date_not']:,}"
-    )
-    print(
-        "study IDs on disk but not in iBroker: "
-        f"{summary['study_ids_on_disk_not_in_ibroker']:,}"
-    )
+    print("  disk-only:                       {:>8,}\n".format(summary["disk_only"]))
     if summary.get("key_study_ids_count", 0) > 0:
-        print("--- MRN-to-study_id key file overlap ---")
-        print(f"study IDs in key file: {summary['key_study_ids_count']:,}")
+        in_key = summary.get("study_ids_on_disk_not_in_ibroker_in_key", 0)
+        not_in_key = summary.get("study_ids_on_disk_not_in_ibroker_not_in_key", 0)
+        print("Key file overlap:")
         print(
-            "study IDs on disk that are in key (overlap): "
-            f"{summary['disk_study_ids_in_key']:,}"
+            "  study IDs in key:        {:>8,}".format(summary["key_study_ids_count"])
         )
         print(
-            "study IDs on disk but not in key: "
-            f"{summary['disk_study_ids_not_in_key']:,}"
+            "  study IDs on disk:       {:>8,} (in key: {:>6,}, not in key: {:>4,})".format(
+                summary["study_ids_on_disk"],
+                summary["disk_study_ids_in_key"],
+                summary["disk_study_ids_not_in_key"],
+            )
         )
         print(
-            "study IDs in key but not on disk: "
-            f"{summary['key_study_ids_not_on_disk']:,}"
+            "  study IDs on disk not in iBroker: {:>6,}, (in key: {:>6,}, not in key: {:>4,})".format(
+                summary["study_ids_on_disk_not_in_ibroker"], in_key, not_in_key
+            )
         )
-    print(f"wrote reconciliation CSV: {output_path}")
+        print(
+            "  study IDs in key not on disk:    {:>8,}\n".format(
+                summary["key_study_ids_not_on_disk"]
+            )
+        )
+    print(f"Wrote: {output_path}")
     if output_path.exists():
         reconciled_df = pd.read_csv(output_path)
         drift_df = reconciled_df[
@@ -502,7 +449,6 @@ def run_export_cycle(args, cycle_number: int):
 
     db = load_chimec_data()
     db = apply_disk_status_for_modality(db, args.modality)
-    print_cycle_status_snapshot(db, args.modality.upper(), refresh_summary)
     run_reconciliation_if_enabled(args, db, cycle_number)
 
     filter_by_genotyping = not args.no_genotyping_filter
@@ -537,9 +483,9 @@ def run_export_cycle(args, cycle_number: int):
                 "Zero targets can occur before full coverage is reached."
             )
     else:
-        print("\n--- Summary of Exams to Download ---")
-        print(f"Total potential targets: {len(targets)}")
-        print(f"Unique patients to process: {targets['study_id'].nunique()}")
+        print(
+            f"\n--- Download targets: {len(targets):,} exams ({targets['study_id'].nunique():,} patients) ---"
+        )
 
         proceed = "y" if args.auto_confirm else None
         if proceed == "y":

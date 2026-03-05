@@ -239,6 +239,9 @@ class PreprocessConfig:
         chunk_size=100,
         no_resume=False,
         incremental=False,
+        exam_dir_filter=None,
+        checkpoint_dir=None,
+        manifest_output=None,
     ):
         self.raw_dir = raw_dir
         self.sot_dir = sot_dir
@@ -251,6 +254,12 @@ class PreprocessConfig:
         self.chunk_size = chunk_size
         self.no_resume = no_resume
         self.incremental = incremental
+        # Optional: set of (patient_id, exam_dir_name) to include; None = no filter
+        self.exam_dir_filter = exam_dir_filter
+        # Optional: override checkpoint dir (for sharded runs to avoid conflicts)
+        self.checkpoint_dir = checkpoint_dir
+        # Optional: override manifest output path (for sharded runs)
+        self.manifest_output = manifest_output
 
 
 # ------------- DICOM helpers -------------
@@ -1156,6 +1165,66 @@ def _combine_staging_files(staging_dir: Path, pattern: str) -> pd.DataFrame:
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 
+def build_genotyped_exam_dir_filter(
+    fingerprint_path: Path,
+    patients_path: Path,
+    key_path: Path,
+) -> Optional[set]:
+    """Build set of (patient_id, exam_dir_name) for genotyped patients with unique (patient, study_uid).
+
+    Deduplicates by StudyInstanceUID: when multiple exam dirs share the same UID, keeps only
+    the newest (by study_date, study_time). Uses fingerprint for (patient, entry_name) ->
+    study_uid; key for MRN->AnonymousID; patients for chip column.
+    Returns None if any file missing.
+    """
+    if (
+        not fingerprint_path.exists()
+        or not patients_path.exists()
+        or not key_path.exists()
+    ):
+        return None
+    with open(fingerprint_path) as f:
+        raw = json.load(f)
+    patients = pd.read_csv(patients_path)
+    key = pd.read_csv(key_path)
+    # genotyped patient IDs (AnonymousID / study_id)
+    if "chip" not in patients.columns or "MRN" not in patients.columns:
+        return None
+    if not {"MRN", "AnonymousID"}.issubset(key.columns):
+        return None
+    merged = patients.merge(key[["MRN", "AnonymousID"]], on="MRN", how="inner")
+    genotyped_ids = set()
+    for x in merged[merged["chip"].notna()]["AnonymousID"].dropna():
+        try:
+            genotyped_ids.add(str(int(float(x))))
+        except (ValueError, TypeError):
+            pass
+    # (patient_id, study_uid) -> (entry_name, study_date, study_time) for the one we keep
+    best_per_uid: dict[tuple[str, str], tuple[str, str, str]] = {}
+    for patient_id, exams in raw.items():
+        if patient_id not in genotyped_ids:
+            continue
+        for entry_name, data in exams.items():
+            if isinstance(data, (list, tuple)):
+                d = list(data) + [None, None, None]
+                uid, _, study_date, study_time = d[:4]
+            else:
+                uid = data.get("study_uid")
+                study_date = data.get("study_date", "") or ""
+                study_time = data.get("study_time", "") or ""
+            if not uid:
+                continue
+            key_uid = (patient_id, uid)
+            date_str = str(study_date) if study_date else ""
+            time_str = str(study_time) if study_time else ""
+            if key_uid not in best_per_uid or (date_str, time_str) > (
+                best_per_uid[key_uid][1],
+                best_per_uid[key_uid][2],
+            ):
+                best_per_uid[key_uid] = (entry_name, date_str, time_str)
+    return {(pid, entry) for (pid, _), (entry, _, _) in best_per_uid.items()}
+
+
 def discover_dicoms(
     raw_dir: Path,
     max_exams: Optional[int] = None,
@@ -1163,6 +1232,8 @@ def discover_dicoms(
     debug_dir: Optional[Path] = None,
     chunk_size: int = 100,
     resume_from_checkpoint: bool = True,
+    exam_dir_filter: Optional[set] = None,
+    checkpoint_dir: Optional[Path] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Scan `raw_dir` for exam directories and extract DICOM tags in parallel.
 
@@ -1181,7 +1252,9 @@ def discover_dicoms(
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
     # setup checkpoint directory
-    checkpoint_dir = Path("data/discovery_checkpoints")
+    if checkpoint_dir is None:
+        checkpoint_dir = Path("data/discovery_checkpoints")
+    checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     # cleanup old checkpoints
@@ -1203,17 +1276,26 @@ def discover_dicoms(
             continue
         for exam_name in os.listdir(patient_path):
             exam_path = patient_path / exam_name
-            if exam_path.is_dir():
-                exam_dirs.append(exam_path)
-                if max_exams is not None and len(exam_dirs) >= max_exams:
-                    logger.info(
-                        f"reached --max-exams limit of {max_exams}, stopping scan"
-                    )
-                    break
+            if not exam_path.is_dir():
+                continue
+            if (
+                exam_dir_filter is not None
+                and (patient_name, exam_name) not in exam_dir_filter
+            ):
+                continue
+            exam_dirs.append(exam_path)
+            if max_exams is not None and len(exam_dirs) >= max_exams:
+                logger.info(f"reached --max-exams limit of {max_exams}, stopping scan")
+                break
         if max_exams is not None and len(exam_dirs) >= max_exams:
             break
 
-    logger.info(f"found {len(exam_dirs)} exam directories")
+    if exam_dir_filter is not None:
+        logger.info(
+            f"found {len(exam_dirs)} exam directories (filtered to genotyped + unique patient/study_uid)"
+        )
+    else:
+        logger.info(f"found {len(exam_dirs)} exam directories")
 
     if not exam_dirs:
         raise RuntimeError("no exam directories found")
@@ -1628,6 +1710,8 @@ def preprocess(cfg: PreprocessConfig) -> None:
             debug_dir=cfg.debug_dir,
             chunk_size=cfg.chunk_size,
             resume_from_checkpoint=not cfg.no_resume,
+            exam_dir_filter=cfg.exam_dir_filter,
+            checkpoint_dir=cfg.checkpoint_dir,
         )
 
         # filter out already processed exams
@@ -1652,6 +1736,8 @@ def preprocess(cfg: PreprocessConfig) -> None:
             debug_dir=cfg.debug_dir,
             chunk_size=cfg.chunk_size,
             resume_from_checkpoint=not cfg.no_resume,
+            exam_dir_filter=cfg.exam_dir_filter,
+            checkpoint_dir=cfg.checkpoint_dir,
         )
         logger.info(f"found {len(views_df)} DICOM files")
 
@@ -1763,7 +1849,8 @@ def preprocess(cfg: PreprocessConfig) -> None:
     failed_exams: List[Dict] = []
 
     logger.info("grouping exams for zarr writing...")
-    grouped = dict(sel_df.groupby("exam_id"))
+    # Avoid dict(groupby): pandas GroupBy.keys is an attr (str), not a method; dict() expects .keys()
+    grouped = {k: v for k, v in sel_df.groupby("exam_id")}
     targets = [
         (eid, grouped[eid]) for eid in cohort["exam_id"].tolist() if eid in grouped
     ]
@@ -1850,7 +1937,9 @@ def preprocess(cfg: PreprocessConfig) -> None:
         manifest = combined_manifest
         logger.info(f"combined manifest now has {len(manifest)} total entries")
 
-    manifest_path = out / "manifest.parquet"
+    manifest_path = (
+        cfg.manifest_output if cfg.manifest_output else out / "manifest.parquet"
+    )
     manifest.to_parquet(manifest_path, index=False)
     logger.info(f"wrote manifest to {manifest_path}")
 
@@ -2256,7 +2345,7 @@ def write_mirai_csv(
             "years_to_last_followup",
             "split_group",
         ]
-    ]
+    ].copy()
     # Ensure numeric columns are actually numeric (not object dtype with "nan" strings)
     out["years_to_cancer"] = (
         pd.to_numeric(out["years_to_cancer"], errors="coerce").fillna(100).astype(int)
@@ -3021,6 +3110,56 @@ def parse_args():
         help="incremental mode: only process new exams, append to existing SoT tables",
     )
     p.add_argument(
+        "--genotyped-only",
+        dest="genotyped_only",
+        action="store_true",
+        help="only process exams for patients with genomic data (unique patient, study_uid pairs)",
+    )
+    p.add_argument(
+        "--fingerprint",
+        dest="fingerprint",
+        type=Path,
+        default=Path("fingerprints/chimec/disk_fingerprints.json"),
+        help="Path to fingerprint JSON (required for --genotyped-only)",
+    )
+    p.add_argument(
+        "--patients",
+        dest="patients_csv",
+        type=Path,
+        default=Path(
+            "/gpfs/data/phs/groups/Projects/Huo_projects/SPORE/annawoodard/List_ChiMEC_priority_2025July30.csv"
+        ),
+        help="Path to patients CSV with chip column (required for --genotyped-only)",
+    )
+    p.add_argument(
+        "--key",
+        dest="key_csv",
+        type=Path,
+        default=Path("/gpfs/data/huo-lab/Image/ChiMEC/study-16352a.csv"),
+        help="Path to MRN→AnonymousID key (required for --genotyped-only)",
+    )
+    p.add_argument(
+        "--shard-allowlist",
+        dest="shard_allowlist",
+        type=Path,
+        default=None,
+        help="Path to JSON allowlist for this shard [[patient_id, exam_dir], ...] (used by run_preprocess_sharded)",
+    )
+    p.add_argument(
+        "--checkpoint-dir",
+        dest="checkpoint_dir",
+        type=Path,
+        default=None,
+        help="Override checkpoint directory (for sharded runs)",
+    )
+    p.add_argument(
+        "--manifest-output",
+        dest="manifest_output",
+        type=Path,
+        default=None,
+        help="Override manifest output path (for sharded runs)",
+    )
+    p.add_argument(
         "--emit-csv",
         dest="emit_csv",
         type=Path,
@@ -3222,6 +3361,28 @@ def parse_args():
         sot_dir = args.sot_dir if args.sot_dir is not None else raw_dir / "sot"
         out_dir = args.out_dir if args.out_dir is not None else raw_dir / "out"
 
+        exam_dir_filter = None
+        if getattr(args, "shard_allowlist", None) is not None:
+            with open(args.shard_allowlist) as f:
+                pairs = json.load(f)
+            exam_dir_filter = {tuple(p) for p in pairs}
+            logger.info(
+                f"shard allowlist: {len(exam_dir_filter):,} (patient, exam_dir) pairs"
+            )
+        elif getattr(args, "genotyped_only", False):
+            exam_dir_filter = build_genotyped_exam_dir_filter(
+                args.fingerprint,
+                args.patients_csv,
+                args.key_csv,
+            )
+            if exam_dir_filter is None:
+                raise ValueError(
+                    "genotyped-only requires fingerprint, patients, and key files to exist"
+                )
+            logger.info(
+                f"genotyped-only: filtering to {len(exam_dir_filter):,} (patient, exam_dir) pairs"
+            )
+
         cfg = PreprocessConfig(
             raw_dir=raw_dir,
             sot_dir=sot_dir,
@@ -3234,6 +3395,9 @@ def parse_args():
             chunk_size=args.chunk_size,
             no_resume=args.no_resume,
             incremental=args.incremental,
+            exam_dir_filter=exam_dir_filter,
+            checkpoint_dir=getattr(args, "checkpoint_dir", None),
+            manifest_output=getattr(args, "manifest_output", None),
         )
         return cfg, args
     else:
@@ -3282,11 +3446,12 @@ def main() -> None:
         preprocess(cfg)
 
         # emit Mirai CSV if either an explicit output path is provided or labels were given
+        # skip in sharded mode: manifest.parquet is created by merge, not by each shard
         emit_path: Optional[Path] = args.emit_csv
         if emit_path is None and args.labels is not None:
             emit_path = cfg.out_dir / "mirai_manifest.csv"
 
-        if emit_path is not None:
+        if emit_path is not None and cfg.manifest_output is None:
             logger.info("generating Mirai CSV…")
             if args.labels is None:
                 raise ValueError("need labels CSV to write Mirai CSV; pass --labels")
@@ -3312,8 +3477,8 @@ def main() -> None:
             )
             logger.info(f"wrote Mirai CSV → {emit_path}")
 
-        # materialize per-view embeddings if requested
-        if args.features_out is not None:
+        # materialize per-view embeddings if requested (skip in sharded mode)
+        if args.features_out is not None and cfg.manifest_output is None:
             logger.info("materializing per-view embeddings...")
             if args.img_encoder_snapshot is None:
                 raise ValueError(
