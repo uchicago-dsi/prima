@@ -57,11 +57,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from omegaconf import OmegaConf
+from sklearn.decomposition import PCA
 from sklearn.metrics import (
     confusion_matrix,
     roc_auc_score,
     roc_curve,
 )
+from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import KFold
 from sksurv.metrics import (
     brier_score,
@@ -1005,6 +1007,112 @@ def parse_args() -> Config:
     )
     args = p.parse_args()
     return _load_config(args.config)
+
+
+def plot_hiddens_pca(
+    cfg: Config,
+    exam_data: ExamData,
+    hiddens_path: Path,
+    color_cols: list[str] | None = None,
+    n_components: int = 2,
+) -> None:
+    """PCA of Mirai hidden vectors, colored by phenotype labels.
+
+    Aggregates view-level hiddens to exam level (mean), merges with phenotype,
+    runs PCA, and saves scatter plots colored by each color_col.
+    """
+    data = np.load(hiddens_path, allow_pickle=True)
+    hiddens = data["hiddens"]
+    paths = data["paths"].tolist()
+
+    meta = exam_data.meta_all
+    if "file_path" not in meta.columns:
+        print("[warn] manifest has no file_path; cannot map hiddens to exams")
+        return
+    path_to_exam = (
+        meta[["file_path", "patient_id", "exam_id"]]
+        .drop_duplicates()
+        .set_index("file_path")
+    )
+    path_to_exam = path_to_exam.astype(str)
+
+    rows = []
+    for i, path in enumerate(paths):
+        path_str = str(path).strip()
+        if path_str not in path_to_exam.index:
+            continue
+        row = path_to_exam.loc[path_str]
+        rows.append(
+            {"patient_id": row["patient_id"], "exam_id": row["exam_id"], "idx": i}
+        )
+    if not rows:
+        print("[warn] no hiddens paths matched manifest file_path")
+        return
+    path_df = pd.DataFrame(rows)
+
+    def mean_hidden(idx_series):
+        return hiddens[idx_series.values].mean(axis=0)
+
+    exam_vecs = (
+        path_df.groupby(["patient_id", "exam_id"])["idx"]
+        .apply(mean_hidden)
+        .reset_index()
+    )
+    exam_vecs.columns = ["patient_id", "exam_id", "vec"]
+    X = np.stack(exam_vecs["vec"].values)
+    exam_keys = exam_vecs[["patient_id", "exam_id"]].copy()
+
+    allowed = exam_data.exam_pairs
+    mask = exam_keys.apply(
+        lambda r: (str(r["patient_id"]), str(r["exam_id"])) in allowed, axis=1
+    )
+    exam_keys = exam_keys[mask].copy()
+    X = X[mask]
+
+    enriched = _load_enriched_manifest(cfg)
+    merged = exam_keys.merge(
+        enriched,
+        on=["patient_id", "exam_id"],
+        how="left",
+    )
+
+    X_scaled = StandardScaler().fit_transform(X)
+    n_pc = min(n_components, X_scaled.shape[0], X_scaled.shape[1])
+    pca = PCA(n_components=n_pc)
+    pc = pca.fit_transform(X_scaled)
+    merged["PC1"] = pc[:, 0]
+    merged["PC2"] = pc[:, 1] if n_pc > 1 else np.nan
+
+    if color_cols is None:
+        color_cols = ["subtype", "receptor_subtype", "CaseControl", "race_category"]
+    color_cols = [c for c in color_cols if c in merged.columns]
+
+    out_dir = cfg.pred_csv.parent
+    for col in color_cols:
+        plot_df = merged.dropna(subset=[col])
+        if len(plot_df) < 2:
+            continue
+        fig, ax = plt.subplots(figsize=(6, 5))
+        for label, grp in plot_df.groupby(col):
+            ax.scatter(
+                grp["PC1"],
+                grp["PC2"],
+                label=str(label)[:30],
+                alpha=0.6,
+                s=12,
+            )
+        ax.set_xlabel("PC1 ({:.1f}%)".format(pca.explained_variance_ratio_[0] * 100))
+        ax.set_ylabel(
+            "PC2 ({:.1f}%)".format(pca.explained_variance_ratio_[1] * 100)
+            if n_pc > 1
+            else ""
+        )
+        ax.legend(loc="best", fontsize=8)
+        fig.tight_layout()
+        out_path = out_dir / f"hiddens_pca_{col}.png"
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+        print(f"Saved {out_path}")
 
 
 def _build_surv_arrays(meta: pd.DataFrame) -> np.ndarray:
@@ -2205,6 +2313,15 @@ def main() -> None:
         except Exception as e:
             # allow quick use even if scikit-survival isn't installed or inputs are incomplete
             print("\n[warn] survival metrics unavailable:", str(e))
+
+    hiddens_path = cfg.pred_csv.parent / "hiddens.npz"
+    if hiddens_path.exists():
+        try:
+            checkpoint("Plotting PCA of Mirai hiddens...")
+            plot_hiddens_pca(cfg, exam_data, hiddens_path)
+            checkpoint("Saved hiddens PCA plots")
+        except Exception as e:
+            print(f"\n[warn] hiddens PCA failed: {e}")
 
     # compute model performance metrics
     try:

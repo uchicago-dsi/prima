@@ -101,7 +101,8 @@ def create_sbatch_script(
     gpuspec: str,
     mem_gb: int,
     timeout_min: int,
-) -> Path:
+    save_hiddens: bool = False,
+) -> tuple[Path, Path]:
     """Generate sbatch script for a single shard."""
     script_path = work_dir / f"job_{shard_idx:03d}.sh"
     log_path = work_dir / f"job_{shard_idx:03d}.log"
@@ -132,7 +133,11 @@ python vendor/mirai/scripts/main.py \\
         script_content += f"  {shlex.quote(arg)} \\\n"
 
     script_content += f"  --metadata_path {shlex.quote(str(shard_csv))} \\\n"
-    script_content += f"  --prediction_save_path {shlex.quote(str(output_csv))}\n"
+    script_content += f"  --prediction_save_path {shlex.quote(str(output_csv))}"
+    if save_hiddens:
+        hiddens_path = work_dir / f"hiddens_output_{shard_idx:03d}.npz"
+        script_content += f" \\\n  --save_hiddens --hiddens_output_path {shlex.quote(str(hiddens_path))}"
+    script_content += "\n"
 
     script_path.write_text(script_content)
     script_path.chmod(0o755)
@@ -333,6 +338,33 @@ def collate_results(
         print(f"Final output written to {final_output}")
 
 
+def collate_hiddens(
+    hiddens_paths: list[Path],
+    final_path: Path,
+) -> None:
+    """Merge per-shard hiddens .npz files into one."""
+    if not hiddens_paths:
+        return
+    import numpy as np
+
+    all_hiddens = []
+    all_paths = []
+    for p in hiddens_paths:
+        if not p.exists():
+            continue
+        data = np.load(p, allow_pickle=True)
+        all_hiddens.append(data["hiddens"])
+        all_paths.extend(data["paths"].tolist())
+    if not all_hiddens:
+        return
+    np.savez(
+        final_path,
+        hiddens=np.concatenate(all_hiddens, axis=0),
+        paths=np.array(all_paths, dtype=object),
+    )
+    print(f"Merged hiddens from {len(hiddens_paths)} shard(s) to {final_path}")
+
+
 def save_job_metadata(
     work_dir: Path,
     job_ids: list[str],
@@ -433,6 +465,11 @@ def main():
         default=None,
         help="DEBUG MODE: Limit total number of samples processed (for testing)",
     )
+    parser.add_argument(
+        "--save_hiddens",
+        action="store_true",
+        help="save transformer hidden vectors per shard, then merge to hiddens.npz",
+    )
 
     args, remaining = parser.parse_known_args()
 
@@ -484,6 +521,7 @@ def main():
     output_csvs = []
     script_paths = []
     log_paths = []
+    hiddens_paths = []
     for i, shard_path in enumerate(shard_paths):
         output_csv = work_dir / f"output_{i:03d}.csv"
         output_csvs.append(output_csv)
@@ -497,9 +535,12 @@ def main():
             args.gpuspec,
             args.mem_gb,
             args.timeout_min,
+            save_hiddens=args.save_hiddens,
         )
         script_paths.append(script_path)
         log_paths.append(log_path)
+        if args.save_hiddens:
+            hiddens_paths.append(work_dir / f"hiddens_output_{i:03d}.npz")
 
     job_ids = submit_jobs(script_paths, log_paths)
     print(f"\nSubmitted {len(job_ids)} job(s)")
@@ -516,6 +557,11 @@ def main():
 
     wait_for_jobs(job_ids)
     collate_results(output_csvs, args.prediction_save_path, job_ids, log_paths)
+    if args.save_hiddens and hiddens_paths:
+        collate_hiddens(
+            hiddens_paths,
+            args.prediction_save_path.parent / "hiddens.npz",
+        )
     print(f"\nDone! Results in {args.prediction_save_path}")
 
 
