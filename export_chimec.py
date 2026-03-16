@@ -9,6 +9,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -33,6 +34,7 @@ from prima.ibroker_refresh import add_ibroker_state_columns, refresh_metadata_sn
 
 # ChiMEC dataset configuration
 CHIMEC_PATIENTS_FILE = "/gpfs/data/phs/groups/Projects/Huo_projects/SPORE/annawoodard/List_ChiMEC_priority_2025July30.csv"
+CHIMEC_PCR_PATIENTS_FILE = "/gpfs/data/phs/groups/Projects/Huo_projects/SPORE/annawoodard/Phenotype_ChiMEC_2026Jan25.csv"
 CHIMEC_KEY_FILE = "/gpfs/data/huo-lab/Image/ChiMEC/study-16352a.csv"
 CHIMEC_METADATA_FILE = "data/imaging_metadata.csv"
 CHIMEC_EXPORT_STATE_FILE = Path("data/export_state_chimec.csv")
@@ -41,6 +43,18 @@ CHIMEC_FINGERPRINT_CACHE = CHIMEC_FINGERPRINT_DIR / "disk_fingerprints.json"
 CHIMEC_BASE_DOWNLOAD_DIR = "/gpfs/data/huo-lab/Image/ChiMEC/"
 CHIMEC_IBROKER_STUDY_NUMBER = "16352A"
 CHIMEC_MODALITY = "MG"  # ChiMEC fingerprint/reconciliation are MG-only
+COHORT_PRIORITY = "priority"
+COHORT_PCR = "pcr"
+COHORT_CONFIGS = {
+    COHORT_PRIORITY: {
+        "default_patients_file": CHIMEC_PATIENTS_FILE,
+        "required_non_null_column": None,
+    },
+    COHORT_PCR: {
+        "default_patients_file": CHIMEC_PCR_PATIENTS_FILE,
+        "required_non_null_column": "pcr",
+    },
+}
 
 
 REQUESTED_OUTCOME_VALUES = {
@@ -59,11 +73,65 @@ REQUESTED_STATUS_VALUES = {
 }
 
 
-def load_chimec_data():
-    """Load and merge ChiMEC dataset."""
+def _load_patients_for_cohort(cohort: str, patients_file: str | None) -> pd.DataFrame:
+    """Load patient cohort table for export selection."""
+    if cohort not in COHORT_CONFIGS:
+        raise ValueError(
+            f"Unsupported cohort '{cohort}'. Expected one of {COHORT_CONFIGS}"
+        )
+
+    cohort_config = COHORT_CONFIGS[cohort]
+    resolved_patients_file = Path(
+        patients_file or cohort_config["default_patients_file"]
+    )
+    patients = pd.read_csv(resolved_patients_file, low_memory=False)
+    print(
+        f"Loaded {len(patients):,} rows from patient info file: {resolved_patients_file}"
+    )
+
+    required_non_null_column = cohort_config["required_non_null_column"]
+    if required_non_null_column is not None:
+        normalized_cols = {
+            str(col).strip().lower().replace("_", "").replace(" ", ""): col
+            for col in patients.columns
+        }
+        required_key = (
+            required_non_null_column.strip().lower().replace("_", "").replace(" ", "")
+        )
+        resolved_required_col = normalized_cols.get(required_key)
+        if resolved_required_col is None:
+            raise KeyError(
+                f"Required cohort column '{required_non_null_column}' is missing from "
+                f"{resolved_patients_file}"
+            )
+        before_filter = len(patients)
+        patients = patients[patients[resolved_required_col].notna()].copy()
+        print(
+            f"Filtered cohort to {len(patients):,}/{before_filter:,} rows with non-null "
+            f"'{resolved_required_col}'."
+        )
+
+    if "MRN" not in patients.columns:
+        raise KeyError(
+            f"MRN column is required in patient file {resolved_patients_file}"
+        )
+    patients["MRN"] = pd.to_numeric(patients["MRN"], errors="coerce")
+    patients = patients[patients["MRN"].notna()].copy()
+    duplicate_mrn_mask = patients["MRN"].duplicated(keep=False)
+    if duplicate_mrn_mask.any():
+        duplicate_count = duplicate_mrn_mask.sum()
+        raise ValueError(
+            f"Patient cohort has {duplicate_count:,} duplicate MRN rows after filtering. "
+            "Cohort must be one row per MRN."
+        )
+
+    return patients
+
+
+def load_chimec_data(cohort: str, patients_file: str | None):
+    """Load and merge ChiMEC dataset for a specific cohort."""
     try:
-        patients = pd.read_csv(CHIMEC_PATIENTS_FILE)
-        print(f"Loaded {len(patients):,} rows from patient info file.")
+        patients = _load_patients_for_cohort(cohort, patients_file)
         key = pd.read_csv(CHIMEC_KEY_FILE)
         print(f"Loaded {len(key):,} rows from study_id-MRN key file.")
         metadata = pd.read_csv(CHIMEC_METADATA_FILE, low_memory=False)
@@ -156,18 +224,68 @@ def load_chimec_data():
 
     print("\nStep 1.3: Cleaning dates and deriving Case/Control status...")
     db["Study DateTime"] = pd.to_datetime(db["Study DateTime"], errors="coerce")
+    normalized_db_cols = {
+        str(col).strip().lower().replace("_", "").replace(" ", ""): col
+        for col in db.columns
+    }
+    if "datedxindex" not in normalized_db_cols:
+        diagnosis_fallback_cols = ["datedx", "datediagnosis", "datedxnew"]
+        resolved_diag_col = None
+        for candidate in diagnosis_fallback_cols:
+            if candidate in normalized_db_cols:
+                resolved_diag_col = normalized_db_cols[candidate]
+                break
+        if resolved_diag_col is None:
+            db["DatedxIndex"] = pd.NaT
+            print("  - No diagnosis date column found in cohort table; using all NaT.")
+        else:
+            db["DatedxIndex"] = db[resolved_diag_col]
+            print(
+                f"  - Using diagnosis date column '{resolved_diag_col}' as DatedxIndex."
+            )
+
     db["DatedxIndex"] = pd.to_datetime(
         db["DatedxIndex"], errors="coerce", dayfirst=True
     )
 
     in_patient_mask = db["_in_patient_file"].astype("boolean").fillna(False)
-    conditions = [
-        db["DatedxIndex"].notna(),
-        in_patient_mask.to_numpy(dtype=bool, na_value=False),
-    ]
-    choices = ["Case", "Control"]
-    db["case_control_status"] = np.select(conditions, choices, default="Unknown")
-    print("  - Derived Case/Control status based on DatedxIndex:")
+    db["in_selected_cohort"] = in_patient_mask.to_numpy(dtype=bool, na_value=False)
+    case_control_source = None
+    for candidate in ["casecontrol", "case_control_status"]:
+        if candidate in normalized_db_cols:
+            case_control_source = normalized_db_cols[candidate]
+            break
+
+    if case_control_source is not None:
+        case_control_raw = (
+            db[case_control_source].fillna("").astype(str).str.strip().str.lower()
+        )
+        is_case = case_control_raw.str.contains("case", na=False)
+        is_control = case_control_raw.str.contains("control", na=False)
+        db["case_control_status"] = np.select(
+            [is_case, is_control], ["Case", "Control"], default="Unknown"
+        )
+        missing_status_mask = db["case_control_status"] == "Unknown"
+        db.loc[
+            missing_status_mask & db["DatedxIndex"].notna(), "case_control_status"
+        ] = "Case"
+        db.loc[
+            missing_status_mask
+            & db["DatedxIndex"].isna()
+            & in_patient_mask.to_numpy(dtype=bool, na_value=False),
+            "case_control_status",
+        ] = "Control"
+        print(
+            f"  - Derived Case/Control status using '{case_control_source}' with diagnosis-date fallback:"
+        )
+    else:
+        conditions = [
+            db["DatedxIndex"].notna(),
+            in_patient_mask.to_numpy(dtype=bool, na_value=False),
+        ]
+        choices = ["Case", "Control"]
+        db["case_control_status"] = np.select(conditions, choices, default="Unknown")
+        print("  - Derived Case/Control status based on DatedxIndex:")
     print(
         db["case_control_status"]
         .value_counts(dropna=False)
@@ -262,6 +380,398 @@ def load_chimec_data():
             + disk_counts.to_string()
         )
     return db
+
+
+def _normalize_args_for_cohort(args: argparse.Namespace) -> None:
+    """Apply cohort-specific defaults that prevent accidental over-filtering."""
+    if args.cohort != COHORT_PCR:
+        return
+
+    requested_modality = args.modality.upper()
+    if requested_modality == "MG":
+        args.modality = "MR"
+        print("PCR cohort selected: overriding modality from MG to MR.")
+    else:
+        args.modality = requested_modality
+
+    if not args.no_genotyping_filter:
+        print("PCR cohort selected: disabling genotyping filter.")
+    args.no_genotyping_filter = True
+
+
+def _should_filter_by_genotyping(args: argparse.Namespace) -> bool:
+    """Return whether genotyping-based filtering should be applied."""
+    return (args.cohort != COHORT_PCR) and (not args.no_genotyping_filter)
+
+
+def _print_modality_scope_note(args: argparse.Namespace) -> None:
+    """Clarify that downstream target selection is modality-scoped."""
+    print(
+        f"Note: downstream candidate filtering/export is scoped to modality={args.modality.upper()} "
+        f"for cohort={args.cohort}."
+    )
+
+
+def _save_pcr_ibroker_time_from_dx_histogram(
+    cohort_scoped: pd.DataFrame, output_prefix: str
+) -> None:
+    """Save histogram and binned counts for MR exam timing relative to diagnosis."""
+    has_dx_mask = cohort_scoped["DatedxIndex"].notna()
+    has_exam_mask = cohort_scoped["Study DateTime"].notna()
+    analyzable = cohort_scoped.loc[has_dx_mask & has_exam_mask].copy()
+    if analyzable.empty:
+        print(
+            "  - Skipping histogram save: no exams with both Study DateTime and DatedxIndex."
+        )
+        return
+
+    delta_days = (
+        analyzable["Study DateTime"] - analyzable["DatedxIndex"]
+    ).dt.total_seconds() / 86400.0
+    output_base = Path(output_prefix)
+    output_base.parent.mkdir(parents=True, exist_ok=True)
+    png_path = output_base.with_suffix(".png")
+    csv_path = output_base.with_suffix(".csv")
+
+    bin_width_days = 60
+    min_edge = int(np.floor(delta_days.min() / bin_width_days) * bin_width_days)
+    max_edge = int(np.ceil(delta_days.max() / bin_width_days) * bin_width_days)
+    if min_edge == max_edge:
+        max_edge = min_edge + bin_width_days
+    bins = np.arange(min_edge, max_edge + bin_width_days, bin_width_days)
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.hist(delta_days, bins=bins, edgecolor="black", alpha=0.8)
+    ax.axvline(0, color="red", linestyle="--", linewidth=1.2)
+    ax.set_xlabel("days from diagnosis (negative = before dx, positive = after dx)")
+    ax.set_ylabel("number of MR exams in iBroker")
+    fig.tight_layout()
+    fig.savefig(png_path, dpi=150)
+    plt.close(fig)
+
+    bin_index = pd.cut(delta_days, bins=bins, include_lowest=True)
+    bin_counts = bin_index.value_counts(sort=False)
+    hist_df = pd.DataFrame(
+        {
+            "bin_start_day": bins[:-1],
+            "bin_end_day": bins[1:],
+            "exam_count": bin_counts.to_numpy(),
+        }
+    )
+    hist_df.to_csv(csv_path, index=False)
+
+    print(
+        f"  - Saved iBroker time-from-dx histogram for selected cohort MR exams: {png_path}"
+    )
+    print(f"  - Saved iBroker time-from-dx binned counts CSV: {csv_path}")
+
+
+def _print_pcr_prefilter_summary(
+    db: pd.DataFrame,
+    modality: str,
+    pre_dx_days: int,
+    post_dx_days: int,
+    histogram_prefix: str,
+) -> None:
+    """Print cohort-constrained PCR counts before generic target filtering."""
+    modality_upper = modality.upper()
+    modality_mask = db["base_modality"] == modality_upper
+    in_cohort_mask = (
+        db.get("in_selected_cohort", pd.Series(False, index=db.index))
+        .fillna(False)
+        .astype(bool)
+    )
+    scoped = db[modality_mask].copy()
+    cohort_scoped = db[modality_mask & in_cohort_mask].copy()
+
+    print("\n--- PCR cohort prefilter summary ---")
+    print(
+        f"  {modality_upper} exams in metadata:          {len(scoped):,} "
+        f"({scoped['study_id'].nunique():,} patients)"
+    )
+    print(
+        f"  {modality_upper} exams in selected cohort:   {len(cohort_scoped):,} "
+        f"({cohort_scoped['study_id'].nunique():,} patients)"
+    )
+    if cohort_scoped.empty:
+        return
+
+    case_series = (
+        cohort_scoped.get(
+            "case_control_status", pd.Series("Unknown", index=cohort_scoped.index)
+        )
+        .fillna("Unknown")
+        .astype(str)
+        .str.strip()
+        .str.lower()
+    )
+    case_mask = case_series == "case"
+    has_dx_mask = cohort_scoped["DatedxIndex"].notna()
+    has_exam_mask = cohort_scoped["Study DateTime"].notna()
+    analyzable_mask = case_mask & has_dx_mask & has_exam_mask
+
+    analyzable = cohort_scoped.loc[analyzable_mask].copy()
+    delta_days = (
+        analyzable["Study DateTime"] - analyzable["DatedxIndex"]
+    ).dt.total_seconds() / 86400.0
+    pre_treatment_mask = delta_days <= 0
+    in_window_mask = (delta_days >= -pre_dx_days) & (delta_days <= post_dx_days)
+
+    print("  iBroker-only attrition (ignoring on-disk/export/requested):")
+    print(
+        f"    case-labeled MR exams in selected cohort:  {case_mask.sum():,} "
+        f"({cohort_scoped.loc[case_mask, 'study_id'].nunique():,} patients)"
+    )
+    print(
+        f"    with dx + exam date available:            {analyzable_mask.sum():,} "
+        f"({cohort_scoped.loc[analyzable_mask, 'study_id'].nunique():,} patients)"
+    )
+    print(
+        f"    pre-treatment MR exams (<=0 days):        {pre_treatment_mask.sum():,} "
+        f"({analyzable.loc[pre_treatment_mask, 'study_id'].nunique():,} patients)"
+    )
+    print(
+        f"    in window [−{pre_dx_days}, +{post_dx_days}] days:      {in_window_mask.sum():,} "
+        f"({analyzable.loc[in_window_mask, 'study_id'].nunique():,} patients)"
+    )
+
+    is_on_disk = cohort_scoped.get(
+        "is_on_disk", pd.Series(False, index=cohort_scoped.index)
+    )
+    is_exported = cohort_scoped.get(
+        "is_exported", pd.Series(False, index=cohort_scoped.index)
+    )
+    is_requested = cohort_scoped.get(
+        "is_requested", pd.Series(False, index=cohort_scoped.index)
+    )
+    is_on_disk = is_on_disk.fillna(False).astype(bool)
+    is_exported = is_exported.fillna(False).astype(bool)
+    is_requested = is_requested.fillna(False).astype(bool)
+    pending = (~is_on_disk) & (~is_exported) & (~is_requested)
+    print(
+        f"  selected cohort pending status filters:      {pending.sum():,} "
+        f"({cohort_scoped.loc[pending, 'study_id'].nunique():,} patients)"
+    )
+    _save_pcr_ibroker_time_from_dx_histogram(cohort_scoped, histogram_prefix)
+
+
+def _print_pcr_window_summary(
+    targets: pd.DataFrame, pre_dx_days: int, post_dx_days: int
+) -> None:
+    """Print PCR candidate MRI counts relative to diagnosis date."""
+    if targets.empty:
+        print("\n--- PCR dx-window summary ---")
+        print("No candidates available for PCR dx-window analysis.")
+        return
+
+    case_series = (
+        targets.get("case_control_status", pd.Series("Unknown", index=targets.index))
+        .fillna("Unknown")
+        .astype(str)
+        .str.strip()
+        .str.lower()
+    )
+    case_counts = case_series.value_counts(dropna=False)
+    case_mask = case_series == "case"
+    in_cohort_mask = (
+        targets.get("in_selected_cohort", pd.Series(False, index=targets.index))
+        .fillna(False)
+        .astype(bool)
+    )
+    has_dx_mask = targets["DatedxIndex"].notna()
+    has_exam_mask = targets["Study DateTime"].notna()
+    analyzable_mask = case_mask & has_dx_mask & has_exam_mask
+
+    analyzable = targets.loc[analyzable_mask].copy()
+    if analyzable.empty:
+        print("\n--- PCR dx-window summary ---")
+        print(
+            "No analyzable case MR exams with both Study DateTime and DatedxIndex after base filtering."
+        )
+        return
+
+    delta_days = (
+        analyzable["Study DateTime"] - analyzable["DatedxIndex"]
+    ).dt.total_seconds() / 86400.0
+    pre_window_mask = (delta_days >= -pre_dx_days) & (delta_days <= 0)
+    around_dx_mask = (delta_days >= -pre_dx_days) & (delta_days <= post_dx_days)
+    early_post_mask = (delta_days > 0) & (delta_days <= post_dx_days)
+    late_post_mask = delta_days > post_dx_days
+    older_pre_mask = delta_days < -pre_dx_days
+    in_window_mask = (delta_days >= -pre_dx_days) & (delta_days <= post_dx_days)
+
+    non_case_mask = ~case_mask
+    case_missing_dx_mask = case_mask & (~has_dx_mask)
+    case_missing_exam_mask = case_mask & has_dx_mask & (~has_exam_mask)
+
+    print("\n--- PCR dx-window summary (after base target filters) ---")
+    print(
+        f"  candidates entering dx-window step: {len(targets):,} exams "
+        f"({targets['study_id'].nunique():,} patients)"
+    )
+    print(
+        f"  in selected PCR cohort file:         {in_cohort_mask.sum():,} exams "
+        f"({targets.loc[in_cohort_mask, 'study_id'].nunique():,} patients)"
+    )
+    print("  case_control_status composition:")
+    print(
+        f"    case: {int(case_counts.get('case', 0)):,}, "
+        f"control: {int(case_counts.get('control', 0)):,}, "
+        f"unknown/other: {len(targets) - int(case_counts.get('case', 0)) - int(case_counts.get('control', 0)):,}"
+    )
+    print("  attrition from candidate MR exams:")
+    print(
+        f"    excluded as non-case:                  {non_case_mask.sum():,} exams "
+        f"({targets.loc[non_case_mask, 'study_id'].nunique():,} patients)"
+    )
+    print(
+        f"    excluded as outside selected cohort:   {(~in_cohort_mask).sum():,} exams "
+        f"({targets.loc[~in_cohort_mask, 'study_id'].nunique():,} patients)"
+    )
+    print(
+        f"    excluded case exams missing dx date:   {case_missing_dx_mask.sum():,} exams "
+        f"({targets.loc[case_missing_dx_mask, 'study_id'].nunique():,} patients)"
+    )
+    print(
+        f"    excluded case exams missing exam date: {case_missing_exam_mask.sum():,} exams "
+        f"({targets.loc[case_missing_exam_mask, 'study_id'].nunique():,} patients)"
+    )
+    print(
+        f"  case exams with dx + exam date:      {len(analyzable):,} exams "
+        f"({analyzable['study_id'].nunique():,} patients)"
+    )
+    print(
+        f"  pre-treatment window [-{pre_dx_days}, 0] days: {pre_window_mask.sum():,} exams "
+        f"({analyzable.loc[pre_window_mask, 'study_id'].nunique():,} patients)"
+    )
+    print(
+        f"  around-dx window [-{pre_dx_days}, +{post_dx_days}] days: {around_dx_mask.sum():,} exams "
+        f"({analyzable.loc[around_dx_mask, 'study_id'].nunique():,} patients)"
+    )
+    print(
+        f"  early post-dx (0, +{post_dx_days}] days: {early_post_mask.sum():,} exams "
+        f"({analyzable.loc[early_post_mask, 'study_id'].nunique():,} patients)"
+    )
+    print(
+        f"  older pre-dx (<-{pre_dx_days} days):   {older_pre_mask.sum():,} exams "
+        f"({analyzable.loc[older_pre_mask, 'study_id'].nunique():,} patients)"
+    )
+    print(
+        f"  late post-dx (>{post_dx_days} days):   {late_post_mask.sum():,} exams "
+        f"({analyzable.loc[late_post_mask, 'study_id'].nunique():,} patients)"
+    )
+    print(
+        f"  final in-window cases kept for export: {in_window_mask.sum():,} exams "
+        f"({analyzable.loc[in_window_mask, 'study_id'].nunique():,} patients)"
+    )
+
+    hist_bins = [
+        -np.inf,
+        -365,
+        -180,
+        -120,
+        -90,
+        -60,
+        -30,
+        -14,
+        -7,
+        0,
+        7,
+        14,
+        30,
+        60,
+        90,
+        120,
+        180,
+        365,
+        np.inf,
+    ]
+    hist_labels = [
+        "<=-365",
+        "(-365,-180]",
+        "(-180,-120]",
+        "(-120,-90]",
+        "(-90,-60]",
+        "(-60,-30]",
+        "(-30,-14]",
+        "(-14,-7]",
+        "(-7,0]",
+        "(0,7]",
+        "(7,14]",
+        "(14,30]",
+        "(30,60]",
+        "(60,90]",
+        "(90,120]",
+        "(120,180]",
+        "(180,365]",
+        ">365",
+    ]
+    binned = pd.cut(delta_days, bins=hist_bins, labels=hist_labels, include_lowest=True)
+    hist_counts = binned.value_counts(sort=False)
+    hist_patients = (
+        analyzable.assign(_bin=binned)
+        .groupby("_bin", observed=True)["study_id"]
+        .nunique()
+        .reindex(hist_labels, fill_value=0)
+    )
+    max_count = int(hist_counts.max()) if len(hist_counts) > 0 else 0
+    scale = max(1, max_count // 40) if max_count > 0 else 1
+
+    print("\n  histogram: case MRI exams by days from dx")
+    print("    bin_days_from_dx      exams   patients   bar")
+    for label in hist_labels:
+        count = int(hist_counts.get(label, 0))
+        patient_count = int(hist_patients.get(label, 0))
+        bar = "#" * (count // scale) if count > 0 else ""
+        print(f"    {label:>16}  {count:>8,}  {patient_count:>9,}   {bar}")
+
+    pre_dx_only = delta_days <= 0
+    pre_dx_df = analyzable.loc[pre_dx_only].copy()
+    pre_dx_delta = delta_days[pre_dx_only]
+    cumulative_thresholds = [14, 30, 60, 90, 120, 180, 270, 365, 540, 730]
+    print("\n  cumulative pre-dx yields (windows [−N, 0] days)")
+    print("    pre_dx_days<=N        exams   patients")
+    for n_days in cumulative_thresholds:
+        within = pre_dx_delta >= -n_days
+        exams_n = int(within.sum())
+        patients_n = int(pre_dx_df.loc[within, "study_id"].nunique())
+        print(f"    {n_days:>12}  {exams_n:>8,}  {patients_n:>9,}")
+
+
+def _filter_pcr_targets_by_dx_window(
+    targets: pd.DataFrame, pre_dx_days: int, post_dx_days: int
+) -> pd.DataFrame:
+    """Restrict PCR export targets to case MR exams near diagnosis."""
+    if targets.empty:
+        return targets
+
+    case_series = (
+        targets.get("case_control_status", pd.Series("Unknown", index=targets.index))
+        .fillna("Unknown")
+        .astype(str)
+        .str.strip()
+        .str.lower()
+    )
+    case_mask = case_series == "case"
+    in_cohort_mask = (
+        targets.get("in_selected_cohort", pd.Series(False, index=targets.index))
+        .fillna(False)
+        .astype(bool)
+    )
+    has_dx_mask = targets["DatedxIndex"].notna()
+    has_exam_mask = targets["Study DateTime"].notna()
+    delta_days = (
+        targets["Study DateTime"] - targets["DatedxIndex"]
+    ).dt.total_seconds() / 86400.0
+    window_mask = (delta_days >= -pre_dx_days) & (delta_days <= post_dx_days)
+    keep_mask = in_cohort_mask & case_mask & has_dx_mask & has_exam_mask & window_mask
+    filtered = targets.loc[keep_mask].copy()
+    print(
+        "PCR export filter applied: "
+        f"{len(targets):,} -> {len(filtered):,} exams "
+        f"({targets['study_id'].nunique():,} -> {filtered['study_id'].nunique():,} patients) "
+        f"using selected cohort + case status + dx window [-{pre_dx_days}, +{post_dx_days}] days."
+    )
+    return filtered
 
 
 def apply_disk_status_for_modality(db: pd.DataFrame, modality: str) -> pd.DataFrame:
@@ -414,7 +924,7 @@ def run_export_cycle(args, cycle_number: int):
     """
     cycle_banner = (
         f"\n=== Export cycle {cycle_number} started at "
-        f"{datetime.now():%Y-%m-%d %H:%M:%S} (ChiMEC) ==="
+        f"{datetime.now():%Y-%m-%d %H:%M:%S} (ChiMEC, cohort={args.cohort}) ==="
     )
     print(cycle_banner)
 
@@ -447,18 +957,50 @@ def run_export_cycle(args, cycle_number: int):
     elif args.refresh_metadata and getattr(args, "_refresh_finished", False):
         print("Metadata refresh already complete in this run; skipping refresh step.")
 
-    db = load_chimec_data()
+    db = load_chimec_data(cohort=args.cohort, patients_file=args.patients_file)
     db = apply_disk_status_for_modality(db, args.modality)
+    _print_modality_scope_note(args)
     run_reconciliation_if_enabled(args, db, cycle_number)
 
-    filter_by_genotyping = not args.no_genotyping_filter
+    db_for_targeting = db
+    if args.cohort == COHORT_PCR:
+        _print_pcr_prefilter_summary(
+            db,
+            args.modality,
+            pre_dx_days=args.pcr_pre_dx_window_days,
+            post_dx_days=args.pcr_post_dx_window_days,
+            histogram_prefix=args.pcr_histogram_prefix,
+        )
+        in_cohort_mask = (
+            db.get("in_selected_cohort", pd.Series(False, index=db.index))
+            .fillna(False)
+            .astype(bool)
+        )
+        db_for_targeting = db[in_cohort_mask].copy()
+        print(
+            f"PCR targeting dataset restricted to selected cohort: {len(db_for_targeting):,} exams "
+            f"({db_for_targeting['study_id'].nunique():,} patients)."
+        )
+
+    filter_by_genotyping = _should_filter_by_genotyping(args)
     targets = identify_download_targets(
-        db,
+        db_for_targeting,
         filter_by_genotyping=filter_by_genotyping,
         modality=args.modality.upper(),
         base_download_dir=CHIMEC_BASE_DOWNLOAD_DIR,
         dataset="chimec",
     )
+    if args.cohort == COHORT_PCR:
+        _print_pcr_window_summary(
+            targets,
+            pre_dx_days=args.pcr_pre_dx_window_days,
+            post_dx_days=args.pcr_post_dx_window_days,
+        )
+        targets = _filter_pcr_targets_by_dx_window(
+            targets,
+            pre_dx_days=args.pcr_pre_dx_window_days,
+            post_dx_days=args.pcr_post_dx_window_days,
+        )
 
     db["is_target"] = False
     db.loc[targets.index, "is_target"] = True
@@ -589,7 +1131,7 @@ def refresh_export_status(
         f"\n=== Refresh cycle {cycle_number}: auditing export status before next run (ChiMEC) ==="
     )
 
-    refresh_db = load_chimec_data()
+    refresh_db = load_chimec_data(cohort=args.cohort, patients_file=args.patients_file)
     refresh_db = apply_disk_status_for_modality(refresh_db, args.modality)
 
     modality = args.modality.upper()
@@ -720,6 +1262,27 @@ def main():
         help="Base modality to filter for (e.g., MG, MR, CT).",
     )
     parser.add_argument(
+        "--cohort",
+        type=str,
+        choices=[COHORT_PRIORITY, COHORT_PCR],
+        default=COHORT_PRIORITY,
+        help=(
+            "Patient cohort used to select ChiMEC patients: "
+            "'priority' uses the historical priority list, "
+            "'pcr' uses phenotype rows with non-null pcr."
+        ),
+    )
+    parser.add_argument(
+        "--patients-file",
+        type=str,
+        default=None,
+        help=(
+            "Override cohort patient CSV path. Defaults are cohort-specific: "
+            f"{COHORT_PRIORITY}={CHIMEC_PATIENTS_FILE}, "
+            f"{COHORT_PCR}={CHIMEC_PCR_PATIENTS_FILE}."
+        ),
+    )
+    parser.add_argument(
         "--loop-wait",
         type=parse_wait_interval,
         default="1h",
@@ -835,8 +1398,36 @@ def main():
         default="data/chimec_disk_ibroker_reconciliation.csv",
         help="Output CSV path for disk-vs-iBroker reconciliation details.",
     )
+    parser.add_argument(
+        "--pcr-pre-dx-window-days",
+        type=int,
+        default=90,
+        help=(
+            "Used when --cohort pcr: keep case MR exams this many days before diagnosis "
+            "through the post-dx window."
+        ),
+    )
+    parser.add_argument(
+        "--pcr-post-dx-window-days",
+        type=int,
+        default=0,
+        help=(
+            "Used when --cohort pcr: include case MR exams up to this many days after diagnosis. "
+            "Default 0 keeps pre-treatment only."
+        ),
+    )
+    parser.add_argument(
+        "--pcr-histogram-prefix",
+        type=str,
+        default="data/pcr_ibroker_time_from_dx",
+        help=(
+            "Used when --cohort pcr: output prefix for iBroker time-from-dx histogram artifacts "
+            "(writes <prefix>.png and <prefix>.csv)."
+        ),
+    )
 
     args = parser.parse_args()
+    _normalize_args_for_cohort(args)
 
     # build-fingerprints: scan disk, read DICOM metadata, write to fingerprints/chimec/
     if args.build_fingerprints:
@@ -868,16 +1459,47 @@ def main():
                 args.refresh_checkpoint_batch_size,
                 args.refresh_max_new_batches_per_cycle,
             )
-        db = load_chimec_data()
+        db = load_chimec_data(cohort=args.cohort, patients_file=args.patients_file)
         db = apply_disk_status_for_modality(db, args.modality)
-        filter_by_genotyping = not args.no_genotyping_filter
-        identify_download_targets(
-            db,
+        _print_modality_scope_note(args)
+        db_for_targeting = db
+        if args.cohort == COHORT_PCR:
+            _print_pcr_prefilter_summary(
+                db,
+                args.modality,
+                pre_dx_days=args.pcr_pre_dx_window_days,
+                post_dx_days=args.pcr_post_dx_window_days,
+                histogram_prefix=args.pcr_histogram_prefix,
+            )
+            in_cohort_mask = (
+                db.get("in_selected_cohort", pd.Series(False, index=db.index))
+                .fillna(False)
+                .astype(bool)
+            )
+            db_for_targeting = db[in_cohort_mask].copy()
+            print(
+                f"PCR targeting dataset restricted to selected cohort: {len(db_for_targeting):,} exams "
+                f"({db_for_targeting['study_id'].nunique():,} patients)."
+            )
+        filter_by_genotyping = _should_filter_by_genotyping(args)
+        targets = identify_download_targets(
+            db_for_targeting,
             filter_by_genotyping=filter_by_genotyping,
             modality=args.modality.upper(),
             base_download_dir=CHIMEC_BASE_DOWNLOAD_DIR,
             dataset="chimec",
         )
+        if args.cohort == COHORT_PCR:
+            _print_pcr_window_summary(
+                targets,
+                pre_dx_days=args.pcr_pre_dx_window_days,
+                post_dx_days=args.pcr_post_dx_window_days,
+            )
+            _filter_pcr_targets_by_dx_window(
+                targets,
+                pre_dx_days=args.pcr_pre_dx_window_days,
+                post_dx_days=args.pcr_post_dx_window_days,
+            )
         run_reconciliation_if_enabled(args, db, cycle_number=1)
         sys.exit(0)
 

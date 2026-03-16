@@ -10,7 +10,7 @@ This script reads from views.parquet (output from preprocessing) and generates:
 
 The gallery features:
 - Single-image viewer with Previous/Next buttons (faster than scrolling)
-- Keyboard navigation (left/right arrows, g for good, a to annotate, s to skip, l to load more)
+- Keyboard navigation (left/right arrows, g for good, a to annotate, s for next, l to load more)
 - Search/filter by patient ID, exam ID, or accession number
 - QC button to mark exams as "good" (no findings)
 - Independent annotation system: tag exams with categories (e.g., artifact types)
@@ -25,7 +25,7 @@ QC Workflow (fully keyboard-driven)
    - g for good (means reviewed with no issues)
    - a to annotate issues, then esc to close modal and move to next exam
    - in annotation modal, letter hotkeys toggle tags, type + enter to add new tag
-   - arrow keys to navigate, s to skip, l to load more
+   - arrow keys to navigate, s for next, l to load more
 4. Re-run script to continue QC on remaining exams (by default, "good" and annotated exams skipped)
 5. To re-visit annotated exams: use --qc-skip-status good auto_excluded
 
@@ -1533,6 +1533,65 @@ def _compute_exam_error_scores(
 
         traceback.print_exc()
         return pd.Series(dtype=float)
+
+
+# average bytes per combined 4-view PNG (from empirical sampling)
+AVG_PNG_BYTES_PER_EXAM = int(183 * 1024)
+GALLERY_HTML_OVERHEAD_BYTES = 5 * 1024 * 1024  # ~5 MB for large galleries
+
+
+def estimate_qc_preprocess_disk(
+    views_parquet: Path,
+    raw_dir: Path,
+    patient_id: Optional[str] = None,
+    exam_id: Optional[str] = None,
+    exam_list_path: Optional[Path] = None,
+    per_view: bool = False,
+) -> Tuple[int, int]:
+    """Estimate disk usage for QC preprocessing (figures + gallery).
+
+    Returns:
+        (n_exams, estimated_bytes)
+    """
+    views_df = pd.read_parquet(views_parquet)
+    views_df = views_df.assign(
+        exam_id=views_df["exam_id"].astype(str),
+        patient_id=views_df["patient_id"].astype(str),
+    )
+    if "accession_number" in views_df.columns:
+        views_df["accession_number"] = views_df["accession_number"].astype(str)
+
+    from prima.qc_filters import compute_auto_filter_sets, load_auto_filter_names
+
+    auto_filter_names = load_auto_filter_names()
+    if auto_filter_names:
+        tags_path = raw_dir / "sot" / "dicom_tags.parquet"
+        if tags_path.exists():
+            filter_sets = compute_auto_filter_sets(
+                views_parquet, tags_path, filter_names=auto_filter_names
+            )
+            auto_excluded = set()
+            for fn in auto_filter_names:
+                auto_excluded.update(filter_sets.get(fn, set()))
+            views_df = views_df[~views_df["exam_id"].isin(auto_excluded)]
+
+    if patient_id:
+        views_df = views_df[views_df["patient_id"] == str(patient_id)]
+    if exam_id:
+        views_df = views_df[views_df["exam_id"] == str(exam_id)]
+    if exam_list_path and exam_list_path.exists():
+        with open(exam_list_path) as f:
+            exam_list = [
+                line.strip() for line in f if line.strip() and not line.startswith("#")
+            ]
+        views_df = views_df[views_df["exam_id"].isin(exam_list)]
+
+    n_exams = views_df["exam_id"].nunique()
+    bytes_per_exam = AVG_PNG_BYTES_PER_EXAM
+    if per_view:
+        bytes_per_exam += 4 * AVG_PNG_BYTES_PER_EXAM  # 4 extra per-view figures
+    estimated = n_exams * bytes_per_exam + GALLERY_HTML_OVERHEAD_BYTES
+    return n_exams, estimated
 
 
 def generate_gallery(
@@ -3090,8 +3149,8 @@ def generate_gallery(
             }}
         }});
         
-        function skipExam() {{
-            // skip without marking - just advance
+        function nextExam() {{
+            // advance to next exam without changing QC status
             advanceAfterQCAction();
         }}
         
@@ -3740,7 +3799,7 @@ def generate_gallery(
                     '<button class="qc-button annotate' + (hasAnnotations ? ' has-tags' : '') + '" ' +
                         'onclick="showAnnotationModal()" title="annotate this exam">🏷 annotate [a]</button>' +
                     '<button class="qc-button skip" ' +
-                        'onclick="skipExam()" title="skip without marking">⏭ skip [s]</button>' +
+                        'onclick="nextExam()" title="advance to next exam">⏭ next [s]</button>' +
                 '</div>' +
                 '<div class="image-container">' +
                     '<img src="' + exam.path + '" alt="Exam ' + exam.exam_id + '">' +
@@ -3819,7 +3878,7 @@ def generate_gallery(
             }} else if (key === 'a') {{
                 showAnnotationModal();
             }} else if (key === 's') {{
-                skipExam();
+                nextExam();
             }} else if (key === 'l') {{
                 loadMore();
             }}
@@ -3971,7 +4030,7 @@ def generate_gallery(
         // show instructions in console
         console.log('QC data auto-saves to server on each button click');
         console.log('Server saves to: {qc_file_str}');
-        console.log('Keyboard shortcuts: g=good, a=annotate (letter hotkeys toggle tags), s=skip, l=load more, arrows=navigate');
+        console.log('Keyboard shortcuts: g=good, a=annotate (letter hotkeys toggle tags), s=next, l=load more, arrows=navigate');
         console.log('Backup: QC data also saved to browser localStorage (scoped by QC file) - safe to refresh page');
         console.log('Dynamic filters: insert filter tokens from dropdown, then combine with &, |, ~ in the filter box');
         console.log('Cutflow: Click 📊 Cutflow button to see dataset statistics');
@@ -4007,7 +4066,7 @@ def generate_gallery(
                 )
                 logger.info("=" * 60)
                 logger.info(
-                    "Keyboard shortcuts: g=good, a=annotate (letter hotkeys), s=skip, l=load more, arrow keys=navigate"
+                    "Keyboard shortcuts: g=good, a=annotate (letter hotkeys), s=next, l=load more, arrow keys=navigate"
                 )
 
     logger.info("gallery generation complete:")
@@ -4050,6 +4109,11 @@ Examples:
 
   # QC without server (downloads qc_status.json on each click)
   python qc_gallery.py --max-exams 10 --random
+
+  # preprocess all exams for local QC (full re-do, move output dir to local machine)
+  python qc_gallery.py --preprocess-all --output qc_export
+  # estimate disk first:
+  python qc_gallery.py --estimate-only
 
   # use custom port
   python qc_gallery.py --serve --port 8080 --patient 12345
@@ -4159,6 +4223,16 @@ QC File Format:
         help="QC buckets to skip in future runs (default: good annotated auto_excluded). Use '--qc-skip-status good auto_excluded' to re-visit annotated findings",
     )
     parser.add_argument(
+        "--preprocess-all",
+        action="store_true",
+        help="preprocess all exams that need QC (skip only auto_excluded). For full re-do before moving to local machine.",
+    )
+    parser.add_argument(
+        "--estimate-only",
+        action="store_true",
+        help="print disk estimate for preprocessing and exit",
+    )
+    parser.add_argument(
         "--serve",
         action="store_true",
         help="start HTTP server to serve gallery and handle QC saves (recommended for remote work)",
@@ -4212,12 +4286,33 @@ QC File Format:
     resolved_pred_csv = args.pred_csv.resolve() if args.pred_csv else None
     resolved_meta_csv = args.meta_csv.resolve() if args.meta_csv else None
 
+    max_exams = args.max_exams
+    if args.preprocess_all:
+        qc_skip_status = {"auto_excluded"}
+        max_exams = None
+    else:
+        qc_skip_status = set(args.qc_skip_status) if args.qc_skip_status else None
+
+    if args.estimate_only:
+        n_exams, estimated_bytes = estimate_qc_preprocess_disk(
+            views_parquet=resolved_views_path,
+            raw_dir=resolved_raw_dir,
+            patient_id=args.patient,
+            exam_id=args.exam,
+            exam_list_path=resolved_exam_list,
+            per_view=args.per_view,
+        )
+        gib = estimated_bytes / (1024**3)
+        print(f"exams to preprocess: {n_exams}")
+        print(f"estimated disk: {gib:.2f} GB ({estimated_bytes:,} bytes)")
+        return 0
+
     # run gallery generation
     generate_gallery(
         views_parquet=resolved_views_path,
         raw_dir=resolved_raw_dir,
         output_dir=resolved_output_dir,
-        max_exams=args.max_exams,
+        max_exams=max_exams,
         random_sample=args.random,
         patient_id=args.patient,
         exam_id=args.exam,
@@ -4229,7 +4324,7 @@ QC File Format:
         meta_csv=resolved_meta_csv,
         prioritize_errors=args.prioritize_errors,
         horizon=args.horizon,
-        qc_skip_status=set(args.qc_skip_status) if args.qc_skip_status else None,
+        qc_skip_status=qc_skip_status,
         serve=args.serve,
         original_args=vars(args),
     )

@@ -17,6 +17,8 @@ colmap: null
 #   "5": 5_year_risk
 cindex_col: null
 kfold: null
+auc_mode: patient_weighted
+random_exam_seed: 42
 
 qc_filters:
   # QC server status map (exam_id -> status)

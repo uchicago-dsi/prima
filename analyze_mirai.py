@@ -78,6 +78,7 @@ PHENOTYPE_CSV = Path(
 )
 PATIENT_KEY_CSV = Path("/gpfs/data/huo-lab/Image/ChiMEC/study-16352a.csv")
 PHENOTYPE_COLUMNS = [
+    "CaseControl",
     "RaceEthnic",
     "dob",
     "grade",
@@ -130,6 +131,8 @@ class Config:
     colmap: dict[int, str] | None
     cindex_col: str | None
     kfold: int | None
+    auc_mode: str
+    random_exam_seed: int
     qc_filters: QCFilterConfig
     config_path: Path
     raw_config: dict[str, Any]
@@ -142,6 +145,7 @@ class ExamData:
 
     merged_views: pd.DataFrame
     exam_level: pd.DataFrame
+    exam_level_unfiltered: pd.DataFrame
     meta_all: pd.DataFrame
     meta_eval: pd.DataFrame
     pred_cols: dict[int, str]
@@ -633,6 +637,143 @@ def _build_exam_filter(
     return active_exam_ids, summary
 
 
+def _build_filter_cutflow_df(
+    df_exam: pd.DataFrame, cfg: Config, views_path: Path, tags_path: Path
+) -> pd.DataFrame:
+    """Compute exam/patient cutflow under current QC+annotation config."""
+    exam_to_patient = (
+        df_exam[["exam_id", "patient_id"]]
+        .drop_duplicates(subset=["exam_id"])
+        .assign(
+            exam_id=lambda d: d["exam_id"].astype(str),
+            patient_id=lambda d: d["patient_id"].astype(str),
+        )
+        .set_index("exam_id")["patient_id"]
+        .to_dict()
+    )
+    active_exam_ids = set(exam_to_patient.keys())
+    initial_patients = len(set(exam_to_patient.values()))
+    rows: list[dict[str, Any]] = [
+        {
+            "step": 0,
+            "mode": "start",
+            "name": "start",
+            "candidate_exams": len(active_exam_ids),
+            "candidate_patients": initial_patients,
+            "excluded_exams": 0,
+            "excluded_patients": 0,
+            "remaining_exams": len(active_exam_ids),
+            "remaining_patients": initial_patients,
+        }
+    ]
+
+    def _apply(mode: str, name: str, candidates: set[str]) -> None:
+        nonlocal active_exam_ids
+        before_exams = len(active_exam_ids)
+        before_patients = len({exam_to_patient[e] for e in active_exam_ids})
+        if mode == "exclude":
+            active_exam_ids = active_exam_ids - set(candidates)
+        else:
+            active_exam_ids = active_exam_ids & set(candidates)
+        after_exams = len(active_exam_ids)
+        after_patients = len({exam_to_patient[e] for e in active_exam_ids})
+        candidate_patients = len(
+            {exam_to_patient[e] for e in candidates if e in exam_to_patient}
+        )
+        rows.append(
+            {
+                "step": len(rows),
+                "mode": mode,
+                "name": name,
+                "candidate_exams": len(candidates),
+                "candidate_patients": candidate_patients,
+                "excluded_exams": before_exams - after_exams,
+                "excluded_patients": before_patients - after_patients,
+                "remaining_exams": after_exams,
+                "remaining_patients": after_patients,
+            }
+        )
+
+    qc_cfg = cfg.qc_filters
+    auto_filter_names = _load_auto_filter_names(qc_cfg)
+    if auto_filter_names:
+        auto_by_filter = compute_auto_filter_sets(
+            views_path, tags_path, filter_names=auto_filter_names
+        )
+        for filter_name in auto_filter_names:
+            _apply(
+                "exclude",
+                f"auto_filter:{filter_name}",
+                auto_by_filter.get(filter_name, set()),
+            )
+
+    qc_status_map = _load_qc_status_map(qc_cfg.qc_file)
+    if qc_cfg.include_statuses is not None:
+        include_set = set(qc_cfg.include_statuses)
+        included_exam_ids = {
+            eid for eid, status in qc_status_map.items() if status in include_set
+        }
+        _apply(
+            "include",
+            f"qc_status:include={','.join(sorted(include_set))}",
+            included_exam_ids,
+        )
+    if qc_cfg.exclude_statuses:
+        exclude_set = set(qc_cfg.exclude_statuses)
+        excluded_exam_ids = {
+            eid for eid, status in qc_status_map.items() if status in exclude_set
+        }
+        _apply(
+            "exclude",
+            f"qc_status:exclude={','.join(sorted(exclude_set))}",
+            excluded_exam_ids,
+        )
+
+    annotation_map = _load_annotations_map(qc_cfg.annotations_file)
+    include_any = set(qc_cfg.annotation_include_any)
+    include_all = set(qc_cfg.annotation_include_all)
+    exclude_any = set(qc_cfg.annotation_exclude_any)
+    exclude_all = set(qc_cfg.annotation_exclude_all)
+    if include_any:
+        include_any_ids = {
+            eid for eid, tags in annotation_map.items() if tags & include_any
+        }
+        _apply(
+            "include",
+            f"annotations:include_any={','.join(sorted(include_any))}",
+            include_any_ids,
+        )
+    if include_all:
+        include_all_ids = {
+            eid for eid, tags in annotation_map.items() if include_all.issubset(tags)
+        }
+        _apply(
+            "include",
+            f"annotations:include_all={','.join(sorted(include_all))}",
+            include_all_ids,
+        )
+    if exclude_any:
+        exclude_any_ids = {
+            eid for eid, tags in annotation_map.items() if tags & exclude_any
+        }
+        _apply(
+            "exclude",
+            f"annotations:exclude_any={','.join(sorted(exclude_any))}",
+            exclude_any_ids,
+        )
+    if exclude_all:
+        exclude_all_ids = {
+            eid for eid, tags in annotation_map.items() if exclude_all.issubset(tags)
+        }
+        _apply(
+            "exclude",
+            f"annotations:exclude_all={','.join(sorted(exclude_all))}",
+            exclude_all_ids,
+        )
+
+    return pd.DataFrame(rows)
+
+
 def _load_exam_data(cfg: Config) -> ExamData:
     """load predictions merged with metadata, aggregated per exam"""
 
@@ -687,6 +828,7 @@ def _load_exam_data(cfg: Config) -> ExamData:
         agg_dict["split_group"] = "first"
 
     df_exam = df.groupby(["patient_id", "exam_id"], as_index=False).agg(agg_dict)
+    df_exam_unfiltered = df_exam.copy()
 
     # QC/auto/annotation filtering
     views_path = cfg.pred_csv.parent.parent / "sot" / "views.parquet"
@@ -737,6 +879,7 @@ def _load_exam_data(cfg: Config) -> ExamData:
     return ExamData(
         merged_views=df,
         exam_level=df_exam,
+        exam_level_unfiltered=df_exam_unfiltered,
         meta_all=meta_all,
         meta_eval=meta_eval,
         pred_cols=pred_cols,
@@ -790,6 +933,53 @@ def _detect_pred_cols(df: pd.DataFrame) -> dict[int, str]:
     return dict(sorted(cols.items()))
 
 
+def _horizon_auc_arrays(
+    df_exam: pd.DataFrame, horizon: int, score_col: str, cfg: Config
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray, int]:
+    """Prepare y/s/weights/patient_id arrays for horizon-specific AUC."""
+    tmp = df_exam[
+        ["patient_id", "years_to_cancer", "years_to_last_followup", score_col]
+    ].copy()
+    tmp = tmp.rename(columns={score_col: "score"})
+    ytc = pd.to_numeric(tmp["years_to_cancer"], errors="coerce").to_numpy()
+    ylf = pd.to_numeric(tmp["years_to_last_followup"], errors="coerce").to_numpy()
+    case = np.less_equal(ytc, horizon)
+    ctrl = np.logical_and(np.greater(ytc, horizon), np.greater_equal(ylf, horizon))
+    include = np.logical_or(case, ctrl)
+    excluded = int((~include).sum())
+
+    eligible = tmp.loc[include].copy()
+    eligible["case"] = case[include].astype(np.int32)
+
+    if cfg.auc_mode == "random_exam":
+        eligible = (
+            eligible.groupby("patient_id", group_keys=False)
+            .sample(n=1, random_state=cfg.random_exam_seed + int(horizon))
+            .reset_index(drop=True)
+        )
+        weights = None
+    else:
+        # each patient contributes total weight 1 across all their eligible exams
+        n_exam_per_patient = eligible.groupby("patient_id")["patient_id"].transform(
+            "size"
+        )
+        weights = (1.0 / n_exam_per_patient.astype(float)).to_numpy()
+
+    y = eligible["case"].astype(np.int32).to_numpy()
+    s = pd.to_numeric(eligible["score"], errors="coerce").to_numpy()
+    patient_ids = eligible["patient_id"].astype(str).to_numpy()
+    return y, s, weights, patient_ids, excluded
+
+
+def _auc_point_estimate(
+    y_true: np.ndarray, y_score: np.ndarray, sample_weight: np.ndarray | None = None
+) -> float:
+    """Compute AUC point estimate with optional sample weights."""
+    if len(y_true) == 0 or not (y_true.any() and (~y_true.astype(bool)).any()):
+        return float("nan")
+    return float(roc_auc_score(y_true, y_score, sample_weight=sample_weight))
+
+
 def summarize(cfg: Config) -> tuple[pd.DataFrame, ExamData]:
     """compute per-horizon summary: cases, controls, excluded, auc, prevalence"""
 
@@ -815,32 +1005,23 @@ def summarize(cfg: Config) -> tuple[pd.DataFrame, ExamData]:
         print(
             f"  Views per exam: min={views_per_exam.min()}, max={views_per_exam.max()}, mean={views_per_exam.mean():.2f}"
         )
+    print(f"AUC mode: {cfg.auc_mode}")
     print()
-
-    # vectorized label tensors (now per exam)
-    ytc = df_exam["years_to_cancer"].astype(float).to_numpy()
-    ylf = df_exam["years_to_last_followup"].astype(float).to_numpy()
 
     rows = []
     for h, col in pred_cols.items():
-        scores = df_exam[col].astype(float).to_numpy()
-        case = ytc <= h
-        ctrl = (ytc > h) & (ylf >= h)
-        include = case | ctrl
-        y = case[include].astype(np.int32)
-        s = scores[include]
-        auc = float("nan")
-        if y.any() and (~y.astype(bool)).any():
-            auc = float(roc_auc_score(y, s))
+        y, s, w, _pids, excluded = _horizon_auc_arrays(df_exam, h, col, cfg)
+        auc = _auc_point_estimate(y, s, sample_weight=w)
         rows.append(
             {
                 "horizon_years": h,
-                "n": int(include.sum()),
-                "cases": int(case.sum()),
-                "controls": int(ctrl.sum()),
-                "excluded": int((~include).sum()),
-                "prevalence": float(case.sum() / max(1, (case | ctrl).sum())),
+                "n": int(len(y)),
+                "cases": int(y.sum()),
+                "controls": int((1 - y).sum()),
+                "excluded": excluded,
+                "prevalence": float(y.sum() / max(1, len(y))),
                 "auc": auc,
+                "auc_mode": cfg.auc_mode,
             }
         )
 
@@ -884,6 +1065,12 @@ def _load_config(config_path: Path) -> Config:
     kfold = None if kfold_value is None else int(kfold_value)
     if kfold is not None and kfold < 2:
         raise ValueError("config key 'kfold' must be >= 2 when provided")
+    auc_mode = str(resolved_input.get("auc_mode", "patient_weighted")).strip().lower()
+    if auc_mode not in {"patient_weighted", "random_exam"}:
+        raise ValueError(
+            "config key 'auc_mode' must be 'patient_weighted' or 'random_exam'"
+        )
+    random_exam_seed = int(resolved_input.get("random_exam_seed", 42))
 
     if not pred_csv.exists():
         raise FileNotFoundError(f"prediction CSV not found: {pred_csv}")
@@ -961,6 +1148,8 @@ def _load_config(config_path: Path) -> Config:
         "colmap": {str(k): v for k, v in colmap.items()} if colmap else None,
         "cindex_col": cindex_col,
         "kfold": kfold,
+        "auc_mode": auc_mode,
+        "random_exam_seed": random_exam_seed,
         "qc_filters": {
             "qc_file": str(qc_file) if qc_file else None,
             "include_statuses": list(include_statuses)
@@ -988,6 +1177,8 @@ def _load_config(config_path: Path) -> Config:
         colmap=colmap,
         cindex_col=cindex_col,
         kfold=kfold,
+        auc_mode=auc_mode,
+        random_exam_seed=random_exam_seed,
         qc_filters=qc_filters,
         config_path=config_path,
         raw_config=raw_config,
@@ -1029,24 +1220,52 @@ def plot_hiddens_pca(
     if "file_path" not in meta.columns:
         print("[warn] manifest has no file_path; cannot map hiddens to exams")
         return
+    # build file_path -> (patient_id, exam_id); also exam_id -> patient_id for fallback
     path_to_exam = (
-        meta[["file_path", "patient_id", "exam_id"]]
-        .drop_duplicates()
-        .set_index("file_path")
+        meta[["file_path", "patient_id", "exam_id"]].drop_duplicates().astype(str)
     )
-    path_to_exam = path_to_exam.astype(str)
+    path_lookup = path_to_exam.set_index("file_path")
+    exam_to_patient = (
+        meta[["patient_id", "exam_id"]]
+        .drop_duplicates()
+        .astype(str)
+        .set_index("exam_id")
+    )
+
+    def _path_to_exam_id(path_str: str) -> str | None:
+        """extract exam_id from zarr path like .../EXAM_ID.zarr#VIEW"""
+        if ".zarr#" in path_str:
+            base = path_str.split("#")[0]
+            return base.split("/")[-1].replace(".zarr", "")
+        return None
 
     rows = []
     for i, path in enumerate(paths):
         path_str = str(path).strip()
-        if path_str not in path_to_exam.index:
-            continue
-        row = path_to_exam.loc[path_str]
-        rows.append(
-            {"patient_id": row["patient_id"], "exam_id": row["exam_id"], "idx": i}
-        )
+        matched = False
+        for view_path in path_str.split("\t"):
+            view_path = view_path.strip()
+            if not view_path:
+                continue
+            if view_path in path_lookup.index:
+                row = path_lookup.loc[view_path]
+                rows.append(
+                    {
+                        "patient_id": row["patient_id"],
+                        "exam_id": row["exam_id"],
+                        "idx": i,
+                    }
+                )
+                matched = True
+                break
+        if not matched:
+            first_view = path_str.split("\t")[0].strip() if path_str else ""
+            exam_id = _path_to_exam_id(first_view or path_str)
+            if exam_id and exam_id in exam_to_patient.index:
+                pid = exam_to_patient.loc[exam_id, "patient_id"]
+                rows.append({"patient_id": pid, "exam_id": exam_id, "idx": i})
     if not rows:
-        print("[warn] no hiddens paths matched manifest file_path")
+        print("[warn] no hiddens paths matched manifest file_path or exam_id")
         return
     path_df = pd.DataFrame(rows)
 
@@ -1060,6 +1279,12 @@ def plot_hiddens_pca(
     )
     exam_vecs.columns = ["patient_id", "exam_id", "vec"]
     X = np.stack(exam_vecs["vec"].values)
+    if X.ndim == 3:
+        X = X.mean(axis=1)
+    elif X.ndim != 2:
+        raise ValueError(
+            f"Expected 2D or 3D hiddens after aggregation, got shape {X.shape}"
+        )
     exam_keys = exam_vecs[["patient_id", "exam_id"]].copy()
 
     allowed = exam_data.exam_pairs
@@ -1070,6 +1295,9 @@ def plot_hiddens_pca(
     X = X[mask]
 
     enriched = _load_enriched_manifest(cfg)
+    enriched = enriched.sort_values(["patient_id", "exam_id"]).drop_duplicates(
+        subset=["patient_id", "exam_id"], keep="first"
+    )
     merged = exam_keys.merge(
         enriched,
         on=["patient_id", "exam_id"],
@@ -1440,6 +1668,8 @@ def _delong_auc_ci(
 def _bootstrap_auc_ci(
     y_true: np.ndarray,
     y_pred: np.ndarray,
+    sample_weight: np.ndarray | None = None,
+    group_ids: np.ndarray | None = None,
     n_bootstrap: int = 300,
     confidence: float = 0.95,
     random_state: int = 42,
@@ -1453,33 +1683,57 @@ def _bootstrap_auc_ci(
         return float("nan"), float("nan"), float("nan")
 
     bootstrap_start = time.time()
-    auc_observed = roc_auc_score(y_true, y_pred)
+    auc_observed = roc_auc_score(y_true, y_pred, sample_weight=sample_weight)
     n = len(y_true)
-
-    # pre-generate all bootstrap indices for efficiency
     rng = np.random.RandomState(random_state)
-    bootstrap_indices = rng.choice(n, size=(n_bootstrap, n), replace=True)
 
-    # helper function for single bootstrap iteration
-    def _single_bootstrap(i):
-        indices = bootstrap_indices[i]
-        y_boot = y_true[indices]
-        s_boot = y_pred[indices]
-        if y_boot.any() and (~y_boot.astype(bool)).any():
-            try:
-                return roc_auc_score(y_boot, s_boot)
-            except Exception:
-                return None
-        return None
+    if group_ids is not None:
+        group_ids = np.asarray(group_ids).astype(str)
+        unique_groups = np.unique(group_ids)
+        group_to_indices = {g: np.where(group_ids == g)[0] for g in unique_groups}
+
+        def _single_bootstrap(_i):
+            boot_groups = rng.choice(
+                unique_groups, size=len(unique_groups), replace=True
+            )
+            idx = np.concatenate([group_to_indices[g] for g in boot_groups])
+            y_boot = y_true[idx]
+            s_boot = y_pred[idx]
+            w_boot = sample_weight[idx] if sample_weight is not None else None
+            if y_boot.any() and (~y_boot.astype(bool)).any():
+                try:
+                    return roc_auc_score(y_boot, s_boot, sample_weight=w_boot)
+                except Exception:
+                    return None
+            return None
+
+    else:
+        bootstrap_indices = rng.choice(n, size=(n_bootstrap, n), replace=True)
+
+        def _single_bootstrap(i):
+            idx = bootstrap_indices[i]
+            y_boot = y_true[idx]
+            s_boot = y_pred[idx]
+            w_boot = sample_weight[idx] if sample_weight is not None else None
+            if y_boot.any() and (~y_boot.astype(bool)).any():
+                try:
+                    return roc_auc_score(y_boot, s_boot, sample_weight=w_boot)
+                except Exception:
+                    return None
+            return None
 
     # try parallelization with joblib using multiprocessing (not threading - GIL prevents speedup)
     try:
         from joblib import Parallel, delayed
 
-        # use multiprocessing backend for CPU-bound work
-        bootstrap_aucs = Parallel(n_jobs=-1, backend="loky", prefer="processes")(
-            delayed(_single_bootstrap)(i) for i in range(n_bootstrap)
-        )
+        if group_ids is not None:
+            # avoid parallel RNG coupling for grouped bootstrap
+            bootstrap_aucs = [_single_bootstrap(i) for i in range(n_bootstrap)]
+        else:
+            # use multiprocessing backend for CPU-bound work
+            bootstrap_aucs = Parallel(n_jobs=-1, backend="loky", prefer="processes")(
+                delayed(_single_bootstrap)(i) for i in range(n_bootstrap)
+            )
         bootstrap_aucs = [x for x in bootstrap_aucs if x is not None]
     except ImportError:
         # fallback to sequential if joblib not available
@@ -1672,24 +1926,20 @@ def compute_model_performance_metrics(
             return {
                 h: (float("nan"), float("nan"), float("nan")) for h in target_horizons
             }
-        ytc = pd.to_numeric(subset["years_to_cancer"], errors="coerce").to_numpy()
-        ylf = pd.to_numeric(
-            subset["years_to_last_followup"], errors="coerce"
-        ).to_numpy()
         result: dict[int, tuple[float, float, float]] = {}
         for h in target_horizons:
-            scores = subset[pred_cols[h]].astype(float).to_numpy()
-            case = np.less_equal(ytc, h)
-            ctrl = np.logical_and(np.greater(ytc, h), np.greater_equal(ylf, h))
-            include = np.logical_or(case, ctrl)
-            if not include.any():
+            y, s, w, pids, _excluded = _horizon_auc_arrays(subset, h, pred_cols[h], cfg)
+            if len(y) == 0:
                 result[h] = (float("nan"), float("nan"), float("nan"))
                 continue
-            y = case[include].astype(np.int32)
-            s = scores[include]
             if y.any() and (~y.astype(bool)).any():
-                if use_bootstrap:
-                    auc, lower, upper = _bootstrap_auc_ci(y, s)
+                if use_bootstrap or cfg.auc_mode == "patient_weighted":
+                    auc, lower, upper = _bootstrap_auc_ci(
+                        y,
+                        s,
+                        sample_weight=w,
+                        group_ids=pids if cfg.auc_mode == "patient_weighted" else None,
+                    )
                 else:
                     auc, lower, upper = _delong_auc_ci(y, s)
                 result[h] = (auc, lower, upper)
@@ -1822,30 +2072,23 @@ def compute_model_performance_metrics(
             f"  [{_format_elapsed(time.time() - func_start)}] Computing summary lookup CIs..."
         )
         summary_lookup = {}
-        # pre-compute arrays once (don't recompute for each horizon)
-        ytc_all = pd.to_numeric(df_all["years_to_cancer"], errors="coerce").to_numpy()
-        ylf_all = pd.to_numeric(
-            df_all["years_to_last_followup"], errors="coerce"
-        ).to_numpy()
-        # pre-extract all score arrays
-        scores_dict = {
-            h: df_all[pred_cols[h]].astype(float).to_numpy() for h in target_horizons
-        }
-
         for _, r in per_horizon_df.iterrows():
             h = int(r["horizon_years"])
             if h in target_horizons:
-                scores_all = scores_dict[h]
-                case_all = np.less_equal(ytc_all, h)
-                ctrl_all = np.logical_and(
-                    np.greater(ytc_all, h), np.greater_equal(ylf_all, h)
+                y_all, s_all, w_all, pids_all, _excluded = _horizon_auc_arrays(
+                    df_all, h, pred_cols[h], cfg
                 )
-                include_all = np.logical_or(case_all, ctrl_all)
-                if include_all.any():
-                    y_all = case_all[include_all].astype(np.int32)
-                    s_all = scores_all[include_all]
+                if len(y_all) > 0:
                     if y_all.any() and (~y_all.astype(bool)).any():
-                        auc, lower, upper = _delong_auc_ci(y_all, s_all)
+                        if cfg.auc_mode == "patient_weighted":
+                            auc, lower, upper = _bootstrap_auc_ci(
+                                y_all,
+                                s_all,
+                                sample_weight=w_all,
+                                group_ids=pids_all,
+                            )
+                        else:
+                            auc, lower, upper = _delong_auc_ci(y_all, s_all)
                         summary_lookup[h] = (auc, lower, upper)
                     else:
                         summary_lookup[h] = (float("nan"), float("nan"), float("nan"))
@@ -2222,6 +2465,10 @@ def main() -> None:
         last_checkpoint = now
 
     checkpoint("Starting analysis")
+    cutflow_csv_path: Path | None = None
+    cutflow_json_path: Path | None = None
+    resolved_cfg_path: Path | None = None
+    cutflow_df_for_html: pd.DataFrame | None = None
 
     if cfg.out_json is not None:
         cfg.out_json.parent.mkdir(parents=True, exist_ok=True)
@@ -2231,7 +2478,8 @@ def main() -> None:
         (cfg.out_json.parent / "analyze_mirai_config.input.yaml").write_text(
             OmegaConf.to_yaml(OmegaConf.create(cfg.raw_config), resolve=False)
         )
-        (cfg.out_json.parent / "analyze_mirai_config.resolved.yaml").write_text(
+        resolved_cfg_path = cfg.out_json.parent / "analyze_mirai_config.resolved.yaml"
+        resolved_cfg_path.write_text(
             OmegaConf.to_yaml(OmegaConf.create(cfg.resolved_config), resolve=True)
         )
         print(f"Saved analysis config snapshots to {cfg.out_json.parent}")
@@ -2239,6 +2487,23 @@ def main() -> None:
     checkpoint("Computing per-horizon summary...")
     per_horizon_df, exam_data = summarize(cfg)
     checkpoint("Computed per-horizon summary")
+    if cfg.out_json is not None:
+        try:
+            views_path = cfg.pred_csv.parent.parent / "sot" / "views.parquet"
+            tags_path = cfg.pred_csv.parent.parent / "sot" / "dicom_tags.parquet"
+            cutflow_df = _build_filter_cutflow_df(
+                exam_data.exam_level_unfiltered, cfg, views_path, tags_path
+            )
+            cutflow_df_for_html = cutflow_df.copy()
+            cutflow_csv_path = cfg.out_json.parent / "filter_cutflow.csv"
+            cutflow_json_path = cfg.out_json.parent / "filter_cutflow.json"
+            cutflow_df.to_csv(cutflow_csv_path, index=False)
+            cutflow_json_path.write_text(
+                json.dumps(cutflow_df.to_dict(orient="records"), indent=2)
+            )
+            print(f"Filter cutflow saved to {cutflow_csv_path}")
+        except Exception as e:
+            print(f"[warn] Could not write filter cutflow: {e}")
     print("\n=== Per-Horizon AUC ===")
     cols = ["horizon_years", "n", "cases", "controls", "excluded", "prevalence", "auc"]
     print(
@@ -2503,6 +2768,7 @@ def main() -> None:
                 "  table { border-collapse: collapse; width: auto; min-width: 100%; }",
                 "  th { background-color: #e0e0e0; padding: 8px; text-align: left; border-bottom: 2px solid #333; white-space: nowrap; }",
                 "  td { padding: 6px 8px; white-space: nowrap; }",
+                "  pre { white-space: pre-wrap; background-color: #f6f8fa; padding: 10px; border: 1px solid #ddd; border-radius: 6px; }",
                 "  .row-group-0 { background-color: #ffffff; }",
                 "  .row-group-1 { background-color: #d4e4f7; }",
                 "  tr td { transition: background-color 120ms ease-in-out; }",
@@ -2510,8 +2776,27 @@ def main() -> None:
                 "</style>",
                 "</head>",
                 "<body>",
-                "<table>",
+                "<div style='margin-bottom: 16px;'>",
+                "<strong>report artifacts:</strong>",
             ]
+            if cutflow_csv_path is not None:
+                html_lines.append(
+                    f"<div>filter cutflow csv: <code>{cutflow_csv_path}</code></div>"
+                )
+            if cutflow_json_path is not None:
+                html_lines.append(
+                    f"<div>filter cutflow json: <code>{cutflow_json_path}</code></div>"
+                )
+            if resolved_cfg_path is not None:
+                html_lines.append(
+                    f"<div>resolved config: <code>{resolved_cfg_path}</code></div>"
+                )
+            html_lines.extend(
+                [
+                    "</div>",
+                    "<table>",
+                ]
+            )
 
             # header row
             html_lines.append("  <tr>")
@@ -2559,6 +2844,36 @@ def main() -> None:
                     if note:
                         html_lines.append(f"<p>{note}</p>")
                 html_lines.append("</div>")
+
+            # embedded cutflow table for environments where local file links don't open
+            if cutflow_df_for_html is not None and not cutflow_df_for_html.empty:
+                html_lines.append("<details style='margin-top: 20px;'>")
+                html_lines.append(
+                    "<summary><strong>filter cutflow (embedded)</strong></summary>"
+                )
+                html_lines.append("<table style='margin-top: 10px;'>")
+                html_lines.append("  <tr>")
+                for col in cutflow_df_for_html.columns:
+                    html_lines.append(f"    <th>{col}</th>")
+                html_lines.append("  </tr>")
+                for _, row in cutflow_df_for_html.iterrows():
+                    html_lines.append("  <tr>")
+                    for col in cutflow_df_for_html.columns:
+                        html_lines.append(f"    <td>{row[col]}</td>")
+                    html_lines.append("  </tr>")
+                html_lines.append("</table>")
+                html_lines.append("</details>")
+
+            # embedded resolved config text
+            if resolved_cfg_path is not None and resolved_cfg_path.exists():
+                html_lines.append("<details style='margin-top: 20px;'>")
+                html_lines.append(
+                    "<summary><strong>resolved config (embedded)</strong></summary>"
+                )
+                html_lines.append("<pre>")
+                html_lines.append(resolved_cfg_path.read_text())
+                html_lines.append("</pre>")
+                html_lines.append("</details>")
 
             html_lines.append("</body>")
             html_lines.append("</html>")
