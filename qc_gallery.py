@@ -77,6 +77,7 @@ pydicom, pandas, matplotlib, tqdm
 """
 
 import argparse
+import gc
 import json
 import logging
 from http.server import HTTPServer, SimpleHTTPRequestHandler
@@ -1948,90 +1949,19 @@ def generate_gallery(
         f"found {len(cached_exams)} cached figures, need to generate {len(exams_needing_generation)}"
     )
 
-    # process each view and track by exam
-    success_count = 0
-    error_count = 0
-
-    # dict to track loaded views per exam: {exam_id: {view_key: (ds, path), ...}}
-    exam_view_cache = {}
-
-    # only load DICOMs for exams that need new figures
-    views_to_load = views_df[views_df["exam_id"].isin(exams_needing_generation)]
-
-    if len(views_to_load) > 0:
-        logger.info(f"loading DICOMs for {len(exams_needing_generation)} exams...")
-        for idx, row in tqdm(
-            views_to_load.iterrows(), total=len(views_to_load), desc="loading DICOMs"
-        ):
-            try:
-                # construct full path to DICOM
-                dicom_path = Path(row["dicom_path"])
-                if not dicom_path.is_absolute():
-                    dicom_path = raw_dir / dicom_path
-
-                if not dicom_path.exists():
-                    logger.warning(f"DICOM not found: {dicom_path}")
-                    error_count += 1
-                    continue
-
-                # load DICOM
-                ds = pydicom.dcmread(str(dicom_path))
-
-                # generate individual debug figure only if requested
-                if per_view:
-                    view_label = f"{row['laterality']} {row['view']}"
-                    _save_debug_figure(
-                        ds,
-                        dicom_path,
-                        "SUCCESS",
-                        view_label,
-                        output_dir,
-                        patient_id=row["patient_id"],
-                        exam_id=row["exam_id"],
-                        accession_number=row.get("accession_number", "unknown"),
-                    )
-                success_count += 1
-
-                # cache view for combined figure
-                exam_key = row["exam_id"]
-                if exam_key not in exam_view_cache:
-                    exam_view_cache[exam_key] = {
-                        "patient_id": row["patient_id"],
-                        "accession_number": row.get("accession_number", "unknown"),
-                        "views": {},
-                        "view_selection_keys": {},
-                    }
-
-                view_key = f"{row['laterality']}_{row['view']}"
-                candidate_key = view_selection_key_from_dataset(ds, dicom_path)
-                current_key = exam_view_cache[exam_key]["view_selection_keys"].get(
-                    view_key
-                )
-                if current_key is None or candidate_key < current_key:
-                    exam_view_cache[exam_key]["view_selection_keys"][view_key] = (
-                        candidate_key
-                    )
-                    exam_view_cache[exam_key]["views"][view_key] = (ds, dicom_path)
-
-            except Exception as e:
-                logger.error(
-                    f"error processing {row.get('dicom_path', 'unknown')}: {e}"
-                )
-                error_count += 1
-    else:
-        logger.info("all figures cached, skipping DICOM loading")
-
     def get_qc_status(exam_id):
         """extract status string from qc_data"""
         return qc_data.get(str(exam_id), "")
 
-    # generate combined 4-view figures for each exam (only those needing generation)
-    logger.info("processing figures...")
-    combined_images = []  # track for HTML gallery
+    # process in batches to avoid OOM (DICOM pixel arrays are large)
+    BATCH_SIZE = 100
+    success_count = 0
+    error_count = 0
+    combined_images = []
     cached_count = len(cached_exams)
     generated_count = 0
 
-    # first, add cached exams to gallery list
+    # add cached exams to gallery list
     for exam_id in cached_exams:
         exam_views = views_df[views_df["exam_id"] == exam_id]
         if len(exam_views) == 0:
@@ -2057,43 +1987,119 @@ def generate_gallery(
             }
         )
 
-    # then, generate new figures for exams that need them
-    for exam_key, exam_data in tqdm(exam_view_cache.items(), desc="generating figures"):
-        try:
-            success, was_cached = _save_four_view_figure(
-                view_data=exam_data["views"],
-                debug_dir=output_dir,
-                patient_id=exam_data["patient_id"],
-                accession_number=exam_data["accession_number"],
-                exam_id=exam_key,
+    exams_needing_list = sorted(exams_needing_generation)
+    if len(exams_needing_list) > 0:
+        views_to_load = views_df[views_df["exam_id"].isin(exams_needing_generation)]
+        n_batches = (len(exams_needing_list) + BATCH_SIZE - 1) // BATCH_SIZE
+        logger.info(
+            f"processing {len(exams_needing_list)} exams in {n_batches} batches of up to {BATCH_SIZE}"
+        )
+
+        for batch_start in tqdm(
+            range(0, len(exams_needing_list), BATCH_SIZE),
+            total=n_batches,
+            desc="batches",
+        ):
+            batch_exam_ids = set(
+                exams_needing_list[batch_start : batch_start + BATCH_SIZE]
             )
+            batch_views = views_to_load[views_to_load["exam_id"].isin(batch_exam_ids)]
+            batch_cache = {}
 
-            if success:
-                if was_cached:
-                    # shouldn't happen since we pre-filtered, but handle it
-                    cached_count += 1
-                else:
-                    generated_count += 1
+            for idx, row in batch_views.iterrows():
+                try:
+                    dicom_path = Path(row["dicom_path"])
+                    if not dicom_path.is_absolute():
+                        dicom_path = raw_dir / dicom_path
 
-                # track for gallery only if save was successful
-                success_dir = output_dir / "success"
-                patient_dir = success_dir / exam_data["patient_id"]
-                accession_dir = patient_dir / exam_data["accession_number"]
-                img_path = accession_dir / f"COMBINED_four_views_{exam_key}.png"
+                    if not dicom_path.exists():
+                        logger.warning(f"DICOM not found: {dicom_path}")
+                        error_count += 1
+                        continue
 
-                combined_images.append(
-                    {
-                        "path": img_path.relative_to(output_dir),
-                        "patient_id": exam_data["patient_id"],
-                        "exam_id": exam_key,
-                        "accession": exam_data["accession_number"],
-                        "num_views": len(exam_data["views"]),
-                        "qc_status": get_qc_status(exam_key),
-                    }
-                )
+                    ds = pydicom.dcmread(str(dicom_path))
 
-        except Exception as e:
-            logger.error(f"error creating combined figure for exam {exam_key}: {e}")
+                    if per_view:
+                        view_label = f"{row['laterality']} {row['view']}"
+                        _save_debug_figure(
+                            ds,
+                            dicom_path,
+                            "SUCCESS",
+                            view_label,
+                            output_dir,
+                            patient_id=row["patient_id"],
+                            exam_id=row["exam_id"],
+                            accession_number=row.get("accession_number", "unknown"),
+                        )
+                    success_count += 1
+
+                    exam_key = row["exam_id"]
+                    if exam_key not in batch_cache:
+                        batch_cache[exam_key] = {
+                            "patient_id": row["patient_id"],
+                            "accession_number": row.get("accession_number", "unknown"),
+                            "views": {},
+                            "view_selection_keys": {},
+                        }
+
+                    view_key = f"{row['laterality']}_{row['view']}"
+                    candidate_key = view_selection_key_from_dataset(ds, dicom_path)
+                    current_key = batch_cache[exam_key]["view_selection_keys"].get(
+                        view_key
+                    )
+                    if current_key is None or candidate_key < current_key:
+                        batch_cache[exam_key]["view_selection_keys"][view_key] = (
+                            candidate_key
+                        )
+                        batch_cache[exam_key]["views"][view_key] = (ds, dicom_path)
+
+                except Exception as e:
+                    logger.error(
+                        f"error processing {row.get('dicom_path', 'unknown')}: {e}"
+                    )
+                    error_count += 1
+
+            for exam_key, exam_data in batch_cache.items():
+                try:
+                    success, was_cached = _save_four_view_figure(
+                        view_data=exam_data["views"],
+                        debug_dir=output_dir,
+                        patient_id=exam_data["patient_id"],
+                        accession_number=exam_data["accession_number"],
+                        exam_id=exam_key,
+                    )
+
+                    if success:
+                        if was_cached:
+                            cached_count += 1
+                        else:
+                            generated_count += 1
+
+                        success_dir = output_dir / "success"
+                        patient_dir = success_dir / exam_data["patient_id"]
+                        accession_dir = patient_dir / exam_data["accession_number"]
+                        img_path = accession_dir / f"COMBINED_four_views_{exam_key}.png"
+
+                        combined_images.append(
+                            {
+                                "path": img_path.relative_to(output_dir),
+                                "patient_id": exam_data["patient_id"],
+                                "exam_id": exam_key,
+                                "accession": exam_data["accession_number"],
+                                "num_views": len(exam_data["views"]),
+                                "qc_status": get_qc_status(exam_key),
+                            }
+                        )
+
+                except Exception as e:
+                    logger.error(
+                        f"error creating combined figure for exam {exam_key}: {e}"
+                    )
+
+            del batch_cache
+            gc.collect()
+    else:
+        logger.info("all figures cached, skipping DICOM loading")
 
     # compute total figures
     total_figures = cached_count + generated_count
