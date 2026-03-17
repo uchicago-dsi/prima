@@ -12,8 +12,8 @@ and reads only DICOM headers (no pixel arrays) from:
     <raw_dir>/<patient_id>/<exam_id>/**/*.dcm
 
 Outputs:
-  - a minimal views parquet with one selected row per canonical view
-  - a minimal dicom_tags parquet containing only the columns needed by
+  - <export_dir>/views_for_qc.parquet with one selected row per canonical view
+  - <export_dir>/dicom_tags.parquet containing only the columns needed by
     prima.qc_filters today
 
 The resulting tables are sufficient for preprocessed-only qc_gallery runs and
@@ -230,29 +230,13 @@ def main() -> int:
         required=True,
         help="Raw DICOM root with structure raw/<patient_id>/<exam_id>/**/*.dcm",
     )
-    parser.add_argument(
-        "--views-output",
-        type=Path,
-        required=True,
-        help="Path to write the minimal views parquet",
-    )
-    parser.add_argument(
-        "--tags-output",
-        type=Path,
-        required=True,
-        help="Path to write the minimal dicom_tags parquet",
-    )
     args = parser.parse_args()
 
-    views_df, tags_df = build_sidecars(
-        export_dir=args.export_dir.resolve(),
-        raw_dir=args.raw_dir.resolve(),
-    )
+    export_dir = args.export_dir.resolve()
+    views_df, tags_df = build_sidecars(export_dir=export_dir, raw_dir=args.raw_dir.resolve())
 
-    views_output = args.views_output.resolve()
-    tags_output = args.tags_output.resolve()
-    views_output.parent.mkdir(parents=True, exist_ok=True)
-    tags_output.parent.mkdir(parents=True, exist_ok=True)
+    views_output = export_dir / "views_for_qc.parquet"
+    tags_output = export_dir / "dicom_tags.parquet"
     views_df.to_parquet(views_output, index=False)
     tags_df.to_parquet(tags_output, index=False)
 
