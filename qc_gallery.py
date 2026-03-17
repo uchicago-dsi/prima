@@ -1613,6 +1613,7 @@ def generate_gallery(
     horizon: int = 5,
     qc_skip_status: Optional[Set[str]] = None,
     serve: bool = False,
+    preprocessed_only: bool = False,
     original_args: Optional[dict] = None,
 ) -> None:
     """generate interactive HTML gallery from processed views.
@@ -1635,11 +1636,12 @@ def generate_gallery(
         horizon: which prediction horizon to use for error scoring (default: 5 years)
         qc_skip_status: set of QC statuses to skip (default: {"good", "annotated", "auto_excluded"})
         serve: if True, suppress non-server instructions in logging
+        preprocessed_only: if True, require cached montage PNGs and never fall back to raw DICOM loading
     """
     if qc_skip_status is None:
         qc_skip_status = {"good", "annotated", "auto_excluded"}
     logger.info(
-        "QC DEBUG generate_gallery args: max_exams=%s, random_sample=%s, prioritize_errors=%s, qc_skip_status=%s, patient_id=%s, exam_id=%s, exam_list_path=%s, qc_file=%s, serve=%s",
+        "QC DEBUG generate_gallery args: max_exams=%s, random_sample=%s, prioritize_errors=%s, qc_skip_status=%s, patient_id=%s, exam_id=%s, exam_list_path=%s, qc_file=%s, serve=%s, preprocessed_only=%s",
         max_exams,
         random_sample,
         prioritize_errors,
@@ -1649,6 +1651,7 @@ def generate_gallery(
         exam_list_path,
         qc_file,
         serve,
+        preprocessed_only,
     )
     # load existing QC data if available
     qc_data = {}
@@ -1716,9 +1719,16 @@ def generate_gallery(
     if auto_filter_names:
         logger.info(f"applying auto-exclusions: {', '.join(auto_filter_names)}")
         tags_path = raw_dir / "sot" / "dicom_tags.parquet"
-        filter_sets = compute_auto_filter_sets(
-            views_parquet, tags_path, filter_names=auto_filter_names
-        )
+        if not tags_path.exists():
+            logger.warning(
+                "auto-filter config is enabled but dicom_tags.parquet is missing: %s",
+                tags_path,
+            )
+            filter_sets = {}
+        else:
+            filter_sets = compute_auto_filter_sets(
+                views_parquet, tags_path, filter_names=auto_filter_names
+            )
         auto_excluded_exams: set = set()
         for filter_name in auto_filter_names:
             matched = filter_sets.get(filter_name, set())
@@ -1989,6 +1999,13 @@ def generate_gallery(
 
     exams_needing_list = sorted(exams_needing_generation)
     if len(exams_needing_list) > 0:
+        if preprocessed_only:
+            sample_ids = ", ".join(exams_needing_list[:10])
+            raise FileNotFoundError(
+                "preprocessed-only mode cannot generate missing montages; "
+                f"{len(exams_needing_list)} exams are missing cached PNGs in "
+                f"{output_dir / 'success'} (sample exam_ids: {sample_ids})"
+            )
         views_to_load = views_df[views_df["exam_id"].isin(exams_needing_generation)]
         n_batches = (len(exams_needing_list) + BATCH_SIZE - 1) // BATCH_SIZE
         logger.info(
@@ -4244,6 +4261,11 @@ QC File Format:
         help="start HTTP server to serve gallery and handle QC saves (recommended for remote work)",
     )
     parser.add_argument(
+        "--preprocessed-only",
+        action="store_true",
+        help="run from cached montage PNGs only; do not require raw DICOM mounts and fail if requested exams are missing cached figures",
+    )
+    parser.add_argument(
         "--port",
         type=int,
         default=5000,
@@ -4266,9 +4288,14 @@ QC File Format:
         logger.error(f"views parquet not found: {views_path}")
         return 1
 
-    if not args.raw.exists():
+    if not args.raw.exists() and not args.preprocessed_only:
         logger.error(f"raw directory not found: {args.raw}")
         return 1
+    if args.preprocessed_only and not args.raw.exists():
+        logger.info(
+            "running in preprocessed-only mode without raw DICOM access: %s",
+            args.raw,
+        )
 
     # validate prioritize-errors arguments
     if args.prioritize_errors:
@@ -4314,26 +4341,31 @@ QC File Format:
         return 0
 
     # run gallery generation
-    generate_gallery(
-        views_parquet=resolved_views_path,
-        raw_dir=resolved_raw_dir,
-        output_dir=resolved_output_dir,
-        max_exams=max_exams,
-        random_sample=args.random,
-        patient_id=args.patient,
-        exam_id=args.exam,
-        exam_list_path=resolved_exam_list,
-        per_view=args.per_view,
-        no_gallery=args.no_gallery,
-        qc_file=resolved_qc_file,
-        pred_csv=resolved_pred_csv,
-        meta_csv=resolved_meta_csv,
-        prioritize_errors=args.prioritize_errors,
-        horizon=args.horizon,
-        qc_skip_status=qc_skip_status,
-        serve=args.serve,
-        original_args=vars(args),
-    )
+    try:
+        generate_gallery(
+            views_parquet=resolved_views_path,
+            raw_dir=resolved_raw_dir,
+            output_dir=resolved_output_dir,
+            max_exams=max_exams,
+            random_sample=args.random,
+            patient_id=args.patient,
+            exam_id=args.exam,
+            exam_list_path=resolved_exam_list,
+            per_view=args.per_view,
+            no_gallery=args.no_gallery,
+            qc_file=resolved_qc_file,
+            pred_csv=resolved_pred_csv,
+            meta_csv=resolved_meta_csv,
+            prioritize_errors=args.prioritize_errors,
+            horizon=args.horizon,
+            qc_skip_status=qc_skip_status,
+            serve=args.serve,
+            preprocessed_only=args.preprocessed_only,
+            original_args=vars(args),
+        )
+    except Exception as e:
+        logger.error("failed to generate gallery: %s", e)
+        return 1
 
     # start HTTP server if requested
     if args.serve:
@@ -4358,6 +4390,7 @@ QC File Format:
             "horizon": args.horizon,
             "qc_skip_status": set(args.qc_skip_status) if args.qc_skip_status else None,
             "serve": True,
+            "preprocessed_only": args.preprocessed_only,
             "original_args": None,
         }
         logger.info(

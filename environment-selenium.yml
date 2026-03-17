@@ -1,0 +1,15 @@
+name: selenium-ff
+channels:
+  - conda-forge
+channel_priority: strict
+dependencies:
+  - python=3.11
+  - pip
+  - selenium
+  - firefox
+  - geckodriver
+  - pandas
+  - requests
+  - lxml
+  - tqdm
+  - beautifulsoup4
