@@ -38,13 +38,13 @@ CHIMEC_PCR_PATIENTS_FILE = "/gpfs/data/phs/groups/Projects/Huo_projects/SPORE/an
 CHIMEC_KEY_FILE = "/gpfs/data/huo-lab/Image/ChiMEC/study-16352a.csv"
 CHIMEC_METADATA_FILE = "data/imaging_metadata.csv"
 CHIMEC_EXPORT_STATE_FILE = Path("data/export_state_chimec.csv")
-CHIMEC_FINGERPRINT_DIR = Path("fingerprints/chimec")
-CHIMEC_FINGERPRINT_CACHE = CHIMEC_FINGERPRINT_DIR / "disk_fingerprints.json"
+CHIMEC_FINGERPRINT_ROOT = Path("fingerprints/chimec")
 CHIMEC_BASE_DOWNLOAD_DIR = "/gpfs/data/huo-lab/Image/ChiMEC/"
 CHIMEC_IBROKER_STUDY_NUMBER = "16352A"
-CHIMEC_MODALITY = "MG"  # ChiMEC fingerprint/reconciliation are MG-only
 COHORT_PRIORITY = "priority"
 COHORT_PCR = "pcr"
+TARGET_PROFILE_STANDARD = "standard"
+TARGET_PROFILE_BREAST_RISK_HFDP = "breast-risk-hfdp"
 COHORT_CONFIGS = {
     COHORT_PRIORITY: {
         "default_patients_file": CHIMEC_PATIENTS_FILE,
@@ -71,6 +71,16 @@ REQUESTED_STATUS_VALUES = {
     "start cmove",
     "study retrieved",
 }
+
+
+def get_fingerprint_dir(modality: str) -> Path:
+    """Return modality-scoped fingerprint directory."""
+    return CHIMEC_FINGERPRINT_ROOT / modality.upper().lower()
+
+
+def get_fingerprint_cache(modality: str) -> Path:
+    """Return modality-scoped fingerprint cache path."""
+    return get_fingerprint_dir(modality) / "disk_fingerprints.json"
 
 
 def _load_patients_for_cohort(cohort: str, patients_file: str | None) -> pd.DataFrame:
@@ -401,6 +411,8 @@ def _normalize_args_for_cohort(args: argparse.Namespace) -> None:
 
 def _should_filter_by_genotyping(args: argparse.Namespace) -> bool:
     """Return whether genotyping-based filtering should be applied."""
+    if args.target_profile == TARGET_PROFILE_BREAST_RISK_HFDP:
+        return False
     return (args.cohort != COHORT_PCR) and (not args.no_genotyping_filter)
 
 
@@ -463,6 +475,117 @@ def _save_pcr_ibroker_time_from_dx_histogram(
         f"  - Saved iBroker time-from-dx histogram for selected cohort MR exams: {png_path}"
     )
     print(f"  - Saved iBroker time-from-dx binned counts CSV: {csv_path}")
+
+
+def _is_breast_mr_description(series: pd.Series) -> pd.Series:
+    """Return mask for breast MRI study descriptions."""
+    text = series.fillna("").astype(str).str.upper()
+    return text.str.contains("BREAST", regex=False) | text.str.contains(
+        "MAM MRI", regex=False
+    )
+
+
+def _print_breast_risk_target_summary(
+    targets: pd.DataFrame,
+    *,
+    dx_like_window_days: int,
+) -> None:
+    """Print summary for breast-only HFDP risk target selection."""
+    if targets.empty:
+        print("\n--- HFDP breast-risk target summary ---")
+        print("No candidates available after base filtering.")
+        return
+
+    breast_mask = _is_breast_mr_description(targets["StudyDescription"])
+    breast = targets.loc[breast_mask].copy()
+    case_series = (
+        breast.get("case_control_status", pd.Series("Unknown", index=breast.index))
+        .fillna("Unknown")
+        .astype(str)
+        .str.strip()
+        .str.lower()
+    )
+    controls = breast.loc[case_series == "control"].copy()
+    cases = breast.loc[case_series == "case"].copy()
+    has_dx = cases["DatedxIndex"].notna()
+    has_exam = cases["Study DateTime"].notna()
+    case_delta = (
+        cases["Study DateTime"] - cases["DatedxIndex"]
+    ).dt.total_seconds() / 86400.0
+    pre_dx = cases.loc[has_dx & has_exam & (case_delta < 0)].copy()
+    dx_like = cases.loc[
+        has_dx & has_exam & (case_delta >= 0) & (case_delta <= dx_like_window_days)
+    ].copy()
+
+    print("\n--- HFDP breast-risk target summary ---")
+    print(
+        f"  base candidates entering profile: {len(targets):,} exams "
+        f"({targets['study_id'].nunique():,} patients)"
+    )
+    print(
+        f"  breast-only candidates:           {len(breast):,} exams "
+        f"({breast['study_id'].nunique():,} patients)"
+    )
+    print(
+        f"  controls:                         {len(controls):,} exams "
+        f"({controls['study_id'].nunique():,} patients)"
+    )
+    print(
+        f"  pre-dx cases:                     {len(pre_dx):,} exams "
+        f"({pre_dx['study_id'].nunique():,} patients)"
+    )
+    print(
+        f"  dx-like cases [0,+{dx_like_window_days}] days:    {len(dx_like):,} exams "
+        f"({dx_like['study_id'].nunique():,} patients)"
+    )
+
+
+def _filter_breast_risk_targets_for_hfdp(
+    targets: pd.DataFrame,
+    *,
+    dx_like_window_days: int,
+) -> pd.DataFrame:
+    """Keep breast MR controls plus case exams before/near diagnosis."""
+    if targets.empty:
+        return targets
+
+    breast_mask = _is_breast_mr_description(targets["StudyDescription"])
+    subset = targets.loc[breast_mask].copy()
+    if subset.empty:
+        print("\nHFDP breast-risk filter found no breast MRI study descriptions.")
+        return subset
+
+    case_series = (
+        subset.get("case_control_status", pd.Series("Unknown", index=subset.index))
+        .fillna("Unknown")
+        .astype(str)
+        .str.strip()
+        .str.lower()
+    )
+    control_mask = case_series == "control"
+    case_mask = case_series == "case"
+    has_dx = subset["DatedxIndex"].notna()
+    has_exam = subset["Study DateTime"].notna()
+    delta_days = (
+        subset["Study DateTime"] - subset["DatedxIndex"]
+    ).dt.total_seconds() / 86400.0
+    pre_dx_mask = case_mask & has_dx & has_exam & (delta_days < 0)
+    dx_like_mask = (
+        case_mask
+        & has_dx
+        & has_exam
+        & (delta_days >= 0)
+        & (delta_days <= dx_like_window_days)
+    )
+    keep_mask = control_mask | pre_dx_mask | dx_like_mask
+    filtered = subset.loc[keep_mask].copy()
+    print(
+        "HFDP breast-risk export filter applied: "
+        f"{len(targets):,} -> {len(filtered):,} exams "
+        f"({targets['study_id'].nunique():,} -> {filtered['study_id'].nunique():,} patients); "
+        f"kept breast MR controls + case exams before dx + case exams within [0,+{dx_like_window_days}] days."
+    )
+    return filtered
 
 
 def _print_pcr_prefilter_summary(
@@ -792,7 +915,7 @@ def apply_disk_status_for_modality(db: pd.DataFrame, modality: str) -> pd.DataFr
     subset = check_disk_for_downloads(
         subset,
         basedir=disk_check_dir,
-        fingerprint_cache=CHIMEC_FINGERPRINT_CACHE,
+        fingerprint_cache=get_fingerprint_cache(modality_upper),
     )
     db["is_on_disk"] = False
     db.loc[subset.index, "is_on_disk"] = subset["is_on_disk"].fillna(False).astype(bool)
@@ -819,15 +942,15 @@ def run_reconciliation_if_enabled(args, db: pd.DataFrame, cycle_number: int) -> 
         )
     summary = reconcile_disk_ibroker_accessions(
         db,
-        basedir=get_modality_disk_dir(CHIMEC_MODALITY),
-        modality=CHIMEC_MODALITY,
+        basedir=get_modality_disk_dir(args.modality),
+        modality=args.modality.upper(),
         output_csv=output_path,
-        fingerprint_cache=CHIMEC_FINGERPRINT_CACHE
-        if CHIMEC_FINGERPRINT_CACHE.exists()
+        fingerprint_cache=get_fingerprint_cache(args.modality)
+        if get_fingerprint_cache(args.modality).exists()
         else None,
         key_file=CHIMEC_KEY_FILE,
     )
-    print("\n=== disk-vs-ibroker reconciliation (MG) ===\n")
+    print(f"\n=== disk-vs-ibroker reconciliation ({args.modality.upper()}) ===\n")
     print(
         "Disk:  {:>8,} exams, {:>6,} study IDs".format(
             summary["disk_total"], summary["study_ids_on_disk"]
@@ -989,6 +1112,7 @@ def run_export_cycle(args, cycle_number: int):
         modality=args.modality.upper(),
         base_download_dir=CHIMEC_BASE_DOWNLOAD_DIR,
         dataset="chimec",
+        allow_post_dx_cases=(args.target_profile == TARGET_PROFILE_BREAST_RISK_HFDP),
     )
     if args.cohort == COHORT_PCR:
         _print_pcr_window_summary(
@@ -1000,6 +1124,15 @@ def run_export_cycle(args, cycle_number: int):
             targets,
             pre_dx_days=args.pcr_pre_dx_window_days,
             post_dx_days=args.pcr_post_dx_window_days,
+        )
+    if args.target_profile == TARGET_PROFILE_BREAST_RISK_HFDP:
+        _print_breast_risk_target_summary(
+            targets,
+            dx_like_window_days=args.risk_dx_like_window_days,
+        )
+        targets = _filter_breast_risk_targets_for_hfdp(
+            targets,
+            dx_like_window_days=args.risk_dx_like_window_days,
         )
 
     db["is_target"] = False
@@ -1262,6 +1395,17 @@ def main():
         help="Base modality to filter for (e.g., MG, MR, CT).",
     )
     parser.add_argument(
+        "--target-profile",
+        type=str,
+        choices=[TARGET_PROFILE_STANDARD, TARGET_PROFILE_BREAST_RISK_HFDP],
+        default=TARGET_PROFILE_STANDARD,
+        help=(
+            "Target selection profile. 'standard' uses the legacy ChiMEC filters. "
+            f"'{TARGET_PROFILE_BREAST_RISK_HFDP}' keeps breast MR controls plus case exams "
+            "before diagnosis and diagnosis-like case exams near t=0."
+        ),
+    )
+    parser.add_argument(
         "--cohort",
         type=str,
         choices=[COHORT_PRIORITY, COHORT_PCR],
@@ -1425,6 +1569,15 @@ def main():
             "(writes <prefix>.png and <prefix>.csv)."
         ),
     )
+    parser.add_argument(
+        "--risk-dx-like-window-days",
+        type=int,
+        default=30,
+        help=(
+            f"Used when --target-profile {TARGET_PROFILE_BREAST_RISK_HFDP}: "
+            "include case breast MR exams from diagnosis through this many days after diagnosis."
+        ),
+    )
 
     args = parser.parse_args()
     _normalize_args_for_cohort(args)
@@ -1433,8 +1586,8 @@ def main():
     if args.build_fingerprints:
         build_chimec_disk_fingerprints(
             basedir=CHIMEC_BASE_DOWNLOAD_DIR,
-            output_dir=CHIMEC_FINGERPRINT_DIR,
-            modality=CHIMEC_MODALITY,
+            output_dir=get_fingerprint_dir(args.modality),
+            modality=args.modality.upper(),
         )
         if not args.status_only and not args.reconcile_disk_ibroker:
             print(
@@ -1488,6 +1641,9 @@ def main():
             modality=args.modality.upper(),
             base_download_dir=CHIMEC_BASE_DOWNLOAD_DIR,
             dataset="chimec",
+            allow_post_dx_cases=(
+                args.target_profile == TARGET_PROFILE_BREAST_RISK_HFDP
+            ),
         )
         if args.cohort == COHORT_PCR:
             _print_pcr_window_summary(
@@ -1495,10 +1651,19 @@ def main():
                 pre_dx_days=args.pcr_pre_dx_window_days,
                 post_dx_days=args.pcr_post_dx_window_days,
             )
-            _filter_pcr_targets_by_dx_window(
+            targets = _filter_pcr_targets_by_dx_window(
                 targets,
                 pre_dx_days=args.pcr_pre_dx_window_days,
                 post_dx_days=args.pcr_post_dx_window_days,
+            )
+        if args.target_profile == TARGET_PROFILE_BREAST_RISK_HFDP:
+            _print_breast_risk_target_summary(
+                targets,
+                dx_like_window_days=args.risk_dx_like_window_days,
+            )
+            targets = _filter_breast_risk_targets_for_hfdp(
+                targets,
+                dx_like_window_days=args.risk_dx_like_window_days,
             )
         run_reconciliation_if_enabled(args, db, cycle_number=1)
         sys.exit(0)

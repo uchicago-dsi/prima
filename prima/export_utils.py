@@ -515,6 +515,7 @@ def identify_download_targets(
     base_download_dir: str,
     dataset: str = "chimec",
     verbose: bool = True,
+    allow_post_dx_cases: bool = False,
 ):
     """Identify target exams for download.
 
@@ -642,16 +643,17 @@ def identify_download_targets(
             if verbose:
                 print(f"  - no genotyping: -{mask_no_chip.sum():,}")
 
-        case_mask = targets["case_control_status"] == "Case"
-        bad_case_date_mask = case_mask & (
-            targets["Study DateTime"] > targets["DatedxIndex"]
-        )
-        targets.loc[bad_case_date_mask, "rejection_reason"] = (
-            "Exam is after diagnosis date"
-        )
-        targets = targets[~bad_case_date_mask]
-        if verbose:
-            print(f"  - Case after diagnosis: -{bad_case_date_mask.sum():,}")
+        if not allow_post_dx_cases:
+            case_mask = targets["case_control_status"] == "Case"
+            bad_case_date_mask = case_mask & (
+                targets["Study DateTime"] > targets["DatedxIndex"]
+            )
+            targets.loc[bad_case_date_mask, "rejection_reason"] = (
+                "Exam is after diagnosis date"
+            )
+            targets = targets[~bad_case_date_mask]
+            if verbose:
+                print(f"  - Case after diagnosis: -{bad_case_date_mask.sum():,}")
 
     if verbose:
         print(f"  => {len(targets):,} targets")
