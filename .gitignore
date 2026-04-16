@@ -22,16 +22,28 @@ out
 # Generated data and visualization outputs
 data/**
 !data/.gitkeep
+fingerprints/
+plots/
+qc_export/
 qc_output/
 debug_viz/
 
 # Local scratch artifacts
+.cache/
+.local/
 .devcontainer/
+2Y00036-2009-04-15/
+CLAUDE.md
 dev.ipynb
+foo/
 foo.txt
 log.txt
+local_sync.py.old
 missing_mrns.txt
-screening_patients_mr.csv
 omoleye.pdf
+report.txt
+screening_patients_mr.csv
+snapshot/
+snapshots/
 todo.txt
 zarr.patch
