@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-Root scripts (`fingerprinter.py`, `sync.py`, `export.py`, `download_data.py`) drive data movement and fingerprinting. Shared helpers (`fingerprint_utils.py`, `filesystem_utils.py`, `analyze_mirai.py`) centralize IO, hashing, and plotting—extend these instead of cloning code. The lightweight package stub lives in `prima/`; cache inventories sit under `data/`, figures under `plots/`, and external dependencies under `vendor/` (treat the Mirai submodule as read-only unless mirroring upstream).
+CLI entrypoints live under `analysis/`, `exports/`, `ops/`, `pipelines/`, `qc/`, `examples/`, and `experiments/`. Shared helpers live in `prima/`; extend those modules instead of cloning code between scripts. Cache inventories sit under `data/`, figures under `plots/`, and external dependencies under `vendor/` (treat the Mirai submodule as read-only unless mirroring upstream).
 
 ## Environment Setup
 Use the `prima` micromamba environment for all operations:
@@ -12,7 +12,7 @@ micromamba activate prima
 This environment has all required dependencies (torch, pydicom, zarr, pandas, etc.).
 
 ## Build, Test, and Development Commands
-Create the micromamba env once with `micromamba create -y -f env.yaml`, then `micromamba activate prima`, `pip install -e .`, `pip install -r requirements.txt`, and `pip install -r requirements-dev.txt` for linting/notebook extras. Scripts expose CLI help; run `python fingerprinter.py --help` or `python sync.py --dry-run` before touching production mounts. After refactors, execute `python -m compileall prima fingerprint_utils.py filesystem_utils.py` as a quick syntax check, then format with `ruff format .` followed by `ruff check --fix .`.
+Create the micromamba env once with `micromamba create -y -f env.yaml`, then `micromamba activate prima`, `pip install -e .`, `pip install -r requirements.txt`, and `pip install -r requirements-dev.txt` for linting/notebook extras. Scripts expose CLI help; run `python ops/fingerprinter.py --help` or `python ops/sync.py --dry-run` before touching production mounts. After refactors, execute `python -m compileall prima analysis exports ops pipelines qc examples experiments` as a quick syntax check, then format with `ruff format .` followed by `ruff check --fix .`.
 
 ## Data Sources & Pipeline
 
@@ -26,16 +26,16 @@ Create the micromamba env once with `micromamba create -y -f env.yaml`, then `mi
 
 ### Pipeline Flow
 ```
-Disk DICOMs → preprocess.py → SoT tables (views.parquet, exams.parquet)
+Disk DICOMs → pipelines/preprocess.py → SoT tables (views.parquet, exams.parquet)
                            → Zarr cache + manifest.parquet
                            → emit-csv joins with phenotype → mirai_manifest.csv
-                           → run_mirai_sharded.py → predictions
+                           → pipelines/run_mirai_sharded.py → predictions
 ```
 
 ### Running Analysis
 ```bash
 # analyze metadata and show data coverage summary
-python analyze_metadata.py --modality MG
+python analysis/analyze_metadata.py --modality MG
 
 # see DATA SOURCES SUMMARY section for:
 # - current training data (on disk with labels)
@@ -44,10 +44,10 @@ python analyze_metadata.py --modality MG
 ```
 
 ## Coding Style & Naming Conventions
-Keep configuration in module-level constants or argparse defaults—no hidden fallbacks scattered across call sites. Follow PEP 8 with 4-space indentation, snake_case functions, CamelCase classes, and ALL_CAPS constants (see `sync.py`). Prefer `pathlib.Path`, structured logging, and concise comments; document tensor or array shapes only when needed. Favor vectorized NumPy/PyTorch utilities for volume work.
+Keep configuration in module-level constants or argparse defaults—no hidden fallbacks scattered across call sites. Follow PEP 8 with 4-space indentation, snake_case functions, CamelCase classes, and ALL_CAPS constants (see `ops/sync.py`). Prefer `pathlib.Path`, structured logging, and concise comments; document tensor or array shapes only when needed. Favor vectorized NumPy/PyTorch utilities for volume work.
 
 ## Testing Guidelines
-There is no automated unit suite. Validate with targeted dry runs (e.g., `python fingerprinter.py --patients 1234 --max-workers 2`). When adjusting fingerprint rules, sync heuristics, or cache schemas, delete the affected directories in `data/fingerprint_checkpoints/` and regenerate—mixed-version caches are unsupported. Capture manual validation steps in commit notes so others can replay them.
+There is no automated unit suite. Validate with targeted dry runs (e.g., `python ops/fingerprinter.py --patients 1234 --max-workers 2`). When adjusting fingerprint rules, sync heuristics, or cache schemas, delete the affected directories in `data/fingerprint_checkpoints/` and regenerate—mixed-version caches are unsupported. Capture manual validation steps in commit notes so others can replay them.
 
 ## Commit & Pull Request Guidelines
 Use short imperative commit subjects (`add exported info to plotting`, `fastpath first syncing`) and land on `main` unless coordination demands a PR. Always run `ruff format .` and `ruff check --fix .` before staging changes. Bundle related code, cache notes, and environment tweaks together. If a PR is opened, mirror the commit summary, list datasets exercised, attach relevant plots, and reference Jira/GitHub tracking.
@@ -61,9 +61,9 @@ Persist only the authoritative metadata (`study_uid`, hashed file lists, cache m
 ## Security & Data Handling
 Never commit PHI or log it to stdout. Keep cache JSON and exported logs under `data/` out of version control unless scrubbed, and double-check destructive flags before touching hospital shares. Coordinate VPN, credential rotations, and mount path changes in lab channels so automation and sync jobs stay reproducible.
 
-## analyze_mirai.py: Mirai Prediction Analysis
+## analysis/analyze_mirai.py: Mirai Prediction Analysis
 
-`analyze_mirai.py` computes per-horizon AUC and survival metrics (Uno's C-index, time-dependent AUC, integrated Brier score) from Mirai's validation outputs.
+`analysis/analyze_mirai.py` computes per-horizon AUC and survival metrics (Uno's C-index, time-dependent AUC, integrated Brier score) from Mirai's validation outputs.
 
 ### Key Design: Per-Exam Aggregation
 

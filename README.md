@@ -9,9 +9,11 @@ The end-to-end workflow for training/inference is:
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │ DATA ACQUISITION                                                            │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│ 1. export_chimec.py --status-only --refresh-metadata → refreshes metadata    │
-│ 2. export.py          → requests exports from iBroker based on metadata      │
-│ 3. sync_local.py      → syncs exported DICOMs to GPFS (from HIRO share)      │
+│ 1. exports/export_chimec.py --status-only --refresh-metadata                 │
+│    → refreshes metadata                                                      │
+│ 2. exports/export_chimec.py → requests exports from iBroker based on         │
+│    metadata                                                                  │
+│ 3. ops/sync_local.py → syncs exported DICOMs to GPFS (from HIRO share)      │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
@@ -24,21 +26,21 @@ The end-to-end workflow for training/inference is:
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ STEP 1: PREPROCESSING (preprocess.py)                                       │
+│ STEP 1: PREPROCESSING (pipelines/preprocess.py)                             │
 │   Scans disk DICOMs → extracts metadata from DICOM headers                  │
 │   Outputs: sot/views.parquet, sot/exams.parquet, out/manifest.parquet       │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ STEP 2: EMIT CSV (preprocess.py emit-csv or automatic)                      │
+│ STEP 2: EMIT CSV (pipelines/preprocess.py emit-csv or automatic)            │
 │   Joins exams with phenotype CSV → creates Mirai-compatible manifest        │
 │   Output: out/mirai_manifest.csv (only exams with labels)                   │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ STEP 3: INFERENCE (run_mirai_sharded.py)                                    │
+│ STEP 3: INFERENCE (pipelines/run_mirai_sharded.py)                          │
 │   Runs Mirai model on manifest → predictions                                │
 │   Output: out/validation_output.csv                                         │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -50,7 +52,7 @@ be processed and can be used for training, as long as patients have phenotype la
 
 ### Repository layout (high level)
 
-- Top-level `*.py`: primary CLI entrypoints and analysis scripts
+- `analysis/`, `exports/`, `ops/`, `pipelines/`, `qc/`: primary CLI entrypoints grouped by task
 - `prima/`: lightweight Python package namespace
 - `scripts/`: operational shell helpers
 - `vendor/mirai/`: Mirai submodule
@@ -132,11 +134,11 @@ Refreshes the iBroker metadata snapshot for all ChiMEC study IDs and overwrites 
 micromamba activate selenium-ff
 export IBROKER_USERNAME=your_username
 export IBROKER_PASSWORD=your_password
-python export_chimec.py --status-only --refresh-metadata
+python exports/export_chimec.py --status-only --refresh-metadata
 # start from scratch (ignore old checkpoints)
-python export_chimec.py --status-only --refresh-metadata --refresh-mode fresh
+python exports/export_chimec.py --status-only --refresh-metadata --refresh-mode fresh
 # continue an interrupted refresh
-python export_chimec.py --status-only --refresh-metadata --refresh-mode resume
+python exports/export_chimec.py --status-only --refresh-metadata --refresh-mode resume
 ```
 
 Output: `data/imaging_metadata.csv` — the complete refreshed catalog of studies in iBroker.
@@ -146,7 +148,7 @@ Output: `data/imaging_metadata.csv` — the complete refreshed catalog of studie
 Light fingerprints (study_id, study_date, study_uid from DICOM) enable robust disk-vs-iBroker cross-check. Dates are always from DICOM metadata, never from filename.
 
 ```bash
-python export_chimec.py --build-fingerprints
+python exports/export_chimec.py --build-fingerprints
 ```
 
 Outputs:
@@ -160,7 +162,7 @@ The command:
 - performs a full refresh of all configured study IDs
 - records current iBroker status fields for downstream export decisions
 
-### export.py
+### exports/export_chimec.py
 
 Uses refreshed metadata to request exports from iBroker. It identifies studies that need to be downloaded (matching modality, not already exported/requested, not already on disk) and submits export requests via the web interface.
 
@@ -197,7 +199,7 @@ The script:
 
 ### HIRO → ChiMEC Data Transfer
 
-After exports are requested, files appear on a HIRO CIFS share. Use `sync_local.py` to sync them to GPFS.
+After exports are requested, files appear on a HIRO CIFS share. Use `ops/sync_local.py` to sync them to GPFS.
 
 #### Mount the HIRO share
 
@@ -213,9 +215,9 @@ password=your_password
 domain=UCHAD
 ```
 
-#### Run sync_local.py
+#### Run ops/sync_local.py
 
-Configure source/destination paths at the top of `sync_local.py`:
+Configure source/destination paths at the top of `ops/sync_local.py`:
 ```python
 SRC_ROOT = Path("/mnt/uchad_samba/16352A/")
 DST_ROOT = Path("/gpfs/data/huo-lab/Image/ChiMEC/MG")
@@ -223,16 +225,16 @@ DST_ROOT = Path("/gpfs/data/huo-lab/Image/ChiMEC/MG")
 
 ```bash
 # dry run first (no files moved or transferred)
-python sync_local.py --dry-run --no-auto-restart
+python ops/sync_local.py --dry-run --no-auto-restart
 
 # real transfer with immediate source deletion (default behavior)
-python sync_local.py
+python ops/sync_local.py
 
 # queue for deletion instead of immediate delete
-python sync_local.py --no-immediate-delete
+python ops/sync_local.py --no-immediate-delete
 
 # single sync pass (default auto-restarts every 2 minutes)
-python sync_local.py --no-auto-restart
+python ops/sync_local.py --no-auto-restart
 ```
 
 The script:
@@ -255,12 +257,12 @@ Scan disk DICOMs, extract metadata, select full-quad exams (L-CC, L-MLO, R-CC, R
 
 ```bash
 # full preprocessing (discovery + zarr cache)
-python preprocess.py preprocess \
+python pipelines/preprocess.py preprocess \
   --raw /gpfs/data/huo-lab/Image/ChiMEC/MG \
   --workers 32
 
 # summary only (skip zarr cache, useful for quick analysis)
-python preprocess.py preprocess \
+python pipelines/preprocess.py preprocess \
   --raw /gpfs/data/huo-lab/Image/ChiMEC/MG \
   --workers 32 \
   --summary
@@ -276,7 +278,7 @@ Outputs are written to `{raw}/sot/` and `{raw}/out/` by default:
 ### Step 2: Generate Mirai CSV (if not done in step 1)
 
 ```bash
-python preprocess.py emit-csv \
+python pipelines/preprocess.py emit-csv \
   --raw /gpfs/data/huo-lab/Image/ChiMEC/MG \
   --labels /gpfs/data/phs/groups/Projects/Huo_projects/SPORE/annawoodard/Phenotype_ChiMEC_2025Oct4.csv
 ```
@@ -286,7 +288,7 @@ python preprocess.py emit-csv \
 To process only new exams (append to existing SoT tables):
 
 ```bash
-python preprocess.py preprocess \
+python pipelines/preprocess.py preprocess \
   --raw /gpfs/data/huo-lab/Image/ChiMEC/MG \
   --workers 32 \
   --incremental
@@ -296,16 +298,16 @@ python preprocess.py preprocess \
 
 ```bash
 # monitor progress in a separate terminal
-python preprocess.py monitor --interval 30
+python pipelines/preprocess.py monitor --interval 30
 
 # list checkpoints
-python preprocess.py checkpoint list
+python pipelines/preprocess.py checkpoint list
 
 # show detailed status
-python preprocess.py checkpoint status
+python pipelines/preprocess.py checkpoint status
 
 # clean old checkpoints (>7 days)
-python preprocess.py checkpoint clean --max-age-days 7
+python pipelines/preprocess.py checkpoint clean --max-age-days 7
 ```
 
 ---
@@ -385,13 +387,13 @@ python scripts/main.py \
 ### Sharded parallel processing (recommended for large datasets)
 
 Important partition behavior:
-- `run_mirai_sharded.py` is a launcher that submits one SLURM job per shard
+- `pipelines/run_mirai_sharded.py` is a launcher that submits one SLURM job per shard
 - the launcher can run on a CPU partition (`tier1q`)
 - shard inference jobs run on the partition passed via `--partition` (use `gpuq`)
-- so GPU placement is controlled by `run_mirai_sharded.py --partition gpuq`, not by where the launcher itself runs
+- so GPU placement is controlled by `pipelines/run_mirai_sharded.py --partition gpuq`, not by where the launcher itself runs
 
 ```bash
-python run_mirai_sharded.py \
+python pipelines/run_mirai_sharded.py \
   --max_samples_per_shard 500 \
   --metadata_path /gpfs/data/huo-lab/Image/ChiMEC/MG/out/mirai_manifest.csv \
   --prediction_save_path /gpfs/data/huo-lab/Image/ChiMEC/MG/out/validation_output.csv \
@@ -418,10 +420,10 @@ The sharded script will:
 Recovery and debugging:
 ```bash
 # recover from a crashed run
-python run_mirai_sharded.py --recover /path/to/mirai_shards/job_metadata.json
+python pipelines/run_mirai_sharded.py --recover /path/to/mirai_shards/job_metadata.json
 
 # debug with a small sample
-python run_mirai_sharded.py --debug_max_samples 100 --num_shards 2 ...
+python pipelines/run_mirai_sharded.py --debug_max_samples 100 --num_shards 2 ...
 ```
 
 ### Performance tuning
@@ -460,7 +462,7 @@ Common bottlenecks:
 
 ## Analysis
 
-### analyze_mirai.py
+### analysis/analyze_mirai.py
 
 Compute per-horizon AUC and survival metrics (Uno's C-index, time-dependent AUC, integrated Brier score).
 
@@ -469,10 +471,10 @@ Compute per-horizon AUC and survival metrics (Uno's C-index, time-dependent AUC,
 cp configs/analysis.yaml /tmp/analyze_mirai.yaml
 
 # run with a single config input
-python analyze_mirai.py /tmp/analyze_mirai.yaml
+python analysis/analyze_mirai.py /tmp/analyze_mirai.yaml
 ```
 
-`analyze_mirai.py` is now config-only (OmegaConf YAML/JSON). The config supports:
+`analysis/analyze_mirai.py` is now config-only (OmegaConf YAML/JSON). The config supports:
 - Paths and core options (`out_dir`, `out_json`, `split`, `colmap`, `kfold`)
 - QC status filtering (`include_statuses`, `exclude_statuses`)
 - Auto-filtering aligned with QC server filters (GEMS, implant, scanned film, etc.)
@@ -483,16 +485,16 @@ Each run saves config snapshots alongside outputs:
 - `analyze_mirai_config.input.yaml`
 - `analyze_mirai_config.resolved.yaml`
 
-### analyze_metadata.py
+### analysis/analyze_metadata.py
 
 Analyze imaging metadata and generate summary plots.
 
 ```bash
 # basic usage
-python analyze_metadata.py --modality MG
+python analysis/analyze_metadata.py --modality MG
 
 # dump screening patients (scans ≥3 months before diagnosis)
-python analyze_metadata.py --modality MG --dump-screening-patients
+python analysis/analyze_metadata.py --modality MG --dump-screening-patients
 ```
 
 Available modalities: CR, DX, MG, US, CT, MR, NM, PT, XA, RF, ES, XC, PX, RG
@@ -503,7 +505,7 @@ Creates plots in `plots/` including download status, scans per patient distribut
 
 ## Quality Control
 
-### qc_gallery.py
+### qc/qc_gallery.py
 
 Interactively review and mark mammogram exams for quality control. Generates combined 4-view figures (L CC, L MLO, R CC, R MLO) with an HTML gallery.
 
@@ -511,7 +513,7 @@ Interactively review and mark mammogram exams for quality control. Generates com
 
 ```bash
 # prioritize worst-performing exams for efficient QC
-python qc_gallery.py --serve --max-exams 100 --prioritize-errors \
+python qc/qc_gallery.py --serve --max-exams 100 --prioritize-errors \
   --pred-csv /gpfs/data/huo-lab/Image/ChiMEC/MG/out/validation_output.csv \
   --meta-csv /gpfs/data/huo-lab/Image/ChiMEC/MG/out/mirai_manifest.csv
 ```
@@ -534,7 +536,7 @@ For large datasets (e.g., 18k exams), use an iterative approach:
 **Batch 1: Initial QC (100 worst-performing exams)**
 ```bash
 # QC first batch prioritized by prediction error
-python qc_gallery.py --serve --max-exams 100 --prioritize-errors \
+python qc/qc_gallery.py --serve --max-exams 100 --prioritize-errors \
   --pred-csv /gpfs/data/huo-lab/Image/ChiMEC/MG/out/validation_output.csv \
   --meta-csv /gpfs/data/huo-lab/Image/ChiMEC/MG/out/mirai_manifest.csv
 ```
@@ -542,7 +544,7 @@ python qc_gallery.py --serve --max-exams 100 --prioritize-errors \
 **Analyze patterns:**
 ```bash
 # After QC'ing 20-50 exams, analyze what makes bad exams bad
-python analyze_qc_patterns.py --qc-file data/qc_status.json
+python analysis/analyze_qc_patterns.py --qc-file data/qc_status.json
 
 # This will print:
 # - DICOM tags that differ between bad and good exams
@@ -565,11 +567,11 @@ python test_positioning_filters.py --max-samples 20
 # Select filter from menu → loads ONLY those exams → fast!
 
 # Or QC specific filter directly:
-python qc_gallery.py --serve --exam-list data/filter_tests/scanned_film_exams.txt
-python qc_gallery.py --serve --exam-list data/filter_tests/gems_ffdm_tc1_exams.txt
+python qc/qc_gallery.py --serve --exam-list data/filter_tests/scanned_film_exams.txt
+python qc/qc_gallery.py --serve --exam-list data/filter_tests/gems_ffdm_tc1_exams.txt
 
 # Step 3: After QC, analyze which filters worked
-python analyze_qc_patterns.py
+python analysis/analyze_qc_patterns.py
 ```
 
 **Batch 2+: Apply validated filters and repeat**
@@ -586,7 +588,7 @@ After validating a filter catches only bad exams:
 
 2. **Restart server** - those exams automatically excluded:
 ```bash
-python qc_gallery.py --serve --max-exams 100 --prioritize-errors \
+python qc/qc_gallery.py --serve --max-exams 100 --prioritize-errors \
   --pred-csv ... --meta-csv ...
 # GEMS exams now auto-skipped, marked as "auto_excluded"
 ```
@@ -608,7 +610,7 @@ With server running, you can also dynamically test filters:
 1. Mark exams using keyboard shortcuts: `G` = Good, `R` = Needs review, `B` = Bad, Arrow keys = Navigate
 2. QC status auto-saves to `data/qc_status.json`
 3. Re-run the script to continue — by default, exams marked "good" or "bad" are automatically skipped
-4. Apply QC filters in downstream analysis via `analyze_mirai.py <config.yaml>` (see below)
+4. Apply QC filters in downstream analysis via `analysis/analyze_mirai.py <config.yaml>` (see below)
 
 **Default behavior**: Future QC runs skip exams marked as "good" (already approved) or "bad" (already rejected), showing only "review" and unmarked exams.
 
@@ -616,30 +618,30 @@ With server running, you can also dynamically test filters:
 
 ```bash
 # server mode (recommended for remote work)
-python qc_gallery.py --serve --max-exams 100 --random
+python qc/qc_gallery.py --serve --max-exams 100 --random
 ```
 
 #### Common options
 
 ```bash
 # custom port
-python qc_gallery.py --serve --port 8080
+python qc/qc_gallery.py --serve --port 8080
 
 # filter to specific patient
-python qc_gallery.py --serve --patient 12345
+python qc/qc_gallery.py --serve --patient 12345
 
 # re-visit exams previously marked as "bad"
-python qc_gallery.py --serve --max-exams 100 --qc-skip-status good
+python qc/qc_gallery.py --serve --max-exams 100 --qc-skip-status good
 
 # only show completely unmarked exams (skip all QC'd exams)
-python qc_gallery.py --serve --max-exams 100 --qc-skip-status good bad review
+python qc/qc_gallery.py --serve --max-exams 100 --qc-skip-status good bad review
 
 # use different prediction horizon for error scoring (default: 5 years)
-python qc_gallery.py --serve --prioritize-errors --horizon 3 \
+python qc/qc_gallery.py --serve --prioritize-errors --horizon 3 \
   --pred-csv ... --meta-csv ...
 
 # custom paths
-python qc_gallery.py \
+python qc/qc_gallery.py \
   --serve \
   --views /path/to/views.parquet \
   --raw /gpfs/data/huo-lab/Image/ChiMEC/MG \
@@ -650,7 +652,7 @@ python qc_gallery.py \
 #### Local mode (without server)
 
 ```bash
-python qc_gallery.py --max-exams 10
+python qc/qc_gallery.py --max-exams 10
 # then open qc_output/gallery.html
 ```
 
@@ -660,7 +662,7 @@ After QC, configure filtering in the analysis config:
 
 ```bash
 # edit config QC block (status + auto filters + annotations), then run:
-python analyze_mirai.py /tmp/analyze_mirai.yaml
+python analysis/analyze_mirai.py /tmp/analyze_mirai.yaml
 ```
 
 **QC filter behavior**:
@@ -670,7 +672,7 @@ In future QC runs (default: `--qc-skip-status good bad`):
 - Exams marked `"review"` or unmarked are shown (need attention)
 - To re-visit "bad" exams: `--qc-skip-status good`
 
-In downstream analysis (`analyze_mirai.py <config.yaml>`):
+In downstream analysis (`analysis/analyze_mirai.py <config.yaml>`):
 - Status filtering is controlled by `qc_filters.include_statuses` / `qc_filters.exclude_statuses`
 - Auto filters are controlled by `qc_filters.enable_auto_filters` and `qc_filters.auto_filters`
 - Annotation filters are controlled by `qc_filters.annotation_include_*` and `qc_filters.annotation_exclude_*`
