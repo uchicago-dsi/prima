@@ -120,6 +120,37 @@ ruff format .
 ruff check --fix .
 ```
 
+
+### Qwen3.5 397B FP8 Repair Overlay
+
+`Qwen3.5-397B-A17B-FP8` currently needs a PRIMA repair overlay on this stack. The repair does two things:
+
+- rebuilds the missing fused MoE expert tensors from the original checkpoint shards
+- caches expert `down_proj` in `bf16` for the repaired layers to avoid the FP8 `NaN` path we saw at generation time
+
+Build the repaired wrapper once:
+
+```bash
+micromamba run -p /net/projects2/annawoodard/micromamba/envs/prima   python scripts/build_qwen35_fp8_repair.py   --base-model-path /net/projects2/annawoodard/models/Qwen3.5-397B-A17B-FP8   --output-model-path /net/projects2/annawoodard/models/Qwen3.5-397B-A17B-FP8-prima-repair
+```
+
+That creates:
+
+- `/net/projects2/annawoodard/models/Qwen3.5-397B-A17B-FP8-prima-repair/repair_manifest.json`
+- `/net/projects2/annawoodard/models/Qwen3.5-397B-A17B-FP8-prima-repair/cache/qwen35_fp8_layer_*.safetensors`
+
+Use the repaired wrapper path directly for inference:
+
+```bash
+micromamba run -p /net/projects2/annawoodard/micromamba/envs/prima   python submit_auto_qc.py   --gpuspec h200 --ngpus 4 --no-wait   --views /net/projects2/annawoodard/qc_export/views_for_qc.parquet   --export-dir /net/projects2/annawoodard/qc_export   --run-file /net/projects2/annawoodard/qc_redo/auto_qc_runs/qwen397b_fp8_bb_probe.json   --model-path /net/projects2/annawoodard/models/Qwen3.5-397B-A17B-FP8-prima-repair   --prompt-mode binary_tag_probe --probe-tag BB --few-shot-examples 0
+```
+
+Cost model:
+
+- first build: expensive one-time repair/dequantize work for the requested layers
+- later inference: reuses the cached repaired tensors, but still pays model load plus cache-load time on each run
+
+
 ---
 
 ## Data Acquisition
