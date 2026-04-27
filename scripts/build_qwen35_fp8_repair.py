@@ -65,6 +65,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Replace an existing repair_manifest.json in the output directory.",
     )
+    parser.add_argument(
+        "--force-bf16-experts",
+        action="store_true",
+        help=(
+            "Record that expert matmuls should bypass the FP8 kernels and run "
+            "through bf16 weights during inference."
+        ),
+    )
     return parser
 
 
@@ -123,6 +131,7 @@ def main() -> int:
         "repair_cache_dir": manifest_cache_path(output_model_path, repair_cache_dir),
         "repair_layer_spec": args.layer_spec,
         "dequant_down_proj_spec": args.dequant_down_proj_spec,
+        "force_bf16_experts": bool(args.force_bf16_experts),
         "build_summary": build_summary,
     }
     with open(manifest_path, "w") as f:
@@ -133,6 +142,7 @@ def main() -> int:
     print(f"Repair cache:          {repair_cache_dir}")
     print(f"Layer spec:            {args.layer_spec}")
     print(f"Down-proj dequant:     {args.dequant_down_proj_spec}")
+    print(f"Force bf16 experts:    {bool(args.force_bf16_experts)}")
     print(
         "Cache summary:         "
         f"written={len(build_summary['written_layers'])} "

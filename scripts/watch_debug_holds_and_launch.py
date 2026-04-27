@@ -13,6 +13,7 @@ import time
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ENV_PREFIX = Path("/net/projects2/annawoodard/micromamba/envs/prima")
+ENV_PYTHON = ENV_PREFIX / "bin" / "python"
 ISOLATED_RUNNER = PROJECT_ROOT / "scripts" / "run_auto_qc_isolated_caches.py"
 
 
@@ -154,11 +155,7 @@ def build_srun_command(
         for arg in auto_qc_args
     ]
     runner_args = [
-        "micromamba",
-        "run",
-        "-p",
-        str(ENV_PREFIX),
-        "python",
+        str(ENV_PYTHON),
         str(ISOLATED_RUNNER),
         "--cache-root",
         str(cache_root),
@@ -198,6 +195,8 @@ def main() -> int:
         raise ValueError("--hf-cache-mode must be repeated exactly once per --job-id")
     if not ISOLATED_RUNNER.exists():
         raise FileNotFoundError(f"missing isolated-cache runner: {ISOLATED_RUNNER}")
+    if not ENV_PYTHON.exists():
+        raise FileNotFoundError(f"missing env python: {ENV_PYTHON}")
 
     append_log(
         args.log_file,

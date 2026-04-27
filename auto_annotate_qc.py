@@ -349,15 +349,110 @@ def build_binary_probe_prompt(
         )
     return (
         f"{example_text}"
-        "This is the target exam.\n"
-        f"Decide whether the QC tag '{probe_tag}' is visually present in the target montage.\n\n"
-        "Rules:\n"
-        "- Judge only the target exam.\n"
-        "- Use a strict visual standard.\n"
-        "- If uncertain, answer false.\n"
-        "- Return valid JSON only with this schema:\n"
-        '{"present":true,"score":0.0,"rationale":"short visual reason"}\n'
+        f"Target exam only: is the QC tag '{probe_tag}' visually present in this mammography montage?\n"
+        "Answer only yes or no.\n"
     )
+
+
+def build_marker_classifier_prompt(
+    *,
+    probe_tag: str,
+    few_shot_examples: list[dict[str, Any]],
+) -> str:
+    """Short classifier prompt that asks for evidence plus an explicit answer line."""
+    example_text = ""
+    if few_shot_examples:
+        example_text = (
+            f"You are also given {len(few_shot_examples)} labeled reference examples before the target exam. "
+            "Use them only as loose visual context.\n\n"
+        )
+    target_description = (
+        "a skin marker or BB marker"
+        if probe_tag.strip().lower() == "bb"
+        else f"the QC tag '{probe_tag}'"
+    )
+    return (
+        f"{example_text}"
+        f"Target exam only: decide whether {target_description} is visually present anywhere in this mammography montage.\n"
+        "Answer in exactly two lines and nothing else:\n"
+        "EVIDENCE: <one short visual phrase, or none>\n"
+        "ANSWER: YES or ANSWER: NO\n"
+    )
+
+
+def build_binary_probe_choice_variants(processor: Any) -> list[dict[str, Any]]:
+    """Tokenize a small forced-choice vocabulary for binary probe decoding."""
+    tokenizer = getattr(processor, "tokenizer", processor)
+    raw_variants = [
+        ("yes", True),
+        ("Yes", True),
+        (" yes", True),
+        (" Yes", True),
+        ("no", False),
+        ("No", False),
+        (" no", False),
+        (" No", False),
+    ]
+    variants: list[dict[str, Any]] = []
+    seen_token_sequences: set[tuple[int, ...]] = set()
+    for text, present in raw_variants:
+        token_ids = tokenizer.encode(text, add_special_tokens=False)
+        if not token_ids:
+            raise RuntimeError(
+                f"binary probe choice {text!r} tokenized to an empty sequence"
+            )
+        token_key = tuple(int(token_id) for token_id in token_ids)
+        if token_key in seen_token_sequences:
+            continue
+        seen_token_sequences.add(token_key)
+        variants.append(
+            {
+                "text": text,
+                "present": present,
+                "token_ids": list(token_key),
+            }
+        )
+    return variants
+
+
+def build_binary_probe_prefix_allowed_tokens_fn(
+    *,
+    prompt_length: int,
+    choice_variants: list[dict[str, Any]],
+    eos_token_ids: list[int],
+) -> Any:
+    """Constrain decoding to an exact binary-probe choice string plus EOS."""
+    choice_token_sequences = [
+        [int(token_id) for token_id in variant["token_ids"]]
+        for variant in choice_variants
+    ]
+    first_choice_tokens = sorted({token_ids[0] for token_ids in choice_token_sequences})
+    if not first_choice_tokens:
+        raise RuntimeError("binary probe decoding has no candidate first tokens")
+
+    def _prefix_allowed_tokens_fn(batch_id: int, input_ids: Any) -> list[int]:
+        del batch_id
+        generated_prefix = [
+            int(token_id) for token_id in input_ids[prompt_length:].tolist()
+        ]
+        allowed_tokens: set[int] = set()
+        matched_complete_choice = False
+        for token_ids in choice_token_sequences:
+            if len(generated_prefix) > len(token_ids):
+                continue
+            if token_ids[: len(generated_prefix)] != generated_prefix:
+                continue
+            if len(generated_prefix) == len(token_ids):
+                matched_complete_choice = True
+            else:
+                allowed_tokens.add(int(token_ids[len(generated_prefix)]))
+        if matched_complete_choice:
+            return list(eos_token_ids)
+        if allowed_tokens:
+            return sorted(allowed_tokens)
+        return first_choice_tokens
+
+    return _prefix_allowed_tokens_fn
 
 
 def build_user_prompt(
@@ -425,6 +520,13 @@ def build_target_prompt_text(
         )
     if prompt_mode == "what_is_this":
         return build_debug_describe_prompt(
+            few_shot_examples=few_shot_examples,
+        )
+    if prompt_mode == "marker_classifier":
+        if not probe_tag:
+            raise ValueError("marker_classifier requires a probe_tag")
+        return build_marker_classifier_prompt(
+            probe_tag=probe_tag,
             few_shot_examples=few_shot_examples,
         )
     raise ValueError(f"unsupported prompt mode: {prompt_mode}")
@@ -530,9 +632,7 @@ def coerce_binary_probe_payload(text: str) -> dict[str, Any] | None:
         return None
 
     lowered = stripped.lower()
-    present_match = re.search(
-        r"\bpresent\b\s*[:=]\s*(true|false|yes|no)\b", lowered
-    )
+    present_match = re.search(r"\bpresent\b\s*[:=]\s*(true|false|yes|no)\b", lowered)
     if present_match is not None:
         present = present_match.group(1) in {"true", "yes"}
     elif re.search(r"\b(yes|true)\b", lowered) and not re.search(
@@ -557,6 +657,33 @@ def coerce_binary_probe_payload(text: str) -> dict[str, Any] | None:
     if rationale_match is not None:
         rationale = rationale_match.group(1).strip()
         if rationale:
+            payload["rationale"] = rationale
+    return payload
+
+
+def coerce_marker_classifier_payload(text: str) -> dict[str, Any] | None:
+    """Parse a short evidence-plus-answer classifier response."""
+    stripped = text.strip()
+    if not stripped:
+        return None
+
+    answer_match = re.search(r"\bANSWER\s*:\s*(YES|NO)\b", stripped, re.I)
+    if answer_match is not None:
+        present = answer_match.group(1).upper() == "YES"
+    else:
+        final_match = re.search(r"\bFINAL\s*:\s*(YES|NO)\b", stripped, re.I)
+        if final_match is not None:
+            present = final_match.group(1).upper() == "YES"
+        elif re.fullmatch(r"(?i)\s*(yes|no)\s*", stripped):
+            present = stripped.strip().upper() == "YES"
+        else:
+            return None
+
+    payload: dict[str, Any] = {"present": present}
+    evidence_match = re.search(r"\bEVIDENCE\s*:\s*(.+)", stripped, re.I)
+    if evidence_match is not None:
+        rationale = evidence_match.group(1).strip()
+        if rationale and rationale.lower() != "none":
             payload["rationale"] = rationale
     return payload
 
@@ -819,6 +946,7 @@ def patch_qwen35_fp8_eager_experts() -> None:
     """Patch HF FP8 eager experts to tolerate tensor-parallel sentinel expert IDs."""
     import functools
     import torch
+    import torch.nn.functional as F
     from transformers.integrations import finegrained_fp8
 
     if getattr(finegrained_fp8, "_prima_qwen35_fp8_eager_patch", False):
@@ -830,8 +958,30 @@ def patch_qwen35_fp8_eager_experts() -> None:
     def patched_forward(self, hidden_states, top_k_index, top_k_weights):
         if not hasattr(self, "_prima_nonfinite_detail"):
             self._prima_nonfinite_detail = None
+        layer_idx = getattr(self, "_prima_layer_idx", None)
+        sync_linear = os.environ.get(
+            "PRIMA_QWEN35_FP8_SYNC_LINEAR", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        force_bf16_experts = bool(
+            getattr(self, "_prima_force_bf16_experts", False)
+        ) or os.environ.get("PRIMA_QWEN35_FP8_FORCE_BF16_EXPERTS", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
-        def _maybe_record_nonfinite(stage: str, tensor: Any, expert_idx: int | None = None) -> None:
+        def _maybe_sync_cuda(tensor: Any) -> None:
+            if not sync_linear:
+                return
+            device = getattr(tensor, "device", None)
+            if device is None or getattr(device, "type", None) != "cuda":
+                return
+            torch.cuda.synchronize(device=device)
+
+        def _maybe_record_nonfinite(
+            stage: str, tensor: Any, expert_idx: int | None = None
+        ) -> None:
             if getattr(self, "_prima_nonfinite_detail", None) is not None:
                 return
             summary = summarize_nonfinite_tensor(tensor)
@@ -839,48 +989,116 @@ def patch_qwen35_fp8_eager_experts() -> None:
                 return
             detail = {
                 "stage": stage,
+                "layer_idx": int(layer_idx) if layer_idx is not None else None,
                 "expert_idx": int(expert_idx) if expert_idx is not None else None,
                 **summary,
             }
             self._prima_nonfinite_detail = detail
             logger.warning(
-                "Qwen3.5 FP8 experts first non-finite tensor at %s expert=%s: %s",
+                "Qwen3.5 FP8 experts first non-finite tensor at layer=%s stage=%s expert=%s: %s",
+                layer_idx,
                 stage,
                 expert_idx,
                 detail,
             )
 
+        def _maybe_log_router_indices_once() -> None:
+            if getattr(self, "_prima_router_detail_logged", False):
+                return
+            if top_k_index.numel() == 0:
+                self._prima_router_detail_logged = True
+                return
+            try:
+                top_k_index_cpu = top_k_index.detach().to(device="cpu", dtype=torch.int64)
+                invalid_mask_cpu = (top_k_index_cpu < 0) | (
+                    top_k_index_cpu >= self.num_experts
+                )
+                invalid_count_cpu = int(invalid_mask_cpu.sum().item())
+                if invalid_count_cpu > 0:
+                    invalid_values = (
+                        top_k_index_cpu[invalid_mask_cpu]
+                        .reshape(-1)[:16]
+                        .tolist()
+                    )
+                    logger.warning(
+                        "Qwen3.5 FP8 eager experts at layer=%s received invalid router indices "
+                        "(min=%d max=%d num_experts=%d invalid=%d sample=%s); "
+                        "masking those routes before one_hot",
+                        layer_idx,
+                        int(top_k_index_cpu.min().item()),
+                        int(top_k_index_cpu.max().item()),
+                        self.num_experts,
+                        invalid_count_cpu,
+                        invalid_values,
+                    )
+                self._prima_router_detail_logged = True
+            except Exception as exc:
+                logger.warning(
+                    "Qwen3.5 FP8 eager experts at layer=%s could not snapshot router "
+                    "indices on CPU before masking: %s",
+                    layer_idx,
+                    exc,
+                )
+                self._prima_router_detail_logged = True
+
+        def _expert_linear(
+            input_tensor: Any,
+            *,
+            weight: Any,
+            weight_scale_inv: Any,
+            activation_scale: Any = None,
+        ) -> Any:
+            if not force_bf16_experts:
+                return self.linear(
+                    input_tensor,
+                    weight,
+                    weight_scale_inv,
+                    activation_scale=activation_scale,
+                )
+
+            if weight.element_size() > 1:
+                bf16_weight = weight.to(device=input_tensor.device, dtype=torch.bfloat16)
+            else:
+                bf16_weight = dequantize_fp8_weight_blocks(
+                    weight,
+                    weight_scale_inv,
+                    block_size=self.block_size,
+                ).to(device=input_tensor.device)
+            bf16_input = input_tensor.to(dtype=torch.bfloat16)
+            output = F.linear(bf16_input, bf16_weight, None)
+            return output.to(dtype=input_tensor.dtype)
+
         _maybe_record_nonfinite("hidden_states_input", hidden_states)
         _maybe_record_nonfinite("routing_weights_input", top_k_weights)
         if top_k_index.numel() > 0:
-            expert_min = int(top_k_index.min().item())
-            expert_max = int(top_k_index.max().item())
-            if expert_min < 0 or expert_max > self.num_experts:
-                raise RuntimeError(
-                    "Qwen3.5 FP8 eager experts received out-of-range router indices: "
-                    f"min={expert_min} max={expert_max} num_experts={self.num_experts}"
-                )
-            invalid_expert_mask = top_k_index == self.num_experts
+            valid_expert_mask = (top_k_index >= 0) & (top_k_index < self.num_experts)
         else:
-            invalid_expert_mask = None
+            valid_expert_mask = None
 
         # Mirror the upstream eager path, but zero out tensor-parallel sentinel
         # routes before one-hot encoding so they are skipped instead of crashing.
         final_hidden_states = torch.zeros_like(hidden_states, dtype=torch.float32)
         with torch.no_grad():
             safe_top_k_index = top_k_index
-            if invalid_expert_mask is not None and invalid_expert_mask.any():
-                logger.warning_once(
-                    "Qwen3.5 FP8 eager experts received tensor-parallel sentinel expert id=%d; masking those routes before one_hot",
-                    self.num_experts,
+            safe_top_k_weights = top_k_weights
+            if valid_expert_mask is not None:
+                _maybe_log_router_indices_once()
+                safe_top_k_index = torch.where(
+                    valid_expert_mask,
+                    top_k_index,
+                    torch.zeros_like(top_k_index),
                 )
-                safe_top_k_index = top_k_index.masked_fill(invalid_expert_mask, 0)
+                safe_top_k_weights = torch.where(
+                    valid_expert_mask,
+                    top_k_weights,
+                    torch.zeros_like(top_k_weights),
+                )
             expert_mask = torch.nn.functional.one_hot(
                 safe_top_k_index, num_classes=self.num_experts
             )
-            if invalid_expert_mask is not None and invalid_expert_mask.any():
+            if valid_expert_mask is not None:
                 expert_mask = expert_mask.masked_fill(
-                    invalid_expert_mask.unsqueeze(-1), 0
+                    (~valid_expert_mask).unsqueeze(-1), 0
                 )
             expert_mask = expert_mask.permute(2, 1, 0)
             expert_hit = (
@@ -900,34 +1118,49 @@ def patch_qwen35_fp8_eager_experts() -> None:
                 if self.activation_scheme == "static"
                 else None
             )
-            proj_out = self.linear(
+            proj_out = _expert_linear(
                 current_state,
-                self.gate_up_proj[expert_idx] if self.has_gate else self.up_proj[expert_idx],
-                self.gate_up_proj_scale_inv[expert_idx]
-                if self.has_gate
-                else self.up_proj_scale_inv[expert_idx],
+                weight=(
+                    self.gate_up_proj[expert_idx]
+                    if self.has_gate
+                    else self.up_proj[expert_idx]
+                ),
+                weight_scale_inv=(
+                    self.gate_up_proj_scale_inv[expert_idx]
+                    if self.has_gate
+                    else self.up_proj_scale_inv[expert_idx]
+                ),
                 activation_scale=gate_up_act_scale,
             )
+            _maybe_sync_cuda(proj_out)
             _maybe_record_nonfinite("gate_up_linear", proj_out, int(expert_idx))
-            proj_out = self._apply_gate(proj_out) if self.has_gate else self.act_fn(proj_out)
+            proj_out = (
+                self._apply_gate(proj_out) if self.has_gate else self.act_fn(proj_out)
+            )
             _maybe_record_nonfinite("gate_activation", proj_out, int(expert_idx))
             down_act_scale = (
                 self.down_proj_activation_scale[expert_idx]
                 if self.activation_scheme == "static"
                 else None
             )
-            proj_out = self.linear(
+            proj_out = _expert_linear(
                 proj_out,
-                self.down_proj[expert_idx],
-                self.down_proj_scale_inv[expert_idx],
+                weight=self.down_proj[expert_idx],
+                weight_scale_inv=self.down_proj_scale_inv[expert_idx],
                 activation_scale=down_act_scale,
             )
+            _maybe_sync_cuda(proj_out)
             _maybe_record_nonfinite("down_linear", proj_out, int(expert_idx))
-            routing_weights = top_k_weights[token_idx, top_k_pos, None]
-            _maybe_record_nonfinite("routing_weights_selected", routing_weights, int(expert_idx))
+            routing_weights = safe_top_k_weights[token_idx, top_k_pos, None]
+            _maybe_record_nonfinite(
+                "routing_weights_selected", routing_weights, int(expert_idx)
+            )
             weighted_out = proj_out * routing_weights.to(proj_out.dtype)
             _maybe_record_nonfinite("weighted_output", weighted_out, int(expert_idx))
-            final_hidden_states.index_add_(0, token_idx, weighted_out.to(final_hidden_states.dtype))
+            final_hidden_states.index_add_(
+                0, token_idx, weighted_out.to(final_hidden_states.dtype)
+            )
+            _maybe_sync_cuda(final_hidden_states)
         _maybe_record_nonfinite("accumulated_output", final_hidden_states)
         return final_hidden_states.to(hidden_states.dtype)
 
@@ -1107,7 +1340,9 @@ class NonFiniteActivationTracer:
         while self.handles:
             self.handles.pop().remove()
 
-    def _capture_nonfinite(self, *, module_name: str, module: Any, side: str, payload: Any) -> None:
+    def _capture_nonfinite(
+        self, *, module_name: str, module: Any, side: str, payload: Any
+    ) -> None:
         if self.first_nonfinite is not None:
             return
         for tensor_path, tensor in iter_nested_tensors(payload, prefix=side):
@@ -1205,14 +1440,17 @@ def build_generation_debug_payload(
     tokenizer = getattr(processor, "tokenizer", None)
     generated_token_ids = [int(token_id) for token_id in new_token_ids[0].tolist()]
     generated_token_pieces = [
-        _decode_token_piece(tokenizer, token_id) for token_id in generated_token_ids[:64]
+        _decode_token_piece(tokenizer, token_id)
+        for token_id in generated_token_ids[:64]
     ]
     first_token_topk: list[dict[str, Any]] = []
     if generation_scores:
         first_score = generation_scores[0][0].detach().float().cpu()
         top_k = min(10, int(first_score.shape[-1]))
         top_values, top_indices = first_score.topk(top_k)
-        for token_id, logit in zip(top_indices.tolist(), top_values.tolist(), strict=True):
+        for token_id, logit in zip(
+            top_indices.tolist(), top_values.tolist(), strict=True
+        ):
             first_token_topk.append(
                 {
                     "token_id": int(token_id),
@@ -1641,6 +1879,7 @@ def maybe_repair_qwen35_fp8_experts(
     """Patch missing fused FP8 expert tensors from per-expert checkpoint weights."""
     manifest_layer_spec = None
     manifest_dequant_spec = None
+    manifest_force_bf16_experts: bool | None = None
     if repair_manifest is not None:
         raw_manifest_layer_spec = repair_manifest.get("repair_layer_spec")
         if raw_manifest_layer_spec is not None:
@@ -1648,11 +1887,27 @@ def maybe_repair_qwen35_fp8_experts(
         raw_manifest_dequant_spec = repair_manifest.get("dequant_down_proj_spec")
         if raw_manifest_dequant_spec is not None:
             manifest_dequant_spec = str(raw_manifest_dequant_spec).strip() or None
+        raw_manifest_force_bf16_experts = repair_manifest.get("force_bf16_experts")
+        if raw_manifest_force_bf16_experts is not None:
+            manifest_force_bf16_experts = bool(raw_manifest_force_bf16_experts)
 
     env_layer_spec = os.environ.get("PRIMA_QWEN35_FP8_REPAIR_LAYERS")
     layer_spec = env_layer_spec or manifest_layer_spec
     if layer_spec is None:
         return None
+
+    raw_env_force_bf16_experts = os.environ.get("PRIMA_QWEN35_FP8_FORCE_BF16_EXPERTS")
+    if raw_env_force_bf16_experts is not None and raw_env_force_bf16_experts.strip():
+        force_bf16_experts = raw_env_force_bf16_experts.strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        force_bf16_experts_source = "env"
+    else:
+        force_bf16_experts = bool(manifest_force_bf16_experts)
+        force_bf16_experts_source = "manifest"
 
     from safetensors import safe_open
     import torch
@@ -1708,6 +1963,8 @@ def maybe_repair_qwen35_fp8_experts(
         repair_cache_dir.mkdir(parents=True, exist_ok=True)
     for layer_idx in layer_indices:
         experts = text_model.layers[layer_idx].mlp.experts
+        setattr(experts, "_prima_layer_idx", int(layer_idx))
+        setattr(experts, "_prima_force_bf16_experts", force_bf16_experts)
         gate_up_target = getattr(experts, "gate_up_proj", None)
         gate_up_scale_target = getattr(experts, "gate_up_proj_scale_inv", None)
         down_target = getattr(experts, "down_proj", None)
@@ -1774,7 +2031,9 @@ def maybe_repair_qwen35_fp8_experts(
                         device=down_target.device,
                         dtype=torch.bfloat16,
                     )
-                elif down_proj_cached is not None and down_proj_scale_cached is not None:
+                elif (
+                    down_proj_cached is not None and down_proj_scale_cached is not None
+                ):
                     down_target.copy_(
                         down_proj_cached.to(
                             device=down_target.device,
@@ -1858,7 +2117,9 @@ def maybe_repair_qwen35_fp8_experts(
                                     )
                         else:
                             pending_weights[expert_idx][proj] = tensor
-                            if {"gate_proj", "up_proj"} <= pending_weights[expert_idx].keys():
+                            if {"gate_proj", "up_proj"} <= pending_weights[
+                                expert_idx
+                            ].keys():
                                 fused = torch.cat(
                                     [
                                         pending_weights[expert_idx]["gate_proj"],
@@ -1897,7 +2158,9 @@ def maybe_repair_qwen35_fp8_experts(
                                     )
                         else:
                             pending_scales[expert_idx][proj] = tensor
-                            if {"gate_proj", "up_proj"} <= pending_scales[expert_idx].keys():
+                            if {"gate_proj", "up_proj"} <= pending_scales[
+                                expert_idx
+                            ].keys():
                                 fused_scale = torch.cat(
                                     [
                                         pending_scales[expert_idx]["gate_proj"],
@@ -1964,10 +2227,16 @@ def maybe_repair_qwen35_fp8_experts(
         "requested": layer_spec,
         "requested_source": "env" if env_layer_spec is not None else "manifest",
         "repaired_layers": repaired_layers,
-        "down_proj_dequantized_layers": sorted(dequant_down_proj_layers & set(repaired_layers)),
-        "repair_cache_dir": str(repair_cache_dir) if repair_cache_dir is not None else None,
+        "down_proj_dequantized_layers": sorted(
+            dequant_down_proj_layers & set(repaired_layers)
+        ),
+        "repair_cache_dir": str(repair_cache_dir)
+        if repair_cache_dir is not None
+        else None,
         "cached_layers_used": cached_layers_used,
         "cached_layers_written": cached_layers_written,
+        "force_bf16_experts": force_bf16_experts,
+        "force_bf16_experts_source": force_bf16_experts_source,
     }
 
 
@@ -2024,7 +2293,9 @@ class LocalVisionAnnotator:
         few_shot_exemplar_pool: list[dict[str, Any]],
         prompt_mode: str,
         probe_tag: str | None,
+        target_prompt_override: str | None,
         text_only_prompt: str | None,
+        disable_thinking: bool,
         debug_dump_dir: Path | None,
         trust_remote_code: bool,
     ) -> None:
@@ -2039,9 +2310,11 @@ class LocalVisionAnnotator:
         self.few_shot_exemplar_pool = list(few_shot_exemplar_pool)
         self.prompt_mode = prompt_mode
         self.probe_tag = probe_tag
-        self.text_only_prompt = (
-            text_only_prompt.strip() if text_only_prompt else None
+        self.target_prompt_override = (
+            target_prompt_override.strip() if target_prompt_override else None
         )
+        self.text_only_prompt = text_only_prompt.strip() if text_only_prompt else None
+        self.disable_thinking = disable_thinking
         self.debug_dump_dir = debug_dump_dir
         if self.debug_dump_dir is not None:
             self.debug_dump_dir.mkdir(parents=True, exist_ok=True)
@@ -2152,7 +2425,9 @@ class LocalVisionAnnotator:
                 repair_manifest=self.repair_manifest,
             )
         self.compute_dtype = (
-            torch.float16 if quant_method == "awq" else getattr(self.model, "dtype", None)
+            torch.float16
+            if quant_method == "awq"
+            else getattr(self.model, "dtype", None)
         )
         self.lm_head_dtype_hook = None
         if quant_method == "awq":
@@ -2164,9 +2439,10 @@ class LocalVisionAnnotator:
             self.lm_head_dtype_hook = align_lm_head_input_dtype(self.model)
             validate_awq_visual_load_layout(self.model_path, self.model)
         generation_config = getattr(self.model, "generation_config", None)
-        if generation_config is not None and getattr(
-            generation_config, "temperature", None
-        ) is not None:
+        if (
+            generation_config is not None
+            and getattr(generation_config, "temperature", None) is not None
+        ):
             generation_config.temperature = None
         logger.info(
             "model ready: device=%s dtype=%s experts_implementation=%s",
@@ -2200,6 +2476,8 @@ class LocalVisionAnnotator:
             few_shot_examples=few_shot_examples,
             probe_tag=self.probe_tag,
         )
+        if self.target_prompt_override is not None:
+            target_prompt_text = self.target_prompt_override
 
         messages: list[dict[str, Any]] = [
             {
@@ -2270,6 +2548,7 @@ class LocalVisionAnnotator:
             messages,
             tokenize=False,
             add_generation_prompt=True,
+            enable_thinking=not self.disable_thinking,
         )
         image_inputs, video_inputs = process_vision_info(messages)
         processor_inputs: dict[str, Any] = {
@@ -2287,6 +2566,7 @@ class LocalVisionAnnotator:
             self.model,
             dtype=self.compute_dtype,
         )
+        prompt_length = inputs["input_ids"].shape[1]
 
         generation_scores: list[Any] = []
         nonfinite_trace_summary: dict[str, Any] | None = None
@@ -2299,6 +2579,30 @@ class LocalVisionAnnotator:
                     "do_sample": False,
                     "max_new_tokens": self.max_new_tokens,
                 }
+                if self.prompt_mode == "binary_tag_probe":
+                    tokenizer = getattr(self.processor, "tokenizer", self.processor)
+                    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+                    if eos_token_id is None:
+                        raise RuntimeError(
+                            "binary probe constrained decoding requires eos_token_id"
+                        )
+                    if isinstance(eos_token_id, list):
+                        eos_token_ids = [int(token_id) for token_id in eos_token_id]
+                    else:
+                        eos_token_ids = [int(eos_token_id)]
+                    choice_variants = build_binary_probe_choice_variants(self.processor)
+                    generation_kwargs["max_new_tokens"] = min(
+                        generation_kwargs["max_new_tokens"],
+                        max(len(variant["token_ids"]) for variant in choice_variants)
+                        + 1,
+                    )
+                    generation_kwargs["prefix_allowed_tokens_fn"] = (
+                        build_binary_probe_prefix_allowed_tokens_fn(
+                            prompt_length=prompt_length,
+                            choice_variants=choice_variants,
+                            eos_token_ids=eos_token_ids,
+                        )
+                    )
                 if self.debug_dump_dir is not None:
                     generation_kwargs.update(
                         return_dict_in_generate=True,
@@ -2320,7 +2624,6 @@ class LocalVisionAnnotator:
                     nonfinite_trace_summary = nonfinite_tracer.summary()
                     nonfinite_tracer.close()
 
-        prompt_length = inputs["input_ids"].shape[1]
         new_token_ids = generated_ids[:, prompt_length:]
         response_text = self.processor.batch_decode(
             new_token_ids,
@@ -2358,6 +2661,18 @@ class LocalVisionAnnotator:
                 probe_tag=str(self.probe_tag),
                 allowed_tags=set(tag_catalog),
             )
+        elif self.prompt_mode == "marker_classifier":
+            response_payload = coerce_marker_classifier_payload(response_text)
+            if response_payload is None:
+                logger.warning(
+                    "exam %s: marker classifier response was not parseable; treating as not present",
+                    exam_id,
+                )
+            suggestions = normalize_binary_probe_response(
+                response_payload,
+                probe_tag=str(self.probe_tag),
+                allowed_tags=set(tag_catalog),
+            )
 
         debug_dump_file = None
         if self.debug_dump_dir is not None:
@@ -2366,7 +2681,9 @@ class LocalVisionAnnotator:
                 "image_file": image_path.name,
                 "prompt_mode": self.prompt_mode,
                 "probe_tag": self.probe_tag,
+                "target_prompt_override": self.target_prompt_override,
                 "text_only_prompt": self.text_only_prompt,
+                "disable_thinking": self.disable_thinking,
                 "few_shot_example_exam_ids": [
                     str(example["exam_id"]) for example in few_shot_examples
                 ],
@@ -2503,7 +2820,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--prompt-mode",
-        choices=["tagger_json", "what_is_this", "binary_tag_probe"],
+        choices=["tagger_json", "what_is_this", "binary_tag_probe", "marker_classifier"],
         default="tagger_json",
         help="Prompt style for the target exam. Use what_is_this for raw freeform debugging.",
     )
@@ -2514,10 +2831,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="QC tag to test when --prompt-mode=binary_tag_probe",
     )
     parser.add_argument(
+        "--target-prompt-override",
+        type=str,
+        default=None,
+        help="Optional target prompt override that still passes the target image to the model.",
+    )
+    parser.add_argument(
         "--text-only-prompt",
         type=str,
         default=None,
         help="Optional text-only override prompt. When set, no image is passed to the model.",
+    )
+    parser.add_argument(
+        "--disable-thinking",
+        action="store_true",
+        help="Disable Qwen3.5 thinking mode via the chat template when supported.",
     )
     parser.add_argument(
         "--debug-dump-dir",
@@ -2559,9 +2887,7 @@ def run_from_args(args: argparse.Namespace) -> int:
     model_path = args.model_path.resolve()
     qc_file = args.qc_file.resolve() if args.qc_file else None
     few_shot_qc_file = (
-        args.few_shot_qc_file.resolve()
-        if args.few_shot_qc_file
-        else qc_file
+        args.few_shot_qc_file.resolve() if args.few_shot_qc_file else qc_file
     )
     exam_list_path = args.exam_list.resolve() if args.exam_list else None
     debug_dump_dir = args.debug_dump_dir.resolve() if args.debug_dump_dir else None
@@ -2584,9 +2910,11 @@ def run_from_args(args: argparse.Namespace) -> int:
         raise ValueError("--few-shot-examples must be non-negative")
 
     tag_catalog = load_tag_catalog(tags_file)
-    if args.prompt_mode == "binary_tag_probe":
+    if args.prompt_mode in {"binary_tag_probe", "marker_classifier"}:
         if not args.probe_tag:
-            raise ValueError("--prompt-mode=binary_tag_probe requires --probe-tag")
+            raise ValueError(
+                f"--prompt-mode={args.prompt_mode} requires --probe-tag"
+            )
         if args.probe_tag not in tag_catalog:
             raise ValueError(
                 f"--probe-tag must be one of the allowed tags; got {args.probe_tag!r}"
@@ -2626,14 +2954,14 @@ def run_from_args(args: argparse.Namespace) -> int:
         few_shot_exemplar_pool=exemplar_pool,
         prompt_mode=args.prompt_mode,
         probe_tag=args.probe_tag,
+        target_prompt_override=args.target_prompt_override,
         text_only_prompt=args.text_only_prompt,
+        disable_thinking=args.disable_thinking,
         debug_dump_dir=debug_dump_dir,
         trust_remote_code=args.trust_remote_code,
     )
 
-    run_id = (
-        f"{utc_now_iso().replace(':', '').replace('+00:00', 'Z')}_{model_label}"
-    )
+    run_id = f"{utc_now_iso().replace(':', '').replace('+00:00', 'Z')}_{model_label}"
     exam_suggestions: dict[str, dict[str, Any]] = {}
     for record in tqdm(exam_records, desc="auto-qc"):
         image_path = Path(record["image_path"])
