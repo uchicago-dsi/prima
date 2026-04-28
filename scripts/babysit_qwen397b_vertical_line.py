@@ -30,7 +30,10 @@ DEFAULT_NOTEBOOK = (
     / "fp8_debug_lab_notebook.md"
 )
 DEFAULT_SUBMITIT_RUNS = Path("/net/projects2/annawoodard/qc_redo/submitit_runs")
-DEFAULT_RUN_NAME_REGEX = r"auto_qc_qwen397b_fp8_vertical_line.*bf16experts.*"
+DEFAULT_RUN_NAME_REGEX = (
+    r"(auto_qc_qwen397b_fp8_vertical_line.*bf16experts.*"
+    r"|qwen397b_vertical_line_ablation.*)"
+)
 DEFAULT_FAMILY_LABEL = "qwen397b_vertical_line_bf16experts"
 DEFAULT_CODEX_MODEL = "gpt-5.5"
 
@@ -350,6 +353,47 @@ def _invoke_codex(
     return json.loads(raw)
 
 
+def build_pending_only_decision(active_records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Return a deterministic decision for scheduler-only pending states."""
+    job_summaries = [
+        f"{record['job_id']} {record['run_name']} state={record['job_state']}"
+        for record in active_records
+    ]
+    return {
+        "campaign_status": "waiting",
+        "action_type": "deterministic_pending_wait",
+        "did_act": False,
+        "needs_human": False,
+        "summary": (
+            "All matching active Qwen vertical-line jobs are pending in Slurm; "
+            "skipped Codex agent invocation and will check again on the next timer tick."
+        ),
+        "why": (
+            "Pending-only scheduler wait does not require model reasoning or code changes. "
+            "Avoiding a Codex wake-up preserves quota while jobs wait for resources or priority."
+        ),
+        "failure_cause": "Scheduler wait only; no runtime logs or failures are available yet.",
+        "evidence": job_summaries,
+        "files_changed": [],
+        "new_job_ids": [],
+        "notebook_updated": False,
+        "goal_progress": (
+            "Preserved the queued jobs and avoided duplicate submissions while conserving agent quota."
+        ),
+        "next_check_hint": (
+            "If any matching job changes from PENDING to RUNNING, inspect submitit logs. "
+            "If all remain PENDING, continue deterministic waiting."
+        ),
+    }
+
+
+def should_skip_codex_for_pending_only(active_records: list[dict[str, Any]]) -> bool:
+    """Skip the expensive agent when every active matching job is only pending."""
+    return bool(active_records) and all(
+        str(record.get("job_state")) == "PENDING" for record in active_records
+    )
+
+
 def build_prompt(template: str, context: dict[str, Any]) -> str:
     return template.replace(
         "{{CAMPAIGN_CONTEXT_JSON}}", json.dumps(context, indent=2, sort_keys=True)
@@ -407,16 +451,20 @@ def main() -> int:
         decision_time = datetime.now().strftime("%Y%m%d_%H%M%S")
         decision_file = args.output_root / "decisions" / f"{decision_time}.json"
         decision_file.parent.mkdir(parents=True, exist_ok=True)
-        prompt_template = args.prompt_template.read_text(encoding="utf-8")
-        prompt = build_prompt(prompt_template, campaign_context)
-        result = _invoke_codex(
-            codex_bin=args.codex_bin,
-            schema_path=args.schema,
-            prompt_text=prompt,
-            output_file=decision_file,
-            model=args.model,
-            dry_run=args.dry_run,
-        )
+        if should_skip_codex_for_pending_only(active_records) and not args.dry_run:
+            result = build_pending_only_decision(active_records)
+            _write_json(decision_file, result)
+        else:
+            prompt_template = args.prompt_template.read_text(encoding="utf-8")
+            prompt = build_prompt(prompt_template, campaign_context)
+            result = _invoke_codex(
+                codex_bin=args.codex_bin,
+                schema_path=args.schema,
+                prompt_text=prompt,
+                output_file=decision_file,
+                model=args.model,
+                dry_run=args.dry_run,
+            )
         history_entry = {
             "decided_at": now_local(),
             "context_summary": {
