@@ -1105,43 +1105,41 @@ def patch_qwen35_fp8_eager_experts() -> None:
         else:
             valid_expert_mask = None
 
-        # Mirror the upstream eager path, but zero out tensor-parallel sentinel
-        # routes before one-hot encoding so they are skipped instead of crashing.
+        # Mirror the upstream eager path, but select routed tokens on CPU so
+        # corrupt/sentinel expert ids are skipped before any CUDA indexing kernel.
         final_hidden_states = torch.zeros_like(hidden_states, dtype=torch.float32)
         with torch.no_grad():
-            safe_top_k_index = top_k_index
-            safe_top_k_weights = top_k_weights
+            top_k_index_cpu = top_k_index.detach().to(device="cpu", dtype=torch.int64)
+            valid_expert_mask_cpu = (top_k_index_cpu >= 0) & (
+                top_k_index_cpu < self.num_experts
+            )
             if valid_expert_mask is not None:
                 _maybe_log_router_indices_once()
-                safe_top_k_index = torch.where(
-                    valid_expert_mask,
-                    top_k_index,
-                    torch.zeros_like(top_k_index),
-                )
-                safe_top_k_weights = torch.where(
-                    valid_expert_mask,
-                    top_k_weights,
-                    torch.zeros_like(top_k_weights),
-                )
-            expert_mask = torch.nn.functional.one_hot(
-                safe_top_k_index, num_classes=self.num_experts
-            )
-            if valid_expert_mask is not None:
-                expert_mask = expert_mask.masked_fill(
-                    (~valid_expert_mask).unsqueeze(-1), 0
-                )
-            expert_mask = expert_mask.permute(2, 1, 0)
-            expert_hit = (
-                torch.greater(expert_mask.sum(dim=(-1, -2)), 0)
-                .nonzero(as_tuple=False)
-                .view(-1)
-            )
+            if valid_expert_mask_cpu.any():
+                expert_hit = torch.unique(top_k_index_cpu[valid_expert_mask_cpu]).tolist()
+            else:
+                expert_hit = []
 
         for expert_idx in expert_hit:
-            if expert_idx == self.num_experts:
-                continue
-
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            expert_routes_cpu = valid_expert_mask_cpu & (top_k_index_cpu == expert_idx)
+            token_idx_cpu, top_k_pos_cpu = torch.where(expert_routes_cpu)
+            if (
+                (token_idx_cpu >= hidden_states.shape[0]).any()
+                or (top_k_pos_cpu >= top_k_weights.shape[1]).any()
+            ):
+                raise RuntimeError(
+                    "invalid FP8 expert route indices: "
+                    f"hidden_states={tuple(hidden_states.shape)} "
+                    f"top_k_weights={tuple(top_k_weights.shape)} "
+                    f"max_token={int(token_idx_cpu.max())} "
+                    f"max_top_k_pos={int(top_k_pos_cpu.max())}"
+                )
+            token_idx = token_idx_cpu.to(
+                device=hidden_states.device, dtype=torch.long, non_blocking=True
+            )
+            top_k_pos = top_k_pos_cpu.to(
+                device=hidden_states.device, dtype=torch.long, non_blocking=True
+            )
             current_state = hidden_states[token_idx]
             gate_up_act_scale = (
                 self.gate_up_proj_activation_scale[expert_idx]
@@ -1181,7 +1179,7 @@ def patch_qwen35_fp8_eager_experts() -> None:
             )
             _maybe_sync_cuda(proj_out)
             _maybe_record_nonfinite("down_linear", proj_out, int(expert_idx))
-            routing_weights = safe_top_k_weights[token_idx, top_k_pos, None]
+            routing_weights = top_k_weights[token_idx, top_k_pos, None]
             _maybe_record_nonfinite(
                 "routing_weights_selected", routing_weights, int(expert_idx)
             )
