@@ -1,9 +1,9 @@
 [Unit]
-Description=Run the PRIMA Qwen3.5 397B vertical-line babysitter hourly
+Description=Run the PRIMA Qwen3.5 397B vertical-line babysitter every 30 minutes
 
 [Timer]
 OnBootSec=5min
-OnUnitActiveSec=1h
+OnUnitActiveSec=30min
 AccuracySec=1min
 Persistent=true
 
