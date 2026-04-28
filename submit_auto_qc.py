@@ -190,6 +190,7 @@ def main() -> int:
 
     executor = submitit.AutoExecutor(folder=str(log_folder))
     executor.update_parameters(
+        name=submit_args.name,
         timeout_min=submit_args.timeout_min,
         slurm_partition=submit_args.partition,
         tasks_per_node=1,

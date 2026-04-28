@@ -1,0 +1,8 @@
+[Unit]
+Description=PRIMA Qwen3.5 397B vertical-line babysitter
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/annawoodard/prima
+ExecStart=/net/projects2/annawoodard/micromamba/envs/prima/bin/python /home/annawoodard/prima/scripts/babysit_qwen397b_vertical_line.py
+

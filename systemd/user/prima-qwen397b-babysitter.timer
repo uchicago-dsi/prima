@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the PRIMA Qwen3.5 397B vertical-line babysitter every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+
