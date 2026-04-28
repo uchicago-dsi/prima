@@ -1,29 +1,64 @@
 #!/usr/bin/env python3
-"""Timed babysitter for the Qwen3.5 397B vertical-line experiment campaign."""
+"""Timed unattended babysitter for the PRIMA Qwen3.5 397B vertical-line campaign."""
 
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+import fcntl
 import json
+import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
+from dataclasses import asdict, dataclass
+from datetime import datetime
 from typing import Any
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-ENV_PREFIX = Path("/net/projects2/annawoodard/micromamba/envs/prima")
-ENV_PYTHON = ENV_PREFIX / "bin" / "python"
-SUBMIT_SCRIPT = PROJECT_ROOT / "submit_auto_qc.py"
-
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_OUTPUT_ROOT = (
+    Path("/net/projects2/annawoodard/qc_redo/interactive_debug")
+    / "qwen397b_babysitter"
+)
+DEFAULT_LOG_FILE = DEFAULT_OUTPUT_ROOT / "babysitter.log"
+DEFAULT_STATE_FILE = DEFAULT_OUTPUT_ROOT / "state" / "state.json"
+DEFAULT_LOCKFILE = DEFAULT_OUTPUT_ROOT / "state" / "babysitter.lock"
+DEFAULT_SCHEMA = REPO_ROOT / "scripts" / "qwen397b_babysitter_output_schema.json"
+DEFAULT_PROMPT = REPO_ROOT / "scripts" / "qwen397b_babysitter_prompt.txt"
+DEFAULT_NOTEBOOK = (
+    Path("/net/projects2/annawoodard/qc_redo/interactive_debug")
+    / "fp8_debug_lab_notebook.md"
+)
 DEFAULT_SUBMITIT_RUNS = Path("/net/projects2/annawoodard/qc_redo/submitit_runs")
-DEFAULT_RUNS = Path("/net/projects2/annawoodard/qc_redo/auto_qc_runs")
-DEFAULT_DEBUG = Path("/net/projects2/annawoodard/qc_redo/auto_qc_debug")
-DEFAULT_LOG = Path("/net/projects2/annawoodard/qc_redo/interactive_debug/qwen397b_campaign_babysitter.log")
-DEFAULT_STATE = Path("/net/projects2/annawoodard/qc_redo/interactive_debug/qwen397b_campaign_babysitter_state.json")
+DEFAULT_RUN_NAME_REGEX = r"auto_qc_qwen397b_fp8_vertical_line.*bf16experts.*"
+DEFAULT_FAMILY_LABEL = "qwen397b_vertical_line_bf16experts"
 
+
+def _detect_codex_bin() -> Path:
+    candidates: list[Path] = []
+    env_bin = os.environ.get("CODEX_BIN")
+    if env_bin:
+        candidates.append(Path(env_bin))
+    which = shutil.which("codex")
+    if which:
+        candidates.append(Path(which))
+    for candidate in (
+        Path("/home/annawoodard/.local/bin/codex"),
+        Path("/usr/local/bin/codex"),
+        Path("/opt/homebrew/bin/codex"),
+    ):
+        candidates.append(candidate)
+    for candidate in candidates:
+        try:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return candidate
+        except OSError:
+            continue
+    return Path("codex")
+
+
+DEFAULT_CODEX_BIN = _detect_codex_bin()
 ACTIVE_STATES = {
     "PENDING",
     "RUNNING",
@@ -32,22 +67,24 @@ ACTIVE_STATES = {
     "SUSPENDED",
     "REQUEUED",
 }
-FAIL_STATES_PREFIXES = ("FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY")
 
 
 @dataclass
 class RunRecord:
-    kind: str
-    resource: str
-    name: str
-    run_root: Path
-    log_dir: Path
+    run_name: str
     job_id: str
-    state: str
+    job_state: str
+    exit_code: str | None
     start: str | None
     end: str | None
-    exit_code: str | None
-    submit_time: datetime
+    node_list: str | None
+    submitit_run_root: str
+    log_dir: str
+    stdout_path: str | None
+    stderr_path: str | None
+    stdout_tail: list[str]
+    stderr_tail: list[str]
+    submit_time_local: str
 
 
 def now_local() -> str:
@@ -56,68 +93,89 @@ def now_local() -> str:
 
 def append_log(log_file: Path, message: str) -> None:
     log_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(log_file, "a") as f:
+    with open(log_file, "a", encoding="utf-8") as f:
         f.write(f"[{now_local()}] {message}\n")
+
+
+def _run(
+    cmd: list[str],
+    *,
+    input_text: str | None = None,
+) -> str:
+    completed = subprocess.run(
+        cmd,
+        cwd=str(REPO_ROOT),
+        text=True,
+        input=input_text,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"command failed ({completed.returncode}): {' '.join(cmd)}\n"
+            f"stdout:\n{completed.stdout}\n"
+            f"stderr:\n{completed.stderr}"
+        )
+    return completed.stdout
+
+
+def _tail_lines(path: Path | None, max_lines: int) -> list[str]:
+    if path is None or not path.exists():
+        return []
+    try:
+        out = _run(["tail", "-n", str(max_lines), str(path)])
+    except Exception:
+        return []
+    return [line.rstrip("\n") for line in out.splitlines()]
+
+
+def _load_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "One-shot babysitter for the Qwen3.5 397B vertical-line campaign. "
-            "Intended to be run from a timer."
+            "Timer-driven babysitter that selects the PRIMA Qwen3.5 397B vertical-line "
+            "campaign by regex and invokes Codex non-interactively to make each decision."
         )
     )
-    parser.add_argument("--log-file", type=Path, default=DEFAULT_LOG)
-    parser.add_argument("--state-file", type=Path, default=DEFAULT_STATE)
+    parser.add_argument("--family-label", default=DEFAULT_FAMILY_LABEL)
+    parser.add_argument("--run-name-regex", default=DEFAULT_RUN_NAME_REGEX)
     parser.add_argument("--submitit-runs-dir", type=Path, default=DEFAULT_SUBMITIT_RUNS)
-    parser.add_argument("--auto-qc-runs-dir", type=Path, default=DEFAULT_RUNS)
-    parser.add_argument("--auto-qc-debug-dir", type=Path, default=DEFAULT_DEBUG)
+    parser.add_argument("--notebook-path", type=Path, default=DEFAULT_NOTEBOOK)
+    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--log-file", type=Path, default=DEFAULT_LOG_FILE)
+    parser.add_argument("--state-file", type=Path, default=DEFAULT_STATE_FILE)
+    parser.add_argument("--lockfile", type=Path, default=DEFAULT_LOCKFILE)
+    parser.add_argument("--schema", type=Path, default=DEFAULT_SCHEMA)
+    parser.add_argument("--prompt-template", type=Path, default=DEFAULT_PROMPT)
+    parser.add_argument("--codex-bin", type=Path, default=DEFAULT_CODEX_BIN)
+    parser.add_argument("--model", default=None)
+    parser.add_argument("--tail-lines", type=int, default=80)
+    parser.add_argument("--max-records", type=int, default=8)
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--pending-fallback-hours", type=float, default=4.0)
     return parser.parse_args()
 
 
-def load_state(state_file: Path) -> dict[str, Any]:
-    if not state_file.exists():
-        return {"history": []}
-    with open(state_file) as f:
-        payload = json.load(f)
-    if not isinstance(payload, dict):
-        raise ValueError(f"invalid state file payload: {state_file}")
-    payload.setdefault("history", [])
-    return payload
-
-
-def save_state(state_file: Path, payload: dict[str, Any]) -> None:
-    state_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(state_file, "w") as f:
-        json.dump(payload, f, indent=2)
-
-
-def classify_failure(log_path: Path) -> str:
-    if not log_path.exists():
-        return "missing_log"
-    text = log_path.read_text(errors="replace")
-    if "Job has timed out" in text or "timed-out and not checkpointable" in text:
-        return "timeout"
-    if (
-        "deep_gemm::DGException" in text
-        or "device-side assert triggered" in text
-        or "first non-finite tensor" in text
-    ):
-        return "fp8_runtime"
-    if "No such file or directory" in text or "FileNotFoundError" in text:
-        return "path_or_dependency"
-    return "unknown"
-
-
-def query_sacct_state(job_id: str) -> tuple[str, str | None, str | None, str | None]:
+def query_sacct_state(job_id: str) -> tuple[str, str | None, str | None, str | None, str | None]:
     proc = subprocess.run(
         [
             "sacct",
             "-j",
             job_id,
-            "--format=State,Start,End,ExitCode",
+            "--format",
+            "State,Start,End,ExitCode,NodeList",
             "-n",
             "-P",
         ],
@@ -128,9 +186,15 @@ def query_sacct_state(job_id: str) -> tuple[str, str | None, str | None, str | N
     for line in proc.stdout.splitlines():
         if not line.strip():
             continue
-        state, start, end, exit_code = line.split("|", 3)
-        return state.strip(), start.strip() or None, end.strip() or None, exit_code.strip() or None
-    return "UNKNOWN", None, None, None
+        state, start, end, exit_code, node_list = line.split("|", 4)
+        return (
+            state.strip(),
+            start.strip() or None,
+            end.strip() or None,
+            exit_code.strip() or None,
+            node_list.strip() or None,
+        )
+    return "UNKNOWN", None, None, None, None
 
 
 def query_squeue_state(job_id: str) -> str | None:
@@ -144,17 +208,12 @@ def query_squeue_state(job_id: str) -> str | None:
     return state or None
 
 
-def effective_state(job_id: str) -> tuple[str, str | None, str | None, str | None]:
-    state, start, end, exit_code = query_sacct_state(job_id)
-    if state in {"UNKNOWN", ""}:
-        queue_state = query_squeue_state(job_id)
-        if queue_state:
-            state = queue_state
-    elif state == "PENDING":
-        queue_state = query_squeue_state(job_id)
-        if queue_state:
-            state = queue_state
-    return state, start, end, exit_code
+def effective_state(job_id: str) -> tuple[str, str | None, str | None, str | None, str | None]:
+    state, start, end, exit_code, node_list = query_sacct_state(job_id)
+    queue_state = query_squeue_state(job_id)
+    if queue_state:
+        state = queue_state
+    return state, start, end, exit_code, node_list
 
 
 def parse_submit_time(run_root: Path) -> datetime:
@@ -164,338 +223,211 @@ def parse_submit_time(run_root: Path) -> datetime:
     return datetime.strptime(match.group(1), "%Y%m%d_%H%M%S")
 
 
-def detect_kind_and_resource(name: str) -> tuple[str, str] | None:
-    lowered = name.lower()
-    if "qwen397b_fp8_vertical_line" not in lowered:
-        return None
-    if "oneexam" in lowered:
-        kind = "oneexam"
-    elif "reviewed33" in lowered:
-        kind = "reviewed33"
-    else:
-        return None
-
-    if "a100" in lowered:
-        resource = "a100"
-    else:
-        resource = "h200"
-    return kind, resource
-
-
-def list_campaign_runs(submitit_runs_dir: Path) -> list[RunRecord]:
-    records: list[RunRecord] = []
-    for run_root in sorted(submitit_runs_dir.glob("auto_qc_qwen397b_fp8_vertical_line*")):
-        submitit_logs = run_root / "submitit_logs"
-        if not submitit_logs.exists():
+def log_paths_from_sacct(job_id: str) -> tuple[Path | None, Path | None]:
+    proc = subprocess.run(
+        [
+            "sacct",
+            "-j",
+            job_id,
+            "--format",
+            "JobIDRaw,StdOut,StdErr",
+            "-n",
+            "-P",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    stdout_path = None
+    stderr_path = None
+    for line in proc.stdout.splitlines():
+        parts = [part.strip() for part in line.split("|")]
+        if len(parts) < 3 or parts[0] != str(job_id):
             continue
-        submitted = sorted(submitit_logs.glob("*_submitted.pkl"))
+        stdout_raw = parts[1].replace("%j", str(job_id)).replace("%A", str(job_id))
+        stderr_raw = parts[2].replace("%j", str(job_id)).replace("%A", str(job_id))
+        stdout_path = Path(stdout_raw) if stdout_raw else None
+        stderr_path = Path(stderr_raw) if stderr_raw else None
+        break
+    return stdout_path, stderr_path
+
+
+def list_campaign_runs(
+    *,
+    submitit_runs_dir: Path,
+    run_name_regex: str,
+    tail_lines: int,
+    max_records: int,
+) -> list[RunRecord]:
+    pattern = re.compile(run_name_regex)
+    records: list[RunRecord] = []
+    for run_root in sorted(submitit_runs_dir.iterdir()):
+        if not run_root.is_dir():
+            continue
+        if not pattern.search(run_root.name):
+            continue
+        log_dir = run_root / "submitit_logs"
+        if not log_dir.exists():
+            continue
+        submitted = sorted(log_dir.glob("*_submitted.pkl"))
         if not submitted:
             continue
         job_id = submitted[0].name.split("_", 1)[0]
-        detected = detect_kind_and_resource(run_root.name)
-        if detected is None:
-            continue
-        kind, resource = detected
-        state, start, end, exit_code = effective_state(job_id)
+        state, start, end, exit_code, node_list = effective_state(job_id)
+        stdout_path, stderr_path = log_paths_from_sacct(job_id)
+        submit_time = parse_submit_time(run_root)
         records.append(
             RunRecord(
-                kind=kind,
-                resource=resource,
-                name=run_root.name,
-                run_root=run_root,
-                log_dir=submitit_logs,
+                run_name=run_root.name,
                 job_id=job_id,
-                state=state,
+                job_state=state,
+                exit_code=exit_code,
                 start=start,
                 end=end,
-                exit_code=exit_code,
-                submit_time=parse_submit_time(run_root),
+                node_list=node_list,
+                submitit_run_root=str(run_root),
+                log_dir=str(log_dir),
+                stdout_path=str(stdout_path) if stdout_path else None,
+                stderr_path=str(stderr_path) if stderr_path else None,
+                stdout_tail=_tail_lines(stdout_path, tail_lines),
+                stderr_tail=_tail_lines(stderr_path, tail_lines),
+                submit_time_local=submit_time.astimezone().isoformat(timespec="seconds"),
             )
         )
-    records.sort(key=lambda record: record.submit_time)
-    return records
+    records.sort(key=lambda record: record.submit_time_local)
+    return records[-max_records:]
 
 
-def latest(records: list[RunRecord], *, kind: str) -> RunRecord | None:
-    candidates = [record for record in records if record.kind == kind]
-    return candidates[-1] if candidates else None
-
-
-def active(records: list[RunRecord], *, kind: str | None = None) -> list[RunRecord]:
-    selected = records
-    if kind is not None:
-        selected = [record for record in records if record.kind == kind]
-    return [record for record in selected if record.state in ACTIVE_STATES]
-
-
-def completed(records: list[RunRecord], *, kind: str) -> list[RunRecord]:
-    return [record for record in records if record.kind == kind and record.state == "COMPLETED"]
-
-
-def failure_records(records: list[RunRecord], *, kind: str) -> list[RunRecord]:
-    return [
-        record
-        for record in records
-        if record.kind == kind and record.state.startswith(FAIL_STATES_PREFIXES)
+def _invoke_codex(
+    *,
+    codex_bin: Path,
+    schema_path: Path,
+    prompt_text: str,
+    output_file: Path,
+    model: str | None,
+    dry_run: bool,
+) -> dict[str, Any]:
+    cmd = [
+        str(codex_bin),
+        "exec",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "-C",
+        str(REPO_ROOT),
+        "--output-schema",
+        str(schema_path),
+        "--output-last-message",
+        str(output_file),
     ]
-
-
-def should_submit_a100_fallback(record: RunRecord, *, threshold_hours: float) -> bool:
-    if record.resource != "h200":
-        return False
-    if record.state != "PENDING":
-        return False
-    age = datetime.now() - record.submit_time
-    return age >= timedelta(hours=threshold_hours)
-
-
-def build_oneexam_submit_cmd(*, resource: str, timeout_min: int) -> list[str]:
-    timestamp = datetime.now().strftime("%Y%m%d")
-    name = f"auto_qc_qwen397b_fp8_vertical_line_oneexam_bf16experts_{resource}_t{timeout_min}"
-    run_file = (
-        DEFAULT_RUNS
-        / f"qwen397b_fp8_vertical_line_oneexam_bf16experts_{resource}_t{timeout_min}_{timestamp}.json"
-    )
-    debug_dir = (
-        DEFAULT_DEBUG
-        / f"qwen397b_fp8_vertical_line_oneexam_bf16experts_{resource}_t{timeout_min}_{timestamp}"
-    )
-    if resource == "a100":
-        gpuspec = "a100"
-        ngpus = "8"
-        constraint = "a100"
-        mem_gb = "900"
-    else:
-        gpuspec = "h200"
-        ngpus = "4"
-        constraint = "h200"
-        mem_gb = "720"
-
-    return [
-        "bash",
-        "-lc",
-        " ".join(
-            [
-                "export PRIMA_QWEN35_FP8_FORCE_BF16_EXPERTS=1 CUDA_LAUNCH_BLOCKING=1 PYTORCH_SHOW_CPP_STACKTRACES=1;",
-                f"micromamba run -p {ENV_PREFIX} python {SUBMIT_SCRIPT}",
-                f"--name {name}",
-                "--log-dir /net/projects2/annawoodard/qc_redo/submitit_runs",
-                "--partition general",
-                f"--constraint {constraint}",
-                f"--gpuspec {gpuspec}",
-                f"--ngpus {ngpus}",
-                "--cpus-per-task 16",
-                f"--mem-gb {mem_gb}",
-                f"--timeout-min {timeout_min}",
-                "--no-wait",
-                "--views /net/projects2/annawoodard/qc_export/views_for_qc.parquet",
-                "--export-dir /net/projects2/annawoodard/qc_export",
-                f"--run-file {run_file}",
-                "--model-path /net/projects2/annawoodard/models/Qwen3.5-397B-A17B-FP8-prima-repair",
-                "--exam 1.2.124.113532.10.7.222.5.20101217.121444.14285505",
-                "--few-shot-examples 0",
-                "--prompt-mode marker_classifier",
-                "--probe-tag 'vertical line (detector artifact)'",
-                "--disable-thinking",
-                f"--debug-dump-dir {debug_dir}",
-                "--tags-file /net/projects2/annawoodard/qc_redo/annotation_tags.json",
-            ]
-        ),
-    ]
-
-
-def build_reviewed33_submit_cmd(*, resource: str, timeout_min: int) -> list[str]:
-    timestamp = datetime.now().strftime("%Y%m%d")
-    name = f"auto_qc_qwen397b_fp8_vertical_line_reviewed33_bf16experts_{resource}_t{timeout_min}"
-    run_file = (
-        DEFAULT_RUNS
-        / f"qwen397b_fp8_vertical_line_reviewed33_bf16experts_{resource}_t{timeout_min}_{timestamp}.json"
-    )
-    debug_dir = (
-        DEFAULT_DEBUG
-        / f"qwen397b_fp8_vertical_line_reviewed33_bf16experts_{resource}_t{timeout_min}_{timestamp}"
-    )
-    if resource == "a100":
-        gpuspec = "a100"
-        ngpus = "8"
-        constraint = "a100"
-        mem_gb = "900"
-    else:
-        gpuspec = "h200"
-        ngpus = "4"
-        constraint = "h200"
-        mem_gb = "720"
-
-    return [
-        "bash",
-        "-lc",
-        " ".join(
-            [
-                "export PRIMA_QWEN35_FP8_FORCE_BF16_EXPERTS=1 CUDA_LAUNCH_BLOCKING=1 PYTORCH_SHOW_CPP_STACKTRACES=1;",
-                f"micromamba run -p {ENV_PREFIX} python {SUBMIT_SCRIPT}",
-                f"--name {name}",
-                "--log-dir /net/projects2/annawoodard/qc_redo/submitit_runs",
-                "--partition general",
-                f"--constraint {constraint}",
-                f"--gpuspec {gpuspec}",
-                f"--ngpus {ngpus}",
-                "--cpus-per-task 16",
-                f"--mem-gb {mem_gb}",
-                f"--timeout-min {timeout_min}",
-                "--no-wait",
-                "--views /net/projects2/annawoodard/qc_export/views_for_qc.parquet",
-                "--export-dir /net/projects2/annawoodard/qc_export",
-                f"--run-file {run_file}",
-                "--model-path /net/projects2/annawoodard/models/Qwen3.5-397B-A17B-FP8-prima-repair",
-                "--exam-list /net/projects2/annawoodard/qc_redo/debug_exam_lists/vertical_line_reviewed33.txt",
-                "--few-shot-examples 0",
-                "--prompt-mode marker_classifier",
-                "--probe-tag 'vertical line (detector artifact)'",
-                "--disable-thinking",
-                f"--debug-dump-dir {debug_dir}",
-                "--tags-file /net/projects2/annawoodard/qc_redo/annotation_tags.json",
-            ]
-        ),
-    ]
-
-
-def run_submit(cmd: list[str], *, log_file: Path, dry_run: bool) -> None:
-    append_log(log_file, "submit_cmd=" + " ".join(cmd))
+    if model:
+        cmd.extend(["-m", model])
     if dry_run:
-        append_log(log_file, "dry_run=true; submission skipped")
-        return
-    proc = subprocess.run(cmd, cwd=PROJECT_ROOT, capture_output=True, text=True, check=False)
-    append_log(log_file, f"submit_returncode={proc.returncode}")
-    if proc.stdout.strip():
-        append_log(log_file, "submit_stdout=" + proc.stdout.strip().replace("\n", " | "))
-    if proc.stderr.strip():
-        append_log(log_file, "submit_stderr=" + proc.stderr.strip().replace("\n", " | "))
+        return {
+            "campaign_status": "dry_run",
+            "action_type": "dry_run",
+            "did_act": False,
+            "needs_human": False,
+            "summary": "Dry run only; Codex not invoked.",
+            "why": "Dry-run mode was explicitly requested for validation.",
+            "failure_cause": "",
+            "evidence": ["dry_run=true"],
+            "files_changed": [],
+            "new_job_ids": [],
+            "notebook_updated": False,
+            "goal_progress": "Validated the babysitter path without changing campaign state.",
+            "next_check_hint": "none",
+        }
+    _run(cmd, input_text=prompt_text)
+    raw = output_file.read_text(encoding="utf-8").strip()
+    return json.loads(raw)
 
 
-def decide_and_act(args: argparse.Namespace) -> dict[str, Any]:
-    records = list_campaign_runs(args.submitit_runs_dir)
-    summary: dict[str, Any] = {
-        "checked_at": now_local(),
-        "num_records": len(records),
-        "active_oneexam": [record.job_id for record in active(records, kind="oneexam")],
-        "active_reviewed33": [record.job_id for record in active(records, kind="reviewed33")],
-        "action": "none",
-    }
-    latest_oneexam = latest(records, kind="oneexam")
-    log_file = args.log_file
-
-    if active(records, kind="reviewed33"):
-        append_log(log_file, "reviewed33 already active; no action")
-        summary["action"] = "wait_reviewed33_active"
-        return summary
-
-    if completed(records, kind="reviewed33"):
-        append_log(log_file, "reviewed33 already completed; no action")
-        summary["action"] = "done_reviewed33_completed"
-        return summary
-
-    active_oneexam = active(records, kind="oneexam")
-    if active_oneexam:
-        latest_active = active_oneexam[-1]
-        append_log(
-            log_file,
-            f"oneexam active job_id={latest_active.job_id} state={latest_active.state} resource={latest_active.resource}",
-        )
-        summary["action"] = "wait_oneexam_active"
-        if should_submit_a100_fallback(
-            latest_active, threshold_hours=args.pending_fallback_hours
-        ) and not any(
-            record.resource == "a100" for record in active_oneexam
-        ):
-            append_log(
-                log_file,
-                f"h200 oneexam pending for >= {args.pending_fallback_hours}h; submitting a100 fallback",
-            )
-            run_submit(
-                build_oneexam_submit_cmd(resource="a100", timeout_min=240),
-                log_file=log_file,
-                dry_run=args.dry_run,
-            )
-            summary["action"] = "submit_oneexam_a100_fallback"
-        return summary
-
-    if latest_oneexam is None:
-        append_log(log_file, "no oneexam runs found; submitting initial h200 oneexam")
-        run_submit(
-            build_oneexam_submit_cmd(resource="h200", timeout_min=240),
-            log_file=log_file,
-            dry_run=args.dry_run,
-        )
-        summary["action"] = "submit_initial_oneexam_h200"
-        return summary
-
-    if latest_oneexam.state == "COMPLETED":
-        chosen_resource = latest_oneexam.resource
-        append_log(
-            log_file,
-            f"latest oneexam completed job_id={latest_oneexam.job_id}; submitting reviewed33 on {chosen_resource}",
-        )
-        run_submit(
-            build_reviewed33_submit_cmd(resource=chosen_resource, timeout_min=240),
-            log_file=log_file,
-            dry_run=args.dry_run,
-        )
-        summary["action"] = f"submit_reviewed33_{chosen_resource}"
-        return summary
-
-    if latest_oneexam.state.startswith(FAIL_STATES_PREFIXES):
-        log_path = latest_oneexam.log_dir / f"{latest_oneexam.job_id}_0_log.err"
-        failure_kind = classify_failure(log_path)
-        append_log(
-            log_file,
-            f"latest oneexam failed job_id={latest_oneexam.job_id} resource={latest_oneexam.resource} failure_kind={failure_kind}",
-        )
-        summary["latest_oneexam_failure_kind"] = failure_kind
-        if failure_kind == "timeout":
-            next_timeout = 240
-            if "t240" in latest_oneexam.name or "retry240" in latest_oneexam.name:
-                next_timeout = 360
-            if "t360" in latest_oneexam.name or "retry360" in latest_oneexam.name:
-                next_timeout = 480
-            run_submit(
-                build_oneexam_submit_cmd(
-                    resource=latest_oneexam.resource, timeout_min=next_timeout
-                ),
-                log_file=log_file,
-                dry_run=args.dry_run,
-            )
-            summary["action"] = f"resubmit_oneexam_timeout_{latest_oneexam.resource}_t{next_timeout}"
-            return summary
-        if failure_kind == "fp8_runtime":
-            fallback_resource = "a100" if latest_oneexam.resource == "h200" else "h200"
-            run_submit(
-                build_oneexam_submit_cmd(resource=fallback_resource, timeout_min=240),
-                log_file=log_file,
-                dry_run=args.dry_run,
-            )
-            summary["action"] = f"resubmit_oneexam_fp8_runtime_{fallback_resource}"
-            return summary
-        run_submit(
-            build_oneexam_submit_cmd(resource="h200", timeout_min=240),
-            log_file=log_file,
-            dry_run=args.dry_run,
-        )
-        summary["action"] = "resubmit_oneexam_unknown_h200"
-        return summary
-
-    append_log(log_file, f"no rule matched latest_oneexam_state={latest_oneexam.state}; no action")
-    summary["action"] = f"no_rule_{latest_oneexam.state}"
-    return summary
+def build_prompt(template: str, context: dict[str, Any]) -> str:
+    return template.replace("{{CAMPAIGN_CONTEXT_JSON}}", json.dumps(context, indent=2, sort_keys=True))
 
 
 def main() -> int:
     args = parse_args()
-    state = load_state(args.state_file)
-    summary = decide_and_act(args)
-    state["last_check"] = summary
-    state.setdefault("history", []).append(summary)
-    state["history"] = state["history"][-100:]
-    save_state(args.state_file, state)
+    args.output_root.mkdir(parents=True, exist_ok=True)
+    state = _load_json(args.state_file, {"history": []})
+
+    args.lockfile.parent.mkdir(parents=True, exist_ok=True)
+    with args.lockfile.open("w") as lock_fp:
+        try:
+            fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            append_log(args.log_file, "skipping run because babysitter lock is held")
+            return 0
+
+        records = list_campaign_runs(
+            submitit_runs_dir=args.submitit_runs_dir,
+            run_name_regex=args.run_name_regex,
+            tail_lines=args.tail_lines,
+            max_records=args.max_records,
+        )
+        active_records = [asdict(record) for record in records if record.job_state in ACTIVE_STATES]
+        terminal_records = [asdict(record) for record in records if record.job_state not in ACTIVE_STATES]
+        campaign_context = {
+            "family_label": args.family_label,
+            "goal": (
+                "Keep the PRIMA Qwen3.5-397B vertical-line experiment moving with no dead time. "
+                "User steers high-level direction; you own operational decisions, fixes, submissions, "
+                "and documentation. Always make a decision."
+            ),
+            "repo_root": str(REPO_ROOT),
+            "job_selection": {
+                "run_name_regex": args.run_name_regex,
+                "submitit_runs_dir": str(args.submitit_runs_dir),
+            },
+            "notebook_path": str(args.notebook_path),
+            "log_file": str(args.log_file),
+            "state_file": str(args.state_file),
+            "current_time": now_local(),
+            "active_runs": active_records,
+            "recent_terminal_runs": terminal_records,
+            "recent_decisions": state.get("history", [])[-8:],
+        }
+
+        decision_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+        decision_file = args.output_root / "decisions" / f"{decision_time}.json"
+        decision_file.parent.mkdir(parents=True, exist_ok=True)
+        prompt_template = args.prompt_template.read_text(encoding="utf-8")
+        prompt = build_prompt(prompt_template, campaign_context)
+        result = _invoke_codex(
+            codex_bin=args.codex_bin,
+            schema_path=args.schema,
+            prompt_text=prompt,
+            output_file=decision_file,
+            model=args.model,
+            dry_run=args.dry_run,
+        )
+        history_entry = {
+            "decided_at": now_local(),
+            "context_summary": {
+                "num_records": len(records),
+                "active_job_ids": [record["job_id"] for record in active_records],
+                "terminal_job_ids": [record["job_id"] for record in terminal_records],
+            },
+            "decision": result,
+        }
+        state.setdefault("history", []).append(history_entry)
+        state["history"] = state["history"][-100:]
+        state["last_check"] = history_entry
+        _write_json(args.state_file, state)
+        append_log(
+            args.log_file,
+            "decision="
+            + json.dumps(
+                {
+                    "campaign_status": result.get("campaign_status"),
+                    "action_type": result.get("action_type"),
+                    "summary": result.get("summary"),
+                    "did_act": result.get("did_act"),
+                    "new_job_ids": result.get("new_job_ids"),
+                    "needs_human": result.get("needs_human"),
+                },
+                sort_keys=True,
+            ),
+        )
     return 0
 
 

@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "campaign_status",
+    "action_type",
+    "did_act",
+    "needs_human",
+    "summary",
+    "why",
+    "failure_cause",
+    "evidence",
+    "files_changed",
+    "new_job_ids",
+    "notebook_updated",
+    "goal_progress",
+    "next_check_hint"
+  ],
+  "properties": {
+    "campaign_status": {
+      "type": "string",
+      "description": "High-level state of the campaign after this decision, e.g. advancing, waiting, stalled, blocked, completed."
+    },
+    "action_type": {
+      "type": "string",
+      "description": "Freeform short slug naming the action chosen this tick, e.g. wait_and_monitor, resubmit_with_longer_walltime, submit_a100_fallback."
+    },
+    "did_act": {
+      "type": "boolean"
+    },
+    "needs_human": {
+      "type": "boolean"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "why": {
+      "type": "string"
+    },
+    "failure_cause": {
+      "type": "string"
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "files_changed": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "new_job_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "notebook_updated": {
+      "type": "boolean"
+    },
+    "goal_progress": {
+      "type": "string"
+    },
+    "next_check_hint": {
+      "type": "string"
+    }
+  }
+}
