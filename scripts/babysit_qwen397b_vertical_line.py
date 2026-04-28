@@ -18,8 +18,7 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT_ROOT = (
-    Path("/net/projects2/annawoodard/qc_redo/interactive_debug")
-    / "qwen397b_babysitter"
+    Path("/net/projects2/annawoodard/qc_redo/interactive_debug") / "qwen397b_babysitter"
 )
 DEFAULT_LOG_FILE = DEFAULT_OUTPUT_ROOT / "babysitter.log"
 DEFAULT_STATE_FILE = DEFAULT_OUTPUT_ROOT / "state" / "state.json"
@@ -33,6 +32,7 @@ DEFAULT_NOTEBOOK = (
 DEFAULT_SUBMITIT_RUNS = Path("/net/projects2/annawoodard/qc_redo/submitit_runs")
 DEFAULT_RUN_NAME_REGEX = r"auto_qc_qwen397b_fp8_vertical_line.*bf16experts.*"
 DEFAULT_FAMILY_LABEL = "qwen397b_vertical_line_bf16experts"
+DEFAULT_CODEX_MODEL = "gpt-5.5"
 
 
 def _detect_codex_bin() -> Path:
@@ -40,6 +40,7 @@ def _detect_codex_bin() -> Path:
     env_bin = os.environ.get("CODEX_BIN")
     if env_bin:
         candidates.append(Path(env_bin))
+    candidates.append(Path("/net/projects/annawoodard/micromamba/envs/codex/bin/codex"))
     which = shutil.which("codex")
     if which:
         candidates.append(Path(which))
@@ -140,7 +141,9 @@ def _load_json(path: Path, default: Any) -> Any:
 
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -161,14 +164,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--schema", type=Path, default=DEFAULT_SCHEMA)
     parser.add_argument("--prompt-template", type=Path, default=DEFAULT_PROMPT)
     parser.add_argument("--codex-bin", type=Path, default=DEFAULT_CODEX_BIN)
-    parser.add_argument("--model", default=None)
+    parser.add_argument("--model", default=DEFAULT_CODEX_MODEL)
     parser.add_argument("--tail-lines", type=int, default=80)
     parser.add_argument("--max-records", type=int, default=8)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
 
-def query_sacct_state(job_id: str) -> tuple[str, str | None, str | None, str | None, str | None]:
+def query_sacct_state(
+    job_id: str,
+) -> tuple[str, str | None, str | None, str | None, str | None]:
     proc = subprocess.run(
         [
             "sacct",
@@ -208,7 +213,9 @@ def query_squeue_state(job_id: str) -> str | None:
     return state or None
 
 
-def effective_state(job_id: str) -> tuple[str, str | None, str | None, str | None, str | None]:
+def effective_state(
+    job_id: str,
+) -> tuple[str, str | None, str | None, str | None, str | None]:
     state, start, end, exit_code, node_list = query_sacct_state(job_id)
     queue_state = query_squeue_state(job_id)
     if queue_state:
@@ -291,7 +298,9 @@ def list_campaign_runs(
                 stderr_path=str(stderr_path) if stderr_path else None,
                 stdout_tail=_tail_lines(stdout_path, tail_lines),
                 stderr_tail=_tail_lines(stderr_path, tail_lines),
-                submit_time_local=submit_time.astimezone().isoformat(timespec="seconds"),
+                submit_time_local=submit_time.astimezone().isoformat(
+                    timespec="seconds"
+                ),
             )
         )
     records.sort(key=lambda record: record.submit_time_local)
@@ -342,7 +351,9 @@ def _invoke_codex(
 
 
 def build_prompt(template: str, context: dict[str, Any]) -> str:
-    return template.replace("{{CAMPAIGN_CONTEXT_JSON}}", json.dumps(context, indent=2, sort_keys=True))
+    return template.replace(
+        "{{CAMPAIGN_CONTEXT_JSON}}", json.dumps(context, indent=2, sort_keys=True)
+    )
 
 
 def main() -> int:
@@ -364,8 +375,14 @@ def main() -> int:
             tail_lines=args.tail_lines,
             max_records=args.max_records,
         )
-        active_records = [asdict(record) for record in records if record.job_state in ACTIVE_STATES]
-        terminal_records = [asdict(record) for record in records if record.job_state not in ACTIVE_STATES]
+        active_records = [
+            asdict(record) for record in records if record.job_state in ACTIVE_STATES
+        ]
+        terminal_records = [
+            asdict(record)
+            for record in records
+            if record.job_state not in ACTIVE_STATES
+        ]
         campaign_context = {
             "family_label": args.family_label,
             "goal": (

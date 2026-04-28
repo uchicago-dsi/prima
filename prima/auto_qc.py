@@ -101,6 +101,9 @@ def normalize_exam_suggestion_record(
     prompt_mode = str(raw_record.get("prompt_mode", "")).strip()
     if prompt_mode:
         normalized_record["prompt_mode"] = prompt_mode
+    prompt_variant = str(raw_record.get("prompt_variant", "")).strip()
+    if prompt_variant:
+        normalized_record["prompt_variant"] = prompt_variant
     debug_dump_file = str(raw_record.get("debug_dump_file", "")).strip()
     if debug_dump_file:
         normalized_record["debug_dump_file"] = debug_dump_file
@@ -120,15 +123,20 @@ def normalize_auto_run(payload: Any) -> dict[str, Any]:
         raise ValueError("exam_suggestions must be a JSON object")
 
     exam_suggestions = {
-        str(exam_id): normalize_exam_suggestion_record(raw_record, tag_catalog=tag_catalog)
+        str(exam_id): normalize_exam_suggestion_record(
+            raw_record, tag_catalog=tag_catalog
+        )
         for exam_id, raw_record in exam_suggestions_raw.items()
     }
     model = str(payload.get("model", "")).strip()
     backend = str(payload.get("backend", "")).strip()
     run_id = str(payload.get("run_id", "")).strip()
     created_at = str(payload.get("created_at", "")).strip() or utc_now_iso()
-    prompt_version = str(payload.get("prompt_version", "")).strip() or AUTO_QC_PROMPT_VERSION
+    prompt_version = (
+        str(payload.get("prompt_version", "")).strip() or AUTO_QC_PROMPT_VERSION
+    )
     prompt_mode = str(payload.get("prompt_mode", "")).strip() or "tagger_json"
+    prompt_variant = str(payload.get("prompt_variant", "")).strip() or "baseline"
 
     return {
         "run_id": run_id or created_at.replace(":", "").replace("+00:00", "Z"),
@@ -137,12 +145,15 @@ def normalize_auto_run(payload: Any) -> dict[str, Any]:
         "created_at": created_at,
         "prompt_version": prompt_version,
         "prompt_mode": prompt_mode,
+        "prompt_variant": prompt_variant,
         "tag_catalog": tag_catalog,
         "exam_suggestions": exam_suggestions,
     }
 
 
-def load_auto_run(path: Path | None, *, persist_normalized: bool = False) -> dict[str, Any]:
+def load_auto_run(
+    path: Path | None, *, persist_normalized: bool = False
+) -> dict[str, Any]:
     """Load a normalized auto-QC run file."""
     if path is None or not path.exists():
         return {}
@@ -194,7 +205,13 @@ def compute_exam_level_tag_metrics(
 ) -> list[dict[str, Any]]:
     """Compute TP/FP/FN/TN summary per tag over a fixed exam universe."""
     metrics: list[dict[str, Any]] = []
-    sorted_tags = sorted({*tag_catalog, *(tag for tags in gt_by_exam.values() for tag in tags), *(tag for tags in pred_by_exam.values() for tag in tags)})
+    sorted_tags = sorted(
+        {
+            *tag_catalog,
+            *(tag for tags in gt_by_exam.values() for tag in tags),
+            *(tag for tags in pred_by_exam.values() for tag in tags),
+        }
+    )
     for tag in sorted_tags:
         tp = fp = fn = tn = 0
         for exam_id in exam_ids:

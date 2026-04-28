@@ -455,13 +455,30 @@ def build_binary_probe_prefix_allowed_tokens_fn(
     return _prefix_allowed_tokens_fn
 
 
+PROMPT_VARIANTS = ("baseline", "recall_tilted")
+
+
+def build_recall_tilted_rule(probe_tag: str | None = None) -> str:
+    """Instruction for high-recall artifact triage without changing tag names."""
+    tag_text = f" for '{probe_tag}'" if probe_tag else ""
+    return (
+        f"- High-recall artifact triage{tag_text}: tag a detector-line artifact when any persistent straight detector-line artifact is visible, even if subtle or only present in part of the montage.\n"
+        "- Do not tag normal anatomy, breast edge, skin fold, compression boundary, text labels, or markers as detector-line artifacts.\n"
+        "- If the evidence is ambiguous but visually consistent with a detector-line artifact, prefer tagging it and explain the visible line briefly.\n"
+    )
+
+
 def build_user_prompt(
     tag_catalog: list[str],
     *,
     few_shot_examples: list[dict[str, Any]],
+    prompt_variant: str,
 ) -> str:
     """User prompt for constrained multi-label prediction."""
     tags_text = "\n".join(f"- {tag}" for tag in tag_catalog)
+    recall_rule = (
+        build_recall_tilted_rule() if prompt_variant == "recall_tilted" else ""
+    )
     example_text = ""
     if few_shot_examples:
         example_text = (
@@ -478,6 +495,7 @@ def build_user_prompt(
         "- If none are clearly present, return an empty suggestions list.\n"
         "- Use the labeled references only as visual guidance.\n"
         "- Keep rationale short and visual.\n"
+        f"{recall_rule}"
         "- Return valid JSON only with this schema:\n"
         '{"suggestions":[{"tag":"<allowed tag>","score":0.0,"rationale":"short visual reason"}]}\n'
     )
@@ -504,12 +522,16 @@ def build_target_prompt_text(
     tag_catalog: list[str],
     few_shot_examples: list[dict[str, Any]],
     probe_tag: str | None,
+    prompt_variant: str,
 ) -> str:
     """Build the target prompt text for the chosen debug or tagging mode."""
+    if prompt_variant not in PROMPT_VARIANTS:
+        raise ValueError(f"unsupported prompt variant: {prompt_variant}")
     if prompt_mode == "tagger_json":
         return build_user_prompt(
             tag_catalog,
             few_shot_examples=few_shot_examples,
+            prompt_variant=prompt_variant,
         )
     if prompt_mode == "binary_tag_probe":
         if not probe_tag:
@@ -525,10 +547,14 @@ def build_target_prompt_text(
     if prompt_mode == "marker_classifier":
         if not probe_tag:
             raise ValueError("marker_classifier requires a probe_tag")
-        return build_marker_classifier_prompt(
+        prompt = build_marker_classifier_prompt(
             probe_tag=probe_tag,
             few_shot_examples=few_shot_examples,
         )
+        if prompt_variant == "recall_tilted":
+            prompt += "\nAdditional decision rule:\n"
+            prompt += build_recall_tilted_rule(probe_tag)
+        return prompt
     raise ValueError(f"unsupported prompt mode: {prompt_mode}")
 
 
@@ -964,7 +990,9 @@ def patch_qwen35_fp8_eager_experts() -> None:
         ).strip().lower() in {"1", "true", "yes", "on"}
         force_bf16_experts = bool(
             getattr(self, "_prima_force_bf16_experts", False)
-        ) or os.environ.get("PRIMA_QWEN35_FP8_FORCE_BF16_EXPERTS", "").strip().lower() in {
+        ) or os.environ.get(
+            "PRIMA_QWEN35_FP8_FORCE_BF16_EXPERTS", ""
+        ).strip().lower() in {
             "1",
             "true",
             "yes",
@@ -1009,16 +1037,16 @@ def patch_qwen35_fp8_eager_experts() -> None:
                 self._prima_router_detail_logged = True
                 return
             try:
-                top_k_index_cpu = top_k_index.detach().to(device="cpu", dtype=torch.int64)
+                top_k_index_cpu = top_k_index.detach().to(
+                    device="cpu", dtype=torch.int64
+                )
                 invalid_mask_cpu = (top_k_index_cpu < 0) | (
                     top_k_index_cpu >= self.num_experts
                 )
                 invalid_count_cpu = int(invalid_mask_cpu.sum().item())
                 if invalid_count_cpu > 0:
                     invalid_values = (
-                        top_k_index_cpu[invalid_mask_cpu]
-                        .reshape(-1)[:16]
-                        .tolist()
+                        top_k_index_cpu[invalid_mask_cpu].reshape(-1)[:16].tolist()
                     )
                     logger.warning(
                         "Qwen3.5 FP8 eager experts at layer=%s received invalid router indices "
@@ -1057,7 +1085,9 @@ def patch_qwen35_fp8_eager_experts() -> None:
                 )
 
             if weight.element_size() > 1:
-                bf16_weight = weight.to(device=input_tensor.device, dtype=torch.bfloat16)
+                bf16_weight = weight.to(
+                    device=input_tensor.device, dtype=torch.bfloat16
+                )
             else:
                 bf16_weight = dequantize_fp8_weight_blocks(
                     weight,
@@ -2292,6 +2322,7 @@ class LocalVisionAnnotator:
         few_shot_examples: int,
         few_shot_exemplar_pool: list[dict[str, Any]],
         prompt_mode: str,
+        prompt_variant: str,
         probe_tag: str | None,
         target_prompt_override: str | None,
         text_only_prompt: str | None,
@@ -2309,6 +2340,9 @@ class LocalVisionAnnotator:
         self.few_shot_examples = few_shot_examples
         self.few_shot_exemplar_pool = list(few_shot_exemplar_pool)
         self.prompt_mode = prompt_mode
+        if prompt_variant not in PROMPT_VARIANTS:
+            raise ValueError(f"unsupported prompt variant: {prompt_variant}")
+        self.prompt_variant = prompt_variant
         self.probe_tag = probe_tag
         self.target_prompt_override = (
             target_prompt_override.strip() if target_prompt_override else None
@@ -2475,6 +2509,7 @@ class LocalVisionAnnotator:
             tag_catalog=tag_catalog,
             few_shot_examples=few_shot_examples,
             probe_tag=self.probe_tag,
+            prompt_variant=self.prompt_variant,
         )
         if self.target_prompt_override is not None:
             target_prompt_text = self.target_prompt_override
@@ -2680,6 +2715,7 @@ class LocalVisionAnnotator:
                 "exam_id": str(exam_id),
                 "image_file": image_path.name,
                 "prompt_mode": self.prompt_mode,
+                "prompt_variant": self.prompt_variant,
                 "probe_tag": self.probe_tag,
                 "target_prompt_override": self.target_prompt_override,
                 "text_only_prompt": self.text_only_prompt,
@@ -2724,6 +2760,7 @@ class LocalVisionAnnotator:
             ],
             "debug_dump_file": debug_dump_file,
             "prompt_mode": self.prompt_mode,
+            "prompt_variant": self.prompt_variant,
         }
 
 
@@ -2820,9 +2857,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--prompt-mode",
-        choices=["tagger_json", "what_is_this", "binary_tag_probe", "marker_classifier"],
+        choices=[
+            "tagger_json",
+            "what_is_this",
+            "binary_tag_probe",
+            "marker_classifier",
+        ],
         default="tagger_json",
         help="Prompt style for the target exam. Use what_is_this for raw freeform debugging.",
+    )
+    parser.add_argument(
+        "--prompt-variant",
+        choices=PROMPT_VARIANTS,
+        default="baseline",
+        help="Prompt decision policy variant. Use recall_tilted for high-recall detector-line triage.",
     )
     parser.add_argument(
         "--probe-tag",
@@ -2912,9 +2960,7 @@ def run_from_args(args: argparse.Namespace) -> int:
     tag_catalog = load_tag_catalog(tags_file)
     if args.prompt_mode in {"binary_tag_probe", "marker_classifier"}:
         if not args.probe_tag:
-            raise ValueError(
-                f"--prompt-mode={args.prompt_mode} requires --probe-tag"
-            )
+            raise ValueError(f"--prompt-mode={args.prompt_mode} requires --probe-tag")
         if args.probe_tag not in tag_catalog:
             raise ValueError(
                 f"--probe-tag must be one of the allowed tags; got {args.probe_tag!r}"
@@ -2953,6 +2999,7 @@ def run_from_args(args: argparse.Namespace) -> int:
         few_shot_examples=args.few_shot_examples,
         few_shot_exemplar_pool=exemplar_pool,
         prompt_mode=args.prompt_mode,
+        prompt_variant=args.prompt_variant,
         probe_tag=args.probe_tag,
         target_prompt_override=args.target_prompt_override,
         text_only_prompt=args.text_only_prompt,
@@ -2976,6 +3023,7 @@ def run_from_args(args: argparse.Namespace) -> int:
             "few_shot_example_exam_ids": result["few_shot_example_exam_ids"],
             "suggestions": result["suggestions"],
             "prompt_mode": result["prompt_mode"],
+            "prompt_variant": result["prompt_variant"],
             "debug_dump_file": result["debug_dump_file"],
         }
 
@@ -2986,6 +3034,7 @@ def run_from_args(args: argparse.Namespace) -> int:
         "created_at": utc_now_iso(),
         "prompt_version": AUTO_QC_PROMPT_VERSION,
         "prompt_mode": args.prompt_mode,
+        "prompt_variant": args.prompt_variant,
         "tag_catalog": tag_catalog,
         "exam_suggestions": exam_suggestions,
     }

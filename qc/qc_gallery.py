@@ -27,16 +27,16 @@ QC Workflow (fully keyboard-driven)
    - a to annotate issues, then esc to close modal and move to next exam
    - in annotation modal, letter hotkeys toggle tags, type + enter to add new tag
    - arrow keys to navigate, s for next, l to load more
-4. Re-run script to continue QC on remaining exams (by default, "good" and annotated exams skipped)
+4. Re-run script to continue QC on remaining exams (by default, "good", annotated, and auto-excluded exams are skipped)
 5. To re-visit annotated exams: use --qc-skip-status good auto_excluded
 
 Data Format
 -----------
-QC status stored in JSON (default: data/qc_status.json):
-  - {exam_id: "good"}
-Annotations stored separately in data/annotations.json:
-  - {exam_id: ["vertical line (detector artifact)", ...]}
-Available annotation tags stored in data/annotation_tags.json
+Unified QC state stored in JSON (default: data/qc_state.json):
+  - {exam_id: {"status": "good", "annotations": [], "annotation_meta": {}}}
+  - {exam_id: {"status": null, "annotations": ["vertical line (detector artifact)"], "annotation_meta": {"vertical line (detector artifact)": {"source": "human"}}}}
+Available annotation tags stored separately in data/annotation_tags.json
+Optional model suggestion runs are loaded separately via --auto-run-file
 
 Server mode (recommended for remote work):
   python qc/qc_gallery.py --serve --max-exams 100 --random
@@ -45,7 +45,7 @@ Server mode (recommended for remote work):
 
 Local mode (no server, manual file moving):
   python qc/qc_gallery.py --max-exams 10
-  Open qc_output/gallery.html in browser - downloads qc_status.json on each click
+  Open qc_output/gallery.html in browser - local browser state is scoped by the QC state file path
 
 Usage
 -----
@@ -63,14 +63,17 @@ python qc/qc_gallery.py --serve --max-exams 100 --qc-skip-status good auto_exclu
 # only show completely unmarked exams (skip all QC'd exams)
 python qc/qc_gallery.py --serve --max-exams 100 --qc-skip-status good annotated auto_excluded
 
-# QC without server (downloads file on each click)
+# QC without server (browser localStorage only)
 python qc/qc_gallery.py --max-exams 10 --random
 
 # QC specific patient with custom port
 python qc/qc_gallery.py --serve --port 8080 --patient 12345
 
-# use custom QC file location
-python qc/qc_gallery.py --serve --qc-file /path/to/my_qc_status.json
+# use custom QC state file location
+python qc/qc_gallery.py --serve --qc-file /path/to/my_qc_state.json
+
+# review a saved model suggestion run against current GT
+python qc/qc_gallery.py --serve --auto-run-file /path/to/auto_qc_run.json
 
 Dependencies
 ------------
@@ -81,9 +84,10 @@ import argparse
 import gc
 import json
 import logging
+import re
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
-from typing import Dict, Optional, Set, Tuple
+from typing import Callable, Dict, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlparse
 import sys
 
@@ -91,6 +95,20 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pydicom
+from prima.auto_qc import (
+    auto_run_to_tag_map,
+    load_auto_run,
+)
+from prima.qc_state import (
+    DEFAULT_ANNOTATION_TAGS,
+    load_qc_state,
+    normalize_annotation_meta,
+    normalize_annotation_tag_catalog,
+    normalize_annotation_tags,
+    qc_state_to_annotations_map,
+    qc_state_to_status_map,
+    save_qc_state,
+)
 from pydicom.dataset import FileDataset
 from pydicom.tag import Tag
 
@@ -113,44 +131,61 @@ logger = logging.getLogger(__name__)
 
 # global variables for HTTP server
 QC_FILE_PATH = None
-ANNOTATIONS_PATH = None  # exam_id -> [list of annotation tags]
 ANNOTATION_TAGS_PATH = None  # list of available annotation tag strings
 OUTPUT_DIR = None
 VIEWS_PATH = None
 TAGS_PATH = None
+AUTO_RUN_PATH = None
 LOAD_MORE_ARGS = None  # store args for dynamic loading
 ENABLE_PRELOAD = False
-_CACHED_FILTER_SETS = None  # lazily computed {filter_name: set(exam_id)}
+_CACHED_FILTER_SETS = (
+    None  # lazily computed auto-filter sets {filter_name: set(exam_id)}
+)
+_CACHED_AUTO_RUN = None
 
 DEBUG_TRACKED_STATUSES = ("good", "auto_excluded")
 
-DEFAULT_ANNOTATION_TAGS = [
-    "vertical line (detector artifact)",
-    "horizontal line (detector artifact)",
-]
-LEGACY_ANNOTATION_TAG_ALIASES = {
-    "detector artifact - vertical line": "vertical line (detector artifact)",
-    "detector artifact - horizontal line": "horizontal line (detector artifact)",
-    "horizontal line (detector artifact": "horizontal line (detector artifact)",
-}
+
+def _normalize_saved_annotation_tags(tags):
+    """Normalize saved annotation values without injecting defaults."""
+    return normalize_annotation_tags(tags)
 
 
-def _normalize_annotation_tags(tags):
-    """Normalize annotation tags to canonical labels and keep canonical tags first."""
-    if not isinstance(tags, list):
-        tags = []
+def _normalize_annotation_tag_catalog(tags):
+    """Normalize the available tag catalog and keep defaults first."""
+    return normalize_annotation_tag_catalog(tags)
 
-    normalized: list[str] = []
-    for raw_tag in tags:
-        tag = str(raw_tag).strip()
-        if not tag:
-            continue
-        canonical = LEGACY_ANNOTATION_TAG_ALIASES.get(tag, tag)
-        if canonical not in normalized:
-            normalized.append(canonical)
 
-    extra_tags = [tag for tag in normalized if tag not in DEFAULT_ANNOTATION_TAGS]
-    return DEFAULT_ANNOTATION_TAGS + extra_tags
+def _load_qc_state(path: Optional[Path], persist_normalized: bool = False):
+    """Load normalized QC state from disk."""
+    return load_qc_state(path, persist_normalized=persist_normalized)
+
+
+def _load_annotations_map(path: Optional[Path], persist_normalized: bool = False):
+    """Load per-exam annotations derived from unified QC state."""
+    qc_state = _load_qc_state(path, persist_normalized=persist_normalized)
+    return qc_state_to_annotations_map(qc_state)
+
+
+def _load_qc_status_map(path: Optional[Path], persist_normalized: bool = False):
+    """Load exam_id -> status derived from unified QC state."""
+    qc_state = _load_qc_state(path, persist_normalized=persist_normalized)
+    return qc_state_to_status_map(qc_state)
+
+
+def _load_auto_run(path: Optional[Path], persist_normalized: bool = False):
+    """Load normalized auto-QC suggestion run metadata."""
+    return load_auto_run(path, persist_normalized=persist_normalized)
+
+
+def _blank_qc_record():
+    """Create an empty QC record in the canonical schema."""
+    return {"status": None, "annotations": [], "annotation_meta": {}}
+
+
+def _slugify_filter_token(value: str) -> str:
+    """Create a stable token for use in @filter expressions."""
+    return re.sub(r"[^a-z0-9]+", "_", str(value).strip().lower()).strip("_")
 
 
 def _status_counts(status_map: Dict[str, str]) -> Dict[str, int]:
@@ -190,18 +225,13 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
             self.end_headers()
 
             if QC_FILE_PATH and QC_FILE_PATH.exists():
-                with open(QC_FILE_PATH) as f:
-                    qc_data = json.load(f)
-                if isinstance(qc_data, dict):
-                    qc_data = {
-                        str(exam_id): status for exam_id, status in qc_data.items()
-                    }
-                    logger.info(
-                        "QC DEBUG load-qc: file=%s, entries=%d, statuses=(%s)",
-                        QC_FILE_PATH,
-                        len(qc_data),
-                        _format_status_counts(_status_counts(qc_data)),
-                    )
+                qc_data = _load_qc_status_map(QC_FILE_PATH, persist_normalized=True)
+                logger.info(
+                    "QC DEBUG load-qc: file=%s, entries=%d, statuses=(%s)",
+                    QC_FILE_PATH,
+                    len(qc_data),
+                    _format_status_counts(_status_counts(qc_data)),
+                )
                 self.wfile.write(json.dumps(qc_data).encode())
             else:
                 logger.info(
@@ -221,7 +251,7 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
             if ANNOTATION_TAGS_PATH and ANNOTATION_TAGS_PATH.exists():
                 with open(ANNOTATION_TAGS_PATH) as f:
                     tags = json.load(f)
-                normalized_tags = _normalize_annotation_tags(tags)
+                normalized_tags = _normalize_annotation_tag_catalog(tags)
                 if normalized_tags != tags:
                     with open(ANNOTATION_TAGS_PATH, "w") as f:
                         json.dump(normalized_tags, f, indent=2)
@@ -239,11 +269,27 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
 
-            if ANNOTATIONS_PATH and ANNOTATIONS_PATH.exists():
-                with open(ANNOTATIONS_PATH) as f:
-                    annotations = json.load(f)
+            try:
+                annotations = _load_annotations_map(
+                    QC_FILE_PATH, persist_normalized=True
+                )
                 self.wfile.write(json.dumps(annotations).encode())
-            else:
+            except Exception as e:
+                logger.warning(f"failed to load annotations: {e}")
+                self.wfile.write(b"{}")
+            return
+
+        if parsed_path.path == "/load-auto-suggestions":
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+            try:
+                auto_run = _load_auto_run(AUTO_RUN_PATH, persist_normalized=True)
+                self.wfile.write(json.dumps(auto_run).encode())
+            except Exception as e:
+                logger.warning(f"failed to load auto suggestions: {e}")
                 self.wfile.write(b"{}")
             return
 
@@ -257,13 +303,15 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
             filters = []
 
             try:
-                fs = self._get_filter_sets()
-                for name, exam_set in fs.items():
+                for name, filter_spec in self._get_filter_catalog().items():
+                    exam_set = filter_spec["exam_ids"]
                     filters.append(
                         {
-                            "name": name.replace("_", " ").title()
-                            + f" ({len(exam_set)})",
+                            "name": filter_spec["label"] + f" ({len(exam_set)})",
                             "filename": name,
+                            "token": filter_spec.get("token", name),
+                            "aliases": filter_spec.get("aliases", []),
+                            "kind": filter_spec.get("kind", "auto"),
                         }
                     )
             except Exception as e:
@@ -536,6 +584,8 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                 self.server._load_more_ready = False
                 self.server._load_more_error = None
                 self.server._load_more_target_batch = next_batch
+                self.server._load_more_progress = 0.0
+                self.server._load_more_message = "Starting load-more..."
 
                 logger.info(
                     f"Loading more exams (fresh): keeping fixed batch size at {next_batch}"
@@ -545,18 +595,26 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                 import threading
 
                 def regenerate():
+                    def update_progress(progress: float, detail: str) -> None:
+                        self.server._load_more_progress = progress
+                        self.server._load_more_message = detail
+
                     try:
                         from copy import deepcopy
 
                         args = deepcopy(LOAD_MORE_ARGS)
                         args["max_exams"] = next_batch
                         args["exam_list_path"] = None  # ensure unfiltered
+                        args["progress_callback"] = update_progress
                         generate_gallery(**args)
+                        self.server._load_more_progress = 1.0
+                        self.server._load_more_message = "Next batch ready."
                         LOAD_MORE_ARGS["max_exams"] = next_batch
                         self.server._load_more_ready = True
                         logger.info(f"Successfully generated {next_batch} exams")
                     except Exception as e:
                         self.server._load_more_error = str(e)
+                        self.server._load_more_message = "Generation failed."
                         logger.error(f"Failed to generate more exams: {e}")
                         import traceback
 
@@ -610,19 +668,26 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                     )
                     return
 
-                try:
-                    batch_size = max(1, int(qs.get("batch_size", [100])[0]))
-                except (ValueError, IndexError):
-                    batch_size = 100
-
-                fs = self._get_filter_sets()
-                if filter_name not in fs:
+                filter_catalog = self._get_filter_catalog()
+                filter_spec = filter_catalog.get(filter_name)
+                if filter_spec is None:
                     self.wfile.write(
                         json.dumps({"error": f"Unknown filter: {filter_name}"}).encode()
                     )
                     return
 
-                filter_exam_ids = fs[filter_name]
+                filter_exam_ids = filter_spec["exam_ids"]
+                filter_kind = filter_spec.get("kind", "auto")
+                try:
+                    requested_batch = qs.get("batch_size", [None])[0]
+                    batch_size = (
+                        max(1, int(requested_batch))
+                        if requested_batch is not None
+                        else len(filter_exam_ids)
+                    )
+                except (ValueError, TypeError):
+                    batch_size = len(filter_exam_ids)
+                batch_size = min(batch_size, len(filter_exam_ids))
 
                 if (
                     hasattr(self.server, "_load_more_in_progress")
@@ -642,6 +707,8 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                 self.server._load_more_ready = False
                 self.server._load_more_error = None
                 self.server._load_more_target_batch = batch_size
+                self.server._load_more_progress = 0.0
+                self.server._load_more_message = "Starting filtered load..."
 
                 logger.info(
                     f"Loading filter batch: filter={filter_name}, "
@@ -661,6 +728,10 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                 tmp_path = Path(tmp.name)
 
                 def regenerate():
+                    def update_progress(progress: float, detail: str) -> None:
+                        self.server._load_more_progress = progress
+                        self.server._load_more_message = detail
+
                     try:
                         from copy import deepcopy
 
@@ -669,7 +740,25 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                         args["exam_list_path"] = tmp_path
                         args["prioritize_errors"] = False
                         args["random_sample"] = False
+                        args["progress_callback"] = update_progress
+                        if str(filter_kind).startswith("annotation"):
+                            requested_skip = args.get("qc_skip_status")
+                            if requested_skip is None:
+                                requested_skip = {"good", "annotated", "auto_excluded"}
+                            else:
+                                requested_skip = set(requested_skip)
+                            args["qc_skip_status"] = {
+                                status
+                                for status in requested_skip
+                                if status != "annotated"
+                            }
+                            logger.info(
+                                "annotation filter batch requested; overriding qc_skip_status to %s",
+                                sorted(args["qc_skip_status"]),
+                            )
                         generate_gallery(**args)
+                        self.server._load_more_progress = 1.0
+                        self.server._load_more_message = "Filtered batch ready."
                         self.server._load_more_ready = True
                         logger.info(
                             f"Successfully generated filter batch: "
@@ -677,6 +766,7 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                         )
                     except Exception as e:
                         self.server._load_more_error = str(e)
+                        self.server._load_more_message = "Generation failed."
                         logger.error(f"Failed to generate filter batch: {e}")
                         import traceback
 
@@ -720,6 +810,8 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                 "ready": bool(getattr(self.server, "_load_more_ready", False)),
                 "error": getattr(self.server, "_load_more_error", None),
                 "next_batch": getattr(self.server, "_load_more_target_batch", None),
+                "progress": getattr(self.server, "_load_more_progress", None),
+                "message": getattr(self.server, "_load_more_message", None),
             }
             self.wfile.write(json.dumps(status).encode())
             return
@@ -759,31 +851,48 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                     ].lower() in {"1", "true", "yes"}
                     QC_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
+                    qc_state = _load_qc_state(QC_FILE_PATH, persist_normalized=True)
                     if replace_mode:
-                        qc_data = qc_updates
-                    else:
-                        qc_data = {}
-                        if QC_FILE_PATH.exists():
-                            try:
-                                with open(QC_FILE_PATH) as f:
-                                    existing = json.load(f)
-                                if isinstance(existing, dict):
-                                    qc_data = {
-                                        str(exam_id): status
-                                        for exam_id, status in existing.items()
-                                    }
-                                else:
-                                    logger.warning(
-                                        "existing QC file is not a JSON object; starting from empty map"
+                        kept_records = {
+                            exam_id: qc_state.get(exam_id, _blank_qc_record())
+                            for exam_id in qc_state
+                        }
+                        qc_state = {
+                            exam_id: {
+                                "status": qc_updates.get(exam_id),
+                                "annotations": []
+                                if qc_updates.get(exam_id) == "good"
+                                else list(
+                                    kept_records.get(exam_id, _blank_qc_record()).get(
+                                        "annotations", []
                                     )
-                            except Exception as e:
-                                logger.warning(
-                                    f"failed to read existing QC file for merge: {e}"
-                                )
-                        qc_data.update(qc_updates)
+                                ),
+                                "annotation_meta": {}
+                                if qc_updates.get(exam_id) == "good"
+                                else normalize_annotation_meta(
+                                    kept_records.get(exam_id, _blank_qc_record()).get(
+                                        "annotation_meta"
+                                    ),
+                                    normalize_annotation_tags(
+                                        kept_records.get(
+                                            exam_id, _blank_qc_record()
+                                        ).get("annotations", [])
+                                    ),
+                                ),
+                            }
+                            for exam_id in set(qc_updates) | set(kept_records)
+                        }
+                    else:
+                        for exam_id, status in qc_updates.items():
+                            record = qc_state.get(exam_id, _blank_qc_record())
+                            record["status"] = status
+                            if status == "good":
+                                record["annotations"] = []
+                                record["annotation_meta"] = {}
+                            qc_state[exam_id] = record
 
-                    with open(QC_FILE_PATH, "w") as f:
-                        json.dump(qc_data, f, indent=2)
+                    qc_state = save_qc_state(QC_FILE_PATH, qc_state)
+                    qc_data = qc_state_to_status_map(qc_state)
 
                     logger.info(
                         f"saved QC data: {len(qc_updates)} updates ({len(qc_data)} total, replace={replace_mode})"
@@ -826,6 +935,7 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                 tags = json.loads(post_data.decode())
 
                 if ANNOTATION_TAGS_PATH:
+                    tags = _normalize_annotation_tag_catalog(tags)
                     ANNOTATION_TAGS_PATH.parent.mkdir(parents=True, exist_ok=True)
                     with open(ANNOTATION_TAGS_PATH, "w") as f:
                         json.dump(tags, f, indent=2)
@@ -854,12 +964,28 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
             post_data = self.rfile.read(content_length)
 
             try:
-                annotations = json.loads(post_data.decode())
+                annotations = {
+                    str(exam_id): _normalize_saved_annotation_tags(tags)
+                    for exam_id, tags in json.loads(post_data.decode()).items()
+                }
 
-                if ANNOTATIONS_PATH:
-                    ANNOTATIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
-                    with open(ANNOTATIONS_PATH, "w") as f:
-                        json.dump(annotations, f, indent=2)
+                if QC_FILE_PATH:
+                    qc_state = _load_qc_state(QC_FILE_PATH, persist_normalized=True)
+                    existing_statuses = qc_state_to_status_map(qc_state)
+                    qc_state = {
+                        exam_id: {
+                            "status": existing_statuses.get(exam_id),
+                            "annotations": annotations.get(exam_id, []),
+                            "annotation_meta": normalize_annotation_meta(
+                                qc_state.get(exam_id, _blank_qc_record()).get(
+                                    "annotation_meta"
+                                ),
+                                annotations.get(exam_id, []),
+                            ),
+                        }
+                        for exam_id in set(existing_statuses) | set(annotations)
+                    }
+                    save_qc_state(QC_FILE_PATH, qc_state)
 
                     logger.info(f"saved annotations: {len(annotations)} exams")
 
@@ -871,9 +997,102 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
                 else:
                     self.send_response(500)
                     self.end_headers()
-                    self.wfile.write(b'{"error": "Annotations path not configured"}')
+                    self.wfile.write(b'{"error": "QC file path not configured"}')
             except Exception as e:
                 logger.error(f"error saving annotations: {e}")
+                self.send_response(500)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
+        elif parsed_path.path == "/accept-auto-suggestions":
+            content_length = int(self.headers["Content-Length"])
+            post_data = self.rfile.read(content_length)
+
+            try:
+                payload = json.loads(post_data.decode())
+                exam_ids = payload.get("exam_ids", [])
+                if not isinstance(exam_ids, list):
+                    raise ValueError("exam_ids must be a JSON list")
+                exam_ids = [str(exam_id) for exam_id in exam_ids]
+
+                if QC_FILE_PATH is None:
+                    raise ValueError("QC file path not configured")
+                if AUTO_RUN_PATH is None:
+                    raise ValueError("Auto suggestion run path not configured")
+
+                qc_state = _load_qc_state(QC_FILE_PATH, persist_normalized=True)
+                auto_run = _load_auto_run(AUTO_RUN_PATH, persist_normalized=True)
+                if not auto_run:
+                    raise ValueError(f"Auto suggestion run not found: {AUTO_RUN_PATH}")
+
+                exam_suggestions = auto_run.get("exam_suggestions", {})
+                total_added_tags = 0
+                total_exam_updates = 0
+                touched_exam_ids: list[str] = []
+                for exam_id in exam_ids:
+                    suggestion_record = exam_suggestions.get(exam_id)
+                    if not suggestion_record:
+                        continue
+
+                    record = qc_state.get(exam_id, _blank_qc_record())
+                    annotations = normalize_annotation_tags(
+                        record.get("annotations", [])
+                    )
+                    annotation_meta = normalize_annotation_meta(
+                        record.get("annotation_meta"), annotations
+                    )
+                    before_annotations = list(annotations)
+
+                    for suggestion in suggestion_record.get("suggestions", []):
+                        tag = suggestion["tag"]
+                        if tag not in annotations:
+                            annotations.append(tag)
+                            total_added_tags += 1
+                        existing_meta = annotation_meta.get(tag, {"source": "auto"})
+                        if existing_meta.get("source") != "human":
+                            new_meta = {"source": "auto"}
+                            if auto_run.get("run_id"):
+                                new_meta["origin_run_id"] = auto_run["run_id"]
+                            model_name = (
+                                suggestion_record.get("model")
+                                or auto_run.get("model")
+                                or None
+                            )
+                            if model_name:
+                                new_meta["model"] = str(model_name)
+                            if suggestion.get("score") is not None:
+                                new_meta["score"] = suggestion.get("score")
+                            annotation_meta[tag] = new_meta
+
+                    if annotations != before_annotations:
+                        total_exam_updates += 1
+                        touched_exam_ids.append(exam_id)
+                    record["annotations"] = annotations
+                    record["annotation_meta"] = normalize_annotation_meta(
+                        annotation_meta, annotations
+                    )
+                    if record.get("status") == "good" and annotations:
+                        record["status"] = None
+                    qc_state[exam_id] = record
+
+                save_qc_state(QC_FILE_PATH, qc_state)
+
+                self.send_response(200)
+                self.send_header("Content-type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(
+                    json.dumps(
+                        {
+                            "status": "ok",
+                            "updated_exams": total_exam_updates,
+                            "added_tags": total_added_tags,
+                            "exam_ids": touched_exam_ids,
+                        }
+                    ).encode()
+                )
+            except Exception as e:
+                logger.error(f"error accepting auto suggestions: {e}")
                 self.send_response(500)
                 self.send_header("Content-type", "application/json")
                 self.end_headers()
@@ -882,8 +1101,8 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
-    def _get_filter_sets(self):
-        """compute or return cached auto-filter exam-id sets from parquet data."""
+    def _get_auto_filter_sets(self):
+        """Compute or return cached auto-filter exam-id sets from parquet data."""
         global _CACHED_FILTER_SETS
         if _CACHED_FILTER_SETS is not None:
             return _CACHED_FILTER_SETS
@@ -901,6 +1120,155 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
         _CACHED_FILTER_SETS = fs
         return fs
 
+    def _get_auto_run(self):
+        """Load or return cached model suggestion run metadata."""
+        global _CACHED_AUTO_RUN
+        if _CACHED_AUTO_RUN is not None:
+            return _CACHED_AUTO_RUN
+
+        if not AUTO_RUN_PATH:
+            return {}
+
+        auto_run = _load_auto_run(AUTO_RUN_PATH, persist_normalized=True)
+        _CACHED_AUTO_RUN = auto_run
+        return auto_run
+
+    def _get_filter_catalog(self):
+        """Build combined filter metadata for auto filters and saved annotations."""
+        auto_sets = self._get_auto_filter_sets()
+        catalog = {
+            name: {
+                "exam_ids": exam_set,
+                "label": name.replace("_", " ").title(),
+                "token": name,
+                "aliases": [name],
+                "kind": "auto",
+            }
+            for name, exam_set in auto_sets.items()
+        }
+
+        auto_run = self._get_auto_run()
+        auto_tag_map = auto_run_to_tag_map(auto_run)
+        if auto_tag_map:
+            auto_exam_ids = set(auto_tag_map)
+            catalog["auto_suggested"] = {
+                "exam_ids": auto_exam_ids,
+                "label": "Auto Suggestion: Any Tag",
+                "token": "auto_suggested",
+                "aliases": ["auto_suggested", "model_suggested"],
+                "kind": "auto_suggestion_group",
+            }
+
+            auto_tag_to_exams: dict[str, set[str]] = {}
+            for exam_id, tags in auto_tag_map.items():
+                for tag in tags:
+                    auto_tag_to_exams.setdefault(tag, set()).add(exam_id)
+
+            used_filenames = set(catalog)
+            used_tokens = {
+                filter_spec["token"]
+                for filter_spec in catalog.values()
+                if filter_spec.get("token")
+            }
+
+            for tag, exam_ids in sorted(
+                auto_tag_to_exams.items(),
+                key=lambda item: (-len(item[1]), item[0].lower()),
+            ):
+                base_token = _slugify_filter_token(tag)
+                if not base_token:
+                    continue
+
+                token = f"auto_{base_token}"
+                if token in used_tokens:
+                    suffix = 2
+                    while f"{token}_{suffix}" in used_tokens:
+                        suffix += 1
+                    token = f"{token}_{suffix}"
+                used_tokens.add(token)
+
+                filename = f"auto_suggestion_{base_token}"
+                if filename in used_filenames:
+                    suffix = 2
+                    while f"{filename}_{suffix}" in used_filenames:
+                        suffix += 1
+                    filename = f"{filename}_{suffix}"
+                used_filenames.add(filename)
+
+                catalog[filename] = {
+                    "exam_ids": exam_ids,
+                    "label": f"Auto Suggestion: {tag}",
+                    "token": token,
+                    "aliases": [token, filename],
+                    "kind": "auto_suggestion",
+                }
+
+        annotations = _load_annotations_map(QC_FILE_PATH, persist_normalized=True)
+        if not annotations:
+            return catalog
+
+        annotated_exams = set(annotations)
+        if annotated_exams:
+            catalog["manual_qc_annotated"] = {
+                "exam_ids": annotated_exams,
+                "label": "Annotation: Any Finding",
+                "token": "annotated",
+                "aliases": ["annotated", "manual_qc_annotated"],
+                "kind": "annotation_group",
+            }
+
+        tag_to_exams = {}
+        for exam_id, tags in annotations.items():
+            for tag in tags:
+                tag_to_exams.setdefault(tag, set()).add(exam_id)
+
+        used_filenames = set(catalog)
+        used_tokens = {
+            filter_spec["token"]
+            for filter_spec in catalog.values()
+            if filter_spec.get("token")
+        }
+        for tag, exam_ids in sorted(
+            tag_to_exams.items(), key=lambda item: (-len(item[1]), item[0].lower())
+        ):
+            base_token = _slugify_filter_token(tag)
+            if not base_token:
+                continue
+
+            token = base_token
+            if token in used_tokens:
+                suffix = 2
+                while f"{base_token}_{suffix}" in used_tokens:
+                    suffix += 1
+                token = f"{base_token}_{suffix}"
+            used_tokens.add(token)
+
+            filename = f"annotation_{token}"
+            if filename in used_filenames:
+                suffix = 2
+                while f"{filename}_{suffix}" in used_filenames:
+                    suffix += 1
+                filename = f"{filename}_{suffix}"
+            used_filenames.add(filename)
+
+            aliases = [token, filename]
+            catalog[filename] = {
+                "exam_ids": exam_ids,
+                "label": f"Annotation: {tag}",
+                "token": token,
+                "aliases": aliases,
+                "kind": "annotation",
+            }
+
+        return catalog
+
+    def _get_filter_sets(self):
+        """Return combined filter exam-id sets keyed by filename."""
+        return {
+            name: filter_spec["exam_ids"]
+            for name, filter_spec in self._get_filter_catalog().items()
+        }
+
     def _compute_cutflow(self):
         """compute cutflow analysis on demand"""
         if not VIEWS_PATH or not TAGS_PATH:
@@ -913,22 +1281,9 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
         total_exams = views_df["exam_id"].nunique()
 
         # load QC data
-        qc_data = {}
-        if QC_FILE_PATH and QC_FILE_PATH.exists():
-            with open(QC_FILE_PATH) as f:
-                qc_data = json.load(f)
-            qc_data = {str(exam_id): status for exam_id, status in qc_data.items()}
+        qc_data = _load_qc_status_map(QC_FILE_PATH, persist_normalized=True)
         # load annotations (exam_id -> list of tags)
-        annotations_data = {}
-        if ANNOTATIONS_PATH and ANNOTATIONS_PATH.exists():
-            with open(ANNOTATIONS_PATH) as f:
-                annotations_data = json.load(f)
-            if isinstance(annotations_data, dict):
-                annotations_data = {
-                    str(exam_id): tags for exam_id, tags in annotations_data.items()
-                }
-            else:
-                annotations_data = {}
+        annotations_data = _load_annotations_map(QC_FILE_PATH, persist_normalized=True)
 
         cutflow = []
         excluded_exams: set = set()
@@ -986,8 +1341,6 @@ class QCGalleryHandler(SimpleHTTPRequestHandler):
         if annotated_exams:
             new_excluded = annotated_exams - excluded_exams
             excluded_exams.update(annotated_exams)
-            filter_sets = dict(filter_sets)  # don't mutate cache
-            filter_sets["manual_qc_annotated"] = annotated_exams
             cutflow.append(
                 {
                     "step": "5. Manual QC",
@@ -1064,6 +1417,7 @@ def start_qc_server(
     qc_file: Path,
     views_path: Path,
     tags_path: Path,
+    auto_run_path: Optional[Path] = None,
     port: int = 5000,
     load_more_args: Optional[dict] = None,
 ) -> None:
@@ -1086,20 +1440,24 @@ def start_qc_server(
     """
     global \
         QC_FILE_PATH, \
-        ANNOTATIONS_PATH, \
         ANNOTATION_TAGS_PATH, \
         OUTPUT_DIR, \
         VIEWS_PATH, \
         TAGS_PATH, \
-        LOAD_MORE_ARGS
+        AUTO_RUN_PATH, \
+        LOAD_MORE_ARGS, \
+        _CACHED_FILTER_SETS, \
+        _CACHED_AUTO_RUN
 
     QC_FILE_PATH = qc_file.resolve()
-    ANNOTATIONS_PATH = QC_FILE_PATH.parent / "annotations.json"
     ANNOTATION_TAGS_PATH = QC_FILE_PATH.parent / "annotation_tags.json"
     OUTPUT_DIR = output_dir.resolve()
     VIEWS_PATH = views_path.resolve()
     TAGS_PATH = tags_path.resolve()
+    AUTO_RUN_PATH = auto_run_path.resolve() if auto_run_path else None
     LOAD_MORE_ARGS = load_more_args
+    _CACHED_FILTER_SETS = None
+    _CACHED_AUTO_RUN = None
 
     # change to output directory so SimpleHTTPRequestHandler can serve files
     import os
@@ -1113,6 +1471,8 @@ def start_qc_server(
     httpd._load_more_ready = False
     httpd._load_more_error = None
     httpd._load_more_target_batch = None
+    httpd._load_more_progress = None
+    httpd._load_more_message = None
 
     import os
     import socket
@@ -1123,7 +1483,7 @@ def start_qc_server(
     logger.info("=" * 60)
     logger.info("QC SERVER STARTED")
     logger.info("=" * 60)
-    logger.info(f"QC file: {QC_FILE_PATH}")
+    logger.info(f"QC state file: {QC_FILE_PATH}")
     logger.info(f"Serving from: {OUTPUT_DIR}")
     logger.info("")
     logger.info("FOR REMOTE ACCESS:")
@@ -1614,6 +1974,7 @@ def generate_gallery(
     per_view: bool = False,
     no_gallery: bool = False,
     qc_file: Optional[Path] = None,
+    auto_run_file: Optional[Path] = None,
     pred_csv: Optional[Path] = None,
     meta_csv: Optional[Path] = None,
     prioritize_errors: bool = False,
@@ -1622,6 +1983,7 @@ def generate_gallery(
     serve: bool = False,
     preprocessed_only: bool = False,
     original_args: Optional[dict] = None,
+    progress_callback: Optional[Callable[[float, str], None]] = None,
 ) -> None:
     """generate interactive HTML gallery from processed views.
 
@@ -1636,7 +1998,8 @@ def generate_gallery(
         exam_list_path: path to text file with exam IDs (one per line) to review
         per_view: if True, also generate individual per-view debug figures
         no_gallery: if True, skip HTML gallery generation
-        qc_file: path to QC status file; exams with status in qc_skip_status will be skipped
+        qc_file: path to unified QC state file; exams with status in qc_skip_status will be skipped
+        auto_run_file: path to a saved model suggestion run to review/accept in the gallery
         pred_csv: path to validation_output.csv with predictions (for error prioritization)
         meta_csv: path to mirai_manifest.csv with labels (for error prioritization)
         prioritize_errors: if True, sort by prediction error (worst first)
@@ -1647,8 +2010,19 @@ def generate_gallery(
     """
     if qc_skip_status is None:
         qc_skip_status = {"good", "annotated", "auto_excluded"}
+
+    def report_progress(progress: float, detail: str) -> None:
+        if progress_callback is None:
+            return
+        bounded = max(0.0, min(1.0, float(progress)))
+        try:
+            progress_callback(bounded, detail)
+        except Exception as e:
+            logger.debug("progress callback failed: %s", e)
+
+    report_progress(0.02, "Loading QC state...")
     logger.info(
-        "QC DEBUG generate_gallery args: max_exams=%s, random_sample=%s, prioritize_errors=%s, qc_skip_status=%s, patient_id=%s, exam_id=%s, exam_list_path=%s, qc_file=%s, serve=%s, preprocessed_only=%s",
+        "QC DEBUG generate_gallery args: max_exams=%s, random_sample=%s, prioritize_errors=%s, qc_skip_status=%s, patient_id=%s, exam_id=%s, exam_list_path=%s, qc_file=%s, auto_run_file=%s, serve=%s, preprocessed_only=%s",
         max_exams,
         random_sample,
         prioritize_errors,
@@ -1657,18 +2031,24 @@ def generate_gallery(
         exam_id,
         exam_list_path,
         qc_file,
+        auto_run_file,
         serve,
         preprocessed_only,
     )
-    # load existing QC data if available
-    qc_data = {}
+    # load existing QC state if available
+    qc_state = {}
     if qc_file and qc_file.exists():
-        logger.info(f"loading QC data from {qc_file}")
-        with open(qc_file) as f:
-            qc_data = json.load(f)
-        # exam IDs in parquet can be numeric while JSON object keys are always strings
-        # normalize early so QC skip/filter logic uses a single key type.
-        qc_data = {str(exam_id): status for exam_id, status in qc_data.items()}
+        logger.info(f"loading QC state from {qc_file}")
+        qc_state = _load_qc_state(qc_file, persist_normalized=True)
+    qc_data = qc_state_to_status_map(qc_state)
+    annotations_data = qc_state_to_annotations_map(qc_state)
+    auto_run = {}
+    auto_suggestion_data = {}
+    if auto_run_file and auto_run_file.exists():
+        logger.info(f"loading auto suggestion run from {auto_run_file}")
+        auto_run = _load_auto_run(auto_run_file, persist_normalized=True)
+        auto_suggestion_data = auto_run_to_tag_map(auto_run)
+    if qc_data:
         logger.info(f"loaded QC status for {len(qc_data)} exams")
     if qc_data:
         logger.info(
@@ -1678,34 +2058,18 @@ def generate_gallery(
         )
     else:
         logger.info("QC DEBUG loaded QC map: empty")
-
-    # load annotation data for done/skip accounting
-    annotations_data = {}
-    annotations_path = qc_file.parent / "annotations.json" if qc_file else None
-    if annotations_path and annotations_path.exists():
-        try:
-            with open(annotations_path) as f:
-                raw_annotations = json.load(f)
-            if isinstance(raw_annotations, dict):
-                annotations_data = {
-                    str(exam_id): tags
-                    for exam_id, tags in raw_annotations.items()
-                    if isinstance(tags, list) and len(tags) > 0
-                }
-                logger.info(
-                    "loaded annotation findings for %d exams from %s",
-                    len(annotations_data),
-                    annotations_path,
-                )
-            else:
-                logger.warning(
-                    "annotation file is not a JSON object (%s); ignoring",
-                    type(raw_annotations).__name__,
-                )
-        except Exception as e:
-            logger.warning(
-                "failed to load annotations from %s: %s", annotations_path, e
-            )
+    if annotations_data and qc_file:
+        logger.info(
+            "loaded annotation findings for %d exams from %s",
+            len(annotations_data),
+            qc_file,
+        )
+    if auto_suggestion_data and auto_run_file:
+        logger.info(
+            "loaded auto suggestions for %d exams from %s",
+            len(auto_suggestion_data),
+            auto_run_file,
+        )
 
     logger.info(f"loading views from {views_parquet}")
     views_df = pd.read_parquet(views_parquet)
@@ -1718,6 +2082,7 @@ def generate_gallery(
     logger.info(
         f"loaded {len(views_df)} views from {views_df['exam_id'].nunique()} exams"
     )
+    report_progress(0.16, "Loaded views metadata...")
 
     # apply auto-exclusions from config
     from prima.qc_filters import compute_auto_filter_sets, load_auto_filter_names
@@ -1757,14 +2122,23 @@ def generate_gallery(
                 exam_key = str(eid)
                 if exam_key not in qc_data:  # don't override manual QC
                     qc_data[exam_key] = "auto_excluded"
+                    record = qc_state.get(exam_key, {"status": None, "annotations": []})
+                    record["status"] = "auto_excluded"
+                    qc_state[exam_key] = record
                     new_auto += 1
             if new_auto > 0 and qc_file:
-                qc_file.parent.mkdir(parents=True, exist_ok=True)
-                with open(qc_file, "w") as f:
-                    json.dump(qc_data, f, indent=2)
+                save_qc_state(qc_file, qc_state)
                 logger.info(
                     f"persisted {new_auto} new auto_excluded entries to {qc_file}"
                 )
+    report_progress(0.28, "Applied exclusions and loaded annotations...")
+
+    annotation_review_views_df = views_df[
+        views_df["exam_id"].isin(annotations_data.keys())
+    ].copy()
+    auto_review_views_df = views_df[
+        views_df["exam_id"].isin(auto_suggestion_data.keys())
+    ].copy()
 
     # filter by patient/exam if specified
     if patient_id:
@@ -1878,6 +2252,7 @@ def generate_gallery(
             logger.info(
                 f"error scores available for {len(error_scores)} exams in views dataset"
             )
+    report_progress(0.4, "Selected exam pool...")
 
     # sample exams if requested
     selected_exam_ids = [str(eid) for eid in views_df["exam_id"].unique().tolist()]
@@ -1932,10 +2307,44 @@ def generate_gallery(
         min(10, len(selected_exam_ids)),
         selected_exam_ids[:10],
     )
+    report_progress(0.5, "Selected exams and checking cached montages...")
 
     # create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"output will be saved to: {output_dir}")
+
+    def build_cached_exam_records(source_views_df: pd.DataFrame):
+        """Build lightweight exam metadata for cached combined montages."""
+        records = []
+        success_dir = output_dir / "success"
+        for source_exam_id in source_views_df["exam_id"].unique():
+            exam_views = source_views_df[source_views_df["exam_id"] == source_exam_id]
+            if len(exam_views) == 0:
+                continue
+
+            row = exam_views.iloc[0]
+            source_patient_id = row["patient_id"]
+            accession = row.get("accession_number", "unknown")
+            img_path = (
+                success_dir
+                / source_patient_id
+                / accession
+                / f"COMBINED_four_views_{source_exam_id}.png"
+            )
+            if not img_path.exists():
+                continue
+
+            records.append(
+                {
+                    "path": img_path.relative_to(output_dir),
+                    "patient_id": source_patient_id,
+                    "exam_id": source_exam_id,
+                    "accession": accession,
+                    "num_views": len(exam_views),
+                    "qc_status": get_qc_status(source_exam_id),
+                }
+            )
+        return records
 
     # first, identify which exams already have cached figures
     logger.info("checking for cached figures...")
@@ -1965,6 +2374,8 @@ def generate_gallery(
     logger.info(
         f"found {len(cached_exams)} cached figures, need to generate {len(exams_needing_generation)}"
     )
+    if len(exams_needing_generation) == 0:
+        report_progress(0.78, "All montages already cached...")
 
     def get_qc_status(exam_id):
         """extract status string from qc_data"""
@@ -2018,11 +2429,16 @@ def generate_gallery(
         logger.info(
             f"processing {len(exams_needing_list)} exams in {n_batches} batches of up to {BATCH_SIZE}"
         )
+        report_progress(
+            0.56, f"Generating {len(exams_needing_list)} missing montages..."
+        )
 
-        for batch_start in tqdm(
-            range(0, len(exams_needing_list), BATCH_SIZE),
-            total=n_batches,
-            desc="batches",
+        for batch_idx, batch_start in enumerate(
+            tqdm(
+                range(0, len(exams_needing_list), BATCH_SIZE),
+                total=n_batches,
+                desc="batches",
+            )
         ):
             batch_exam_ids = set(
                 exams_needing_list[batch_start : batch_start + BATCH_SIZE]
@@ -2122,19 +2538,36 @@ def generate_gallery(
 
             del batch_cache
             gc.collect()
+            report_progress(
+                0.56 + 0.28 * ((batch_idx + 1) / max(n_batches, 1)),
+                f"Generated montage batch {batch_idx + 1}/{n_batches}...",
+            )
     else:
         logger.info("all figures cached, skipping DICOM loading")
 
     # compute total figures
     total_figures = cached_count + generated_count
+    annotated_review_images = build_cached_exam_records(annotation_review_views_df)
+    if annotated_review_images:
+        logger.info(
+            "annotation review pool ready: %d cached annotated exams",
+            len(annotated_review_images),
+        )
+    auto_suggestion_review_images = build_cached_exam_records(auto_review_views_df)
+    if auto_suggestion_review_images:
+        logger.info(
+            "auto suggestion review pool ready: %d cached suggested exams",
+            len(auto_suggestion_review_images),
+        )
+    report_progress(0.9, "Building gallery HTML...")
 
     # generate HTML gallery
     if not no_gallery and combined_images:
         logger.info("generating HTML gallery...")
         gallery_path = output_dir / "gallery.html"
 
-        # prepare QC file path for saving
-        qc_file_str = str(qc_file.resolve()) if qc_file else "data/qc_status.json"
+        # prepare QC state file path for saving
+        qc_file_str = str(qc_file.resolve()) if qc_file else "data/qc_state.json"
         qc_storage_namespace = qc_file_str
 
         # construct load more command
@@ -2472,6 +2905,29 @@ def generate_gallery(
         .completion-banner button:hover {{
             background-color: #6bdfcf;
         }}
+        .progress-shell {{
+            width: 100%;
+            height: 10px;
+            margin-top: 12px;
+            border-radius: 999px;
+            overflow: hidden;
+            background: #1e1e1e;
+            border: 1px solid #3e3e42;
+        }}
+        .progress-bar {{
+            height: 100%;
+            width: 38%;
+            border-radius: 999px;
+            background: linear-gradient(90deg, #2d4a44 0%, #4ec9b0 45%, #9cdcfe 100%);
+            box-shadow: 0 0 12px rgba(78, 201, 176, 0.35);
+        }}
+        .progress-bar.indeterminate {{
+            animation: qc-progress-slide 1.3s ease-in-out infinite;
+        }}
+        @keyframes qc-progress-slide {{
+            0% {{ transform: translateX(-110%); }}
+            100% {{ transform: translateX(290%); }}
+        }}
     </style>
 </head>
 <body>
@@ -2488,17 +2944,19 @@ def generate_gallery(
             </div>
             <div style="display: flex; gap: 5px;">
                 <button class="info-button" onclick="showCutflow()"><span>📊</span><span>cutflow</span></button>
-                <button class="info-button" onclick="resetAllQC()" title="Clear all saved QC statuses/annotations for this QC file"><span>🗑</span><span>reset</span></button>
+                <button id="autoReviewBtn" class="info-button" onclick="showAutoReview()" title="Compare loaded auto suggestions against accepted GT in this gallery pool" style="display: {"flex" if auto_suggestion_data else "none"};"><span>🤖</span><span>auto qc</span></button>
+                <button class="info-button" onclick="resetAllQC()" title="Clear all saved QC statuses/annotations for this QC state file"><span>🗑</span><span>reset</span></button>
                 <button class="info-button" onclick="refreshCurrentBatch()" title="Rebuild gallery from saved QC state (safe: does not delete QC/source data)"><span>🔁</span><span>refresh</span></button>
             </div>
             <div class="filter-controls">
                 <input type="text" id="searchBox" placeholder="filter: text or @filter with &, |, ~" 
                        onkeyup="filterGallery()">
-                <select id="filterSelect" onfocus="loadAvailableFilters()" onchange="insertSelectedFilterToken()">
+                <select id="filterSelect" onfocus="loadAvailableFilters()" onchange="useSelectedFilterToken()">
                     <option value="">load filter list...</option>
                 </select>
                 <button onclick="insertSelectedFilterToken()">insert filter</button>
                 <button onclick="clearFilterExpression()">clear filter</button>
+                <button id="acceptVisibleAutoBtn" onclick="acceptVisibleAutoSuggestions()" title="accept all model suggestions for currently visible exams" style="display: {"inline-block" if auto_suggestion_data else "none"};">accept visible auto</button>
                 <button onclick="loadFilterBatch()" title="load a batch of exams matching the selected filter">load matching</button>
             </div>
             <div class="nav-buttons">
@@ -2522,6 +2980,19 @@ def generate_gallery(
             </div>
         </div>
     </div>
+
+    <!-- Auto QC Review Modal -->
+    <div id="autoReviewModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>auto qc review</h2>
+                <span class="close" onclick="closeAutoReview()">&times;</span>
+            </div>
+            <div id="autoReviewContent">
+                Loading...
+            </div>
+        </div>
+    </div>
     
     <!-- Annotation Modal -->
     <div id="annotationModal" class="modal">
@@ -2532,7 +3003,7 @@ def generate_gallery(
             </div>
             <div>
                 <p style="color: #858585; font-size: 13px; margin-top: 0; margin-bottom: 15px;">
-                    Press letter hotkeys to toggle tags, or type new tag and press enter. Press esc to save/close and move to the next exam.
+                    Press letter hotkeys to toggle tags, or type new tag and press enter. Press esc to save/close. Use next [s] when you're ready to advance.
                 </p>
                 <div id="annotationTagsList" style="margin-bottom: 20px;">
                 </div>
@@ -2595,6 +3066,52 @@ def generate_gallery(
             }}{"," if i < len(combined_images) - 1 else ""}
 """
 
+        html_content += """
+        ];
+
+        let globalAnnotatedExams = [
+"""
+
+        for i, img_info in enumerate(annotated_review_images):
+            path_str = str(img_info["path"]).replace("\\", "/")
+            patient_id_str = img_info["patient_id"]
+            exam_id_str = img_info["exam_id"]
+            accession_str = img_info["accession"]
+            num_views_int = img_info["num_views"]
+            qc_status_str = img_info["qc_status"]
+            html_content += f"""            {{
+                path: "{path_str}",
+                patient_id: "{patient_id_str}",
+                exam_id: "{exam_id_str}",
+                accession: "{accession_str}",
+                num_views: {num_views_int},
+                qc_status: "{qc_status_str}"
+            }}{"," if i < len(annotated_review_images) - 1 else ""}
+"""
+
+        html_content += """
+        ];
+
+        let globalAutoSuggestedExams = [
+"""
+
+        for i, img_info in enumerate(auto_suggestion_review_images):
+            path_str = str(img_info["path"]).replace("\\", "/")
+            patient_id_str = img_info["patient_id"]
+            exam_id_str = img_info["exam_id"]
+            accession_str = img_info["accession"]
+            num_views_int = img_info["num_views"]
+            qc_status_str = img_info["qc_status"]
+            html_content += f"""            {{
+                path: "{path_str}",
+                patient_id: "{patient_id_str}",
+                exam_id: "{exam_id_str}",
+                accession: "{accession_str}",
+                num_views: {num_views_int},
+                qc_status: "{qc_status_str}"
+            }}{"," if i < len(auto_suggestion_review_images) - 1 else ""}
+"""
+
         html_content += f"""
         ];
 
@@ -2603,6 +3120,7 @@ def generate_gallery(
         const qcStorageKey = 'qc_data::' + qcStorageNamespace;
         const annotationsStorageKey = 'annotations::' + qcStorageNamespace;
         const annotationTagsStorageKey = 'annotation_tags::' + qcStorageNamespace;
+        const autoSuggestionRunPath = {json.dumps(str(auto_run_file.resolve()) if auto_run_file else "")};
         const enablePreload = {str(ENABLE_PRELOAD).lower()};
         const serverMode = {str(serve).lower()};
         const totalToQC = {total_to_qc};
@@ -2614,22 +3132,28 @@ def generate_gallery(
         let availableFilters = [];
         let filtersLoaded = false;
         const filterTokenToFilename = {{}};
+        const filterKindsByFilename = {{}};
         const filterSetsByFilename = {{}};
+        const pendingFilterLoads = new Set();
         const unresolvedFilterWarnings = new Set();
+        const sessionAnnotatedFilterFilename = 'session_annotated';
         
-        // session rate tracking (persist across load-more reloads in same tab)
+        // session tracking survives refreshes/window reopen for the same QC state file.
         const sessionStatsKey = 'qc_session_stats::' + qcStorageNamespace;
-        const sessionStatsVersion = 1;
+        const sessionStatsVersion = 2;
+        const sessionResetAfterMs = 12 * 60 * 60 * 1000;
         
         function loadSessionStats() {{
             const fresh = {{
                 version: sessionStatsVersion,
                 startTimeMs: Date.now(),
+                lastActivityMs: Date.now(),
                 qcCount: 0,
                 startingRemainingToQC: remainingToQC,
-                totalToQC: totalToQC
+                totalToQC: totalToQC,
+                annotatedExamIds: []
             }};
-            const raw = sessionStorage.getItem(sessionStatsKey);
+            const raw = localStorage.getItem(sessionStatsKey);
             if (!raw) {{
                 return fresh;
             }}
@@ -2654,12 +3178,24 @@ def generate_gallery(
                 if (remainingToQC > parsed.startingRemainingToQC) {{
                     return fresh;
                 }}
+                if (
+                    Number.isFinite(parsed.lastActivityMs) &&
+                    Date.now() - parsed.lastActivityMs > sessionResetAfterMs
+                ) {{
+                    return fresh;
+                }}
                 return {{
                     version: sessionStatsVersion,
                     startTimeMs: parsed.startTimeMs,
+                    lastActivityMs: Number.isFinite(parsed.lastActivityMs)
+                        ? parsed.lastActivityMs
+                        : parsed.startTimeMs,
                     qcCount: parsed.qcCount,
                     startingRemainingToQC: parsed.startingRemainingToQC,
-                    totalToQC: parsed.totalToQC
+                    totalToQC: parsed.totalToQC,
+                    annotatedExamIds: Array.isArray(parsed.annotatedExamIds)
+                        ? [...new Set(parsed.annotatedExamIds.map(examId => String(examId)))]
+                        : []
                 }};
             }} catch (e) {{
                 console.error('Failed to parse session stats:', e);
@@ -2677,7 +3213,8 @@ def generate_gallery(
         let batchQCCount = 0;
         
         function saveSessionStats() {{
-            sessionStorage.setItem(sessionStatsKey, JSON.stringify(sessionStats));
+            sessionStats.lastActivityMs = Date.now();
+            localStorage.setItem(sessionStatsKey, JSON.stringify(sessionStats));
         }}
         // ensure session state is materialized for this tab
         saveSessionStats();
@@ -2688,6 +3225,9 @@ def generate_gallery(
         // annotation system: tags are independent of QC status
         let annotationTags = [];  // available tag strings
         let annotations = {{}};    // exam_id -> [tag1, tag2, ...]
+        let autoSuggestionRun = {{}};
+        let autoSuggestions = {{}};  // exam_id -> [{{tag, score?, rationale?}}, ...]
+        let retainedAnnotatedExamIds = new Set();  // keep newly annotated exams visible in the current batch
         let annotationHotkeys = {{ keyToTag: {{}}, tagToKey: {{}} }};
         const validStatuses = new Set(['good', 'auto_excluded']);
         const doneStatuses = new Set(['good']);
@@ -2702,6 +3242,15 @@ def generate_gallery(
             return Array.isArray(tags) ? tags : [];
         }}
 
+        function getAutoSuggestions(examId) {{
+            const entries = autoSuggestions[String(examId)];
+            return Array.isArray(entries) ? entries : [];
+        }}
+
+        function hasAutoSuggestions(examId) {{
+            return getAutoSuggestions(examId).length > 0;
+        }}
+
         function hasAnnotationFindings(examId) {{
             return getExamAnnotations(examId).length > 0;
         }}
@@ -2710,11 +3259,18 @@ def generate_gallery(
             return doneStatuses.has(getStatus(examId)) || hasAnnotationFindings(examId);
         }}
 
-        function shouldSkipExam(examId) {{
-            if (qcSkipStatus.includes(getStatus(examId))) {{
+        function shouldSkipExam(examId, options = {{}}) {{
+            const examIdStr = String(examId);
+            const includeAnnotated = options.includeAnnotated === true;
+            if (qcSkipStatus.includes(getStatus(examIdStr))) {{
                 return true;
             }}
-            if (skipAnnotatedExams && hasAnnotationFindings(examId)) {{
+            if (
+                !includeAnnotated &&
+                skipAnnotatedExams &&
+                hasAnnotationFindings(examIdStr) &&
+                !retainedAnnotatedExamIds.has(examIdStr)
+            ) {{
                 return true;
             }}
             return false;
@@ -2754,6 +3310,64 @@ def generate_gallery(
             if (!el) return;
             const manualCount = getManualQCCount();
             el.textContent = "qc'd so far: " + manualCount.toLocaleString();
+        }}
+
+        function getSessionAnnotatedExamIds() {{
+            const raw = Array.isArray(sessionStats.annotatedExamIds)
+                ? sessionStats.annotatedExamIds
+                : [];
+            return [...new Set(
+                raw
+                    .map(examId => String(examId))
+                    .filter(examId => hasAnnotationFindings(examId))
+            )];
+        }}
+
+        function buildClientOnlyFilters() {{
+            const sessionAnnotatedExamIds = getSessionAnnotatedExamIds();
+            const filters = [];
+            if (sessionAnnotatedExamIds.length > 0) {{
+                filters.push({{
+                    name: 'This Session Annotated (' + sessionAnnotatedExamIds.length + ')',
+                    filename: sessionAnnotatedFilterFilename,
+                    token: sessionAnnotatedFilterFilename,
+                    aliases: [
+                        sessionAnnotatedFilterFilename,
+                        'this_session_annotated'
+                    ],
+                    kind: 'annotation_session',
+                    clientExamIds: sessionAnnotatedExamIds
+                }});
+            }}
+            return filters;
+        }}
+
+        function updateSessionAnnotatedButton() {{
+            const btn = document.getElementById('sessionAnnotatedBtn');
+            if (!btn) return;
+            const count = getSessionAnnotatedExamIds().length;
+            btn.textContent = count > 0 ? 'this session (' + count + ')' : 'this session';
+            btn.disabled = count === 0;
+            btn.title = count > 0
+                ? 'show only exams annotated in this browser session'
+                : 'no exams annotated in this browser session yet';
+        }}
+
+        function syncSessionAnnotatedExam(examId) {{
+            const examIdStr = String(examId);
+            const current = new Set(
+                Array.isArray(sessionStats.annotatedExamIds)
+                    ? sessionStats.annotatedExamIds.map(existing => String(existing))
+                    : []
+            );
+            if (hasAnnotationFindings(examIdStr)) {{
+                current.add(examIdStr);
+            }} else {{
+                current.delete(examIdStr);
+            }}
+            sessionStats.annotatedExamIds = [...current].sort();
+            saveSessionStats();
+            updateSessionAnnotatedButton();
         }}
         
         // load statuses from server-rendered payload first
@@ -2814,26 +3428,83 @@ def generate_gallery(
             "horizontal line (detector artifact": "horizontal line (detector artifact)"
         }};
 
-        function normalizeAnnotationTags(tags) {{
+        function canonicalizeAnnotationTag(tag) {{
+            const raw = String(tag || '').trim();
+            if (raw === '') return '';
+            return legacyAnnotationTagAliases[raw] || raw;
+        }}
+
+        function normalizeAnnotationValues(tags) {{
             const normalized = [];
             tags.forEach(tag => {{
-                const raw = String(tag || '').trim();
-                if (raw === '') return;
-                const canonical = legacyAnnotationTagAliases[raw] || raw;
+                const canonical = canonicalizeAnnotationTag(tag);
+                if (canonical === '') return;
                 if (!normalized.includes(canonical)) {{
                     normalized.push(canonical);
                 }}
             }});
 
+            return normalized;
+        }}
+
+        function normalizeAnnotationTagCatalog(tags) {{
+            const normalized = normalizeAnnotationValues(tags);
             const extras = normalized.filter(tag => !defaultAnnotationTags.includes(tag));
             return [...defaultAnnotationTags, ...extras];
+        }}
+
+        function normalizeAnnotationMap(rawMap) {{
+            const normalized = {{}};
+            if (!rawMap || typeof rawMap !== 'object') {{
+                return normalized;
+            }}
+            Object.keys(rawMap).forEach(examId => {{
+                const tags = normalizeAnnotationValues(Array.isArray(rawMap[examId]) ? rawMap[examId] : []);
+                if (tags.length > 0) {{
+                    normalized[String(examId)] = tags;
+                }}
+            }});
+            return normalized;
+        }}
+
+        function normalizeAutoSuggestionMap(rawRun) {{
+            const normalized = {{}};
+            const examSuggestions = rawRun && typeof rawRun === 'object'
+                ? rawRun.exam_suggestions
+                : null;
+            if (!examSuggestions || typeof examSuggestions !== 'object') {{
+                return normalized;
+            }}
+            Object.keys(examSuggestions).forEach(examId => {{
+                const record = examSuggestions[examId];
+                const entries = Array.isArray(record && record.suggestions) ? record.suggestions : [];
+                const deduped = [];
+                const seenTags = new Set();
+                entries.forEach(entry => {{
+                    const canonical = canonicalizeAnnotationTag(entry && entry.tag);
+                    if (!canonical || seenTags.has(canonical)) return;
+                    seenTags.add(canonical);
+                    const normalizedEntry = {{ tag: canonical }};
+                    if (entry && Number.isFinite(Number(entry.score))) {{
+                        normalizedEntry.score = Number(entry.score);
+                    }}
+                    if (entry && typeof entry.rationale === 'string' && entry.rationale.trim() !== '') {{
+                        normalizedEntry.rationale = entry.rationale.trim();
+                    }}
+                    deduped.push(normalizedEntry);
+                }});
+                if (deduped.length > 0) {{
+                    normalized[String(examId)] = deduped;
+                }}
+            }});
+            return normalized;
         }}
         
         // load annotations from localStorage first (survives page refresh)
         const savedAnnotations = localStorage.getItem(annotationsStorageKey);
         if (savedAnnotations) {{
             try {{
-                annotations = JSON.parse(savedAnnotations);
+                annotations = normalizeAnnotationMap(JSON.parse(savedAnnotations));
             }} catch (e) {{
                 console.error('failed to parse saved annotations:', e);
             }}
@@ -2841,11 +3512,12 @@ def generate_gallery(
         const savedAnnotationTags = localStorage.getItem(annotationTagsStorageKey);
         if (savedAnnotationTags) {{
             try {{
-                annotationTags = normalizeAnnotationTags(JSON.parse(savedAnnotationTags));
+                annotationTags = normalizeAnnotationTagCatalog(JSON.parse(savedAnnotationTags));
             }} catch (e) {{
                 console.error('failed to parse saved annotation tags:', e);
             }}
         }}
+        updateSessionAnnotatedButton();
         
         // then merge with server data (server wins for tags, merge for annotations)
         fetch('/load-annotation-tags')
@@ -2853,7 +3525,7 @@ def generate_gallery(
             .then(tags => {{
                 if (tags.length > 0) {{
                     // merge: keep any localStorage tags not on server, add server tags
-                    annotationTags = normalizeAnnotationTags([...tags, ...annotationTags]);
+                    annotationTags = normalizeAnnotationTagCatalog([...tags, ...annotationTags]);
                     localStorage.setItem(annotationTagsStorageKey, JSON.stringify(annotationTags));
                 }}
                 console.log('loaded annotation tags:', annotationTags);
@@ -2869,20 +3541,36 @@ def generate_gallery(
             .then(response => response.json())
             .then(data => {{
                 // merge server annotations with localStorage
-                Object.keys(data).forEach(examId => {{
-                    annotations[examId] = data[examId];
-                }});
+                annotations = {{
+                    ...annotations,
+                    ...normalizeAnnotationMap(data)
+                }};
                 console.log('loaded annotations for', Object.keys(annotations).length, 'exams');
+                if (
+                    (!Array.isArray(sessionStats.annotatedExamIds) || sessionStats.annotatedExamIds.length === 0) &&
+                    allExams.some(exam => hasAnnotationFindings(exam.exam_id))
+                ) {{
+                    // bootstrap current-session recall for older browser state that only tracked counts
+                    sessionStats.annotatedExamIds = allExams
+                        .filter(exam => hasAnnotationFindings(exam.exam_id))
+                        .map(exam => String(exam.exam_id));
+                }} else {{
+                    sessionStats.annotatedExamIds = getSessionAnnotatedExamIds();
+                }}
+                saveSessionStats();
+                updateSessionAnnotatedButton();
                 updateManualQCIndicator();
                 applyFilters();
             }})
             .catch(error => {{
                 console.error('failed to load annotations from server:', error);
             }});
+
+        loadAutoSuggestionsFromServer();
         
         function saveAnnotationTags() {{
             localStorage.setItem(annotationTagsStorageKey, JSON.stringify(annotationTags));
-            fetch('/save-annotation-tags', {{
+            return fetch('/save-annotation-tags', {{
                 method: 'POST',
                 headers: {{ 'Content-Type': 'application/json' }},
                 body: JSON.stringify(annotationTags)
@@ -2891,11 +3579,301 @@ def generate_gallery(
         
         function saveAnnotations() {{
             localStorage.setItem(annotationsStorageKey, JSON.stringify(annotations));
-            fetch('/save-annotations', {{
+            return fetch('/save-annotations', {{
                 method: 'POST',
                 headers: {{ 'Content-Type': 'application/json' }},
                 body: JSON.stringify(annotations)
-            }}).catch(error => console.error('failed to save annotations:', error));
+            }})
+                .then(response => {{
+                    if (!response.ok) {{
+                        throw new Error('HTTP ' + response.status);
+                    }}
+                    invalidateFilterCaches();
+                    return loadAvailableFilters();
+                }})
+                .then(() => {{
+                    applyFilters();
+                }})
+                .catch(error => console.error('failed to save annotations:', error));
+        }}
+
+        function syncQCFromServerMap(serverQCData) {{
+            const qcFromServer = (serverQCData && typeof serverQCData === 'object') ? serverQCData : {{}};
+            Object.keys(qcData).forEach(examId => {{
+                delete qcData[examId];
+            }});
+            Object.keys(qcFromServer).forEach(examId => {{
+                const serverStatus = qcFromServer[examId];
+                if (validStatuses.has(serverStatus)) {{
+                    qcData[examId] = serverStatus;
+                }}
+            }});
+            localStorage.setItem(qcStorageKey, JSON.stringify(qcData));
+        }}
+
+        function updateAutoSuggestionButton() {{
+            const btn = document.getElementById('acceptVisibleAutoBtn');
+            if (!btn) return;
+            const visibleSuggestedCount = filteredExams.filter(exam => hasAutoSuggestions(exam.exam_id)).length;
+            btn.disabled = visibleSuggestedCount === 0;
+            btn.textContent = visibleSuggestedCount > 0
+                ? 'accept visible auto (' + visibleSuggestedCount + ')'
+                : 'accept visible auto';
+            btn.title = visibleSuggestedCount > 0
+                ? 'accept all model suggestions for the currently visible exams'
+                : 'no visible exams have model suggestions';
+        }}
+
+        function loadAutoSuggestionsFromServer() {{
+            if (!autoSuggestionRunPath) {{
+                autoSuggestionRun = {{}};
+                autoSuggestions = {{}};
+                updateAutoSuggestionButton();
+                return Promise.resolve(autoSuggestions);
+            }}
+
+            return fetch('/load-auto-suggestions')
+                .then(response => response.json())
+                .then(data => {{
+                    autoSuggestionRun = (data && typeof data === 'object') ? data : {{}};
+                    autoSuggestions = normalizeAutoSuggestionMap(autoSuggestionRun);
+                    invalidateFilterCaches();
+                    const autoReviewBtn = document.getElementById('autoReviewBtn');
+                    if (autoReviewBtn) {{
+                        autoReviewBtn.style.display = Object.keys(autoSuggestions).length > 0 ? 'flex' : 'none';
+                    }}
+                    const acceptBtn = document.getElementById('acceptVisibleAutoBtn');
+                    if (acceptBtn) {{
+                        acceptBtn.style.display = Object.keys(autoSuggestions).length > 0 ? 'inline-block' : 'none';
+                    }}
+                    return loadAvailableFilters()
+                        .catch(error => {{
+                            console.error('failed to reload filters after loading auto suggestions:', error);
+                        }})
+                        .then(() => {{
+                            updateAutoSuggestionButton();
+                            applyFilters();
+                            return autoSuggestions;
+                        }});
+                }})
+                .catch(error => {{
+                    console.error('failed to load auto suggestions from server:', error);
+                    autoSuggestionRun = {{}};
+                    autoSuggestions = {{}};
+                    updateAutoSuggestionButton();
+                    return autoSuggestions;
+                }});
+        }}
+
+        function computeAutoComparisonRows(examPool) {{
+            const exams = Array.isArray(examPool) ? examPool : [];
+            const examIds = exams.map(exam => String(exam.exam_id));
+            const tagSet = new Set(annotationTags);
+            examIds.forEach(examId => {{
+                getExamAnnotations(examId).forEach(tag => tagSet.add(tag));
+                getAutoSuggestions(examId).forEach(entry => tagSet.add(entry.tag));
+            }});
+
+            const rows = [];
+            [...tagSet].sort().forEach(tag => {{
+                let tp = 0;
+                let fp = 0;
+                let fn = 0;
+                let tn = 0;
+                examIds.forEach(examId => {{
+                    const hasGT = getExamAnnotations(examId).includes(tag);
+                    const hasPred = getAutoSuggestions(examId).some(entry => entry.tag === tag);
+                    if (hasGT && hasPred) tp++;
+                    else if (!hasGT && hasPred) fp++;
+                    else if (hasGT && !hasPred) fn++;
+                    else tn++;
+                }});
+                if (tp === 0 && fp === 0 && fn === 0) {{
+                    return;
+                }}
+                rows.push({{
+                    tag,
+                    tp,
+                    fp,
+                    fn,
+                    tn,
+                    precision: (tp + fp) > 0 ? tp / (tp + fp) : null,
+                    recall: (tp + fn) > 0 ? tp / (tp + fn) : null
+                }});
+            }});
+
+            return rows.sort((a, b) => (
+                (b.tp - a.tp) ||
+                (b.fp - a.fp) ||
+                a.tag.localeCompare(b.tag)
+            ));
+        }}
+
+        function formatMetric(value) {{
+            return value === null ? 'n/a' : (value * 100).toFixed(1) + '%';
+        }}
+
+        function renderAutoReviewContent() {{
+            const content = document.getElementById('autoReviewContent');
+            if (!content) return;
+            if (Object.keys(autoSuggestions).length === 0) {{
+                content.innerHTML = '<p style="color: #9cdcfe;">No auto suggestion run is loaded.</p>';
+                return;
+            }}
+
+            const rows = computeAutoComparisonRows(allExams);
+            const suggestedVisible = allExams.filter(exam => hasAutoSuggestions(exam.exam_id)).length;
+            let html = '';
+            html += '<p><strong>run:</strong> ' + (autoSuggestionRun.run_id || '(unnamed)') + '</p>';
+            html += '<p><strong>model:</strong> ' + (autoSuggestionRun.model || '(not recorded)') + '</p>';
+            html += '<p><strong>pool:</strong> ' + allExams.length + ' loaded exams, ' + suggestedVisible + ' with model suggestions</p>';
+            html += '<p style="color: #858585;">Metrics below are computed on the currently loaded gallery pool.</p>';
+            if (rows.length === 0) {{
+                html += '<p style="color: #9cdcfe;">No overlapping GT/predicted tags in the current pool yet.</p>';
+                content.innerHTML = html;
+                return;
+            }}
+
+            html += '<table class="cutflow-table"><thead><tr>';
+            html += '<th>tag</th><th>TP</th><th>FP</th><th>FN</th><th>TN</th><th>precision</th><th>recall</th>';
+            html += '</tr></thead><tbody>';
+            rows.forEach(row => {{
+                html += '<tr>';
+                html += '<td>' + row.tag + '</td>';
+                html += '<td style="color: #6bcc6b;">' + row.tp + '</td>';
+                html += '<td style="color: ' + (row.fp > 0 ? '#e06b6b' : '#d4d4d4') + ';">' + row.fp + '</td>';
+                html += '<td style="color: ' + (row.fn > 0 ? '#e5c07b' : '#d4d4d4') + ';">' + row.fn + '</td>';
+                html += '<td>' + row.tn + '</td>';
+                html += '<td>' + formatMetric(row.precision) + '</td>';
+                html += '<td>' + formatMetric(row.recall) + '</td>';
+                html += '</tr>';
+            }});
+            html += '</tbody></table>';
+            content.innerHTML = html;
+        }}
+
+        function showAutoReview() {{
+            const modal = document.getElementById('autoReviewModal');
+            modal.style.display = 'block';
+            renderAutoReviewContent();
+        }}
+
+        function closeAutoReview() {{
+            document.getElementById('autoReviewModal').style.display = 'none';
+        }}
+
+        async function acceptVisibleAutoSuggestions() {{
+            const visibleExamIds = filteredExams
+                .map(exam => String(exam.exam_id))
+                .filter(examId => hasAutoSuggestions(examId));
+            if (visibleExamIds.length === 0) {{
+                alert('No visible exams have auto suggestions.');
+                return;
+            }}
+
+            const ok = confirm(
+                'Accept model suggestions for ' + visibleExamIds.length + ' currently visible exams? ' +
+                'This will add suggested tags into accepted annotations and preserve auto provenance.'
+            );
+            if (!ok) return;
+
+            try {{
+                const doneBefore = {{}};
+                visibleExamIds.forEach(examId => {{
+                    doneBefore[examId] = isDoneExam(examId);
+                }});
+
+                const response = await fetch('/accept-auto-suggestions', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ exam_ids: visibleExamIds }})
+                }});
+                const data = await response.json();
+                if (!response.ok || data.error) {{
+                    throw new Error(data.error || ('HTTP ' + response.status));
+                }}
+
+                const [serverAnnotations, serverQCData] = await Promise.all([
+                    fetch('/load-annotations').then(resp => resp.json()),
+                    fetch('/load-qc').then(resp => resp.json())
+                ]);
+                annotations = normalizeAnnotationMap(serverAnnotations);
+                syncQCFromServerMap(serverQCData);
+                retainedAnnotatedExamIds = new Set(
+                    [...retainedAnnotatedExamIds, ...visibleExamIds]
+                );
+                visibleExamIds.forEach(examId => {{
+                    updateDoneCounters(Boolean(doneBefore[examId]), isDoneExam(examId));
+                    syncAnnotatedExamPoolForExam(examId);
+                    syncSessionAnnotatedExam(examId);
+                }});
+                updateManualQCIndicator();
+                renderAutoReviewContent();
+                applyFilters();
+                alert(
+                    'Accepted auto suggestions for ' + data.updated_exams +
+                    ' exams (' + data.added_tags + ' new tags).'
+                );
+            }} catch (error) {{
+                console.error('failed to accept visible auto suggestions:', error);
+                alert('Failed to accept auto suggestions: ' + (error.message || error));
+            }}
+        }}
+
+        function getAnnotationFilterAliases(tag) {{
+            const aliases = [];
+            availableFilters.forEach(filter => {{
+                if (!filter || filter.kind !== 'annotation') return;
+                if (filter.name !== `Annotation: ${{tag}}`) return;
+                if (filter.token) {{
+                    aliases.push('@' + String(filter.token).replace(/^@+/, ''));
+                }}
+                if (filter.filename) {{
+                    aliases.push('@' + String(filter.filename).replace(/^@+/, ''));
+                }}
+                if (Array.isArray(filter.aliases)) {{
+                    filter.aliases.forEach(alias => {{
+                        const normalized = String(alias || '').trim().replace(/^@+/, '');
+                        if (normalized) {{
+                            aliases.push('@' + normalized);
+                        }}
+                    }});
+                }}
+            }});
+
+            if (aliases.length === 0) {{
+                const fallbackToken = filterTokenFromName(tag);
+                if (fallbackToken) {{
+                    aliases.push('@' + fallbackToken);
+                    aliases.push('@annotation_' + fallbackToken);
+                }}
+            }}
+
+            return [...new Set(aliases)];
+        }}
+
+        function replaceRenamedAnnotationFilterTokens(oldTag, newTag) {{
+            const input = document.getElementById('searchBox');
+            if (!input) return;
+
+            let updated = input.value;
+            const oldAliases = getAnnotationFilterAliases(oldTag);
+            const newAliases = getAnnotationFilterAliases(newTag);
+            const replacement = newAliases[0] || ('@' + filterTokenFromName(newTag));
+
+            oldAliases.forEach(alias => {{
+                if (!alias) return;
+                updated = updated.split(alias).join(replacement);
+            }});
+
+            if (updated !== input.value) {{
+                input.value = updated;
+            }}
+
+            const select = document.getElementById('filterSelect');
+            if (select) {{
+                select.value = '';
+            }}
         }}
 
         function buildAnnotationHotkeys(tags) {{
@@ -3039,6 +4017,8 @@ def generate_gallery(
                     return;
                 }}
                 delete annotations[exam.exam_id];
+                retainedAnnotatedExamIds.delete(String(exam.exam_id));
+                syncSessionAnnotatedExam(exam.exam_id);
                 saveAnnotations();
             }}
             const wasDone = isDoneExam(exam.exam_id);
@@ -3061,6 +4041,13 @@ def generate_gallery(
             annotationTags.forEach(tag => {{
                 const hotkey = annotationHotkeys.tagToKey[tag];
                 const isActive = examAnnotations.includes(tag);
+                const row = document.createElement('div');
+                row.style.cssText = `
+                    display: flex;
+                    gap: 10px;
+                    align-items: stretch;
+                    margin-bottom: 10px;
+                `;
                 const btn = document.createElement('button');
                 const hotkeyLabel = hotkey || '';
                 if (hotkeyLabel) {{
@@ -3071,9 +4058,8 @@ def generate_gallery(
                 btn.dataset.tag = tag;
                 btn.style.cssText = `
                     display: block;
-                    width: 100%;
+                    flex: 1;
                     padding: 12px 16px;
-                    margin-bottom: 10px;
                     font-size: 14px;
                     text-align: left;
                     border: 1px solid ${{isActive ? '#4ec9b0' : '#3e3e42'}};
@@ -3093,7 +4079,26 @@ def generate_gallery(
                 btn.onclick = () => {{
                     toggleAnnotation(tag);
                 }};
-                tagsList.appendChild(btn);
+
+                const editBtn = document.createElement('button');
+                editBtn.textContent = 'edit';
+                editBtn.style.cssText = `
+                    padding: 12px 14px;
+                    font-size: 13px;
+                    border: 1px solid #3e3e42;
+                    border-radius: 4px;
+                    background-color: #252526;
+                    color: #d4d4d4;
+                    cursor: pointer;
+                    white-space: nowrap;
+                `;
+                editBtn.onclick = () => {{
+                    renameAnnotationTag(tag);
+                }};
+
+                row.appendChild(btn);
+                row.appendChild(editBtn);
+                tagsList.appendChild(row);
             }});
         }}
 
@@ -3111,33 +4116,36 @@ def generate_gallery(
             input.value = '';
         }}
 
-        function closeAnnotationModalAndAdvance() {{
-            if (filteredExams.length === 0) {{
-                closeAnnotationModal();
-                return;
-            }}
+        function closeAnnotationModalAndStay() {{
             closeAnnotationModal();
-            advanceAfterQCAction();
         }}
         
         function toggleAnnotation(tag) {{
             const exam = filteredExams[currentIndex];
+            const examId = String(exam.exam_id);
             const wasDone = isDoneExam(exam.exam_id);
-            if (!annotations[exam.exam_id]) {{
-                annotations[exam.exam_id] = [];
+            if (!annotations[examId]) {{
+                annotations[examId] = [];
             }}
             
-            const idx = annotations[exam.exam_id].indexOf(tag);
+            const idx = annotations[examId].indexOf(tag);
             if (idx >= 0) {{
-                annotations[exam.exam_id].splice(idx, 1);
-                if (annotations[exam.exam_id].length === 0) {{
-                    delete annotations[exam.exam_id];
+                annotations[examId].splice(idx, 1);
+                if (annotations[examId].length === 0) {{
+                    delete annotations[examId];
                 }}
             }} else {{
-                annotations[exam.exam_id].push(tag);
+                annotations[examId].push(tag);
+            }}
+            if (hasAnnotationFindings(examId)) {{
+                retainedAnnotatedExamIds.add(examId);
+            }} else {{
+                retainedAnnotatedExamIds.delete(examId);
             }}
             const willBeDone = isDoneExam(exam.exam_id);
             updateDoneCounters(wasDone, willBeDone);
+            syncAnnotatedExamPoolForExam(exam.exam_id);
+            syncSessionAnnotatedExam(exam.exam_id);
             
             saveAnnotations();
             updateManualQCIndicator();
@@ -3145,10 +4153,52 @@ def generate_gallery(
             renderAnnotationTagsList();
             updateView();
         }}
+
+        function renameAnnotationTag(oldTag) {{
+            const proposed = prompt('rename annotation tag:', oldTag);
+            if (proposed === null) return;
+
+            const newTag = canonicalizeAnnotationTag(proposed);
+            if (newTag === '') {{
+                alert('annotation tag cannot be empty');
+                return;
+            }}
+            if (newTag === oldTag) {{
+                return;
+            }}
+
+            annotationTags = normalizeAnnotationTagCatalog(
+                annotationTags.map(tag => (tag === oldTag ? newTag : tag))
+            );
+
+            Object.keys(annotations).forEach(examId => {{
+                const currentTags = Array.isArray(annotations[examId]) ? annotations[examId] : [];
+                const renamedTags = [];
+                currentTags.forEach(tag => {{
+                    const canonical = canonicalizeAnnotationTag(tag === oldTag ? newTag : tag);
+                    if (canonical && !renamedTags.includes(canonical)) {{
+                        renamedTags.push(canonical);
+                    }}
+                }});
+                if (renamedTags.length > 0) {{
+                    annotations[examId] = renamedTags;
+                }} else {{
+                    delete annotations[examId];
+                }}
+            }});
+
+            replaceRenamedAnnotationFilterTokens(oldTag, newTag);
+            annotationHotkeys = buildAnnotationHotkeys(annotationTags);
+            saveAnnotationTags();
+            saveAnnotations();
+            updateManualQCIndicator();
+            renderAnnotationTagsList();
+            updateView();
+        }}
         
         function addNewAnnotationTag() {{
             const input = document.getElementById('newAnnotationInput');
-            const newTag = input.value.trim();
+            const newTag = canonicalizeAnnotationTag(input.value);
             
             if (newTag === '') return;
             
@@ -3236,6 +4286,28 @@ def generate_gallery(
                 }});
         }}
 
+        function renderLoadingStatus(title, detail, progress = null) {{
+            let progressHtml;
+            if (Number.isFinite(progress)) {{
+                const pct = Math.max(0, Math.min(100, Math.round(progress * 100)));
+                progressHtml =
+                    '<div class="progress-shell">' +
+                        '<div class="progress-bar" style="width: ' + pct + '%;"></div>' +
+                    '</div>' +
+                    '<p style="font-size: 12px; color: #9cdcfe; margin: 8px 0 0 0;">' + pct + '%</p>';
+            }} else {{
+                progressHtml = '<div class="progress-shell"><div class="progress-bar indeterminate"></div></div>';
+            }}
+            return '<p style="color: #4ec9b0; font-weight: bold; margin: 0;">' + title + '</p>' +
+                '<p style="font-size: 12px; color: #858585; margin: 10px 0 0 0;">' + detail + '</p>' +
+                progressHtml;
+        }}
+
+        function renderReadyStatus(title, detail) {{
+            return '<p style="color: #4ec9b0; font-weight: bold; margin: 0;">' + title + '</p>' +
+                '<p style="font-size: 12px; color: #858585; margin: 10px 0 0 0;">' + detail + '</p>';
+        }}
+
         function pollLoadMoreStatus(loadMoreBtn, statusDiv, attempt = 0) {{
             const maxAttempts = 600;  // ~15 minutes at 1.5s
             fetch('/load-more-status')
@@ -3250,8 +4322,7 @@ def generate_gallery(
                     }}
 
                     if (status.ready) {{
-                        statusDiv.innerHTML = '<p style="color: #4ec9b0; font-weight: bold; margin: 0;">✓ Next batch ready!</p>' +
-                            '<p style="font-size: 12px; color: #858585; margin: 10px 0 0 0;">Reloading now...</p>';
+                        statusDiv.innerHTML = renderReadyStatus('✓ Next batch ready!', 'Reloading now...');
                         setTimeout(() => {{
                             location.reload();
                         }}, 200);
@@ -3260,15 +4331,20 @@ def generate_gallery(
 
                     if (status.in_progress) {{
                         const target = status.next_batch ? status.next_batch.toLocaleString() : 'more';
-                        statusDiv.innerHTML = '<p style="color: #4ec9b0; font-weight: bold; margin: 0;">⏳ Generating ' + target + ' exams...</p>' +
-                            '<p style="font-size: 12px; color: #858585; margin: 10px 0 0 0;">This may take a minute. Page will reload when ready.</p>';
+                        statusDiv.innerHTML = renderLoadingStatus(
+                            status.message || ('⏳ Generating ' + target + ' exams...'),
+                            'This may take a minute. Page will reload when ready.',
+                            status.progress
+                        );
                     }}
 
                     if (attempt >= maxAttempts) {{
                         loadMoreBtn.disabled = false;
                         loadMoreBtn.textContent = '🔄 Load More Exams [l]';
-                        statusDiv.innerHTML = '<p style="color: #f0d060; font-weight: bold; margin: 0;">Still generating in background.</p>' +
-                            '<p style="font-size: 12px; color: #858585; margin: 10px 0 0 0;">Wait a bit and click load more again to check status.</p>';
+                        statusDiv.innerHTML = renderReadyStatus(
+                            'Still generating in background.',
+                            'Wait a bit and click load more again to check status.'
+                        );
                         return;
                     }}
 
@@ -3303,8 +4379,10 @@ def generate_gallery(
             loadMoreBtn.disabled = true;
             loadMoreBtn.textContent = '⏳ Loading...';
             statusDiv.style.display = 'block';
-            statusDiv.innerHTML = '<p style="color: #4ec9b0; font-weight: bold; margin: 0;">⏳ Saving latest QC decisions...</p>' +
-                '<p style="font-size: 12px; color: #858585; margin: 10px 0 0 0;">Starting load-more right after save completes.</p>';
+            statusDiv.innerHTML = renderLoadingStatus(
+                '⏳ Saving latest QC decisions...',
+                'Starting load-more right after save completes.'
+            );
 
             try {{
                 await saveQCToServer();
@@ -3317,8 +4395,10 @@ def generate_gallery(
                 
                 console.log('Load more triggered:', data);
 
-                statusDiv.innerHTML = '<p style="color: #4ec9b0; font-weight: bold; margin: 0;">⏳ Generating more exams...</p>' +
-                    '<p style="font-size: 12px; color: #858585; margin: 10px 0 0 0;">This may take a minute. Page will reload when ready.</p>';
+                statusDiv.innerHTML = renderLoadingStatus(
+                    '⏳ Generating more exams...',
+                    'This may take a minute. Page will reload when ready.'
+                );
                 pollLoadMoreStatus(loadMoreBtn, statusDiv);
             }} catch (error) {{
                 console.error('Failed to load more:', error);
@@ -3329,16 +4409,11 @@ def generate_gallery(
             }}
         }}
         
-        async function loadFilterBatch() {{
-            const select = document.getElementById('filterSelect');
-            const filterName = select.value;
+        async function loadFilterBatchForSelection(filterName, filterLabel) {{
             if (!filterName) {{
                 alert('Select a filter from the dropdown first');
                 return;
             }}
-
-            const batchSize = prompt('How many matching exams to load?', '{max_exams or 100}');
-            if (!batchSize) return;
 
             // immediate visual feedback
             const btn = document.querySelector('[onclick="loadFilterBatch()"]');
@@ -3349,18 +4424,18 @@ def generate_gallery(
             }}
             const stats = document.getElementById('stats');
             const origStats = stats ? stats.textContent : '';
-            if (stats) stats.textContent = '⏳ Saving QC & requesting ' + batchSize + ' ' + filterName.replace(/_/g, ' ') + ' exams...';
+            if (stats) stats.textContent = '⏳ Saving QC & requesting all ' + filterLabel + ' exams...';
 
             try {{
                 await saveQCToServer();
-                const response = await fetch('/load-filter-batch?filter=' + encodeURIComponent(filterName) + '&batch_size=' + parseInt(batchSize, 10));
+                const response = await fetch('/load-filter-batch?filter=' + encodeURIComponent(filterName));
                 const data = await response.json();
                 if (!response.ok || data.error) {{
                     throw new Error(data.error || ('HTTP ' + response.status));
                 }}
                 console.log('Filter batch triggered:', data);
 
-                if (stats) stats.textContent = '⏳ Generating ' + batchSize + ' ' + filterName.replace(/_/g, ' ') + ' exams... page will reload when ready';
+                if (stats) stats.textContent = '⏳ Generating all ' + filterLabel + ' exams... page will reload when ready';
 
                 // reuse the load-more polling UI
                 const loadMoreBtn = document.getElementById('loadMoreBtn');
@@ -3368,8 +4443,10 @@ def generate_gallery(
                 if (loadMoreBtn) loadMoreBtn.disabled = true;
                 if (statusDiv) {{
                     statusDiv.style.display = 'block';
-                    statusDiv.innerHTML = '<p style="color: #4ec9b0; font-weight: bold; margin: 0;">⏳ ' + data.message + '</p>' +
-                        '<p style="font-size: 12px; color: #858585; margin: 10px 0 0 0;">Page will reload when ready.</p>';
+                    statusDiv.innerHTML = renderLoadingStatus(
+                        '⏳ ' + data.message,
+                        'Page will reload when ready.'
+                    );
                 }}
 
                 pollLoadMoreStatus(loadMoreBtn || document.createElement('button'), statusDiv || document.createElement('div'));
@@ -3381,16 +4458,61 @@ def generate_gallery(
             }}
         }}
 
+        async function loadFilterBatch() {{
+            const select = document.getElementById('filterSelect');
+            const filterName = select.value;
+            if (!filterName) {{
+                alert('Select a filter from the dropdown first');
+                return;
+            }}
+
+            const selectedOption = select.options[select.selectedIndex];
+            const filterLabel = selectedOption ? selectedOption.textContent : filterName.replace(/_/g, ' ');
+            const filterKind =
+                (selectedOption && selectedOption.dataset && selectedOption.dataset.kind) ||
+                'auto';
+            if (filterKind.startsWith('annotation')) {{
+                await useSelectedFilterToken();
+                return;
+            }}
+            await loadFilterBatchForSelection(filterName, filterLabel);
+        }}
+
+        async function useSessionAnnotatedFilter() {{
+            const count = getSessionAnnotatedExamIds().length;
+            if (count === 0) {{
+                alert('No exams annotated in this browser session yet.');
+                return;
+            }}
+
+            try {{
+                await loadAvailableFilters();
+                const select = document.getElementById('filterSelect');
+                if (select) {{
+                    select.value = sessionAnnotatedFilterFilename;
+                }}
+                replaceFilterBox('@' + sessionAnnotatedFilterFilename, {{ focus: false }});
+                applyFilters();
+            }} catch (error) {{
+                alert('Failed to load session filter: ' + (error.message || error));
+                console.error('Session filter load error:', error);
+            }}
+        }}
+
         function loadAvailableFilters() {{
-            fetch('/list-filters')
+            return fetch('/list-filters')
                 .then(response => response.json())
                 .then(filters => {{
                     const select = document.getElementById('filterSelect');
-                    availableFilters = Array.isArray(filters) ? filters : [];
+                    const serverFilters = Array.isArray(filters) ? filters : [];
+                    const clientFilters = buildClientOnlyFilters();
+                    availableFilters = [...serverFilters, ...clientFilters];
                     filtersLoaded = true;
 
                     // reset alias maps when reloading list
                     Object.keys(filterTokenToFilename).forEach(token => delete filterTokenToFilename[token]);
+                    Object.keys(filterKindsByFilename).forEach(filename => delete filterKindsByFilename[filename]);
+                    Object.keys(filterSetsByFilename).forEach(filename => delete filterSetsByFilename[filename]);
 
                     // keep the default option
                     select.innerHTML = '<option value="">Load filter list...</option>';
@@ -3398,13 +4520,26 @@ def generate_gallery(
                         const option = document.createElement('option');
                         option.value = filter.filename;
                         option.textContent = filter.name;
+                        option.dataset.token = filter.token || filterTokenFromFilename(filter.filename);
+                        option.dataset.kind = filter.kind || 'auto';
+                        filterKindsByFilename[filter.filename] = option.dataset.kind;
+                        if (Array.isArray(filter.clientExamIds)) {{
+                            filterSetsByFilename[filter.filename] = new Set(
+                                filter.clientExamIds.map(examId => String(examId))
+                            );
+                        }}
                         select.appendChild(option);
                         registerFilterAliases(filter);
                     }});
+                    updateSessionAnnotatedButton();
                     console.log(`Loaded ${{availableFilters.length}} filter options`);
+                    if (document.getElementById('searchBox').value.trim() !== '') {{
+                        applyFilters();
+                    }}
                 }})
                 .catch(error => {{
                     console.error('Failed to load filter list:', error);
+                    throw error;
                 }});
         }}
 
@@ -3437,12 +4572,31 @@ def generate_gallery(
                 aliases.add(nameToken);
                 aliases.add('@' + nameToken);
             }}
+            if (Array.isArray(filter.aliases)) {{
+                filter.aliases.forEach(alias => {{
+                    const normalizedAlias = normalizeFilterToken(alias);
+                    if (normalizedAlias) {{
+                        aliases.add(normalizedAlias);
+                        aliases.add('@' + normalizedAlias.replace(/^@+/, ''));
+                    }}
+                }});
+            }}
             aliases.forEach(alias => {{
                 const key = normalizeFilterToken(alias);
                 if (key) {{
                     filterTokenToFilename[key] = filter.filename;
                 }}
             }});
+        }}
+
+        function invalidateFilterCaches() {{
+            availableFilters = [];
+            filtersLoaded = false;
+            Object.keys(filterTokenToFilename).forEach(token => delete filterTokenToFilename[token]);
+            Object.keys(filterKindsByFilename).forEach(filename => delete filterKindsByFilename[filename]);
+            Object.keys(filterSetsByFilename).forEach(filename => delete filterSetsByFilename[filename]);
+            pendingFilterLoads.clear();
+            unresolvedFilterWarnings.clear();
         }}
 
         function resolveFilterFilenameFromToken(token) {{
@@ -3454,6 +4608,85 @@ def generate_gallery(
                 return filterTokenToFilename[normalized.slice(1)] || null;
             }}
             return filterTokenToFilename['@' + normalized] || null;
+        }}
+
+        function isAnnotationFilterFilename(filename) {{
+            return String(filterKindsByFilename[filename] || '').startsWith('annotation');
+        }}
+
+        function mergeExamPools(primaryExams, secondaryExams) {{
+            const merged = [...primaryExams];
+            const seen = new Set(primaryExams.map(exam => String(exam.exam_id)));
+            secondaryExams.forEach(exam => {{
+                const examId = String(exam.exam_id);
+                if (!seen.has(examId)) {{
+                    seen.add(examId);
+                    merged.push(exam);
+                }}
+            }});
+            return merged;
+        }}
+
+        function findKnownExamRecord(examId) {{
+            const examIdStr = String(examId);
+            const pools = [filteredExams, allExams, globalAnnotatedExams, globalAutoSuggestedExams];
+            for (const pool of pools) {{
+                const match = pool.find(exam => String(exam.exam_id) === examIdStr);
+                if (match) {{
+                    return {{ ...match }};
+                }}
+            }}
+            return null;
+        }}
+
+        function syncAnnotatedExamPoolForExam(examId) {{
+            const examIdStr = String(examId);
+            const idx = globalAnnotatedExams.findIndex(exam => String(exam.exam_id) === examIdStr);
+            if (hasAnnotationFindings(examIdStr)) {{
+                const record = findKnownExamRecord(examIdStr);
+                if (!record) {{
+                    return;
+                }}
+                if (idx >= 0) {{
+                    globalAnnotatedExams[idx] = record;
+                }} else {{
+                    globalAnnotatedExams.push(record);
+                }}
+            }} else if (idx >= 0) {{
+                globalAnnotatedExams.splice(idx, 1);
+            }}
+        }}
+
+        function filterUsesExpandedUniverse(filename) {{
+            const kind = String(filterKindsByFilename[filename] || '');
+            return kind.startsWith('annotation') || kind.startsWith('auto_suggestion');
+        }}
+
+        function expressionUsesExpandedUniverse(expression) {{
+            const filterExpr = String(expression || '').trim();
+            if (filterExpr === '' || !filterExpr.includes('@')) {{
+                return false;
+            }}
+            try {{
+                const tokens = tokenizeFilterExpression(filterExpr);
+                return tokens.some(token => {{
+                    if (token.type !== 'TERM') return false;
+                    const filename = resolveFilterFilenameFromToken(token.value);
+                    return Boolean(filename && filterUsesExpandedUniverse(filename));
+                }});
+            }} catch (error) {{
+                return false;
+            }}
+        }}
+
+        function getFilterSourceExams(filterExpr) {{
+            if (!expressionUsesExpandedUniverse(filterExpr)) {{
+                return [...allExams];
+            }}
+            return mergeExamPools(
+                mergeExamPools(allExams, globalAnnotatedExams),
+                globalAutoSuggestedExams
+            );
         }}
 
         async function ensureFilterSetLoaded(filename) {{
@@ -3471,8 +4704,27 @@ def generate_gallery(
             return examSet;
         }}
 
-        function appendTokenToFilterBox(token) {{
+        function ensureFilterSetLoadedAsync(filename) {{
+            if (!filename || filterSetsByFilename[filename] || pendingFilterLoads.has(filename)) {{
+                return;
+            }}
+            pendingFilterLoads.add(filename);
+            ensureFilterSetLoaded(filename)
+                .then(() => {{
+                    unresolvedFilterWarnings.delete(filename);
+                    applyFilters();
+                }})
+                .catch(error => {{
+                    console.error('Failed to load filter set:', filename, error);
+                }})
+                .finally(() => {{
+                    pendingFilterLoads.delete(filename);
+                }});
+        }}
+
+        function appendTokenToFilterBox(token, options = {{}}) {{
             const input = document.getElementById('searchBox');
+            const shouldFocus = options.focus !== false;
             const existing = input.value.trim();
             if (existing === '') {{
                 input.value = token;
@@ -3481,12 +4733,28 @@ def generate_gallery(
             }} else {{
                 input.value += ' & ' + token;
             }}
-            input.focus();
+            if (shouldFocus) {{
+                input.focus();
+            }} else {{
+                input.blur();
+            }}
         }}
 
-        async function insertSelectedFilterToken() {{
+        function replaceFilterBox(token, options = {{}}) {{
+            const input = document.getElementById('searchBox');
+            const shouldFocus = options.focus !== false;
+            input.value = token;
+            if (shouldFocus) {{
+                input.focus();
+            }} else {{
+                input.blur();
+            }}
+        }}
+
+        async function applySelectedFilterToken(options = {{}}) {{
             const select = document.getElementById('filterSelect');
             const filename = select.value;
+            const appendMode = options.append === true;
 
             if (!filename) {{
                 alert('Please select a filter from the dropdown');
@@ -3495,14 +4763,45 @@ def generate_gallery(
 
             try {{
                 const examSet = await ensureFilterSetLoaded(filename);
-                const token = '@' + filterTokenFromFilename(filename);
-                appendTokenToFilterBox(token);
+                const selectedOption = select.options[select.selectedIndex];
+                const tokenStem =
+                    (selectedOption && selectedOption.dataset && selectedOption.dataset.token) ||
+                    filterTokenFromFilename(filename);
+                const filterKind =
+                    (selectedOption && selectedOption.dataset && selectedOption.dataset.kind) ||
+                    'auto';
+                const filterLabel =
+                    (selectedOption && selectedOption.textContent) ||
+                    filename.replace(/_/g, ' ');
+                const token = '@' + tokenStem;
+                if (appendMode) {{
+                    appendTokenToFilterBox(token);
+                }} else {{
+                    replaceFilterBox(token, {{ focus: false }});
+                }}
                 applyFilters();
+                if (filterKind.startsWith('annotation')) {{
+                    const stats = document.getElementById('stats');
+                    if (stats && examSet.size > 0) {{
+                        const currentStats = stats.textContent;
+                        if (!currentStats.includes('annotated universe')) {{
+                            stats.textContent = currentStats + ' | annotated universe';
+                        }}
+                    }}
+                }}
                 console.log(`Loaded filter '${{filename}}' with ${{examSet.size}} exam IDs and inserted token '${{token}}'`);
             }} catch (error) {{
                 alert('Failed to load filter: ' + (error.message || error));
                 console.error('Filter load error:', error);
             }}
+        }}
+
+        async function insertSelectedFilterToken() {{
+            await applySelectedFilterToken({{ append: true }});
+        }}
+
+        async function useSelectedFilterToken() {{
+            await applySelectedFilterToken({{ append: false }});
         }}
 
         function clearFilterExpression() {{
@@ -3640,10 +4939,11 @@ def generate_gallery(
                 if (filename) {{
                     const filterSet = filterSetsByFilename[filename];
                     if (!filterSet) {{
+                        ensureFilterSetLoadedAsync(filename);
                         if (!unresolvedFilterWarnings.has(filename)) {{
                             unresolvedFilterWarnings.add(filename);
                             console.warn(
-                                `Filter token '${{node.value}}' maps to '${{filename}}' but list is not loaded yet. Select it once from the dropdown to load.`
+                                `Filter token '${{node.value}}' maps to '${{filename}}' and is loading now.`
                             );
                         }}
                         return false;
@@ -3670,8 +4970,10 @@ def generate_gallery(
             // remember current exam before filtering
             const currentExam = filteredExams.length > 0 ? filteredExams[currentIndex] : null;
             
-            // start with all exams
-            let exams = [...allExams];
+            // annotation/auto-suggestion filters can search beyond the current batch
+            const sourceExams = getFilterSourceExams(filterExpr);
+            const includeAnnotatedInResults = expressionUsesExpandedUniverse(filterExpr);
+            let exams = [...sourceExams];
 
             // apply expression filter (supports &, |, ~; plain text still works)
             if (filterExpr !== '') {{
@@ -3692,7 +4994,7 @@ def generate_gallery(
 
             // skip already-reviewed exams (good / annotated / auto_excluded based on qcSkipStatus)
             exams = exams.filter(exam => {{
-                return !shouldSkipExam(exam.exam_id);
+                return !shouldSkipExam(exam.exam_id, {{ includeAnnotated: includeAnnotatedInResults }});
             }});
             
             filteredExams = exams;
@@ -3707,10 +5009,10 @@ def generate_gallery(
                 }} else {{
                     // current exam filtered out, find next exam from original position
                     // look for the first exam in new filtered list that comes after the old current exam
-                    const currentExamIdxInAll = allExams.findIndex(e => e.exam_id === currentExam.exam_id);
+                    const currentExamIdxInAll = sourceExams.findIndex(e => e.exam_id === currentExam.exam_id);
                     let foundNext = false;
-                    for (let i = currentExamIdxInAll + 1; i < allExams.length; i++) {{
-                        const nextExamIdx = filteredExams.findIndex(e => e.exam_id === allExams[i].exam_id);
+                    for (let i = currentExamIdxInAll + 1; i < sourceExams.length; i++) {{
+                        const nextExamIdx = filteredExams.findIndex(e => e.exam_id === sourceExams[i].exam_id);
                         if (nextExamIdx >= 0) {{
                             currentIndex = nextExamIdx;
                             foundNext = true;
@@ -3787,24 +5089,30 @@ def generate_gallery(
                 stats.textContent = '0 exams';
                 prevBtn.disabled = true;
                 nextBtn.disabled = true;
+                updateAutoSuggestionButton();
                 return;
             }}
             
             const exam = filteredExams[currentIndex];
             const currentStatus = getStatus(exam.exam_id);
-            const totalRemaining = remainingToQC - batchQCCount;
+            const totalRemaining = Math.max(remainingToQC - batchQCCount, 0);
+            const queueRemaining = Math.max(filteredExams.length - currentIndex - 1, 0);
+            const displayRemaining = totalRemaining > 0 ? totalRemaining : queueRemaining;
             
             // count QC statuses for exams in current gallery
-            const qcCounts = {{good: 0, annotated: 0, pending: 0}};
+            const qcCounts = {{good: 0, annotated: 0, pending: 0, auto_suggested: 0}};
             allExams.forEach(exam => {{
                 const status = getStatus(exam.exam_id);
                 if (status === 'good') qcCounts.good++;
                 else if (hasAnnotationFindings(exam.exam_id)) qcCounts.annotated++;
                 else qcCounts.pending++;
+                if (hasAutoSuggestions(exam.exam_id)) qcCounts.auto_suggested++;
             }});
             
             const examAnnotations = getExamAnnotations(exam.exam_id);
             const hasAnnotations = examAnnotations.length > 0;
+            const autoExamSuggestions = getAutoSuggestions(exam.exam_id);
+            const hasAutoSuggestion = autoExamSuggestions.length > 0;
             
             let annotationPills = '';
             if (hasAnnotations) {{
@@ -3815,6 +5123,19 @@ def generate_gallery(
                         'font-size: 12px; color: #4ec9b0;">' + tag + '</span>';
                 }});
             }}
+
+            let autoSuggestionHtml = '';
+            if (hasAutoSuggestion) {{
+                autoSuggestionHtml = '<div style="margin-top: 8px; color: #e5c07b;">' +
+                    '<strong>auto:</strong> ' +
+                    autoExamSuggestions.map(entry => {{
+                        const score = Number.isFinite(entry.score) ? ' (' + entry.score.toFixed(2) + ')' : '';
+                        return '<span style="display: inline-block; padding: 1px 8px; margin: 0 3px; ' +
+                            'background-color: #2a2110; border: 1px solid #e5c07b; border-radius: 12px; ' +
+                            'font-size: 12px; color: #e5c07b;">' + entry.tag + score + '</span>';
+                    }}).join('') +
+                '</div>';
+            }}
             
             viewer.innerHTML = 
                 '<div class="exam-info">' +
@@ -3822,6 +5143,7 @@ def generate_gallery(
                     '<strong>exam:</strong> ' + exam.exam_id + ' | ' +
                     '<strong>accession:</strong> ' + exam.accession +
                     annotationPills +
+                    autoSuggestionHtml +
                 '</div>' +
                 '<div class="qc-controls">' +
                     '<button class="qc-button good' + (currentStatus === 'good' ? ' active' : '') + '" ' +
@@ -3844,7 +5166,7 @@ def generate_gallery(
             let rateText = '';
             if (batchQCCount > 0 && batchElapsedMin > 0.01) {{
                 const rate = batchQCCount / batchElapsedMin;
-                const remainingNow = totalRemaining;
+                const remainingNow = displayRemaining;
                 const etaMin = remainingNow / rate;
                 let etaStr;
                 if (etaMin < 1) etaStr = '<1 min';
@@ -3853,13 +5175,15 @@ def generate_gallery(
                 rateText = ' | ' + rate.toFixed(1) + '/min, ETA ' + etaStr + ' (' + remainingNow + ' remaining)';
             }}
             
-            statsText += ' | ' + totalRemaining + ' remaining | ' +
+            statsText += ' | ' + displayRemaining + ' remaining | ' +
                          'qc: ' + qcCounts.good + ' good, ' + qcCounts.annotated + ' annotated, ' + 
-                         qcCounts.pending + ' pending' + rateText;
+                         qcCounts.pending + ' pending | auto: ' + qcCounts.auto_suggested + ' suggested' +
+                         rateText;
             stats.textContent = statsText;
             
             prevBtn.disabled = currentIndex === 0;
             nextBtn.disabled = currentIndex === filteredExams.length - 1;
+            updateAutoSuggestionButton();
         }}
         
         // keyboard navigation
@@ -3868,14 +5192,15 @@ def generate_gallery(
             const annotationModal = document.getElementById('annotationModal');
             const modalIsOpen = annotationModal.style.display === 'block';
 
-            // esc closes modal overlays; for annotation modal, also advances to next exam
+            // esc closes modal overlays
             if (e.key === 'Escape') {{
                 if (modalIsOpen) {{
                     e.preventDefault();
-                    closeAnnotationModalAndAdvance();
+                    closeAnnotationModalAndStay();
                     return;
                 }}
                 document.getElementById('cutflowModal').style.display = 'none';
+                document.getElementById('autoReviewModal').style.display = 'none';
                 document.getElementById('completionBanner').style.display = 'none';
                 return;
             }}
@@ -3918,7 +5243,7 @@ def generate_gallery(
             const message =
                 'This will clear ALL saved QC statuses and annotations in:\\n' +
                 qcStorageNamespace +
-                '\\n\\nThis includes previous sessions saved to this QC file.\\n' +
+                '\\n\\nThis includes previous sessions saved to this QC state file.\\n' +
                 'Source DICOM files and generated images are NOT deleted.\\n\\n' +
                 'Continue?';
             if (!confirm(message)) return;
@@ -3926,6 +5251,7 @@ def generate_gallery(
             // clear JS state
             Object.keys(qcData).forEach(k => delete qcData[k]);
             Object.keys(annotations).forEach(k => delete annotations[k]);
+            retainedAnnotatedExamIds = new Set();
             allExams.forEach(exam => {{ exam.qc_status = ''; }});
             updateManualQCIndicator();
             
@@ -3937,12 +5263,13 @@ def generate_gallery(
             localStorage.removeItem('qc_data');
             localStorage.removeItem('annotations');
             localStorage.removeItem('annotation_tags');
-            sessionStorage.removeItem(sessionStatsKey);
+            localStorage.removeItem(sessionStatsKey);
             sessionStats = loadSessionStats();
             sessionStartTime = sessionStats.startTimeMs;
             sessionQCCount = sessionStats.qcCount;
             sessionStartRemainingToQC = sessionStats.startingRemainingToQC;
             saveSessionStats();
+            updateSessionAnnotatedButton();
             
             // save empty data to server
             saveQCToServer({{ replace: true }}).catch(error => {{
@@ -4043,10 +5370,14 @@ def generate_gallery(
         // close modals if clicking outside
         window.onclick = function(event) {{
             const cutflowModal = document.getElementById('cutflowModal');
+            const autoReviewModal = document.getElementById('autoReviewModal');
             const completionBanner = document.getElementById('completionBanner');
             
             if (event.target === cutflowModal) {{
                 cutflowModal.style.display = 'none';
+            }}
+            if (event.target === autoReviewModal) {{
+                autoReviewModal.style.display = 'none';
             }}
             if (event.target === completionBanner) {{
                 completionBanner.style.display = 'none';
@@ -4055,13 +5386,11 @@ def generate_gallery(
         
         // initialize
         updateView();
-        loadAvailableFilters();
-        
         // show instructions in console
         console.log('QC data auto-saves to server on each button click');
         console.log('Server saves to: {qc_file_str}');
         console.log('Keyboard shortcuts: g=good, a=annotate (letter hotkeys toggle tags), s=next, l=load more, arrows=navigate');
-        console.log('Backup: QC data also saved to browser localStorage (scoped by QC file) - safe to refresh page');
+        console.log('Backup: QC data also saved to browser localStorage (scoped by QC state file) - safe to refresh page');
         console.log('Dynamic filters: insert filter tokens from dropdown, then combine with &, |, ~ in the filter box');
         console.log('Cutflow: Click 📊 Cutflow button to see dataset statistics');
     </script>
@@ -4073,12 +5402,13 @@ def generate_gallery(
             f.write(html_content)
 
         logger.info(f"HTML gallery saved to: {gallery_path}")
+        report_progress(0.98, "Finalizing gallery...")
 
         if not serve:
             logger.info(f"Open in browser: file://{gallery_path.absolute()}")
 
         if qc_file:
-            logger.info(f"QC file: {qc_file.resolve()}")
+            logger.info(f"QC state file: {qc_file.resolve()}")
             annotated_count = len(annotations_data)
             logger.info(
                 f"QC status: {len([s for s in qc_data.values() if s == 'good'])} good, "
@@ -4088,9 +5418,8 @@ def generate_gallery(
             if not serve:
                 logger.info("=" * 60)
                 logger.info(
-                    "QC data saved to localStorage + downloads folder on each click"
+                    "QC data saved to browser localStorage scoped by the QC state file"
                 )
-                logger.info(f"Move downloaded qc_status.json to: {qc_file.resolve()}")
                 logger.info(
                     "For auto-save to server, use --serve flag (recommended for remote work)"
                 )
@@ -4108,6 +5437,7 @@ def generate_gallery(
         logger.info(f"    - newly generated: {generated_count}")
     logger.info(f"  errors: {error_count}")
     logger.info(f"  output directory: {output_dir}")
+    report_progress(1.0, "Gallery ready.")
 
 
 def main():
@@ -4137,7 +5467,7 @@ Examples:
   # only show completely unmarked exams (skip all QC'd exams)
   python qc/qc_gallery.py --serve --max-exams 100 --qc-skip-status good annotated auto_excluded
 
-  # QC without server (downloads qc_status.json on each click)
+  # QC without server (browser localStorage only)
   python qc/qc_gallery.py --max-exams 10 --random
 
   # preprocess all exams for local QC (full re-do, move output dir to local machine)
@@ -4148,20 +5478,23 @@ Examples:
   # use custom port
   python qc/qc_gallery.py --serve --port 8080 --patient 12345
   
-  # use custom QC file location
-  python qc/qc_gallery.py --serve --qc-file /path/to/my_qc_status.json
+  # use custom QC state file location
+  python qc/qc_gallery.py --serve --qc-file /path/to/my_qc_state.json
+
+  # load a saved model suggestion run for review / bulk acceptance
+  python qc/qc_gallery.py --serve --auto-run-file /path/to/auto_qc_run.json
 
 Server mode workflow:
   1. Run with --serve, forwards port 5000 to your local machine
   2. Open http://localhost:5000/ in browser
   3. Mark exams with g or annotate with a - auto-saves to server after each click
   4. ctrl+c to stop server when done
-  5. Re-run to continue QC (by default, "good" and annotated exams skipped)
+  5. Re-run to continue QC (by default, "good", annotated, and auto-excluded exams are skipped)
      To re-visit annotated findings: --qc-skip-status good auto_excluded
 
-QC File Format:
-  JSON file mapping exam_id to status: {"exam_id_1": "good", ...}
-  Valid statuses: "good"
+QC State File Format:
+  JSON object mapping exam_id -> {"status": <string|null>, "annotations": <list>}
+  Example: {"exam_id_1": {"status": "good", "annotations": []}}
         """,
     )
 
@@ -4242,8 +5575,14 @@ QC File Format:
     parser.add_argument(
         "--qc-file",
         type=Path,
-        default=Path("data/qc_status.json"),
-        help="path to QC status file (default: data/qc_status.json)",
+        default=Path("data/qc_state.json"),
+        help="path to unified QC state file (default: data/qc_state.json)",
+    )
+    parser.add_argument(
+        "--auto-run-file",
+        type=Path,
+        default=None,
+        help="path to a saved auto-QC suggestion run JSON file",
     )
     parser.add_argument(
         "--qc-skip-status",
@@ -4320,11 +5659,18 @@ QC File Format:
     resolved_raw_dir = args.raw.resolve()
     resolved_output_dir = args.output.resolve()
     resolved_qc_file = args.qc_file.resolve()
+    resolved_auto_run_file = (
+        args.auto_run_file.resolve() if args.auto_run_file is not None else None
+    )
     resolved_views_path = views_path.resolve()
     resolved_tags_path = tags_path.resolve()
     resolved_exam_list = args.exam_list.resolve() if args.exam_list else None
     resolved_pred_csv = args.pred_csv.resolve() if args.pred_csv else None
     resolved_meta_csv = args.meta_csv.resolve() if args.meta_csv else None
+
+    if resolved_auto_run_file is not None and not resolved_auto_run_file.exists():
+        logger.error(f"auto suggestion run file not found: {resolved_auto_run_file}")
+        return 1
 
     max_exams = args.max_exams
     if args.preprocess_all:
@@ -4361,6 +5707,7 @@ QC File Format:
             per_view=args.per_view,
             no_gallery=args.no_gallery,
             qc_file=resolved_qc_file,
+            auto_run_file=resolved_auto_run_file,
             pred_csv=resolved_pred_csv,
             meta_csv=resolved_meta_csv,
             prioritize_errors=args.prioritize_errors,
@@ -4391,6 +5738,7 @@ QC File Format:
             "per_view": args.per_view,
             "no_gallery": args.no_gallery,
             "qc_file": resolved_qc_file,
+            "auto_run_file": resolved_auto_run_file,
             "pred_csv": resolved_pred_csv,
             "meta_csv": resolved_meta_csv,
             "prioritize_errors": args.prioritize_errors,
@@ -4411,6 +5759,7 @@ QC File Format:
             resolved_qc_file,
             resolved_views_path,
             resolved_tags_path,
+            resolved_auto_run_file,
             args.port,
             load_more_args,
         )
