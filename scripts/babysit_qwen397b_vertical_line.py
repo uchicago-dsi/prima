@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -22,6 +23,7 @@ DEFAULT_OUTPUT_ROOT = (
 )
 DEFAULT_LOG_FILE = DEFAULT_OUTPUT_ROOT / "babysitter.log"
 DEFAULT_STATE_FILE = DEFAULT_OUTPUT_ROOT / "state" / "state.json"
+DEFAULT_ACTIVE_HOST_FILE = DEFAULT_OUTPUT_ROOT / "state" / "active_host.txt"
 DEFAULT_LOCKFILE = (
     Path(os.environ.get("XDG_RUNTIME_DIR", str(DEFAULT_OUTPUT_ROOT / "state")))
     / "prima-qwen397b-babysitter.lock"
@@ -171,6 +173,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--log-file", type=Path, default=DEFAULT_LOG_FILE)
     parser.add_argument("--state-file", type=Path, default=DEFAULT_STATE_FILE)
+    parser.add_argument("--active-host-file", type=Path, default=DEFAULT_ACTIVE_HOST_FILE)
     parser.add_argument("--lockfile", type=Path, default=DEFAULT_LOCKFILE)
     parser.add_argument("--schema", type=Path, default=DEFAULT_SCHEMA)
     parser.add_argument("--prompt-template", type=Path, default=DEFAULT_PROMPT)
@@ -412,6 +415,18 @@ def main() -> int:
     args = parse_args()
     args.output_root.mkdir(parents=True, exist_ok=True)
     state = _load_json(args.state_file, {"history": []})
+    current_host = socket.gethostname().split(".", 1)[0]
+    if args.active_host_file.exists():
+        active_host = args.active_host_file.read_text(encoding="utf-8").strip()
+        if active_host and active_host != current_host:
+            append_log(
+                args.log_file,
+                f"skipping run on host {current_host}; active host is {active_host}",
+            )
+            return 0
+    else:
+        args.active_host_file.parent.mkdir(parents=True, exist_ok=True)
+        args.active_host_file.write_text(current_host + "\n", encoding="utf-8")
 
     args.lockfile.parent.mkdir(parents=True, exist_ok=True)
     with args.lockfile.open("w") as lock_fp:
