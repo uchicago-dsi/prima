@@ -4,12 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+
+
+QWEN35_FP8_BF16_ENV = {"PRIMA_QWEN35_FP8_FORCE_BF16_EXPERTS": "1"}
 
 
 @dataclass(frozen=True)
@@ -61,6 +65,12 @@ def parse_args() -> argparse.Namespace:
 
 def shell_join(command: list[str]) -> str:
     return " ".join(shlex.quote(part) for part in command)
+
+
+def shell_export_lines(env: dict[str, str]) -> str:
+    return "\n".join(
+        f"export {key}={shlex.quote(value)}" for key, value in sorted(env.items())
+    )
 
 
 def build_command(args: argparse.Namespace, arm: Arm, stamp: str) -> list[str]:
@@ -164,6 +174,8 @@ def main() -> int:
     commands_path = args.run_dir / f"{args.name_prefix}_{stamp}_commands.sh"
     commands_path.write_text(
         "#!/usr/bin/env bash\nset -euo pipefail\n"
+        + shell_export_lines(QWEN35_FP8_BF16_ENV)
+        + "\n"
         + "\n".join(shell_join(command) for command in commands)
         + "\n"
     )
@@ -174,8 +186,10 @@ def main() -> int:
     )
 
     if args.submit:
+        submit_env = os.environ.copy()
+        submit_env.update(QWEN35_FP8_BF16_ENV)
         for command in commands:
-            subprocess.run(command, check=True)
+            subprocess.run(command, check=True, env=submit_env)
     else:
         print(f"wrote commands: {commands_path}")
         print("dry run only; rerun with --submit to submit all three arms")
