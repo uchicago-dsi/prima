@@ -22,7 +22,10 @@ DEFAULT_OUTPUT_ROOT = (
 )
 DEFAULT_LOG_FILE = DEFAULT_OUTPUT_ROOT / "babysitter.log"
 DEFAULT_STATE_FILE = DEFAULT_OUTPUT_ROOT / "state" / "state.json"
-DEFAULT_LOCKFILE = DEFAULT_OUTPUT_ROOT / "state" / "babysitter.lock"
+DEFAULT_LOCKFILE = (
+    Path(os.environ.get("XDG_RUNTIME_DIR", str(DEFAULT_OUTPUT_ROOT / "state")))
+    / "prima-qwen397b-babysitter.lock"
+)
 DEFAULT_SCHEMA = REPO_ROOT / "scripts" / "qwen397b_babysitter_output_schema.json"
 DEFAULT_PROMPT = REPO_ROOT / "scripts" / "qwen397b_babysitter_prompt.txt"
 DEFAULT_NOTEBOOK = (
@@ -105,10 +108,15 @@ def _run(
     cmd: list[str],
     *,
     input_text: str | None = None,
+    extra_path: Path | None = None,
 ) -> str:
+    env = os.environ.copy()
+    if extra_path is not None:
+        env["PATH"] = f"{extra_path}:{env.get('PATH', '')}"
     completed = subprocess.run(
         cmd,
         cwd=str(REPO_ROOT),
+        env=env,
         text=True,
         input=input_text,
         capture_output=True,
@@ -348,7 +356,7 @@ def _invoke_codex(
             "goal_progress": "Validated the babysitter path without changing campaign state.",
             "next_check_hint": "none",
         }
-    _run(cmd, input_text=prompt_text)
+    _run(cmd, input_text=prompt_text, extra_path=codex_bin.parent)
     raw = output_file.read_text(encoding="utf-8").strip()
     return json.loads(raw)
 
