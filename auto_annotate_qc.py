@@ -429,6 +429,8 @@ def build_marker_classifier_prompt(
         return (
             f"{example_text}"
             f"Target exam only: decide whether {target_description} is visually present anywhere in this mammography montage.\n"
+            "For a vertical line detector artifact, look for a straight, narrow, low-contrast gray vertical seam or stripe running top-to-bottom, often at a similar x-position across views.\n"
+            "The artifact must be vertical. Answer NO if the main finding is horizontal compression hardware, horizontal compression artifact, paddle/bar edges, or clamp edges.\n"
             "Be specific. Do not answer YES for breast edges, skin folds, compression boundaries, text labels, markers, anatomy, or normal montage seams.\n"
             "Use CONFIDENCE: high only when the visual evidence is unmistakable; use medium or low for borderline appearances.\n"
             "Answer in exactly four lines and nothing else:\n"
