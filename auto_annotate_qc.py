@@ -132,13 +132,23 @@ def build_exam_montage_index(
     return index
 
 
-def clean_exemplar_annotations(annotations: list[str]) -> list[str]:
+def clean_exemplar_annotations(
+    annotations: list[str],
+    *,
+    preserve_tags: set[str] | None = None,
+) -> list[str]:
     """Repair obvious legacy default-tag contamination for few-shot exemplars only."""
     normalized = normalize_annotation_tags(annotations)
     default_tags = set(DEFAULT_ANNOTATION_TAGS)
+    preserve_tags = preserve_tags or set()
+    kept_default_tags = {tag for tag in normalized if tag in preserve_tags}
     extras = [tag for tag in normalized if tag not in default_tags]
-    if extras:
-        return extras
+    if extras or kept_default_tags:
+        return [
+            tag
+            for tag in normalized
+            if tag in kept_default_tags or tag not in default_tags
+        ]
     if set(normalized) == default_tags:
         return []
     return normalized
@@ -149,6 +159,7 @@ def load_few_shot_exemplars(
     qc_file: Path | None,
     views_df: pd.DataFrame,
     export_dir: Path,
+    preserve_tags: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Load a reliable few-shot exemplar pool from accepted human GT."""
     if qc_file is None or not qc_file.exists():
@@ -162,7 +173,10 @@ def load_few_shot_exemplars(
     skipped_missing_montage = 0
     skipped_ambiguous_defaults = 0
     for exam_id, raw_annotations in annotations_map.items():
-        cleaned_annotations = clean_exemplar_annotations(list(raw_annotations))
+        cleaned_annotations = clean_exemplar_annotations(
+            list(raw_annotations),
+            preserve_tags=preserve_tags,
+        )
         if not cleaned_annotations:
             skipped_ambiguous_defaults += 1
             continue
@@ -3061,6 +3075,9 @@ def run_from_args(args: argparse.Namespace) -> int:
         qc_file=few_shot_qc_file,
         views_df=views_df,
         export_dir=export_dir,
+        preserve_tags={args.probe_tag}
+        if args.prompt_mode == "marker_classifier" and args.probe_tag
+        else None,
     )
     if args.few_shot_examples > 0 and not exemplar_pool:
         logger.warning(
