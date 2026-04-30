@@ -241,6 +241,45 @@ def select_few_shot_examples(
     return selected
 
 
+def select_probe_few_shot_examples(
+    *,
+    exemplar_pool: list[dict[str, Any]],
+    max_examples: int,
+    probe_tag: str,
+    exclude_exam_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Choose exemplars for one target tag, prioritizing target positives."""
+    if max_examples <= 0:
+        return []
+
+    candidates = [
+        record
+        for record in exemplar_pool
+        if str(record["exam_id"]) != str(exclude_exam_id)
+    ]
+    target_positive = [
+        record for record in candidates if probe_tag in set(record.get("annotations", []))
+    ]
+    selected = sorted(target_positive, key=lambda record: str(record["exam_id"]))[
+        :max_examples
+    ]
+    if len(selected) >= max_examples:
+        return selected
+
+    selected_ids = {str(record["exam_id"]) for record in selected}
+    filler_pool = [
+        record for record in candidates if str(record["exam_id"]) not in selected_ids
+    ]
+    selected.extend(
+        select_few_shot_examples(
+            exemplar_pool=filler_pool,
+            max_examples=max_examples - len(selected),
+            exclude_exam_id=None,
+        )
+    )
+    return selected
+
+
 def load_exam_records(
     *,
     views_df: pd.DataFrame,
@@ -358,6 +397,7 @@ def build_marker_classifier_prompt(
     *,
     probe_tag: str,
     few_shot_examples: list[dict[str, Any]],
+    prompt_variant: str,
 ) -> str:
     """Short classifier prompt that asks for evidence plus an explicit answer line."""
     example_text = ""
@@ -371,6 +411,18 @@ def build_marker_classifier_prompt(
         if probe_tag.strip().lower() == "bb"
         else f"the QC tag '{probe_tag}'"
     )
+    if prompt_variant == "confidence_specificity":
+        return (
+            f"{example_text}"
+            f"Target exam only: decide whether {target_description} is visually present anywhere in this mammography montage.\n"
+            "Be specific. Do not answer YES for breast edges, skin folds, compression boundaries, text labels, markers, anatomy, or normal montage seams.\n"
+            "Use CONFIDENCE: high only when the visual evidence is unmistakable; use medium or low for borderline appearances.\n"
+            "Answer in exactly four lines and nothing else:\n"
+            "EVIDENCE: <one short visual phrase, or none>\n"
+            "ANSWER: YES or ANSWER: NO\n"
+            "CONFIDENCE: high, medium, or low\n"
+            "REVIEW: YES or REVIEW: NO\n"
+        )
     return (
         f"{example_text}"
         f"Target exam only: decide whether {target_description} is visually present anywhere in this mammography montage.\n"
@@ -455,7 +507,7 @@ def build_binary_probe_prefix_allowed_tokens_fn(
     return _prefix_allowed_tokens_fn
 
 
-PROMPT_VARIANTS = ("baseline", "recall_tilted")
+PROMPT_VARIANTS = ("baseline", "recall_tilted", "confidence_specificity")
 
 
 def build_recall_tilted_rule(probe_tag: str | None = None) -> str:
@@ -550,6 +602,7 @@ def build_target_prompt_text(
         prompt = build_marker_classifier_prompt(
             probe_tag=probe_tag,
             few_shot_examples=few_shot_examples,
+            prompt_variant=prompt_variant,
         )
         if prompt_variant == "recall_tilted":
             prompt += "\nAdditional decision rule:\n"
@@ -645,6 +698,18 @@ def normalize_binary_probe_response(
             suggestion["score"] = float(score)
         except (TypeError, ValueError):
             pass
+    confidence = str(payload.get("confidence", "")).strip().lower()
+    if confidence in {"high", "medium", "low"}:
+        suggestion["confidence"] = confidence
+        if "score" not in suggestion:
+            suggestion["score"] = {
+                "high": 0.95,
+                "medium": 0.66,
+                "low": 0.33,
+            }[confidence]
+    review = payload.get("review")
+    if isinstance(review, bool):
+        suggestion["review"] = review
     rationale = str(payload.get("rationale", "")).strip()
     if rationale:
         suggestion["rationale"] = rationale
@@ -711,6 +776,14 @@ def coerce_marker_classifier_payload(text: str) -> dict[str, Any] | None:
         rationale = evidence_match.group(1).strip()
         if rationale and rationale.lower() != "none":
             payload["rationale"] = rationale
+    confidence_match = re.search(
+        r"\bCONFIDENCE\s*:\s*(high|medium|low)\b", stripped, re.I
+    )
+    if confidence_match is not None:
+        payload["confidence"] = confidence_match.group(1).lower()
+    review_match = re.search(r"\bREVIEW\s*:\s*(YES|NO)\b", stripped, re.I)
+    if review_match is not None:
+        payload["review"] = review_match.group(1).upper() == "YES"
     return payload
 
 
@@ -2495,11 +2568,19 @@ class LocalVisionAnnotator:
         import torch
         from qwen_vl_utils import process_vision_info
 
-        few_shot_examples = select_few_shot_examples(
-            exemplar_pool=self.few_shot_exemplar_pool,
-            max_examples=self.few_shot_examples,
-            exclude_exam_id=exam_id,
-        )
+        if self.prompt_mode == "marker_classifier" and self.probe_tag:
+            few_shot_examples = select_probe_few_shot_examples(
+                exemplar_pool=self.few_shot_exemplar_pool,
+                max_examples=self.few_shot_examples,
+                probe_tag=str(self.probe_tag),
+                exclude_exam_id=exam_id,
+            )
+        else:
+            few_shot_examples = select_few_shot_examples(
+                exemplar_pool=self.few_shot_exemplar_pool,
+                max_examples=self.few_shot_examples,
+                exclude_exam_id=exam_id,
+            )
         if self.text_only_prompt is not None:
             few_shot_examples = []
         target_prompt_text = build_target_prompt_text(

@@ -51,6 +51,12 @@ def normalize_auto_suggestion_entry(
     rationale = str(payload.get("rationale", "")).strip() if payload else ""
     if rationale:
         normalized["rationale"] = rationale
+    confidence = str(payload.get("confidence", "")).strip().lower() if payload else ""
+    if confidence in {"high", "medium", "low"}:
+        normalized["confidence"] = confidence
+    review = payload.get("review") if payload else None
+    if isinstance(review, bool):
+        normalized["review"] = review
 
     return normalized
 
