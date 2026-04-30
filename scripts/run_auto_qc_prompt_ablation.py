@@ -13,7 +13,11 @@ from datetime import datetime
 from pathlib import Path
 
 
-QWEN35_FP8_BF16_ENV = {"PRIMA_QWEN35_FP8_FORCE_BF16_EXPERTS": "1"}
+QWEN35_FP8_BF16_ENV = {
+    "CUDA_LAUNCH_BLOCKING": "1",
+    "PRIMA_QWEN35_FP8_FORCE_BF16_EXPERTS": "1",
+    "PYTORCH_SHOW_CPP_STACKTRACES": "1",
+}
 
 
 @dataclass(frozen=True)

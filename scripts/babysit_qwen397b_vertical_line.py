@@ -405,6 +405,67 @@ def should_skip_codex_for_pending_only(active_records: list[dict[str, Any]]) -> 
     )
 
 
+def build_completed_idle_decision(
+    terminal_records: list[dict[str, Any]],
+    last_check: dict[str, Any],
+) -> dict[str, Any]:
+    """Return a deterministic decision for unchanged completed campaign state."""
+    terminal_job_ids = [str(record["job_id"]) for record in terminal_records]
+    last_decision = last_check.get("decision", {})
+    last_decided_at = last_check.get("decided_at", "unknown")
+    return {
+        "campaign_status": "completed",
+        "action_type": "deterministic_completed_idle",
+        "did_act": False,
+        "needs_human": False,
+        "summary": (
+            "No matching Qwen vertical-line jobs are active, and the completed "
+            "campaign state is unchanged since the last Codex-reviewed completion. "
+            "Skipped Codex agent invocation."
+        ),
+        "why": (
+            "Repeated completed-state rechecks do not require model reasoning when "
+            "the matching terminal job set has not changed. Avoiding a Codex wake-up "
+            "preserves quota while still allowing future ticks to notice new jobs."
+        ),
+        "failure_cause": "No current failure; campaign was already classified completed.",
+        "evidence": [
+            f"terminal_job_ids={terminal_job_ids}",
+            f"last_completed_decision_at={last_decided_at}",
+            f"last_action_type={last_decision.get('action_type', '')}",
+        ],
+        "files_changed": [],
+        "new_job_ids": [],
+        "notebook_updated": False,
+        "goal_progress": "Preserved completed idle state without duplicate GPU work or agent quota.",
+        "next_check_hint": (
+            "Continue deterministic idle checks until matching active jobs appear "
+            "or the matching terminal job set changes."
+        ),
+    }
+
+
+def should_skip_codex_for_completed_idle(
+    *,
+    active_records: list[dict[str, Any]],
+    terminal_records: list[dict[str, Any]],
+    state: dict[str, Any],
+) -> bool:
+    """Skip the expensive agent when a completed campaign remains unchanged."""
+    if active_records or not terminal_records:
+        return False
+    last_check = state.get("last_check", {})
+    last_decision = last_check.get("decision", {})
+    if last_decision.get("campaign_status") != "completed":
+        return False
+    previous_terminal = {
+        str(job_id)
+        for job_id in last_check.get("context_summary", {}).get("terminal_job_ids", [])
+    }
+    current_terminal = {str(record["job_id"]) for record in terminal_records}
+    return current_terminal == previous_terminal
+
+
 def build_prompt(template: str, context: dict[str, Any]) -> str:
     return template.replace(
         "{{CAMPAIGN_CONTEXT_JSON}}", json.dumps(context, indent=2, sort_keys=True)
@@ -476,6 +537,18 @@ def main() -> int:
         decision_file.parent.mkdir(parents=True, exist_ok=True)
         if should_skip_codex_for_pending_only(active_records) and not args.dry_run:
             result = build_pending_only_decision(active_records)
+            _write_json(decision_file, result)
+        elif (
+            should_skip_codex_for_completed_idle(
+                active_records=active_records,
+                terminal_records=terminal_records,
+                state=state,
+            )
+            and not args.dry_run
+        ):
+            result = build_completed_idle_decision(
+                terminal_records, state.get("last_check", {})
+            )
             _write_json(decision_file, result)
         else:
             prompt_template = args.prompt_template.read_text(encoding="utf-8")
