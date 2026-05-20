@@ -136,6 +136,7 @@ Make outputs easy to recreate without relying on shell history or memory.
 - If an output depends on multiple sequential commands, record them in order.
 - When changing a producer script, regenerate downstream derived files that depend on it or note clearly that they are stale.
 - Prefer deterministic scripts and explicit CLI arguments over one-off notebook state or ad hoc shell edits.
+- Do not add date tags to filenames or directory names unless the date is truly part of the scientific meaning. For most outputs, dated suffixes become meaningless later and make stable paths harder to maintain.
 
 ## Key References
 
