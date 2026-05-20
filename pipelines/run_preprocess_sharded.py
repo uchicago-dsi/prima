@@ -16,13 +16,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from pipelines.preprocess import build_genotyped_exam_dir_filter
+from pipelines.preprocess import (
+    build_genotyped_exam_dir_filter,
+    build_unique_exam_dir_filter,
+)
 
 DEFAULT_FINGERPRINT = Path("fingerprints/chimec/disk_fingerprints.json")
 DEFAULT_PATIENTS = Path(
     "/gpfs/data/phs/groups/Projects/Huo_projects/SPORE/annawoodard/List_ChiMEC_priority_2025July30.csv"
 )
 DEFAULT_KEY = Path("/gpfs/data/huo-lab/Image/ChiMEC/study-16352a.csv")
+PREPROCESS_SCRIPT = PROJECT_ROOT / "pipelines" / "preprocess.py"
 
 
 def partition_allowlist(allowlist: set, num_shards: int) -> list[list]:
@@ -95,6 +99,7 @@ cd {shlex.quote(str(Path.cwd()))}
 eval "$(micromamba shell hook -s bash)"
 micromamba activate prima
 export PYTHONUNBUFFERED=1
+umask 002
 
 echo "[shard {shard_idx}] starting at $(date)"
 {" ".join(shlex.quote(p) for p in cmd_parts)}
@@ -120,6 +125,48 @@ def submit_jobs(script_paths: list[Path]) -> list[str]:
         job_ids.append(job_id)
         print(f"Submitted {script_path.name}: job {job_id}")
     return job_ids
+
+
+def submit_recover_job(
+    *,
+    work_dir: Path,
+    metadata_path: Path,
+    job_ids: list[str],
+    partition: str,
+) -> str:
+    """Submit dependent recover/merge job that runs after all shards succeed."""
+    dependency = ":".join(job_ids)
+    script_path = work_dir / "recover_merge.sh"
+    log_path = work_dir / "recover_merge.log"
+    repo_root = Path.cwd()
+    script_content = f"""#!/bin/bash
+#SBATCH --job-name=preproc_merge
+#SBATCH --partition={partition}
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=32G
+#SBATCH --time=08:00:00
+#SBATCH --output={log_path}
+#SBATCH --error={log_path}
+#SBATCH --dependency=afterok:{dependency}
+
+set -eo pipefail
+
+cd {shlex.quote(str(repo_root))}
+eval "$(micromamba shell hook -s bash)"
+micromamba activate prima
+umask 002
+
+python pipelines/run_preprocess_sharded.py --recover {shlex.quote(str(metadata_path))} --num_shards 1
+"""
+    script_path.write_text(script_content)
+    script_path.chmod(0o755)
+    result = subprocess.run(
+        ["sbatch", str(script_path)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip().split()[-1]
 
 
 def wait_for_jobs(job_ids: list[str], poll_interval: int = 60) -> None:
@@ -246,6 +293,11 @@ def main():
         action="store_true",
         help="Filter to patients with genomic data",
     )
+    parser.add_argument(
+        "--all-available",
+        action="store_true",
+        help="Use all unique on-disk exams from the fingerprint cache, not just genotyped patients",
+    )
     parser.add_argument("--fingerprint", type=Path, default=DEFAULT_FINGERPRINT)
     parser.add_argument("--patients", type=Path, default=DEFAULT_PATIENTS)
     parser.add_argument("--key", type=Path, default=DEFAULT_KEY)
@@ -268,6 +320,11 @@ def main():
         type=Path,
         default=None,
         help="Work dir for shards (default: <raw>/preprocess_shards)",
+    )
+    parser.add_argument(
+        "--no-auto-recover-job",
+        action="store_true",
+        help="With --no-wait, do not auto-submit a dependent recover/merge job",
     )
 
     args = parser.parse_args()
@@ -294,7 +351,7 @@ def main():
                 [
                     sys.executable,
                     "-u",
-                    "pipelines/preprocess.py",
+                    str(PREPROCESS_SCRIPT),
                     "emit-csv",
                     "--raw",
                     str(raw_dir),
@@ -306,7 +363,7 @@ def main():
                     str(labels_path),
                 ],
                 check=True,
-                cwd=Path(__file__).resolve().parent,
+                cwd=PROJECT_ROOT,
             )
             print(f"  Wrote {out_dir / 'mirai_manifest.csv'}")
         print("Done.")
@@ -320,23 +377,36 @@ def main():
     work_dir = args.work_dir or raw_dir / "preprocess_shards"
     checkpoint_base = Path("data/discovery_checkpoints")
 
-    if not args.genotyped_only:
-        parser.error("Sharded preprocessing requires --genotyped-only")
+    if args.genotyped_only == args.all_available:
+        parser.error("Choose exactly one of --genotyped-only or --all-available")
 
-    allowlist = build_genotyped_exam_dir_filter(
-        args.fingerprint,
-        args.patients,
-        args.key,
-    )
-    if allowlist is None:
-        print(
-            "ERROR: Could not build genotyped allowlist. Check fingerprint, patients, key.",
-            file=sys.stderr,
+    if args.genotyped_only:
+        allowlist = build_genotyped_exam_dir_filter(
+            args.fingerprint,
+            args.patients,
+            args.key,
         )
-        sys.exit(1)
+        if allowlist is None:
+            print(
+                "ERROR: Could not build genotyped allowlist. Check fingerprint, patients, key.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        cohort_label = "genotyped-only"
+    else:
+        allowlist = build_unique_exam_dir_filter(args.fingerprint)
+        if allowlist is None:
+            print(
+                "ERROR: Could not build all-available allowlist. Check fingerprint cache.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        cohort_label = "all-available"
 
     shards = partition_allowlist(allowlist, args.num_shards)
-    print(f"Partitioned {len(allowlist):,} exams into {args.num_shards} shards")
+    print(
+        f"Partitioned {len(allowlist):,} {cohort_label} exams into {args.num_shards} shards"
+    )
     for i, s in enumerate(shards):
         print(f"  Shard {i}: {len(s):,} exams")
 
@@ -378,13 +448,26 @@ def main():
         "sot_dir": str(sot_dir),
         "out_dir": str(out_dir),
         "labels": str(args.labels) if args.labels else None,
+        "allowlist_mode": cohort_label,
     }
     metadata_path = work_dir / "job_metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2))
     print(f"\nMetadata: {metadata_path}")
 
     if args.no_wait:
-        print("\nJobs submitted. Run with --recover to merge after completion.")
+        if not args.no_auto_recover_job:
+            recover_job_id = submit_recover_job(
+                work_dir=work_dir,
+                metadata_path=metadata_path,
+                job_ids=job_ids,
+                partition=args.partition,
+            )
+            metadata["recover_job_id"] = recover_job_id
+            metadata_path.write_text(json.dumps(metadata, indent=2))
+            print(f"Submitted dependent recover job: {recover_job_id}")
+        else:
+            print("Skipped dependent recover job (--no-auto-recover-job).")
+        print("\nJobs submitted.")
         return
 
     wait_for_jobs(job_ids)
@@ -397,7 +480,7 @@ def main():
             [
                 sys.executable,
                 "-u",
-                "pipelines/preprocess.py",
+                str(PREPROCESS_SCRIPT),
                 "emit-csv",
                 "--raw",
                 str(raw_dir),
@@ -409,7 +492,7 @@ def main():
                 str(args.labels),
             ],
             check=True,
-            cwd=Path(__file__).resolve().parent,
+            cwd=PROJECT_ROOT,
         )
         print(f"  Wrote {out_dir / 'mirai_manifest.csv'}")
     print("\nDone.")

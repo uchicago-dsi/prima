@@ -1,0 +1,218 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+
+\title{Choosing Between Patient-Weighted and Random-Exam AUC}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section*{Question}
+When some patients contribute multiple eligible exams, but we do \emph{not} want a naive exam-level analysis, there are two natural options:
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{Random-exam:} sample one eligible exam per patient and compute AUC on that reduced dataset.
+\item \textbf{Patient-weighted:} keep all eligible exams, but if patient $i$ has $n_i$ eligible exams, assign each of that patient's exams weight
+\[
+w_{ij} = \frac{1}{n_i},
+\]
+so the patient's total contribution is
+\[
+\sum_{j=1}^{n_i} w_{ij} = 1.
+\]
+\end{enumerate}
+
+The question is not whether exam-level weighting is wrong; we already agree that it is. The real question is whether equal-patient influence is better achieved by \emph{discarding} repeated exams or by \emph{retaining} them with normalized weights.
+
+\section*{Shared Goal}
+Both methods are trying to estimate the same kind of estimand:
+\begin{quote}
+each patient should have equal overall influence on the AUC, regardless of how many eligible exams they contributed.
+\end{quote}
+So both methods are trying to solve the right problem. The issue is which one does so with less arbitrariness and less loss of information.
+
+\section*{What Random-Exam Does}
+Under random-exam, each patient contributes exactly one eligible exam, chosen at random. This certainly enforces equal patient influence, but it does so by discarding the rest of the observed exams for that patient.
+
+That means the final AUC depends on two ingredients:
+\begin{enumerate}[leftmargin=2em]
+\item the data, and
+\item an additional random choice of which exam survives for each patient.
+\end{enumerate}
+
+\section*{What Patient-Weighted Does}
+Under patient-weighted AUC, all eligible exams are retained. If patient $i$ has $n_i$ eligible exams, each exam gets weight $1/n_i$. This also enforces equal patient influence, but it does not discard observed data.
+
+Patient-weighting does not sample exams. It deterministically assigns each exam the contribution it would receive on average if one exam were chosen uniformly from that patient.
+
+\section*{Exact Formula}
+Fix a prediction horizon $h$. Define the eligible sets:
+\begin{align*}
+\mathcal{C}_h &= \{a : 0 \le \text{years\_to\_cancer}_a < h\},\\
+\mathcal{N}_h &= \{b : \text{years\_to\_cancer}_b \ge h \text{ and } \text{years\_to\_last\_followup}_b \ge h\}.
+\end{align*}
+
+So:
+\begin{enumerate}[leftmargin=2em]
+\item $\mathcal{C}_h$ is the set of case exams for horizon $h$;
+\item $\mathcal{N}_h$ is the set of control exams for horizon $h$.
+\end{enumerate}
+
+Now let patient $i$ contribute $n_i^{\text{case}}(h)$ eligible case exams and $n_i^{\text{ctrl}}(h)$ eligible control exams at horizon $h$. Then the exam-level weights are
+\[
+w_{ij}^{\text{case}}(h) = \frac{1}{n_i^{\text{case}}(h)},
+\qquad
+w_{ik}^{\text{ctrl}}(h) = \frac{1}{n_i^{\text{ctrl}}(h)}.
+\]
+
+That means each patient has total weight $1$ within the case set and total weight $1$ within the control set:
+\[
+\sum_{j=1}^{n_i^{\text{case}}(h)} w_{ij}^{\text{case}}(h)=1,
+\qquad
+\sum_{k=1}^{n_i^{\text{ctrl}}(h)} w_{ik}^{\text{ctrl}}(h)=1.
+\]
+
+If $s_a$ and $s_b$ are the model scores for a case exam $a$ and a control exam $b$, define
+\[
+\phi(s_a,s_b)=
+\begin{cases}
+1, & s_a > s_b,\\
+\tfrac{1}{2}, & s_a = s_b,\\
+0, & s_a < s_b.
+\end{cases}
+\]
+
+Then the patient-weighted AUC at horizon $h$ is
+\[
+\mathrm{AUC}(h)=
+\frac{
+\sum_{a\in \mathcal{C}_h}\sum_{b\in \mathcal{N}_h}
+w_a(h)\,w_b(h)\,\phi(s_a,s_b)
+}{
+\left(\sum_{a\in \mathcal{C}_h} w_a(h)\right)
+\left(\sum_{b\in \mathcal{N}_h} w_b(h)\right)
+}.
+\]
+
+This is just the weighted probability that a case exam outranks a control exam, with each patient's total influence normalized to one unit.
+
+\section*{Why Patient-Weighted Is Preferable}
+\subsection*{1. It has the same fairness property as random-exam}
+Both procedures ensure that patients with many exams do not dominate the metric. In that sense, random-exam has no conceptual advantage over patient-weighted.
+
+\subsection*{2. It does not throw away valid information}
+If a patient has several eligible exams, those are real observed data. Random-exam keeps one and discards the others. Patient-weighted uses all of them while still keeping the patient's total influence fixed at one unit.
+
+So patient-weighted preserves the central benefit of random-exam without paying the cost of data deletion.
+
+\subsection*{3. It is more statistically efficient}
+Randomly dropping data usually increases variance. Here that means:
+\begin{enumerate}[leftmargin=2em]
+\item the estimated AUC is noisier than it needs to be;
+\item results depend more strongly on which patients happened to have multiple exams; and
+\item repeated runs with different seeds can give slightly different answers even if the dataset is unchanged.
+\end{enumerate}
+
+Patient-weighted avoids that extra Monte Carlo noise because it is deterministic once the data are fixed.
+
+\subsection*{4. It is easier to justify scientifically}
+If we already have multiple valid exams for a patient, it is hard to defend a primary analysis whose rule is: ``pick one at random and ignore the rest.'' In contrast, the weighted rule is easy to explain:
+\begin{quote}
+we let every patient count equally, and we divide that patient's weight across all of their eligible exams.
+\end{quote}
+
+\section*{Small Example}
+Suppose there are three patients at a fixed horizon:
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+Patient & Exam & Score & Label \\
+\midrule
+A & 1 & 0.80 & case \\
+B & 1 & 0.75 & case \\
+C & 1 & 0.95 & control \\
+C & 2 & 0.55 & control \\
+C & 3 & 0.15 & control \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Patient C has three eligible control exams, one with a very high score and two with lower scores.
+
+Under \textbf{random-exam}, we keep only one of C's exams:
+\begin{enumerate}[leftmargin=2em]
+\item If exam C1 is selected, the control score is $0.95$, which is above both case scores. The model looks very poor.
+\item If exam C2 or C3 is selected, the control score is below both case scores. The model looks essentially perfect.
+\end{enumerate}
+
+So with the same underlying data, random-exam can support sharply different conclusions depending only on which control exam happened to be sampled.
+
+Under \textbf{patient-weighted}, patient C contributes all three exams with weights
+\[
+w_{C1}=w_{C2}=w_{C3}=\frac{1}{3}.
+\]
+Now each case is compared against C's full distribution of observed exams:
+\begin{enumerate}[leftmargin=2em]
+\item each case loses to the high-scoring control exam $0.95$;
+\item each case beats the lower-scoring control exams $0.55$ and $0.15$.
+\end{enumerate}
+
+That gives a stable summary: each case wins two of its three weighted comparisons, so the resulting AUC is about
+\[
+\frac{2}{3} \approx 0.67.
+\]
+
+This is exactly the kind of situation where the two approaches can lead to different scientific interpretations:
+\begin{enumerate}[leftmargin=2em]
+\item random-exam can make the model look either poor or nearly perfect;
+\item patient-weighted says the more defensible conclusion is intermediate discrimination, because the patient's repeated exams show mixed evidence.
+\end{enumerate}
+
+\section*{Direct Comparison}
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Method & Equal patient influence? & Uses all eligible exams? \\
+\midrule
+Random-exam & Yes & No \\
+Patient-weighted & Yes & Yes \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+That table captures the core argument. Once exam-level weighting is off the table, patient-weighted weakly dominates random-exam:
+\begin{enumerate}[leftmargin=2em]
+\item it preserves the same fairness goal;
+\item it keeps more information; and
+\item it avoids introducing extra seed-dependent randomness.
+\end{enumerate}
+
+\section*{What Random-Exam Is Still Good For}
+Random-exam can still be useful as a \emph{sensitivity analysis}. If patient-weighted and random-exam give similar conclusions, that is reassuring. It shows that the result is not highly sensitive to how repeated exams are handled.
+
+But that is an argument for using random-exam as a check, not as the primary method.
+
+\section*{Practical Recommendation}
+If the goal is:
+\begin{quote}
+``give each patient equal influence, without letting repeated exams artificially inflate the metric,''
+\end{quote}
+then patient-weighted AUC is the cleaner primary analysis.
+
+Random-exam is a reasonable secondary analysis, but it is harder to defend as the default because it solves the equal-patient problem by deleting valid information that the weighted estimator can keep.
+
+\section*{Bottom Line}
+Once we agree that naive exam-level AUC is not the right target, the real comparison is:
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{random-exam:} equal patient influence by subsampling;
+\item \textbf{patient-weighted:} equal patient influence by weighting.
+\end{enumerate}
+
+The weighted approach is preferable because it achieves the same goal while using all available eligible exams and avoiding unnecessary randomness.
+
+\end{document}

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import logging
 import os
 import shutil
@@ -23,7 +24,7 @@ logging.getLogger("pydicom.valuerep").setLevel(logging.ERROR)
 
 # --- CONFIGURATION ---
 SRC_ROOT = Path("/mnt/uchad_samba/16352A/")
-DST_ROOT = Path("/gpfs/data/huo-lab/Image/ChiMEC/MG")
+DST_ROOT = Path("/gpfs/data/huo-lab/Image/ChiMEC/MR")
 # SRC_ROOT = Path("/mnt/uchad_samba/13073B")
 # DST_ROOT = Path("/gpfs/data/karczmar-lab/CAPS/MRI1.0")
 DELETE_QUEUE_DIR = SRC_ROOT / "_synced_and_queued_for_deletion"
@@ -254,57 +255,75 @@ def _cleanup_empty_patient_dirs(dry_run: bool) -> int:
     return removed
 
 
-def _robust_rmtree(path: Path):
+def _robust_rmtree(path: Path, *, max_attempts: int = 5, retry_delay_sec: float = 2.0):
     """
     remove directory tree robustly, handling permission errors.
     raises RuntimeError if directory still exists after deletion attempt.
     """
-    # collect errors during rmtree
-    rmtree_errors: list[tuple[str, str]] = []
+    last_error_sample: list[tuple[str, str]] = []
 
-    def onerror(func, fpath, exc_info):
-        """try to fix permissions and retry; log failures"""
-        try:
-            os.chmod(fpath, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
-        except Exception:
-            pass
-        try:
-            func(fpath)
-        except Exception as e:
-            rmtree_errors.append((fpath, str(e)))
+    for attempt in range(1, max_attempts + 1):
+        # collect errors during each rmtree attempt
+        rmtree_errors: list[tuple[str, str]] = []
 
-    try:
-        shutil.rmtree(str(path), onerror=onerror)
-    except PermissionError as e:
-        logging.warning(
-            f"Permission error deleting {path}: {e}. Attempting to fix permissions..."
-        )
-        # try to make everything writable and retry
-        for root, dirs, files in os.walk(path):
-            for d in dirs:
+        def onerror(func, fpath, exc_info):
+            """try to fix permissions and retry; log failures"""
+            exc = exc_info[1]
+            err_no = getattr(exc, "errno", None)
+            if err_no not in (errno.EBUSY, errno.ENOTEMPTY):
                 try:
-                    os.chmod(
-                        os.path.join(root, d),
-                        stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC,
-                    )
+                    os.chmod(fpath, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
                 except Exception:
                     pass
-            for f in files:
-                try:
-                    os.chmod(os.path.join(root, f), stat.S_IWRITE | stat.S_IREAD)
-                except Exception:
-                    pass
-        # retry deletion
-        rmtree_errors.clear()
-        shutil.rmtree(str(path), onerror=onerror)
+            try:
+                func(fpath)
+            except Exception as e:
+                rmtree_errors.append((fpath, str(e)))
 
-    # verify deletion actually happened
-    if path.exists():
+        try:
+            shutil.rmtree(str(path), onerror=onerror)
+        except PermissionError as e:
+            logging.warning(
+                f"Permission error deleting {path}: {e}. Attempting to fix permissions..."
+            )
+            for root, dirs, files in os.walk(path):
+                for d in dirs:
+                    try:
+                        os.chmod(
+                            os.path.join(root, d),
+                            stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC,
+                        )
+                    except Exception:
+                        pass
+                for f in files:
+                    try:
+                        os.chmod(os.path.join(root, f), stat.S_IWRITE | stat.S_IREAD)
+                    except Exception:
+                        pass
+            rmtree_errors.clear()
+            shutil.rmtree(str(path), onerror=onerror)
+
+        if not path.exists():
+            return
+
         remaining = list(path.rglob("*"))[:10]
-        error_sample = rmtree_errors[:5] if rmtree_errors else []
+        last_error_sample = rmtree_errors[:5] if rmtree_errors else []
+        busy = any(
+            ("Errno 16" in err) or ("Device or resource busy" in err)
+            for _, err in last_error_sample
+        )
+        if attempt < max_attempts and (busy or path.exists()):
+            logging.warning(
+                f"Delete retry {attempt}/{max_attempts} for {path}: "
+                f"{'busy source files on mounted share' if busy else 'directory still present'}. "
+                f"Sleeping {retry_delay_sec:.1f}s before retry."
+            )
+            time.sleep(retry_delay_sec)
+            continue
+
         raise RuntimeError(
-            f"Failed to delete {path}: directory still exists. "
-            f"Errors: {error_sample}. "
+            f"Failed to delete {path}: directory still exists after {attempt} attempt(s). "
+            f"Errors: {last_error_sample}. "
             f"Remaining files (sample): {[str(p) for p in remaining]}"
         )
 
@@ -587,7 +606,9 @@ def process_single_exam(
                 msg = f"failed delete after transfer: {e}"
                 logging.error(f"Failed to delete {src_path}: {e}")
                 deletion_log.append((str(src_path), msg))
-                raise
+                logging.warning(
+                    f"Leaving source exam in place after successful copy because cleanup failed: {src_path}"
+                )
         else:
             dst = DELETE_QUEUE_DIR / patient_id / exam_name
             dst.parent.mkdir(parents=True, exist_ok=True)

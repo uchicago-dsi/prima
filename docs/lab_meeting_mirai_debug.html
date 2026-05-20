@@ -1,0 +1,850 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mirai Debug Update</title>
+<style>
+:root { color-scheme: dark; --bg:#0d1117; --panel:#161b22; --text:#e6edf3; --muted:#9da7b3; --accent:#7cc0ff; --border:#30363d; }
+body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:linear-gradient(180deg,#0b1020,#111827 35%,#0d1117); color:var(--text); }
+main { max-width: 980px; margin: 0 auto; padding: 40px 24px 80px; }
+h1,h2,h3 { line-height:1.2; }
+h1 { font-size: 2.2rem; margin:0 0 18px; }
+h2 { margin-top: 36px; border-top:1px solid var(--border); padding-top:24px; }
+h3 { margin-top: 28px; color: var(--accent); }
+p, li { font-size: 1.02rem; line-height: 1.65; }
+p { color: var(--text); }
+ul, ol { padding-left: 22px; }
+code { background: rgba(124,192,255,0.12); border:1px solid rgba(124,192,255,0.2); padding:0.1rem 0.35rem; border-radius:6px; font-size: 0.95em; }
+pre { background: var(--panel); border:1px solid var(--border); padding: 14px 16px; border-radius: 12px; overflow:auto; }
+pre code { background: none; border: 0; padding: 0; }
+table { width:100%; border-collapse: collapse; margin: 18px 0 8px; background: var(--panel); border:1px solid var(--border); border-radius: 12px; overflow:hidden; }
+th, td { padding: 10px 12px; border-bottom:1px solid var(--border); text-align:left; color: var(--text); }
+th { background:#1d2430; font-weight:700; }
+tr:last-child td { border-bottom:0; }
+a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+<h1>Mirai Debugging Update</h1>
+<h2>Question</h2>
+<p>Why is the current Mirai pipeline underperforming on ChiMEC?</p>
+<h2>Bottom Line</h2>
+<p>The problem is now localized to the <strong>current input-to-tensor path</strong>, not QC, not the calibrator, and not the Mirai codebase in general.</p>
+<p>The key result is:</p>
+<ul>
+<li>current code + current zarr input path: weak</li>
+<li>current code + legacy PNG16 input path: strong</li>
+<li>Omoleye-era code + legacy PNG16 input path: strong</li>
+<li>current code + current zarr input path after PIL mode fix: strong</li>
+</ul>
+<p>So the failure follows the <strong>current zarr/current-input representation</strong>, not the model weights or the codebase.</p>
+<h2>AUC Comparisons on the Same Shard</h2>
+<p>All runs below used the same comparison shard of ChiMEC exams.</p>
+<table>
+<thead>
+<tr>
+<th>Condition</th>
+<th style="text-align: right;">1y</th>
+<th style="text-align: right;">2y</th>
+<th style="text-align: right;">3y</th>
+<th style="text-align: right;">4y</th>
+<th style="text-align: right;">5y</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Current code + current zarr path + current calibrator</td>
+<td style="text-align: right;">0.4765</td>
+<td style="text-align: right;">0.5320</td>
+<td style="text-align: right;">0.5388</td>
+<td style="text-align: right;">0.5469</td>
+<td style="text-align: right;">0.5793</td>
+</tr>
+<tr>
+<td>Current code + current zarr path + no calibrator</td>
+<td style="text-align: right;">0.4765</td>
+<td style="text-align: right;">0.5320</td>
+<td style="text-align: right;">0.5388</td>
+<td style="text-align: right;">0.5469</td>
+<td style="text-align: right;">0.5793</td>
+</tr>
+<tr>
+<td>Current code + current zarr path + old Omoleye calibrator</td>
+<td style="text-align: right;">0.4765</td>
+<td style="text-align: right;">0.5320</td>
+<td style="text-align: right;">0.5388</td>
+<td style="text-align: right;">0.5469</td>
+<td style="text-align: right;">0.5793</td>
+</tr>
+<tr>
+<td>Omoleye-era code + legacy PNG16 path + old calibrator</td>
+<td style="text-align: right;">0.6858</td>
+<td style="text-align: right;">0.6711</td>
+<td style="text-align: right;">0.6678</td>
+<td style="text-align: right;">0.6763</td>
+<td style="text-align: right;">0.6881</td>
+</tr>
+<tr>
+<td>Current code + legacy PNG16 path + current calibrator</td>
+<td style="text-align: right;">0.6857</td>
+<td style="text-align: right;">0.6711</td>
+<td style="text-align: right;">0.6678</td>
+<td style="text-align: right;">0.6763</td>
+<td style="text-align: right;">0.6880</td>
+</tr>
+<tr>
+<td>Current code + current zarr path after PIL mode fix</td>
+<td style="text-align: right;">0.6857</td>
+<td style="text-align: right;">0.6711</td>
+<td style="text-align: right;">0.6678</td>
+<td style="text-align: right;">0.6763</td>
+<td style="text-align: right;">0.6880</td>
+</tr>
+</tbody>
+</table>
+<h2>What These Experiments Rule Out</h2>
+<p>They rule out:</p>
+<ul>
+<li>the current calibrator as the main cause</li>
+<li>the old calibrator as the missing ingredient</li>
+<li>the current Mirai codebase as the main cause</li>
+<li>the encoder / transformer snapshot family as the main cause</li>
+</ul>
+<p>They strongly implicate:</p>
+<ul>
+<li>the current zarr-backed image representation, or</li>
+<li>the current conversion from loaded image to final model tensor</li>
+</ul>
+<p>This was then validated directly by patching the zarr loader to match the legacy PNG tensorization convention and rerunning the shard.</p>
+<h2>Tensor-Level Audit</h2>
+<p>I compared matched views from the current zarr path and the legacy PNG16 path under the <strong>same current Mirai test transform stack</strong>.</p>
+<p>Audit artifact:</p>
+<ul>
+<li><code>/gpfs/data/huo-lab/Image/ChiMEC/MG/out/debug_tensor_audit_quick/summary.json</code></li>
+</ul>
+<p>Sample used for the quick audit:</p>
+<ul>
+<li><code>20</code> matched views</li>
+<li><code>5</code> exams</li>
+</ul>
+<h3>Result</h3>
+<p>For all sampled matched views:</p>
+<ul>
+<li>raw pixels were <strong>identical</strong></li>
+<li>post-image-transform arrays were <strong>identical</strong></li>
+<li>final tensors were <strong>not</strong> identical</li>
+</ul>
+<p>Summary from the quick audit:</p>
+<ul>
+<li>raw pixel MAE: <code>0.0</code></li>
+<li>raw equal fraction: <code>1.0</code></li>
+<li>post-transform MAE: <code>0.0</code></li>
+<li>post-transform equal fraction: <code>1.0</code></li>
+<li>final tensor MAE: <code>0.6300</code></li>
+<li>final tensor equal fraction: <code>0.8846</code></li>
+</ul>
+<p>This means the divergence is happening <strong>after</strong> pixel loading and <strong>after</strong> the deterministic image transforms.</p>
+<h3>Mechanism</h3>
+<p>The two paths preserve the same pixel values but arrive at <code>ToTensor()</code> with different PIL modes:</p>
+<ul>
+<li>zarr path: <code>I;16</code></li>
+<li>legacy PNG16 path: <code>I</code></li>
+</ul>
+<p>That difference matters because <code>torchvision.transforms.ToTensor()</code> does not treat those modes equivalently.</p>
+<p>In a direct matched-view check:</p>
+<ul>
+<li>zarr raw array min/max: <code>0</code> to <code>65535</code></li>
+<li>legacy raw array min/max: <code>0</code> to <code>65535</code></li>
+<li>zarr post-transform array min/max: identical to legacy</li>
+<li>legacy post-transform array min/max: identical to zarr</li>
+</ul>
+<p>But the raw tensor produced by <code>torchvision.transforms.ToTensor()</code> differs sharply:</p>
+<ul>
+<li>zarr path raw tensor range: <code>-32768</code> to <code>32767</code></li>
+<li>legacy path raw tensor range: <code>0</code> to <code>65535</code></li>
+</ul>
+<p>So the likely bug is:</p>
+<ul>
+<li>the zarr-backed image arrives as PIL mode <code>I;16</code></li>
+<li>the legacy PNG path arrives as PIL mode <code>I</code></li>
+<li><code>ToTensor()</code> handles those modes differently</li>
+<li>that changes the tensor values sent into Mirai, even though the underlying pixels are the same</li>
+</ul>
+<p>So the error is not in the image content. The error is in the <strong>mode / dtype convention used immediately before tensorization</strong>.</p>
+<h2>Validation of the Fix</h2>
+<p>I changed the zarr loader so that it materializes the same PIL mode convention as the legacy PNG16 path:</p>
+<ul>
+<li>before: zarr images were opened as <code>I;16</code></li>
+<li>after: zarr images are opened as <code>I</code> while preserving the same <code>0..65535</code> pixel values</li>
+</ul>
+<p>Rerun artifact:</p>
+<ul>
+<li><code>/gpfs/data/huo-lab/Image/ChiMEC/MG/out/debug_zarr_modefix/output_chunk000_modefix.csv</code></li>
+</ul>
+<p>Rerun AUCs:</p>
+<ul>
+<li>1y: <code>0.6857</code></li>
+<li>2y: <code>0.6711</code></li>
+<li>3y: <code>0.6678</code></li>
+<li>4y: <code>0.6763</code></li>
+<li>5y: <code>0.6880</code></li>
+</ul>
+<p>Interpretation:</p>
+<ul>
+<li>the fix restores the current zarr-backed path to the same performance as the legacy PNG16 path</li>
+<li>this validates that the main bug was the PIL mode / tensorization mismatch</li>
+</ul>
+<h2>Interpretation</h2>
+<p>This is the strongest result so far because it both explains the large AUC gap mechanistically and resolves it on the test shard.</p>
+<p>The problem does <strong>not</strong> appear to be:</p>
+<ul>
+<li>low-level pixel corruption</li>
+<li>a different cohort</li>
+<li>a calibrator problem</li>
+<li>a broad old-vs-new codebase issue</li>
+</ul>
+<p>The problem was:</p>
+<ul>
+<li>a mode / dtype / tensorization mismatch in the current zarr-backed path</li>
+</ul>
+<h2>Comparison to the Omoleye Validation Subset</h2>
+<p>We were able to locate the original ChiMEC validation scripts and saved outputs in Omoleye's read-only workspace.</p>
+<p>Original launch scripts:</p>
+<ul>
+<li><code>/gpfs/data/huo-lab/ojomoleye/repos/MiraiValidation_paper/Mirai/demo/validate_chimec.sh</code></li>
+<li><code>/gpfs/data/huo-lab/ojomoleye/repos/MiraiValidation_paper/Mirai/demo/validate_chimec_yrcut.sh</code></li>
+<li><code>/gpfs/data/huo-lab/ojomoleye/repos/MiraiValidation_paper/Mirai/demo/validate_chimec_yrcut2.sh</code></li>
+</ul>
+<p>These scripts confirm that the paper-era runs used:</p>
+<ul>
+<li>old Mirai code</li>
+<li>old calibrator <code>MIRAI_FULL_PRED_RF.callibrator.p</code></li>
+<li>explicit input files under <code>data/mirai_validation/cleaned/</code></li>
+<li>explicit output files under <code>data/mirai_validation/raw/</code></li>
+</ul>
+<p>Located paper-era input files:</p>
+<ul>
+<li><code>/gpfs/data/huo-lab/ojomoleye/data/mirai_validation/cleaned/allchimec_eligible_MiraiInput.csv</code></li>
+<li><code>/gpfs/data/huo-lab/ojomoleye/data/mirai_validation/cleaned/allchimec_eligible_MiraiInput_yrcut.csv</code></li>
+<li><code>/gpfs/data/huo-lab/ojomoleye/data/mirai_validation/cleaned/allchimec_eligible_MiraiInput_yrcut2.csv</code></li>
+</ul>
+<p>Located paper-era output files:</p>
+<ul>
+<li><code>/gpfs/data/huo-lab/ojomoleye/data/mirai_validation/raw/allchimec_MiraiOutput.csv</code></li>
+<li><code>/gpfs/data/huo-lab/ojomoleye/data/mirai_validation/raw/allchimec_MiraiOutput_yrcut.csv</code></li>
+<li><code>/gpfs/data/huo-lab/ojomoleye/data/mirai_validation/raw/allchimec_MiraiOutput_yrcut2.csv</code></li>
+</ul>
+<h3>Key Counts</h3>
+<p>For the <code>yrcut</code> subset:</p>
+<ul>
+<li>paper-era input exams: <code>6376</code></li>
+<li>paper-era output exams: <code>6337</code></li>
+<li>paper-era output patients: <code>2053</code></li>
+</ul>
+<p>Using accession-number mapping, we compared those output exams to the current fixed run:</p>
+<ul>
+<li>overlapping exams: <code>5437</code></li>
+<li>overlapping patients: <code>1889</code></li>
+<li>paper-era <code>yrcut</code> output exams missing from our current fixed run: <code>900</code></li>
+</ul>
+<h3>Why the first overlap attempt failed</h3>
+<p>The saved paper-era outputs use accession-style exam IDs like:</p>
+<ul>
+<li><code>10930784.2O03570</code></li>
+</ul>
+<p>Our current pipeline uses UID-style <code>exam_id</code> values. The overlap only becomes visible after mapping our current exams through:</p>
+<ul>
+<li><code>patient_id + accession_number</code></li>
+</ul>
+<h3>Score Agreement on Shared Exams</h3>
+<p>On the <code>5437</code> shared exams, the risk scores are correlated but not identical.</p>
+<p>Correlation of old vs current fixed scores:</p>
+<ul>
+<li>1y: <code>0.8525</code></li>
+<li>2y: <code>0.8589</code></li>
+<li>3y: <code>0.8624</code></li>
+<li>4y: <code>0.8628</code></li>
+<li>5y: <code>0.8654</code></li>
+</ul>
+<p>Mean absolute error:</p>
+<ul>
+<li>1y: <code>0.00604</code></li>
+<li>2y: <code>0.00833</code></li>
+<li>3y: <code>0.00832</code></li>
+<li>4y: <code>0.00757</code></li>
+<li>5y: <code>0.00728</code></li>
+</ul>
+<p>So the fixed current pipeline is now much closer to the paper-era results than before, but it is still not numerically identical on the same exams.</p>
+<h3>AUC on the Exact Overlapping <code>yrcut</code> Exams</h3>
+<p>Using the paper-era <code>yrcut</code> labels and restricting both models to the exact shared exams:</p>
+<table>
+<thead>
+<tr>
+<th>Horizon</th>
+<th style="text-align: right;">Eligible exams</th>
+<th style="text-align: right;">Cases</th>
+<th style="text-align: right;">Controls</th>
+<th style="text-align: right;">Omoleye output AUC</th>
+<th style="text-align: right;">Current fixed AUC</th>
+<th style="text-align: right;">Delta</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2y</td>
+<td style="text-align: right;">5215</td>
+<td style="text-align: right;">286</td>
+<td style="text-align: right;">4929</td>
+<td style="text-align: right;">0.6226</td>
+<td style="text-align: right;">0.6212</td>
+<td style="text-align: right;">-0.0014</td>
+</tr>
+<tr>
+<td>3y</td>
+<td style="text-align: right;">4721</td>
+<td style="text-align: right;">549</td>
+<td style="text-align: right;">4172</td>
+<td style="text-align: right;">0.6306</td>
+<td style="text-align: right;">0.6186</td>
+<td style="text-align: right;">-0.0120</td>
+</tr>
+<tr>
+<td>4y</td>
+<td style="text-align: right;">4107</td>
+<td style="text-align: right;">745</td>
+<td style="text-align: right;">3362</td>
+<td style="text-align: right;">0.6250</td>
+<td style="text-align: right;">0.6129</td>
+<td style="text-align: right;">-0.0121</td>
+</tr>
+<tr>
+<td>5y</td>
+<td style="text-align: right;">3572</td>
+<td style="text-align: right;">896</td>
+<td style="text-align: right;">2676</td>
+<td style="text-align: right;">0.6331</td>
+<td style="text-align: right;">0.6202</td>
+<td style="text-align: right;">-0.0130</td>
+</tr>
+</tbody>
+</table>
+<p>There were no 1-year cases in the exact overlapping <code>yrcut</code> subset, so 1-year AUC is undefined there.</p>
+<p>Interpretation:</p>
+<ul>
+<li>the catastrophic AUC failure is fixed</li>
+<li>on the same exams, the current fixed pipeline is now close to the paper-era outputs</li>
+<li>but it remains slightly lower on the exact shared subset</li>
+<li>this means there is likely still some residual paper-vs-current input construction difference, not just a broad model failure</li>
+</ul>
+<p>This overlap-restricted AUC comparison is important because it already isolates one specific question:</p>
+<ul>
+<li>these AUCs use <strong>our current chosen views</strong> on the exact accession-mapped overlapping exams</li>
+<li>therefore, they remove the effect of the missing <code>900</code> exams</li>
+<li>the remaining delta on this overlap-restricted comparison reflects differences within the shared subset, such as view/duplicate selection and residual input construction differences</li>
+</ul>
+<p>So:</p>
+<ul>
+<li>the <code>900</code> missing exams explain part of the paper-vs-current gap</li>
+<li>but not all of it</li>
+<li>the overlap-restricted AUC table shows that some smaller gap remains even after conditioning on the shared exams</li>
+</ul>
+<h3>What the residual difference now looks like</h3>
+<p>The next pass narrowed the remaining difference further.</p>
+<h4>1. The missing <code>900</code> exams are upstream subset differences</h4>
+<p>We classified the <code>900</code> paper-era <code>yrcut</code> output exams that do not appear in the current fixed overlap.</p>
+<p>Result:</p>
+<ul>
+<li>all <code>900</code> are missing because there is <strong>no matching <code>patient_id + accession_number</code> exam</strong> in the current <code>sot_all</code> tables</li>
+<li>they are <strong>not</strong> being dropped later by the fixed Mirai inference step</li>
+<li>they are <strong>not</strong> a downstream QC or AUC-filter artifact</li>
+</ul>
+<p>So the <code>900</code>-exam gap is primarily a <strong>subset construction / exam identity gap</strong> between the paper-era input table and the current rebuilt SoT tables.</p>
+<h4>2. Shared exams often do not use the same underlying view files</h4>
+<p>Among the shared accession-mapped exams, we compared the old PNG view files to the current view table by:</p>
+<ul>
+<li><code>patient_id</code></li>
+<li>accession number</li>
+<li>laterality</li>
+<li>view</li>
+</ul>
+<p>Using the SOP instance UID embedded in the old PNG filename, we asked whether the current pipeline is using the same underlying DICOM for the same <code>L/R x CC/MLO</code> slot.</p>
+<p>Result:</p>
+<ul>
+<li>unique shared view positions compared: <code>21825</code></li>
+<li>unique shared view positions with an exact SOP UID match: <code>0</code></li>
+<li>unique shared view positions with multiple current matches: <code>2185</code></li>
+</ul>
+<p>Interpretation:</p>
+<ul>
+<li>even when the accession-level exam overlaps, the paper-era and current pipelines are typically <strong>not</strong> selecting the same underlying image file for a given view slot</li>
+<li>so the remaining paper-vs-current difference is not just score drift on identical images</li>
+<li>part of it is a real <strong>view-selection / exam-construction difference</strong></li>
+<li>the differences do <strong>not</strong> look like a simple quality-screening advantage such as “old pipeline kept clean presentation images while current pipeline kept marked-up or odd images”</li>
+<li>in the sampled overlapping view positions, the current candidates are overwhelmingly:</li>
+<li><code>for_presentation = True</code></li>
+<li><code>is_marked_up = False</code></li>
+<li>and often look like sibling duplicates from the same acquisition family rather than obviously worse images</li>
+</ul>
+<p>There are also <code>211</code> suffix-insensitive SOP matches, which suggests part of the old-vs-current mismatch is identifier formatting / instance naming rather than a completely different image in every case.</p>
+<h4>3. Different selected views can still look very similar after preprocessing</h4>
+<p>We then ran a small tensor audit on <code>5</code> shared exams (<code>20</code> view pairs) using:</p>
+<ul>
+<li>the old PNG view file from the paper-era <code>yrcut</code> input table</li>
+<li>the current selected zarr-backed view for the same accession / laterality / view slot</li>
+<li>the same current Mirai test transform stack</li>
+</ul>
+<p>Result:</p>
+<ul>
+<li>the old and current raw images often had different native shapes</li>
+<li>current zarr-backed views: typically <code>2048 x 1664</code></li>
+<li>old PNG views: typically <code>3328 x 2560</code> or <code>4096 x 3328</code></li>
+<li>after the current scale-and-align transform stack, the resulting tensors were still <strong>extremely similar</strong></li>
+<li>mean final-tensor correlation: about <code>0.9997</code></li>
+<li>mean final-tensor absolute difference: about <code>0.0076</code></li>
+</ul>
+<p>Interpretation:</p>
+<ul>
+<li>the current pipeline is often choosing a different underlying view file</li>
+<li>but those different view files are usually still visually and numerically very similar after Mirai preprocessing</li>
+<li>this is consistent with a <strong>small residual performance gap</strong>, not another catastrophic preprocessing failure</li>
+</ul>
+<h4>4. Batch size <code>8</code> is not feasible on the exact Omoleye PNG subset</h4>
+<p>We launched the current code on the exact copied <code>yrcut</code> input CSV inside the held GPU pilot allocations.</p>
+<p>Current status:</p>
+<ul>
+<li><code>batch_size = 1</code>: completed successfully</li>
+<li><code>batch_size = 8</code>: failed with CUDA OOM on the full exact PNG subset</li>
+</ul>
+<p>That means the directly comparable Omoleye-style setting remains <code>batch_size = 1</code>. The larger-batch exact-subset rerun is not a viable apples-to-apples setting on this input representation.</p>
+<h4>5. On Omoleye's exact <code>yrcut</code> input table, the current fixed pipeline is essentially aligned</h4>
+<p>We then ran the current fixed pipeline directly on a copied version of Omoleye's exact <code>yrcut</code> input CSV using the Omoleye-style <code>batch_size = 1</code> setting.</p>
+<p>Result:</p>
+<ul>
+<li>1y: <code>NA</code> (<code>0</code> one-year cases in this subset)</li>
+<li>2y: <code>0.6312</code></li>
+<li>3y: <code>0.6302</code></li>
+<li>4y: <code>0.6272</code></li>
+<li>5y: <code>0.6311</code></li>
+</ul>
+<p>Compared with the saved Omoleye <code>yrcut</code> outputs:</p>
+<ul>
+<li>2y: <code>0.6226</code></li>
+<li>3y: <code>0.6306</code></li>
+<li>4y: <code>0.6250</code></li>
+<li>5y: <code>0.6331</code></li>
+</ul>
+<p>Interpretation:</p>
+<ul>
+<li>this does <strong>not</strong> show that batch size alone changed the answer</li>
+<li>we do not have a successful <code>batch_size = 8</code> run on the exact PNG subset because that setting OOMs</li>
+<li>instead, it shows that when we remove the rebuilt-manifest / accession-mapping / missing-exam issues and run the current fixed pipeline on <strong>Omoleye's exact input table</strong>, performance is essentially the same as his</li>
+</ul>
+<p>So the closer match is not best interpreted as:</p>
+<ul>
+<li>"batch size 1 rescued the model"</li>
+</ul>
+<p>It is better interpreted as:</p>
+<ul>
+<li>"the current fixed pipeline matches Omoleye once we run on the same exact subset definition and image list"</li>
+</ul>
+<p>That means the residual difference we saw earlier was mostly due to:</p>
+<ul>
+<li>the large zarr tensorization bug, now fixed</li>
+<li>plus subset construction / view-selection differences between the rebuilt current cohort and the paper-era <code>yrcut</code> table</li>
+</ul>
+<h3>What remains unexplained</h3>
+<p>The remaining gap is now much narrower and more specific. At this point, the main unresolved issue is not model failure, but cohort/input bookkeeping:</p>
+<ul>
+<li>differences in exact input set construction before inference</li>
+<li>differences in mirrored / accession-linked / duplicated exam handling</li>
+<li>different underlying SOP/view selection within the same accession</li>
+<li>paper-era cohort exclusions that are not yet replicated exactly in the rebuilt all-available cohort</li>
+</ul>
+<h3>Role of QC</h3>
+<p>QC is still pending and may still move the full-cohort numbers, but it is no longer a good explanation for the original catastrophic failure.</p>
+<p>What is already resolved:</p>
+<ul>
+<li>the large underperformance on the current pipeline was driven by the zarr <code>I;16</code> vs legacy <code>I</code> tensorization mismatch</li>
+<li>fixing that bug restores strong shard-level performance and brings the current pipeline into close agreement with the paper-era subset</li>
+</ul>
+<p>What QC could still plausibly explain:</p>
+<ul>
+<li>part of the smaller remaining gap between the rebuilt all-available cohort and the paper-era subset</li>
+<li>performance loss from noisier or less curated exams in the widened cohort</li>
+<li>residual differences between the paper-era subset and the current rebuilt cohort after the main tensorization bug is fixed</li>
+</ul>
+<p>So the current state is:</p>
+<ul>
+<li>the main Mirai bug is identified and fixed</li>
+<li>QC remains an important pending refinement step, not the leading explanation for the original failure</li>
+</ul>
+<h2>Practical Consequence</h2>
+<p>This is good news for the longer-term PRS project.</p>
+<p>It suggests we do <strong>not</strong> need to build on the old Omoleye codebase just to get working Mirai behavior. Instead, we can:</p>
+<ol>
+<li>use the corrected current input-to-tensor path,</li>
+<li>keep the current codebase as the development platform,</li>
+<li>then build feature extraction / PRS integration on top of the corrected current pipeline.</li>
+</ol>
+<h2>Current Full-Cohort Result</h2>
+<p>After propagating the fix to the widened all-available cohort, the corrected current pipeline now gives:</p>
+<ul>
+<li>1y AUC: <code>0.6965</code></li>
+<li>2y AUC: <code>0.6909</code></li>
+<li>3y AUC: <code>0.6877</code></li>
+<li>4y AUC: <code>0.6834</code></li>
+<li>5y AUC: <code>0.6816</code></li>
+</ul>
+<p>On the Omoleye-style <code>TTC ≥ 6 months</code> row:</p>
+<ul>
+<li>1y AUC: <code>0.6231</code></li>
+<li>2y AUC: <code>0.5970</code></li>
+<li>3y AUC: <code>0.5912</code></li>
+<li>4y AUC: <code>0.5909</code></li>
+<li>5y AUC: <code>0.5874</code></li>
+</ul>
+<h2>Next Step</h2>
+<p>The next step is no longer to find the main zarr bug. The remaining work is to explain the smaller residual difference to the paper-era subset:</p>
+<ol>
+<li>compare Omoleye input subset construction directly against our current manifest</li>
+<li>decide whether we need to explicitly recreate the paper-era subset definition inside the current pipeline for manuscript-quality replication</li>
+<li>decide how much of the remaining cohort difference is:</li>
+<li>missing exams from the rebuilt SoT tables</li>
+<li>different SOP/view selection within overlapping accessions</li>
+<li>paper-era cohort bookkeeping that we no longer want to preserve</li>
+</ol>
+<h2>Validation-Paper Expansion Plan</h2>
+<p>Reading the final Omoleye 2023 PDF clarifies which parts of the original paper are most natural to extend in the larger corrected cohort.</p>
+<p>What the original paper actually did:</p>
+<ul>
+<li>external validation of Mirai in a high-risk, racially diverse ChiMEC cohort</li>
+<li>compared Mirai with:</li>
+<li>BI-RADS assessment</li>
+<li>visually assessed breast density</li>
+<li>BDC weighted density</li>
+<li>reported:</li>
+<li>per-horizon AUCs</li>
+<li>Harrell concordance index</li>
+<li>subgroup AUCs by age, race/ethnicity, density, receptor subtype, and grade</li>
+<li>mirroring experiments showing the affected breast drives much of the short-term signal</li>
+<li>a simple combined Mirai + BI-RADS 1-year logistic model</li>
+</ul>
+<p>The best paper-quality extensions in the expanded corrected cohort are therefore:</p>
+<ol>
+<li>Reproduce the original paper tables and figures on the corrected expanded cohort.</li>
+<li>This is the cleanest validation contribution.</li>
+<li>It should include the same TTC <code>&lt; 6 months</code> exclusion used in the paper.</li>
+<li>
+<p>It should explicitly show old paper cohort versus expanded cohort counts and performance.</p>
+</li>
+<li>
+<p>Directly quantify transport from the paper-era subset to the widened cohort.</p>
+</li>
+<li>same institution</li>
+<li>same model</li>
+<li>corrected preprocessing</li>
+<li>larger, less curated cohort</li>
+<li>
+<p>This becomes a useful “how much does cohort construction matter?” analysis.</p>
+</li>
+<li>
+<p>Re-run and expand the mirroring / affected-breast analyses.</p>
+</li>
+<li>This is the most biologically interesting part of the original paper.</li>
+<li>
+<p>It also helps explain whether the enlarged cohort still supports the same “precancerous signal” interpretation.</p>
+</li>
+<li>
+<p>Add calibration and score-distribution analyses.</p>
+</li>
+<li>The original paper emphasized discrimination more than calibration.</li>
+<li>
+<p>Calibration, observed/expected risk, and threshold behavior would add something genuinely new.</p>
+</li>
+<li>
+<p>Add vendor / calendar-period robustness.</p>
+</li>
+<li>The original paper did not make this the main focus.</li>
+<li>
+<p>In the expanded cohort, this is a strong practical validation question.</p>
+</li>
+<li>
+<p>Add repeated-exam sensitivity analyses.</p>
+</li>
+<li>first exam per patient</li>
+<li>last eligible prediagnostic exam</li>
+<li>patient-weighted all exams</li>
+<li>
+<p>This will matter because the rebuilt cohort and the expanded cohort both include repeated exams.</p>
+</li>
+<li>
+<p>If BI-RADS and density are sufficiently complete, re-run the combined-model analyses.</p>
+</li>
+<li>Mirai alone</li>
+<li>BI-RADS alone</li>
+<li>Mirai + BI-RADS</li>
+<li>density / BDC comparisons</li>
+<li>This gives the validation paper a concrete clinical-comparison angle beyond “Mirai AUC improved.”</li>
+</ol>
+<p>What seems most worth doing before PRS is available:</p>
+<ul>
+<li>exact replication of the paper’s main analyses on the corrected expanded cohort</li>
+<li>explicit comparison between paper-era curated subset and expanded cohort</li>
+<li>mirroring / affected-breast analyses</li>
+<li>calibration</li>
+<li>vendor / time-period robustness</li>
+</ul>
+<p>What is probably lower priority:</p>
+<ul>
+<li>spending more time chasing tiny residual paper-era score differences</li>
+<li>old-code-path reproduction beyond what is already enough to show the main bug is fixed</li>
+<li>new modeling before QC is stabilized</li>
+</ul>
+<h2>Additional Analyses Worth Doing Before PRS</h2>
+<p>Some extensions are stronger than a simple "same paper, bigger cohort" update.</p>
+<p>High-value additions:</p>
+<ul>
+<li>calibration by horizon</li>
+<li>reliability plots</li>
+<li>observed-to-expected ratios by score decile</li>
+<li>calibration slope / intercept if we want a compact summary</li>
+<li>transportability from the paper-era curated subset to the widened cohort</li>
+<li>this is now a real story because we found and fixed a pipeline bug and can separate that from cohort construction</li>
+<li>threshold-oriented risk enrichment</li>
+<li>what fraction of future cancers land in the top <code>1%</code>, <code>5%</code>, or <code>10%</code> of Mirai risk</li>
+<li>PPV / sensitivity tradeoff at clinically interpretable cut points</li>
+<li>stability across acquisition context</li>
+<li>manufacturer/vendor</li>
+<li>calendar period</li>
+<li>eventually QC-defined technical subsets</li>
+<li>repeated-exam sensitivity</li>
+<li>all exams patient-weighted</li>
+<li>first exam per patient</li>
+<li>last exam per patient</li>
+<li>random one exam per patient</li>
+<li>mirroring / affected-breast analyses</li>
+<li>this was one of the most interesting parts of the original paper and is more publishable than a plain AUC update</li>
+<li>cumulative incidence or Kaplan-Meier style stratification by Mirai risk quantile</li>
+<li>useful if we want a validation-paper figure that reads more clinically than AUC alone</li>
+</ul>
+<p>The best overall framing is probably:</p>
+<ul>
+<li>corrected technical validation</li>
+<li>expanded-cohort transportability</li>
+<li>robustness and biological specificity analyses</li>
+</ul>
+<h2>Pre-QC Extension Results on the Corrected Expanded Cohort</h2>
+<p>I ran a first extension pass on the corrected all-available cohort using the same QC filters as the current main run, with the primary paper-matched restriction:</p>
+<ul>
+<li><code>time to cancer &gt;= 6 months</code></li>
+</ul>
+<p>Artifacts:</p>
+<ul>
+<li><code>/gpfs/data/huo-lab/Image/ChiMEC/MG/out_all_modefix/validation_extensions/manufacturer_auc_ttc6.csv</code></li>
+<li><code>/gpfs/data/huo-lab/Image/ChiMEC/MG/out_all_modefix/validation_extensions/calendar_period_auc_ttc6.csv</code></li>
+<li><code>/gpfs/data/huo-lab/Image/ChiMEC/MG/out_all_modefix/validation_extensions/exam_selection_auc_ttc6.csv</code></li>
+</ul>
+<p>Primary filtered cohort:</p>
+<ul>
+<li><code>13,086</code> exams</li>
+<li><code>2,973</code> patients</li>
+</ul>
+<h3>Manufacturer robustness</h3>
+<p>Main manufacturers after filtering:</p>
+<ul>
+<li><code>HOLOGIC, Inc.</code>: <code>9,189</code> exams</li>
+<li><code>GE MEDICAL SYSTEMS</code>: <code>3,481</code> exams</li>
+<li><code>LORAD</code>: <code>246</code> exams</li>
+</ul>
+<p>Representative AUCs:</p>
+<ul>
+<li>HOLOGIC:</li>
+<li>1y <code>0.632</code></li>
+<li>2y <code>0.603</code></li>
+<li>3y <code>0.610</code></li>
+<li>4y <code>0.610</code></li>
+<li>5y <code>0.609</code></li>
+<li>GE:</li>
+<li>1y <code>0.587</code></li>
+<li>2y <code>0.573</code></li>
+<li>3y <code>0.552</code></li>
+<li>4y <code>0.555</code></li>
+<li>5y <code>0.552</code></li>
+</ul>
+<p>Interpretation:</p>
+<ul>
+<li>performance is not catastrophically different by manufacturer</li>
+<li>but HOLOGIC is consistently stronger than GE by about <code>0.03</code> to <code>0.06</code> AUC depending on horizon</li>
+<li>that makes vendor/manufacturer robustness worth keeping in a validation paper</li>
+</ul>
+<h3>Calendar-period robustness</h3>
+<p>Calendar bins:</p>
+<ul>
+<li><code>2001-2010</code>: <code>3,748</code> exams</li>
+<li><code>2011-2015</code>: <code>5,091</code> exams</li>
+<li><code>2016-2020</code>: <code>3,049</code> exams</li>
+<li><code>2021-2025</code>: <code>1,198</code> exams</li>
+</ul>
+<p>Representative 1-year AUCs:</p>
+<ul>
+<li><code>2001-2010</code>: <code>0.647</code></li>
+<li><code>2011-2015</code>: <code>0.622</code></li>
+<li><code>2016-2020</code>: <code>0.648</code></li>
+<li><code>2021-2025</code>: <code>0.680</code></li>
+</ul>
+<p>Representative 5-year AUCs:</p>
+<ul>
+<li><code>2001-2010</code>: <code>0.629</code></li>
+<li><code>2011-2015</code>: <code>0.614</code></li>
+<li><code>2016-2020</code>: <code>0.626</code></li>
+<li><code>2021-2025</code>: <code>0.647</code></li>
+</ul>
+<p>Interpretation:</p>
+<ul>
+<li>there is no obvious catastrophic calendar-era collapse after the technical fix</li>
+<li>the newest bin has wide uncertainty because it has very few cases</li>
+<li>the middle eras are fairly consistent, which is reassuring for a wider-cohort validation story</li>
+</ul>
+<h3>Repeated-exam sensitivity</h3>
+<p>This was the most informative extension result so far.</p>
+<p>At <code>TTC &gt;= 6 months</code>, 1-year / 5-year AUCs were:</p>
+<ul>
+<li>all exams, patient-weighted:</li>
+<li>1y <code>0.623</code></li>
+<li>5y <code>0.587</code></li>
+<li>first exam per patient:</li>
+<li>1y <code>0.668</code></li>
+<li>5y <code>0.623</code></li>
+<li>last exam per patient:</li>
+<li>1y <code>0.600</code></li>
+<li>5y <code>0.565</code></li>
+<li>one random exam per patient:</li>
+<li>1y <code>0.643</code></li>
+<li>5y <code>0.601</code></li>
+</ul>
+<p>Interpretation:</p>
+<ul>
+<li>apparent performance depends materially on how repeated exams are handled</li>
+<li>first-exam-per-patient performance is clearly stronger than last-exam-per-patient performance</li>
+<li>this means the repeated-exam design choice should be explicit in any validation manuscript and ideally treated as a sensitivity analysis, not a hidden implementation detail</li>
+</ul>
+<p>This result is useful even before QC is finished because it changes how we should frame the cohort:</p>
+<ul>
+<li>"all available exams" and "one exam per patient" are not interchangeable evaluation targets</li>
+</ul>
+<h4>Repeated-exam sensitivity table</h4>
+<table>
+<thead>
+<tr>
+<th>Evaluation design</th>
+<th style="text-align: right;">1y AUC</th>
+<th style="text-align: right;">2y AUC</th>
+<th style="text-align: right;">3y AUC</th>
+<th style="text-align: right;">4y AUC</th>
+<th style="text-align: right;">5y AUC</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>All exams, patient-weighted</td>
+<td style="text-align: right;">0.623</td>
+<td style="text-align: right;">0.597</td>
+<td style="text-align: right;">0.591</td>
+<td style="text-align: right;">0.591</td>
+<td style="text-align: right;">0.587</td>
+</tr>
+<tr>
+<td>First exam per patient</td>
+<td style="text-align: right;">0.668</td>
+<td style="text-align: right;">0.644</td>
+<td style="text-align: right;">0.630</td>
+<td style="text-align: right;">0.631</td>
+<td style="text-align: right;">0.623</td>
+</tr>
+<tr>
+<td>Last exam per patient</td>
+<td style="text-align: right;">0.600</td>
+<td style="text-align: right;">0.575</td>
+<td style="text-align: right;">0.568</td>
+<td style="text-align: right;">0.564</td>
+<td style="text-align: right;">0.565</td>
+</tr>
+<tr>
+<td>One random exam per patient</td>
+<td style="text-align: right;">0.643</td>
+<td style="text-align: right;">0.608</td>
+<td style="text-align: right;">0.604</td>
+<td style="text-align: right;">0.603</td>
+<td style="text-align: right;">0.601</td>
+</tr>
+</tbody>
+</table>
+<p>Interpretation:</p>
+<ul>
+<li>first-exam-per-patient is clearly the strongest of the one-exam-per-patient designs</li>
+<li>last-exam-per-patient is the weakest</li>
+<li>the patient-weighted all-exam analysis lands between them, but closer to the lower-performing settings at longer horizons</li>
+<li>this should be treated as a real design choice in the manuscript, not just an implementation detail</li>
+</ul>
+<h2>Practical Checklist</h2>
+<h3>Must-have before writing</h3>
+<ol>
+<li>Re-run the main corrected cohort after QC is finished.</li>
+<li>Re-run the manufacturer, calendar-period, and repeated-exam sensitivity tables after QC.</li>
+<li>Reproduce the original paper-style subgroup table as closely as the available metadata allows:</li>
+<li>age</li>
+<li>race/ethnicity</li>
+<li>receptor subtype</li>
+<li>grade</li>
+<li>Re-run the mirroring / affected-breast analyses on the corrected expanded cohort.</li>
+<li>Quantify the paper-era subset versus widened-cohort transport gap explicitly.</li>
+</ol>
+<h3>Strong additions if time allows</h3>
+<ol>
+<li>Add calibration by horizon.</li>
+<li>Add score-quantile enrichment analyses:</li>
+<li>top <code>1%</code></li>
+<li>top <code>5%</code></li>
+<li>top <code>10%</code></li>
+<li>Add cumulative-incidence style stratification by Mirai risk quantile.</li>
+<li>Add threshold-oriented tables that read clinically, not just statistically.</li>
+</ol>
+<h3>After QC</h3>
+<ol>
+<li>Treat all current pre-QC extension results as provisional and rerun them on the QC-final cohort.</li>
+<li>Check whether vendor differences shrink after QC.</li>
+<li>Check whether the repeated-exam sensitivity pattern persists after QC.</li>
+<li>Reassess whether any residual gap versus the paper-era subset is still attributable to cohort construction versus data quality.</li>
+</ol>
+<h2>Key Artifacts</h2>
+<ul>
+<li>current calibrated output:</li>
+<li><code>/gpfs/data/huo-lab/Image/ChiMEC/MG/out/mirai_shards/output_000.csv</code></li>
+<li>Omoleye-era output:</li>
+<li><code>/gpfs/data/huo-lab/Image/ChiMEC/MG/out/debug_omoleye_chunk000/omoleye_output_chunk000.csv</code></li>
+<li>current code on legacy PNG16:</li>
+<li><code>/gpfs/data/huo-lab/Image/ChiMEC/MG/out/debug_currentcode_legacypng/output_chunk000_currentcode_legacypng.csv</code></li>
+<li>condition comparison summary:</li>
+<li><code>/gpfs/data/huo-lab/Image/ChiMEC/MG/out/debug_compare_conditions/condition_auc_summary.csv</code></li>
+<li>tensor audit summary:</li>
+<li><code>/gpfs/data/huo-lab/Image/ChiMEC/MG/out/debug_tensor_audit_quick/summary.json</code></li>
+<li>zarr-path rerun after fix:</li>
+<li><code>/gpfs/data/huo-lab/Image/ChiMEC/MG/out/debug_zarr_modefix/output_chunk000_modefix.csv</code></li>
+<li>paper-era input/output subset:</li>
+<li><code>/gpfs/data/huo-lab/ojomoleye/data/mirai_validation/cleaned/allchimec_eligible_MiraiInput_yrcut.csv</code></li>
+<li><code>/gpfs/data/huo-lab/ojomoleye/data/mirai_validation/raw/allchimec_MiraiOutput_yrcut.csv</code></li>
+<li>exact-subset comparison outputs:</li>
+<li><code>/gpfs/data/huo-lab/Image/ChiMEC/MG/out/debug_omoleye_subset_compare/summary.json</code></li>
+<li><code>/gpfs/data/huo-lab/Image/ChiMEC/MG/out/debug_omoleye_subset_compare/omoleye_yrcut_missing_reason_counts.csv</code></li>
+<li><code>/gpfs/data/huo-lab/Image/ChiMEC/MG/out/debug_omoleye_subset_compare/omoleye_yrcut_view_identity.csv</code></li>
+<li><code>/gpfs/data/huo-lab/Image/ChiMEC/MG/out/debug_omoleye_subset_compare/output_currentcode_omoleye_yrcut_bs1.csv</code></li>
+<li>fixed full-cohort outputs:</li>
+<li><code>/gpfs/data/huo-lab/Image/ChiMEC/MG/out_all_modefix/validation_output.csv</code></li>
+<li><code>/gpfs/data/huo-lab/Image/ChiMEC/MG/out_all_modefix/validation_output_clinical.csv</code></li>
+<li><code>/gpfs/data/huo-lab/Image/ChiMEC/MG/out_all_modefix/model_performance_metrics.csv</code></li>
+</ul>
+</main>
+</body>
+</html>

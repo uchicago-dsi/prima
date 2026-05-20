@@ -53,13 +53,17 @@ import hashlib
 import json
 import logging
 import os
+import shlex
 import signal
+import shutil
+import subprocess
 import sys
 import time
 import warnings
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Set, Tuple
 
 try:
     import cv2  # type: ignore
@@ -265,6 +269,19 @@ class PreprocessConfig:
         self.checkpoint_dir = checkpoint_dir
         # Optional: override manifest output path (for sharded runs)
         self.manifest_output = manifest_output
+
+
+@dataclass(frozen=True)
+class ExamRecord:
+    patient_id: str
+    exam_id: str
+    raw_exam_dir: Path
+    archive_path: Path
+    state: Literal["raw", "archived"]
+
+    @property
+    def record_id(self) -> str:
+        return f"{self.patient_id}/{self.exam_id}"
 
 
 # ------------- DICOM helpers -------------
@@ -636,7 +653,9 @@ def _save_debug_figure(
 
 
 def _process_exam_dir(
-    exam_path: Path, debug_dir: Optional[Path] = None
+    exam_path: Path,
+    debug_dir: Optional[Path] = None,
+    zarr_root: Optional[Path] = None,
 ) -> Tuple[List[Dict], List[Dict]]:
     """Process all DICOMs in a single exam directory.
 
@@ -888,16 +907,52 @@ def _process_exam_dir(
                 "has_four_views": False,
             }
 
+        # select canonical full quad inside the worker so archived exams only need one materialization
+        selected_rows = _select_full_quad_rows(rows)
+        selected_sop_uids = {r["sop_instance_uid"] for r in selected_rows}
+        selected_tag_rows = [
+            tag_row
+            for tag_row in tag_rows
+            if tag_row["sop_instance_uid"] in selected_sop_uids
+        ]
+
         # check if exam has all four required views (L-CC, L-MLO, R-CC, R-MLO)
         view_keys = {(r["laterality"], r["view"]) for r in rows}
         required_views = {("L", "CC"), ("L", "MLO"), ("R", "CC"), ("R", "MLO")}
         has_four_views = len(view_keys & required_views) == 4
 
+        manifest_rows: List[Dict] = []
+        zarr_error = None
+        if selected_rows and zarr_root is not None:
+            try:
+                zpath, shapes = write_exam_zarr(pd.DataFrame(selected_rows), zarr_root)
+                for r in selected_rows:
+                    key = VIEWS[(r["laterality"], r["view"])]
+                    manifest_rows.append(
+                        {
+                            "patient_id": r["patient_id"],
+                            "exam_id": r["exam_id"],
+                            "laterality": r["laterality"],
+                            "view": r["view"],
+                            "zarr_uri": str(zpath),
+                            "zarr_key": key,
+                            "height": shapes[key][0],
+                            "width": shapes[key][1],
+                        }
+                    )
+            except Exception as e:
+                zarr_error = {
+                    "patient_id": rows[0]["patient_id"],
+                    "exam_id": rows[0]["exam_id"],
+                    "error_type": type(e).__name__,
+                    "error_message": str(e),
+                }
+
         # return successful exam data
         log_memory_usage(f"end_exam_{exam_path.name}")
         return {
-            "rows": rows,
-            "tag_rows": tag_rows,
+            "rows": selected_rows,
+            "tag_rows": selected_tag_rows,
             "exam_status": "success",
             "total_files": len(dcm_files),
             "failed_files": len(failed_files),
@@ -906,6 +961,8 @@ def _process_exam_dir(
             "for_presentation_dicoms": sum(r["for_presentation"] for r in rows),
             "valid_views": len(view_keys),
             "has_four_views": has_four_views,
+            "manifest_rows": manifest_rows,
+            "zarr_error": zarr_error,
         }
     except Exception as e:
         logger.error(f"Unexpected error processing exam {exam_path}: {e}")
@@ -1059,7 +1116,7 @@ def resume_from_checkpoint(
     logger.info(f"resuming from checkpoint: {checkpoint_file}")
 
     try:
-        views_df, tags_df = discover_dicoms(
+        views_df, tags_df, _, _, _ = discover_dicoms(
             raw_dir=raw_dir,
             max_exams=max_exams,
             workers=workers,
@@ -1170,44 +1227,24 @@ def _combine_staging_files(staging_dir: Path, pattern: str) -> pd.DataFrame:
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 
-def build_genotyped_exam_dir_filter(
+def build_unique_exam_dir_filter(
     fingerprint_path: Path,
-    patients_path: Path,
-    key_path: Path,
+    allowed_patient_ids: Optional[Set[str]] = None,
 ) -> Optional[set]:
-    """Build set of (patient_id, exam_dir_name) for genotyped patients with unique (patient, study_uid).
+    """Build set of (patient_id, exam_dir_name) with unique (patient, study_uid).
 
     Deduplicates by StudyInstanceUID: when multiple exam dirs share the same UID, keeps only
-    the newest (by study_date, study_time). Uses fingerprint for (patient, entry_name) ->
-    study_uid; key for MRN->AnonymousID; patients for chip column.
-    Returns None if any file missing.
+    the newest (by study_date, study_time). If ``allowed_patient_ids`` is provided, limits the
+    result to those patients.
     """
-    if (
-        not fingerprint_path.exists()
-        or not patients_path.exists()
-        or not key_path.exists()
-    ):
+    if not fingerprint_path.exists():
         return None
     with open(fingerprint_path) as f:
         raw = json.load(f)
-    patients = pd.read_csv(patients_path)
-    key = pd.read_csv(key_path)
-    # genotyped patient IDs (AnonymousID / study_id)
-    if "chip" not in patients.columns or "MRN" not in patients.columns:
-        return None
-    if not {"MRN", "AnonymousID"}.issubset(key.columns):
-        return None
-    merged = patients.merge(key[["MRN", "AnonymousID"]], on="MRN", how="inner")
-    genotyped_ids = set()
-    for x in merged[merged["chip"].notna()]["AnonymousID"].dropna():
-        try:
-            genotyped_ids.add(str(int(float(x))))
-        except (ValueError, TypeError):
-            pass
     # (patient_id, study_uid) -> (entry_name, study_date, study_time) for the one we keep
     best_per_uid: dict[tuple[str, str], tuple[str, str, str]] = {}
     for patient_id, exams in raw.items():
-        if patient_id not in genotyped_ids:
+        if allowed_patient_ids is not None and patient_id not in allowed_patient_ids:
             continue
         for entry_name, data in exams.items():
             if isinstance(data, (list, tuple)):
@@ -1230,6 +1267,229 @@ def build_genotyped_exam_dir_filter(
     return {(pid, entry) for (pid, _), (entry, _, _) in best_per_uid.items()}
 
 
+def build_genotyped_exam_dir_filter(
+    fingerprint_path: Path,
+    patients_path: Path,
+    key_path: Path,
+) -> Optional[set]:
+    """Build set of (patient_id, exam_dir_name) for genotyped patients with unique (patient, study_uid)."""
+    if (
+        not fingerprint_path.exists()
+        or not patients_path.exists()
+        or not key_path.exists()
+    ):
+        return None
+    patients = pd.read_csv(patients_path)
+    key = pd.read_csv(key_path)
+    # genotyped patient IDs (AnonymousID / study_id)
+    if "chip" not in patients.columns or "MRN" not in patients.columns:
+        return None
+    if not {"MRN", "AnonymousID"}.issubset(key.columns):
+        return None
+    merged = patients.merge(key[["MRN", "AnonymousID"]], on="MRN", how="inner")
+    genotyped_ids = set()
+    for x in merged[merged["chip"].notna()]["AnonymousID"].dropna():
+        try:
+            genotyped_ids.add(str(int(float(x))))
+        except (ValueError, TypeError):
+            pass
+    return build_unique_exam_dir_filter(fingerprint_path, genotyped_ids)
+
+
+ARCHIVE_SUFFIX = ".tar.zst"
+
+
+def archive_path_for_exam(raw_exam_dir: Path) -> Path:
+    return raw_exam_dir.with_name(f"{raw_exam_dir.name}{ARCHIVE_SUFFIX}")
+
+
+def _run_tar_command(args: List[str], *, cwd: Optional[Path] = None) -> None:
+    result = subprocess.run(
+        args,
+        cwd=str(cwd) if cwd is not None else None,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"tar command failed ({result.returncode}): {' '.join(args)}\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+
+
+def _run_shell_pipeline(command: str, *, cwd: Optional[Path] = None) -> None:
+    result = subprocess.run(
+        ["bash", "-lc", command],
+        cwd=str(cwd) if cwd is not None else None,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"shell pipeline failed ({result.returncode}): {command}\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+
+
+def discover_exam_records(
+    raw_dir: Path,
+    max_exams: Optional[int] = None,
+    exam_dir_filter: Optional[set] = None,
+) -> List[ExamRecord]:
+    """Discover exams from a mixed raw + archived tree.
+
+    Layout assumptions:
+    - raw exam dir: raw_dir/patient_id/exam_id/
+    - archived exam: raw_dir/patient_id/exam_id.tar.zst
+
+    When both raw and archive exist, raw wins.
+    """
+    logger.info(f"scanning for raw/archive exam records in: {raw_dir}")
+    records_by_key: Dict[Tuple[str, str], ExamRecord] = {}
+
+    for patient_name in os.listdir(raw_dir):
+        patient_path = raw_dir / patient_name
+        if not patient_path.is_dir():
+            continue
+
+        for entry_name in os.listdir(patient_path):
+            entry_path = patient_path / entry_name
+            exam_name: Optional[str] = None
+            state: Optional[Literal["raw", "archived"]] = None
+
+            if entry_path.is_dir():
+                exam_name = entry_name
+                state = "raw"
+            elif entry_path.is_file() and entry_name.endswith(ARCHIVE_SUFFIX):
+                exam_name = entry_name[: -len(ARCHIVE_SUFFIX)]
+                state = "archived"
+            else:
+                continue
+
+            if (
+                exam_dir_filter is not None
+                and (patient_name, exam_name) not in exam_dir_filter
+            ):
+                continue
+
+            raw_exam_dir = patient_path / exam_name
+            archive_path = archive_path_for_exam(raw_exam_dir)
+            key = (patient_name, exam_name)
+            candidate = ExamRecord(
+                patient_id=patient_name,
+                exam_id=exam_name,
+                raw_exam_dir=raw_exam_dir,
+                archive_path=archive_path,
+                state=state,
+            )
+
+            existing = records_by_key.get(key)
+            if existing is None or (existing.state == "archived" and state == "raw"):
+                records_by_key[key] = candidate
+
+            if max_exams is not None and len(records_by_key) >= max_exams:
+                logger.info(f"reached --max-exams limit of {max_exams}, stopping scan")
+                break
+
+        if max_exams is not None and len(records_by_key) >= max_exams:
+            break
+
+    records = list(records_by_key.values())
+    raw_count = sum(r.state == "raw" for r in records)
+    archived_count = sum(r.state == "archived" for r in records)
+    logger.info(
+        f"found {len(records)} exam records ({raw_count} raw, {archived_count} archived)"
+    )
+    if not records:
+        raise RuntimeError("no exam records found")
+    return records
+
+
+def materialize_exam(
+    record: ExamRecord,
+    staging_root: Path,
+) -> Tuple[Path, bool]:
+    """Return a materialized exam directory for processing.
+
+    Returns (materialized_exam_dir, extracted_from_archive).
+    """
+    if record.state == "raw":
+        return record.raw_exam_dir, False
+
+    staging_exam_dir = staging_root / record.patient_id / record.exam_id
+    if staging_exam_dir.exists():
+        return staging_exam_dir, True
+
+    staging_exam_dir.parent.mkdir(parents=True, exist_ok=True)
+    logger.info(f"extracting archived exam {record.record_id} to staging")
+    _run_shell_pipeline(
+        f"zstd -dc {shlex.quote(str(record.archive_path))} | tar -xf - -C {shlex.quote(str(staging_exam_dir.parent))}"
+    )
+    if not staging_exam_dir.exists():
+        raise RuntimeError(
+            f"archive extraction completed but staging dir missing: {staging_exam_dir}"
+        )
+    return staging_exam_dir, True
+
+
+def archive_exam_dir(raw_exam_dir: Path, archive_path: Path) -> None:
+    if not raw_exam_dir.exists():
+        return
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_archive = archive_path.with_suffix(f"{archive_path.suffix}.tmp")
+    if tmp_archive.exists():
+        tmp_archive.unlink()
+    logger.info(f"archiving raw exam {raw_exam_dir} -> {archive_path}")
+    _run_shell_pipeline(
+        f"tar -cf - {shlex.quote(raw_exam_dir.name)} | zstd -T0 -o {shlex.quote(str(tmp_archive))}",
+        cwd=raw_exam_dir.parent,
+    )
+    tmp_archive.replace(archive_path)
+    shutil.rmtree(raw_exam_dir)
+
+
+def cleanup_materialized_archives(staging_root: Path) -> None:
+    if staging_root.exists():
+        logger.info(f"removing archive staging tree {staging_root}")
+        shutil.rmtree(staging_root)
+
+
+def archive_processed_raw_exams(records: List[ExamRecord]) -> None:
+    raw_records = [r for r in records if r.state == "raw"]
+    for record in raw_records:
+        archive_exam_dir(record.raw_exam_dir, record.archive_path)
+
+
+def cleanup_successful_checkpoint_state(
+    checkpoint_dir: Path,
+    raw_dir: Path,
+    max_exams: Optional[int] = None,
+) -> None:
+    """Remove resumability artifacts after a successful preprocess run.
+
+    We keep checkpoints on interrupted/failed runs, but successful runs should not
+    accumulate chunk parquet files or stale discovery checkpoint JSON.
+    """
+    raw_dir_hash = hashlib.md5(str(raw_dir).encode()).hexdigest()[:8]
+    checkpoint_file = (
+        checkpoint_dir / f"discovery_{raw_dir_hash}_{max_exams or 'all'}.json"
+    )
+    staging_dir = checkpoint_dir / f"staging_{raw_dir_hash}"
+    materialized_dir = checkpoint_dir / f"materialized_{raw_dir_hash}"
+
+    for path in (staging_dir, materialized_dir):
+        if path.exists():
+            logger.info(f"removing successful-run checkpoint staging {path}")
+            shutil.rmtree(path)
+    if checkpoint_file.exists():
+        logger.info(f"removing successful-run checkpoint file {checkpoint_file}")
+        checkpoint_file.unlink()
+
+
 def discover_dicoms(
     raw_dir: Path,
     max_exams: Optional[int] = None,
@@ -1239,11 +1499,16 @@ def discover_dicoms(
     resume_from_checkpoint: bool = True,
     exam_dir_filter: Optional[set] = None,
     checkpoint_dir: Optional[Path] = None,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Scan `raw_dir` for exam directories and extract DICOM tags in parallel.
+    zarr_root: Optional[Path] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame, List[Dict], List[Dict], List[ExamRecord]]:
+    """Scan a mixed raw/archive tree and process each exam once.
 
-    assumes structure: raw_dir/patient_id/exam_id/[series_dirs]/file.dcm
-    walks to exam level, then processes each exam in parallel with checkpointing
+    Assumes:
+    - raw exam dir: raw_dir/patient_id/exam_id/[series_dirs]/file.dcm
+    - archived exam: raw_dir/patient_id/exam_id.tar.zst
+
+    For archived exams, extraction happens once to staging and the same materialized
+    tree is used for metadata extraction and zarr writing.
 
     Args:
         raw_dir: Root directory containing patient/exam structure
@@ -1271,39 +1536,11 @@ def discover_dicoms(
         checkpoint_dir / f"discovery_{raw_dir_hash}_{max_exams or 'all'}.json"
     )
 
-    logger.info(f"scanning for exam directories in: {raw_dir}")
-    exam_dirs = []
-
-    # walk to depth 2: patient_id/exam_id
-    for patient_name in os.listdir(raw_dir):
-        patient_path = raw_dir / patient_name
-        if not patient_path.is_dir():
-            continue
-        for exam_name in os.listdir(patient_path):
-            exam_path = patient_path / exam_name
-            if not exam_path.is_dir():
-                continue
-            if (
-                exam_dir_filter is not None
-                and (patient_name, exam_name) not in exam_dir_filter
-            ):
-                continue
-            exam_dirs.append(exam_path)
-            if max_exams is not None and len(exam_dirs) >= max_exams:
-                logger.info(f"reached --max-exams limit of {max_exams}, stopping scan")
-                break
-        if max_exams is not None and len(exam_dirs) >= max_exams:
-            break
-
-    if exam_dir_filter is not None:
-        logger.info(
-            f"found {len(exam_dirs)} exam directories (filtered to genotyped + unique patient/study_uid)"
-        )
-    else:
-        logger.info(f"found {len(exam_dirs)} exam directories")
-
-    if not exam_dirs:
-        raise RuntimeError("no exam directories found")
+    exam_records = discover_exam_records(
+        raw_dir,
+        max_exams=max_exams,
+        exam_dir_filter=exam_dir_filter,
+    )
 
     # create debug directory if requested
     if debug_dir:
@@ -1318,9 +1555,12 @@ def discover_dicoms(
     staging_dir.mkdir(parents=True, exist_ok=True)
 
     processed_exams = set()
+    processed_records_this_run: List[ExamRecord] = []
+    all_manifest_rows: List[Dict] = []
+    all_zarr_failures: List[Dict] = []
     chunk_counter = 0  # track which chunk we're on for file naming
     exam_stats = {
-        "total_exams": len(exam_dirs),
+        "total_exams": len(exam_records),
         "exams_with_valid_dicoms": 0,
         "exams_with_four_views": 0,
         "total_dicoms": 0,
@@ -1343,7 +1583,7 @@ def discover_dicoms(
                 if key in saved_stats and key != "total_exams":
                     exam_stats[key] = saved_stats[key]
             # total_exams should always reflect the full set
-            exam_stats["total_exams"] = len(exam_dirs)
+            exam_stats["total_exams"] = len(exam_records)
             logger.info(
                 f"resuming from checkpoint: {len(processed_exams)} exams already processed, at chunk {chunk_counter}"
             )
@@ -1351,7 +1591,9 @@ def discover_dicoms(
             logger.warning(f"failed to load checkpoint: {e}, starting fresh")
 
     # filter out already processed exams
-    remaining_exams = [exam for exam in exam_dirs if str(exam) not in processed_exams]
+    remaining_exams = [
+        record for record in exam_records if record.record_id not in processed_exams
+    ]
     logger.info(
         f"processing {len(remaining_exams)} remaining exams (skipping {len(processed_exams)} already processed)"
     )
@@ -1361,7 +1603,17 @@ def discover_dicoms(
         # combine all staging files
         views_df = _combine_staging_files(staging_dir, "views_chunk_*.parquet")
         tags_df = _combine_staging_files(staging_dir, "tags_chunk_*.parquet")
-        return views_df, tags_df
+        manifest_df = _combine_staging_files(staging_dir, "manifest_chunk_*.parquet")
+        failures_df = _combine_staging_files(
+            staging_dir, "zarr_failures_chunk_*.parquet"
+        )
+        return (
+            views_df,
+            tags_df,
+            manifest_df.to_dict("records"),
+            failures_df.to_dict("records"),
+            processed_records_this_run,
+        )
 
     # process exams in chunks
     logger.info(f"processing exams with {workers} workers in chunks of {chunk_size}...")
@@ -1373,10 +1625,16 @@ def discover_dicoms(
             "chunk_counter": chunk_counter,
             "exam_stats": exam_stats,
             "timestamp": time.time(),
-            "total_exams": len(exam_dirs),
+            "total_exams": len(exam_records),
         }
         with open(checkpoint_file, "w") as f:
             json.dump(checkpoint_data, f, indent=2)
+
+    archive_staging_dir = (
+        checkpoint_dir
+        / f"materialized_{hashlib.md5(str(raw_dir).encode()).hexdigest()[:8]}"
+    )
+    archive_staging_dir.mkdir(parents=True, exist_ok=True)
 
     num_chunks = (len(remaining_exams) + chunk_size - 1) // chunk_size
     chunk_ranges = range(0, len(remaining_exams), chunk_size)
@@ -1396,7 +1654,19 @@ def discover_dicoms(
             save_checkpoint()
             views_df = _combine_staging_files(staging_dir, "views_chunk_*.parquet")
             tags_df = _combine_staging_files(staging_dir, "tags_chunk_*.parquet")
-            return views_df, tags_df
+            manifest_df = _combine_staging_files(
+                staging_dir, "manifest_chunk_*.parquet"
+            )
+            failures_df = _combine_staging_files(
+                staging_dir, "zarr_failures_chunk_*.parquet"
+            )
+            return (
+                views_df,
+                tags_df,
+                manifest_df.to_dict("records"),
+                failures_df.to_dict("records"),
+                processed_records_this_run,
+            )
 
         chunk_end = min(chunk_start + chunk_size, len(remaining_exams))
         chunk_exams = remaining_exams[chunk_start:chunk_end]
@@ -1411,11 +1681,18 @@ def discover_dicoms(
         # accumulate rows for this chunk only
         chunk_rows = []
         chunk_tag_rows = []
+        chunk_manifest_rows = []
+        chunk_zarr_failures = []
 
         with ProcessPoolExecutor(max_workers=workers) as executor:
             futures = {
-                executor.submit(_process_exam_dir, exam_path, debug_dir): exam_path
-                for exam_path in chunk_exams
+                executor.submit(
+                    _process_exam_dir,
+                    materialize_exam(record, archive_staging_dir)[0],
+                    debug_dir,
+                    zarr_root,
+                ): record
+                for record in chunk_exams
             }
 
             # process chunk with progress bar
@@ -1427,18 +1704,21 @@ def discover_dicoms(
                 position=1,
                 leave=False,
             ):
-                exam_path = futures[future]
+                record = futures[future]
                 try:
                     result = future.result(timeout=120)  # 2 minute timeout per exam
 
                     # handle case where result might be None
                     if result is None:
-                        logger.error(f"got None result for {exam_path}")
+                        logger.error(f"got None result for {record.record_id}")
                         exam_stats["failed_exams"] += 1
                         continue
 
                     chunk_rows.extend(result["rows"])
                     chunk_tag_rows.extend(result["tag_rows"])
+                    chunk_manifest_rows.extend(result.get("manifest_rows", []))
+                    if result.get("zarr_error") is not None:
+                        chunk_zarr_failures.append(result["zarr_error"])
                     exam_stats["total_dicoms"] += result["total_dicoms"]
                     exam_stats["valid_dicoms"] += result["valid_dicoms"]
                     exam_stats["for_presentation_dicoms"] += result[
@@ -1454,24 +1734,27 @@ def discover_dicoms(
                         exam_stats["failed_exams"] += 1
 
                     # mark as processed
-                    processed_exams.add(str(exam_path))
+                    processed_exams.add(record.record_id)
+                    processed_records_this_run.append(record)
 
                     # track peak memory
                     current_mem = get_memory_usage_mb()
                     chunk_max_mem = max(chunk_max_mem, current_mem)
 
                 except TimeoutError:
-                    logger.error(f"timeout processing {exam_path}")
+                    logger.error(f"timeout processing {record.record_id}")
                     exam_stats["failed_exams"] += 1
                     processed_exams.add(
-                        str(exam_path)
+                        record.record_id
                     )  # mark as processed to avoid retry
+                    processed_records_this_run.append(record)
                 except Exception as e:
-                    logger.error(f"failed to process {exam_path}: {e}")
+                    logger.error(f"failed to process {record.record_id}: {e}")
                     exam_stats["failed_exams"] += 1
                     processed_exams.add(
-                        str(exam_path)
+                        record.record_id
                     )  # mark as processed to avoid retry
+                    processed_records_this_run.append(record)
 
         # write chunk data to staging files
         if chunk_rows:
@@ -1480,13 +1763,21 @@ def discover_dicoms(
 
             views_file = staging_dir / f"views_chunk_{chunk_counter:04d}.parquet"
             tags_file = staging_dir / f"tags_chunk_{chunk_counter:04d}.parquet"
+            manifest_file = staging_dir / f"manifest_chunk_{chunk_counter:04d}.parquet"
+            failures_file = (
+                staging_dir / f"zarr_failures_chunk_{chunk_counter:04d}.parquet"
+            )
 
             chunk_views_df.to_parquet(views_file, index=False)
             chunk_tags_df.to_parquet(tags_file, index=False)
+            pd.DataFrame(chunk_manifest_rows).to_parquet(manifest_file, index=False)
+            pd.DataFrame(chunk_zarr_failures).to_parquet(failures_file, index=False)
 
             logger.info(
                 f"wrote chunk {chunk_counter} to staging: {len(chunk_rows)} views, {len(chunk_tag_rows)} tags"
             )
+        all_manifest_rows.extend(chunk_manifest_rows)
+        all_zarr_failures.extend(chunk_zarr_failures)
 
         chunk_counter += 1
 
@@ -1508,6 +1799,8 @@ def discover_dicoms(
     logger.info("combining staging files...")
     views_df = _combine_staging_files(staging_dir, "views_chunk_*.parquet")
     tags_df = _combine_staging_files(staging_dir, "tags_chunk_*.parquet")
+    manifest_df = _combine_staging_files(staging_dir, "manifest_chunk_*.parquet")
+    failures_df = _combine_staging_files(staging_dir, "zarr_failures_chunk_*.parquet")
 
     logger.info(
         f"loaded {len(views_df)} views and {len(tags_df)} DICOM tag records from staging"
@@ -1552,7 +1845,13 @@ def discover_dicoms(
             f"\nDICOM tags: {num_tag_cols} unique tags for {len(tags_df)} images (wide format)"
         )
 
-    return views_df, tags_df
+    return (
+        views_df,
+        tags_df,
+        manifest_df.to_dict("records"),
+        failures_df.to_dict("records"),
+        processed_records_this_run,
+    )
 
 
 def select_full_quad(df_views: pd.DataFrame) -> pd.DataFrame:
@@ -1600,6 +1899,17 @@ def select_full_quad(df_views: pd.DataFrame) -> pd.DataFrame:
     full_exams = counts[counts == 4].index
     out = df[df["exam_id"].isin(full_exams)].reset_index(drop=True)
     return out
+
+
+def _select_full_quad_rows(rows: List[Dict]) -> List[Dict]:
+    """Exam-local version of select_full_quad() for one-pass processing."""
+    if not rows:
+        return []
+    df = pd.DataFrame(rows)
+    out = select_full_quad(df)
+    if out.empty:
+        return []
+    return out.to_dict("records")
 
 
 # ------------- Zarr writing -------------
@@ -1700,6 +2010,24 @@ def preprocess(cfg: PreprocessConfig) -> None:
 
     # discovery
     logger.info("discovering DICOMs...")
+    processed_exam_records: List[ExamRecord] = []
+    checkpoint_base = (
+        Path(cfg.checkpoint_dir)
+        if cfg.checkpoint_dir is not None
+        else Path("data/discovery_checkpoints")
+    )
+    archive_staging_dir = (
+        checkpoint_base
+        / f"materialized_{hashlib.md5(str(raw).encode()).hexdigest()[:8]}"
+    )
+
+    prep_dir = out / "zarr"
+    if not cfg.summary:
+        logger.info(f"preparing zarr cache in {out}...")
+        prep_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest_rows: List[Dict] = []
+    failed_exams: List[Dict] = []
 
     if cfg.incremental and (sot / "views.parquet").exists():
         logger.info("incremental mode: loading existing views...")
@@ -1708,15 +2036,18 @@ def preprocess(cfg: PreprocessConfig) -> None:
         logger.info(f"found {len(existing_exam_ids)} existing exams")
 
         # discover new DICOMs
-        views_df, tags_df = discover_dicoms(
-            raw,
-            max_exams=cfg.max_exams,
-            workers=cfg.workers,
-            debug_dir=cfg.debug_dir,
-            chunk_size=cfg.chunk_size,
-            resume_from_checkpoint=not cfg.no_resume,
-            exam_dir_filter=cfg.exam_dir_filter,
-            checkpoint_dir=cfg.checkpoint_dir,
+        views_df, tags_df, manifest_rows, failed_exams, processed_exam_records = (
+            discover_dicoms(
+                raw,
+                max_exams=cfg.max_exams,
+                workers=cfg.workers,
+                debug_dir=cfg.debug_dir,
+                chunk_size=cfg.chunk_size,
+                resume_from_checkpoint=not cfg.no_resume,
+                exam_dir_filter=cfg.exam_dir_filter,
+                checkpoint_dir=cfg.checkpoint_dir,
+                zarr_root=None if cfg.summary else prep_dir,
+            )
         )
 
         # filter out already processed exams
@@ -1727,6 +2058,12 @@ def preprocess(cfg: PreprocessConfig) -> None:
 
         if len(new_views) == 0:
             logger.info("no new exams found, nothing to process")
+            cleanup_materialized_archives(archive_staging_dir)
+            cleanup_successful_checkpoint_state(
+                checkpoint_base,
+                raw,
+                cfg.max_exams,
+            )
             return
 
         views_df = new_views
@@ -1734,27 +2071,26 @@ def preprocess(cfg: PreprocessConfig) -> None:
         new_sop_uids = set(new_views["sop_instance_uid"])
         tags_df = tags_df[tags_df["sop_instance_uid"].isin(new_sop_uids)]
     else:
-        views_df, tags_df = discover_dicoms(
-            raw,
-            max_exams=cfg.max_exams,
-            workers=cfg.workers,
-            debug_dir=cfg.debug_dir,
-            chunk_size=cfg.chunk_size,
-            resume_from_checkpoint=not cfg.no_resume,
-            exam_dir_filter=cfg.exam_dir_filter,
-            checkpoint_dir=cfg.checkpoint_dir,
+        views_df, tags_df, manifest_rows, failed_exams, processed_exam_records = (
+            discover_dicoms(
+                raw,
+                max_exams=cfg.max_exams,
+                workers=cfg.workers,
+                debug_dir=cfg.debug_dir,
+                chunk_size=cfg.chunk_size,
+                resume_from_checkpoint=not cfg.no_resume,
+                exam_dir_filter=cfg.exam_dir_filter,
+                checkpoint_dir=cfg.checkpoint_dir,
+                zarr_root=None if cfg.summary else prep_dir,
+            )
         )
         logger.info(f"found {len(views_df)} DICOM files")
 
-    # selection to full quad
-    logger.info("selecting full quad exams...")
-    sel_df = select_full_quad(views_df)
-    logger.info(f"selected {len(sel_df)} views from full quad exams")
-
-    # filter tags to match selected views only
-    selected_sop_uids = set(sel_df["sop_instance_uid"])
-    tags_df = tags_df[tags_df["sop_instance_uid"].isin(selected_sop_uids)]
-    logger.info(f"retained {len(tags_df)} DICOM tag records for selected views")
+    # one-pass worker already restricts views/tags to canonical full-quad selections
+    sel_df = views_df
+    logger.info(
+        f"one-pass worker emitted {len(sel_df)} selected views from full quad exams"
+    )
 
     # exams table
     exams = (
@@ -1843,86 +2179,19 @@ def preprocess(cfg: PreprocessConfig) -> None:
     if cfg.summary:
         logger.info("=== summary-only: wrote SoT, skipped zarr cache ===")
         logger.info(f"SoT dir: {sot}")
+        cleanup_materialized_archives(archive_staging_dir)
+        cleanup_successful_checkpoint_state(
+            checkpoint_base,
+            raw,
+            cfg.max_exams,
+        )
         return
-
-    # zarr cache + manifest for the cohort
-    logger.info(f"preparing zarr cache in {out}...")
-    prep_dir = out / "zarr"
-    prep_dir.mkdir(parents=True, exist_ok=True)
-
-    manifest_rows: List[Dict] = []
-    failed_exams: List[Dict] = []
-
-    logger.info("grouping exams for zarr writing...")
-    # Avoid dict(groupby): pandas GroupBy.keys is an attr (str), not a method; dict() expects .keys()
-    grouped = {k: v for k, v in sel_df.groupby("exam_id")}
-    targets = [
-        (eid, grouped[eid]) for eid in cohort["exam_id"].tolist() if eid in grouped
-    ]
-    logger.info(f"will write {len(targets)} exams to zarr with {cfg.workers} workers")
 
     # load existing manifest if incremental
     existing_manifest = None
     if cfg.incremental and (out / "manifest.parquet").exists():
         existing_manifest = pd.read_parquet(out / "manifest.parquet")
         logger.info(f"loaded existing manifest with {len(existing_manifest)} entries")
-
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    with ThreadPoolExecutor(max_workers=cfg.workers) as ex:
-        futs = {
-            ex.submit(write_exam_zarr, grp_df, prep_dir): eid for eid, grp_df in targets
-        }
-        try:
-            for fut in tqdm(
-                as_completed(futs), total=len(futs), desc="writing zarr", unit="exam"
-            ):
-                if shutdown_requested:
-                    logger.info(
-                        "shutdown requested during zarr writing, cancelling remaining tasks..."
-                    )
-                    ex.shutdown(wait=False, cancel_futures=True)
-                    raise KeyboardInterrupt("user requested shutdown")
-
-                eid = futs[fut]
-                try:
-                    zpath, shapes = fut.result()
-                    grp_df = grouped[eid]
-                    for _, r in grp_df.iterrows():
-                        key = VIEWS[(r["laterality"], r["view"])]
-                        manifest_rows.append(
-                            {
-                                "patient_id": r["patient_id"],
-                                "exam_id": r["exam_id"],
-                                "laterality": r["laterality"],
-                                "view": r["view"],
-                                "zarr_uri": str(zpath),
-                                "zarr_key": key,
-                                "height": shapes[key][0],
-                                "width": shapes[key][1],
-                            }
-                        )
-                except Exception as e:
-                    grp_df = grouped[eid]
-                    first = grp_df.iloc[0]
-                    patient_id = first["patient_id"]
-                    error_type = type(e).__name__
-                    error_msg = str(e)
-                    failed_exams.append(
-                        {
-                            "patient_id": patient_id,
-                            "exam_id": eid,
-                            "error_type": error_type,
-                            "error_message": error_msg,
-                        }
-                    )
-                    logger.warning(
-                        f"failed to convert exam {eid} (patient {patient_id}): {error_type}: {error_msg}"
-                    )
-        except KeyboardInterrupt:
-            logger.info("cancelling zarr writing...")
-            ex.shutdown(wait=False, cancel_futures=True)
-            raise
 
     if shutdown_requested:
         logger.warning("shutdown requested, skipping manifest write")
@@ -1982,6 +2251,13 @@ def preprocess(cfg: PreprocessConfig) -> None:
     logger.info(f"\n{vendor_counts.to_string(index=False)}")
     logger.info(f"written SoT: {sot}")
     logger.info(f"written cache manifest: {manifest_path}")
+    archive_processed_raw_exams(processed_exam_records)
+    cleanup_materialized_archives(archive_staging_dir)
+    cleanup_successful_checkpoint_state(
+        checkpoint_base,
+        raw,
+        cfg.max_exams,
+    )
 
 
 # ------------- Consumer helpers -------------
@@ -2128,7 +2404,8 @@ def write_mirai_csv(
 ) -> None:
     """Create a Mirai-compatible CSV that points to Zarr URIs instead of PNGs.
 
-    Expects labels_csv to contain columns: MRN, CaseControl, datedx.
+    Expects labels_csv to contain columns: MRN, CaseControl, and at least one
+    diagnosis date column among datedx, date_diagnosis, or datedx_new.
     Uses hardcoded mapping files:
     - /gpfs/data/huo-lab/Image/ChiMEC/study-16352a.csv to map MRN → AnonymousID (patient_id)
     - /gpfs/data/phs/groups/Projects/Huo_projects/SPORE/CRDW_data/2025Oct23/dr_7934_pats.txt for DATE_OF_LAST_CONTACT
@@ -2145,7 +2422,7 @@ def write_mirai_csv(
     manifest_parquet : Path
         parquet emitted by preprocess() mapping views to zarr URIs and keys
     labels_csv : Path
-        CSV with MRN, CaseControl, datedx columns
+        CSV with MRN, CaseControl, and a diagnosis date column
     exams_parquet : Path
         SoT parquet with exam_id, patient_id, accession_number, study_date
     out_csv : Path
@@ -2162,7 +2439,7 @@ def write_mirai_csv(
     )
     mrn_col = "MRN"
     case_col = "CaseControl"
-    dxdate_col = "datedx"
+    dxdate_candidates = ["datedx", "date_diagnosis", "datedx_new"]
     split_col = None
     man = pd.read_parquet(manifest_parquet)
     req_m = {"patient_id", "exam_id", "laterality", "view", "zarr_uri", "zarr_key"}
@@ -2173,6 +2450,12 @@ def write_mirai_csv(
     # build labels dataframe from CSV
     logger.info("loading labels CSV…")
     labels_df = pd.read_csv(labels_csv)
+    dxdate_cols = [col for col in dxdate_candidates if col in labels_df.columns]
+    if not dxdate_cols:
+        raise KeyError(
+            "labels CSV missing diagnosis date column; expected one of "
+            f"{dxdate_candidates}"
+        )
 
     if mrn_col not in labels_df.columns:
         raise KeyError(f"MRN column '{mrn_col}' not found in {labels_csv.name}")
@@ -2180,11 +2463,6 @@ def write_mirai_csv(
         raise KeyError(
             f"case/control column '{case_col}' not found in {labels_csv.name}"
         )
-    if dxdate_col not in labels_df.columns:
-        raise KeyError(
-            f"diagnosis date column '{dxdate_col}' not found in {labels_csv.name}"
-        )
-
     # normalize MRN to 8-digit zero-padded string
     labels_df["MRN"] = labels_df[mrn_col].astype(str).str.strip().str.zfill(8)
     logger.info(f"loaded {len(labels_df)} rows from labels CSV")
@@ -2245,7 +2523,10 @@ def write_mirai_csv(
 
     # parse dates
     j["study_date_ts"] = _parse_date_col(j["study_date"])
-    j["dx_date_ts"] = _parse_date_col(j[dxdate_col])
+    dx_date_ts = pd.Series(pd.NaT, index=j.index, dtype="datetime64[ns]")
+    for col in dxdate_cols:
+        dx_date_ts = dx_date_ts.fillna(_parse_date_col(j[col]))
+    j["dx_date_ts"] = dx_date_ts
 
     # compute years_to_cancer
     cc = j[case_col].astype(str).str.lower()
@@ -2285,19 +2566,20 @@ def write_mirai_csv(
         )
 
     # assemble labels
-    lab = pd.DataFrame(
-        {
-            "patient_id": j["patient_id"].astype(str),
-            "exam_id": j["exam_id"].astype(str),
-            "years_to_cancer": ytc.astype("Int64"),
-            "years_to_last_followup": ylf.astype("Int64"),
-            "split_group": (
-                j[split_col].astype(str).str.lower()
-                if split_col and split_col in j.columns
-                else pd.Series(["test"] * len(j))
-            ),
-        }
-    )
+    lab_data = {
+        "patient_id": j["patient_id"].astype(str),
+        "exam_id": j["exam_id"].astype(str),
+        "years_to_cancer": ytc.astype("Int64"),
+        "years_to_last_followup": ylf.astype("Int64"),
+        "split_group": (
+            j[split_col].astype(str).str.lower()
+            if split_col and split_col in j.columns
+            else pd.Series(["test"] * len(j))
+        ),
+    }
+    if "chip" in j.columns:
+        lab_data["chip"] = j["chip"]
+    lab = pd.DataFrame(lab_data)
     lab = lab[(lab["exam_id"].notna()) & (lab["exam_id"].astype(str) != "nan")]
     lab["years_to_cancer"] = lab["years_to_cancer"].fillna(100).astype(int)
     lab["years_to_last_followup"] = lab["years_to_last_followup"].fillna(0).astype(int)
@@ -2339,18 +2621,19 @@ def write_mirai_csv(
         + "#"
         + df["zarr_key"]
     )
-    out = df[
-        [
-            "patient_id",
-            "exam_id",
-            "laterality",
-            "view",
-            "file_path",
-            "years_to_cancer",
-            "years_to_last_followup",
-            "split_group",
-        ]
-    ].copy()
+    out_cols = [
+        "patient_id",
+        "exam_id",
+        "laterality",
+        "view",
+        "file_path",
+        "years_to_cancer",
+        "years_to_last_followup",
+        "split_group",
+    ]
+    if "chip" in df.columns:
+        out_cols.append("chip")
+    out = df[out_cols].copy()
     # Ensure numeric columns are actually numeric (not object dtype with "nan" strings)
     out["years_to_cancer"] = (
         pd.to_numeric(out["years_to_cancer"], errors="coerce").fillna(100).astype(int)

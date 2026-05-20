@@ -902,6 +902,36 @@ def _filter_pcr_targets_by_dx_window(
     return filtered
 
 
+def _filter_targets_by_csv(targets: pd.DataFrame, targets_csv: str) -> pd.DataFrame:
+    """Restrict targets to the exact exam rows listed in an external CSV."""
+    csv_path = Path(targets_csv)
+    pending = pd.read_csv(csv_path, low_memory=False)
+    required_cols = ["study_id", "Study DateTime", "StudyDescription"]
+    missing = [col for col in required_cols if col not in pending.columns]
+    if missing:
+        raise KeyError(f"Targets CSV {csv_path} is missing required columns: {missing}")
+
+    pending = pending[required_cols].copy()
+    pending["Study DateTime"] = pd.to_datetime(
+        pending["Study DateTime"], errors="coerce"
+    )
+    pending["StudyDescription"] = pending["StudyDescription"].astype(str)
+    pending = pending.dropna(subset=required_cols).drop_duplicates()
+    pending["_requested_target_csv"] = True
+
+    merged = targets.merge(pending, on=required_cols, how="left")
+    keep_mask = merged["_requested_target_csv"].fillna(False).astype(bool)
+    filtered = merged.loc[keep_mask].drop(columns=["_requested_target_csv"]).copy()
+
+    print(
+        "CSV target filter applied: "
+        f"{len(targets):,} -> {len(filtered):,} exams "
+        f"({targets['study_id'].nunique():,} -> {filtered['study_id'].nunique():,} patients) "
+        f"using {csv_path}."
+    )
+    return filtered
+
+
 def apply_disk_status_for_modality(db: pd.DataFrame, modality: str) -> pd.DataFrame:
     """Apply disk status check only for the requested modality subset."""
     modality_upper = modality.upper()
@@ -1119,7 +1149,7 @@ def run_export_cycle(args, cycle_number: int):
         dataset="chimec",
         allow_post_dx_cases=(args.target_profile == TARGET_PROFILE_BREAST_RISK_HFDP),
     )
-    if args.cohort == COHORT_PCR:
+    if args.cohort == COHORT_PCR and not args.targets_csv:
         _print_pcr_window_summary(
             targets,
             pre_dx_days=args.pcr_pre_dx_window_days,
@@ -1139,6 +1169,8 @@ def run_export_cycle(args, cycle_number: int):
             targets,
             dx_like_window_days=args.risk_dx_like_window_days,
         )
+    if args.targets_csv:
+        targets = _filter_targets_by_csv(targets, args.targets_csv)
 
     db["is_target"] = False
     db.loc[targets.index, "is_target"] = True
@@ -1583,6 +1615,16 @@ def main():
             "include case breast MR exams from diagnosis through this many days after diagnosis."
         ),
     )
+    parser.add_argument(
+        "--targets-csv",
+        type=str,
+        default=None,
+        help=(
+            "Optional CSV of exact exams to export. Must include study_id, "
+            "Study DateTime, and StudyDescription. Applied after standard "
+            "availability filtering."
+        ),
+    )
 
     args = parser.parse_args()
     _normalize_args_for_cohort(args)
@@ -1650,7 +1692,7 @@ def main():
                 args.target_profile == TARGET_PROFILE_BREAST_RISK_HFDP
             ),
         )
-        if args.cohort == COHORT_PCR:
+        if args.cohort == COHORT_PCR and not args.targets_csv:
             _print_pcr_window_summary(
                 targets,
                 pre_dx_days=args.pcr_pre_dx_window_days,
@@ -1670,6 +1712,8 @@ def main():
                 targets,
                 dx_like_window_days=args.risk_dx_like_window_days,
             )
+        if args.targets_csv:
+            targets = _filter_targets_by_csv(targets, args.targets_csv)
         run_reconciliation_if_enabled(args, db, cycle_number=1)
         sys.exit(0)
 

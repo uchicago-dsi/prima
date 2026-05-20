@@ -84,6 +84,7 @@ from sksurv.metrics import (
     integrated_brier_score,
 )
 from sksurv.util import Surv
+from lifelines import KaplanMeierFitter
 
 PHENOTYPE_CSV = Path(
     "/gpfs/data/phs/groups/Projects/Huo_projects/SPORE/annawoodard/Phenotype_ChiMEC_2025Oct4.csv"
@@ -107,6 +108,17 @@ PHENOTYPE_COLUMNS = [
 POSITIVE_MARKERS = {"pos", "positive", "1", "true", "yes", "y"}
 NEGATIVE_MARKERS = {"neg", "negative", "0", "false", "no", "n"}
 OMOLEYE_TARGET_HORIZONS = [1, 2, 3, 4, 5]
+PRIMARY_TTC_YEARS = 0.5
+EXTENSION_MIN_GROUP_EXAMS = 200
+EXTENSION_RANDOM_EXAM_SEED = 42
+EXTENSION_CALENDAR_BINS = [
+    ("2001-2010", 2001, 2010),
+    ("2011-2015", 2011, 2015),
+    ("2016-2020", 2016, 2020),
+    ("2021-2025", 2021, 2025),
+]
+EXTENSION_THRESHOLD_FRACTIONS = [0.01, 0.05, 0.10]
+EXTENSION_QUANTILE_LABELS = ["Q1 (lowest)", "Q2", "Q3", "Q4", "Q5 (highest)"]
 
 
 @dataclass(frozen=True)
@@ -444,7 +456,7 @@ def _load_enriched_manifest(cfg: Config) -> pd.DataFrame:
         else "Unknown"
     )
 
-    exams_parquet = cfg.meta_csv.parent.parent / "sot" / "exams.parquet"
+    exams_parquet = _resolve_sot_dir(cfg.meta_csv) / "exams.parquet"
     if exams_parquet.exists():
         exams = pd.read_parquet(exams_parquet)
         exams = exams.assign(
@@ -509,6 +521,19 @@ def _load_annotations_map(qc_file: Path | None) -> dict[str, set[str]]:
         for exam_id, tags in annotation_map.items()
         if tags
     }
+
+
+def _resolve_sot_dir(path: Path) -> Path:
+    """Resolve the sibling SoT directory for a prediction/metadata path."""
+
+    raw_root = path.parent.parent
+    parent_name = path.parent.name.lower()
+    candidates = ["sot_all", "sot"] if "out_all" in parent_name else ["sot", "sot_all"]
+    for candidate in candidates:
+        resolved = raw_root / candidate
+        if resolved.exists():
+            return resolved
+    return raw_root / candidates[0]
 
 
 def _build_exam_filter(
@@ -810,8 +835,9 @@ def _load_exam_data(cfg: Config) -> ExamData:
     df_exam_unfiltered = df_exam.copy()
 
     # QC/auto/annotation filtering
-    views_path = cfg.pred_csv.parent.parent / "sot" / "views.parquet"
-    tags_path = cfg.pred_csv.parent.parent / "sot" / "dicom_tags.parquet"
+    sot_dir = _resolve_sot_dir(cfg.pred_csv)
+    views_path = sot_dir / "views.parquet"
+    tags_path = sot_dir / "dicom_tags.parquet"
     base_exam_ids = set(df_exam["exam_id"].astype(str).unique())
     kept_exam_ids, filter_summary = _build_exam_filter(
         base_exam_ids, cfg, views_path, tags_path
@@ -2035,64 +2061,61 @@ def compute_model_performance_metrics(
 
     rows: list[dict] = []
 
-    # All examinations (unfiltered) uses per-horizon summary to keep numbers aligned
-    # need to compute CIs for precomputed AUCs
-    summary_lookup: dict[int, tuple[float, float, float]] | None = None
-    if not per_horizon_df.empty:
-        summary_start = time.time()
-        print(
-            f"  [{_format_elapsed(time.time() - func_start)}] Computing summary lookup CIs..."
-        )
-        summary_lookup = {}
-        for _, r in per_horizon_df.iterrows():
-            h = int(r["horizon_years"])
-            if h in target_horizons:
-                y_all, s_all, w_all, pids_all, _excluded = _horizon_auc_arrays(
-                    df_all, h, pred_cols[h], cfg
-                )
-                if len(y_all) > 0:
-                    if y_all.any() and (~y_all.astype(bool)).any():
-                        if cfg.auc_mode == "patient_weighted":
-                            auc, lower, upper = _bootstrap_auc_ci(
-                                y_all,
-                                s_all,
-                                sample_weight=w_all,
-                                group_ids=pids_all,
-                            )
-                        else:
-                            auc, lower, upper = _delong_auc_ci(y_all, s_all)
-                        summary_lookup[h] = (auc, lower, upper)
-                    else:
-                        summary_lookup[h] = (float("nan"), float("nan"), float("nan"))
+    def _compute_precomputed_auc_lookup(
+        subset: pd.DataFrame,
+    ) -> dict[int, tuple[float, float, float]]:
+        lookup: dict[int, tuple[float, float, float]] = {}
+        for h in target_horizons:
+            y_sub, s_sub, w_sub, pids_sub, _excluded = _horizon_auc_arrays(
+                subset, h, pred_cols[h], cfg
+            )
+            if len(y_sub) > 0 and y_sub.any() and (~y_sub.astype(bool)).any():
+                if cfg.auc_mode == "patient_weighted":
+                    auc, lower, upper = _bootstrap_auc_ci(
+                        y_sub,
+                        s_sub,
+                        sample_weight=w_sub,
+                        group_ids=pids_sub,
+                    )
                 else:
-                    summary_lookup[h] = (float("nan"), float("nan"), float("nan"))
-        summary_time = time.time() - summary_start
-        print(
-            f"  [{_format_elapsed(time.time() - func_start)}] Completed summary lookup ({_format_elapsed(summary_time)})"
-        )
+                    auc, lower, upper = _delong_auc_ci(y_sub, s_sub)
+                lookup[h] = (auc, lower, upper)
+            else:
+                lookup[h] = (float("nan"), float("nan"), float("nan"))
+        return lookup
 
-    overall_harrell = _extract_overall_harrell()
+    summary_start = time.time()
     print(
-        f"  [{_format_elapsed(time.time() - func_start)}] Adding row: all examinations"
+        f"  [{_format_elapsed(time.time() - func_start)}] Computing overall-row AUC CIs..."
+    )
+    filtered_summary_lookup = _compute_precomputed_auc_lookup(df_filtered)
+    unfiltered_summary_lookup = _compute_precomputed_auc_lookup(df_all)
+    summary_time = time.time() - summary_start
+    print(
+        f"  [{_format_elapsed(time.time() - func_start)}] Completed overall-row AUC CIs ({_format_elapsed(summary_time)})"
+    )
+
+    print(
+        f"  [{_format_elapsed(time.time() - func_start)}] Adding row: all examinations (ttc > 6 months)"
     )
     _add_row(
         rows,
         "all examinations",
-        "all examinations",
-        df_all,
-        precomputed_aucs=summary_lookup if summary_lookup else None,
-        harrell_override=overall_harrell,
+        "all examinations (ttc > 6 months)",
+        df_filtered,
+        precomputed_aucs=filtered_summary_lookup,
         use_bootstrap=False,
     )
 
     print(
-        f"  [{_format_elapsed(time.time() - func_start)}] Adding row: all examinations (ttc ≥ 6 mo)"
+        f"  [{_format_elapsed(time.time() - func_start)}] Adding row: all examinations (no ttc restriction)"
     )
     _add_row(
         rows,
         "all examinations",
-        "all examinations (ttc ≥ 6 mo)",
-        df_filtered,
+        "all examinations (no ttc restriction)",
+        df_all,
+        precomputed_aucs=unfiltered_summary_lookup,
         use_bootstrap=False,
     )
 
@@ -2200,6 +2223,459 @@ def compute_model_performance_metrics(
         f"  [{_format_elapsed(time.time() - func_start)}] Completed model performance metrics computation ({_format_elapsed(total_time)})"
     )
     return df_result
+
+
+def _extension_merge_exam_metadata(
+    exam_level: pd.DataFrame, meta_all: pd.DataFrame
+) -> pd.DataFrame:
+    """Merge enriched exam-level metadata needed for validation extensions."""
+    keep_cols = [
+        "patient_id",
+        "exam_id",
+        "device_manufacturer",
+        "study_date",
+        "age_at_exam",
+        "age_at_exam_years",
+        "race_category",
+        "RaceEthnic",
+        "tumor_grade_group",
+        "grade_new",
+        "receptor_subtype",
+        "subtype",
+    ]
+    keep_cols = [c for c in keep_cols if c in meta_all.columns]
+    meta_exam = (
+        meta_all[keep_cols]
+        .assign(
+            patient_id=meta_all["patient_id"].astype(str),
+            exam_id=meta_all["exam_id"].astype(str),
+        )
+        .groupby(["patient_id", "exam_id"], as_index=False)
+        .first()
+    )
+    return exam_level.merge(meta_exam, on=["patient_id", "exam_id"], how="left")
+
+
+def _apply_primary_ttc_filter(df_exam: pd.DataFrame) -> pd.DataFrame:
+    """Apply the paper-matched TTC >= 6 month filter."""
+    out = df_exam.copy()
+    out["years_to_cancer"] = pd.to_numeric(out["years_to_cancer"], errors="coerce")
+    return out[out["years_to_cancer"] >= PRIMARY_TTC_YEARS].copy()
+
+
+def _extension_group_auc_rows(
+    df_exam: pd.DataFrame,
+    cfg: Config,
+    pred_cols: dict[int, str],
+    *,
+    analysis_name: str,
+    group_type: str,
+    group_name: str,
+) -> list[dict]:
+    """Compute horizon-specific AUC rows for one subgroup."""
+    rows: list[dict] = []
+    target_horizons = [h for h in sorted(pred_cols) if h in OMOLEYE_TARGET_HORIZONS]
+    for horizon in target_horizons:
+        y, s, w, pids, excluded = _horizon_auc_arrays(
+            df_exam, horizon, pred_cols[horizon], cfg
+        )
+        auc, lower, upper = _bootstrap_auc_ci(
+            y,
+            s,
+            sample_weight=w,
+            group_ids=pids if cfg.auc_mode == "patient_weighted" else None,
+        )
+        rows.append(
+            {
+                "analysis": analysis_name,
+                "group_type": group_type,
+                "group_name": group_name,
+                "horizon_years": horizon,
+                "n_exams": int(len(y)),
+                "n_patients": int(pd.Series(pids).nunique()),
+                "cases": int(y.sum()),
+                "controls": int((1 - y).sum()),
+                "excluded_by_horizon": int(excluded),
+                "auc": float(auc),
+                "auc_ci_lower": float(lower),
+                "auc_ci_upper": float(upper),
+            }
+        )
+    return rows
+
+
+def _select_first_exam_per_patient(df_exam: pd.DataFrame) -> pd.DataFrame:
+    tmp = df_exam.copy()
+    tmp["study_dt"] = pd.to_datetime(tmp["study_date"].astype(str), errors="coerce")
+    return (
+        tmp.sort_values(["patient_id", "study_dt", "exam_id"])
+        .groupby("patient_id", as_index=False)
+        .first()
+        .drop(columns=["study_dt"])
+    )
+
+
+def _select_last_exam_per_patient(df_exam: pd.DataFrame) -> pd.DataFrame:
+    tmp = df_exam.copy()
+    tmp["study_dt"] = pd.to_datetime(tmp["study_date"].astype(str), errors="coerce")
+    return (
+        tmp.sort_values(["patient_id", "study_dt", "exam_id"])
+        .groupby("patient_id", as_index=False)
+        .last()
+        .drop(columns=["study_dt"])
+    )
+
+
+def _select_random_exam_per_patient(df_exam: pd.DataFrame, seed: int) -> pd.DataFrame:
+    return (
+        df_exam.groupby("patient_id", group_keys=False)
+        .sample(n=1, random_state=seed)
+        .reset_index(drop=True)
+    )
+
+
+def compute_validation_extensions(
+    cfg: Config,
+    exam_data: ExamData,
+) -> dict[str, pd.DataFrame]:
+    """Compute manufacturer/calendar/repeated-exam extension tables."""
+    meta_all = _load_enriched_manifest(cfg)
+    df_exam = _extension_merge_exam_metadata(exam_data.exam_level, meta_all)
+    df_exam = _apply_primary_ttc_filter(df_exam)
+    pred_cols = exam_data.pred_cols
+
+    manufacturer_counts = (
+        df_exam["device_manufacturer"].fillna("Missing").value_counts()
+    )
+    manufacturer_keep = manufacturer_counts[
+        manufacturer_counts >= EXTENSION_MIN_GROUP_EXAMS
+    ].index
+    manufacturer_work = df_exam.copy()
+    manufacturer_work["manufacturer_group"] = np.where(
+        manufacturer_work["device_manufacturer"]
+        .fillna("Missing")
+        .isin(manufacturer_keep),
+        manufacturer_work["device_manufacturer"].fillna("Missing"),
+        "Other",
+    )
+    manufacturer_rows: list[dict] = []
+    for group_name, subset in manufacturer_work.groupby("manufacturer_group"):
+        manufacturer_rows.extend(
+            _extension_group_auc_rows(
+                subset,
+                cfg,
+                pred_cols,
+                analysis_name="manufacturer_ttc_ge_6m",
+                group_type="manufacturer",
+                group_name=str(group_name),
+            )
+        )
+
+    calendar_work = df_exam.copy()
+    calendar_work["study_year"] = pd.to_datetime(
+        calendar_work["study_date"].astype(str), errors="coerce"
+    ).dt.year
+    calendar_rows: list[dict] = []
+    for label, start, end in EXTENSION_CALENDAR_BINS:
+        subset = calendar_work[
+            (calendar_work["study_year"] >= start)
+            & (calendar_work["study_year"] <= end)
+        ].copy()
+        calendar_rows.extend(
+            _extension_group_auc_rows(
+                subset,
+                cfg,
+                pred_cols,
+                analysis_name="calendar_period_ttc_ge_6m",
+                group_type="calendar_period",
+                group_name=label,
+            )
+        )
+
+    exam_selection_subsets = {
+        "all_exams_patient_weighted": df_exam,
+        "first_exam_per_patient": _select_first_exam_per_patient(df_exam),
+        "last_exam_per_patient": _select_last_exam_per_patient(df_exam),
+        "random_exam_per_patient": _select_random_exam_per_patient(
+            df_exam, EXTENSION_RANDOM_EXAM_SEED
+        ),
+    }
+    exam_selection_rows: list[dict] = []
+    for name, subset in exam_selection_subsets.items():
+        exam_selection_rows.extend(
+            _extension_group_auc_rows(
+                subset,
+                cfg,
+                pred_cols,
+                analysis_name="exam_selection_ttc_ge_6m",
+                group_type="exam_selection",
+                group_name=name,
+            )
+        )
+
+    return {
+        "manufacturer": pd.DataFrame(manufacturer_rows),
+        "calendar_period": pd.DataFrame(calendar_rows),
+        "exam_selection": pd.DataFrame(exam_selection_rows),
+    }
+
+
+def _eligible_horizon_frame(
+    df_exam: pd.DataFrame, horizon: int, score_col: str, cfg: Config
+) -> pd.DataFrame:
+    """Return horizon-eligible exam rows with case labels and within-patient weights."""
+    tmp = df_exam[
+        [
+            "patient_id",
+            "exam_id",
+            "years_to_cancer",
+            "years_to_last_followup",
+            score_col,
+        ]
+    ].copy()
+    tmp = tmp.rename(columns={score_col: "score"})
+    ytc = pd.to_numeric(tmp["years_to_cancer"], errors="coerce").to_numpy()
+    ylf = pd.to_numeric(tmp["years_to_last_followup"], errors="coerce").to_numpy()
+    case = np.less_equal(ytc, horizon)
+    ctrl = np.logical_and(np.greater(ytc, horizon), np.greater_equal(ylf, horizon))
+    include = np.logical_or(case, ctrl)
+    eligible = tmp.loc[include].copy()
+    eligible["case"] = case[include].astype(np.int32)
+    if cfg.auc_mode == "random_exam":
+        eligible = (
+            eligible.groupby("patient_id", group_keys=False)
+            .sample(n=1, random_state=cfg.random_exam_seed + int(horizon))
+            .reset_index(drop=True)
+        )
+        eligible["weight"] = 1.0
+    else:
+        n_exam_per_patient = eligible.groupby("patient_id")["patient_id"].transform(
+            "size"
+        )
+        eligible["weight"] = 1.0 / n_exam_per_patient.astype(float)
+    eligible["score"] = pd.to_numeric(eligible["score"], errors="coerce")
+    eligible = eligible[eligible["score"].notna()].copy()
+    return eligible
+
+
+def _weighted_mean(values: pd.Series, weights: pd.Series) -> float:
+    vals = pd.to_numeric(values, errors="coerce").to_numpy(dtype=float)
+    w = pd.to_numeric(weights, errors="coerce").to_numpy(dtype=float)
+    mask = np.isfinite(vals) & np.isfinite(w)
+    if not mask.any() or np.sum(w[mask]) <= 0:
+        return float("nan")
+    return float(np.sum(vals[mask] * w[mask]) / np.sum(w[mask]))
+
+
+def _assign_equal_count_quantiles(scores: pd.Series, n_bins: int) -> pd.Series:
+    """Assign approximately equal-count quantile bins, robust to tied scores."""
+    ranks = scores.rank(method="first")
+    return pd.qcut(ranks, q=n_bins, labels=False, duplicates="drop")
+
+
+def compute_calibration_tables(
+    cfg: Config, exam_data: ExamData
+) -> dict[str, pd.DataFrame]:
+    """Compute calibration, threshold enrichment, and KM-style risk-quantile summaries."""
+    meta_all = _load_enriched_manifest(cfg)
+    df_exam = _extension_merge_exam_metadata(exam_data.exam_level, meta_all)
+    df_exam = _apply_primary_ttc_filter(df_exam)
+    pred_cols = exam_data.pred_cols
+    target_horizons = [h for h in sorted(pred_cols) if h in OMOLEYE_TARGET_HORIZONS]
+
+    calibration_rows: list[dict] = []
+    threshold_rows: list[dict] = []
+    km_rows: list[dict] = []
+
+    for horizon in target_horizons:
+        eligible = _eligible_horizon_frame(df_exam, horizon, pred_cols[horizon], cfg)
+        if eligible.empty:
+            continue
+
+        # Decile-based calibration
+        deciles = _assign_equal_count_quantiles(eligible["score"], 10)
+        eligible = eligible.assign(decile=deciles)
+        for decile, subset in eligible.groupby("decile"):
+            decile_num = int(decile) + 1
+            calibration_rows.append(
+                {
+                    "horizon_years": horizon,
+                    "decile": decile_num,
+                    "n_exams": int(len(subset)),
+                    "n_patients": int(subset["patient_id"].astype(str).nunique()),
+                    "weight_total": float(subset["weight"].sum()),
+                    "mean_predicted_risk": _weighted_mean(
+                        subset["score"], subset["weight"]
+                    ),
+                    "observed_event_rate": _weighted_mean(
+                        subset["case"], subset["weight"]
+                    ),
+                    "oe_ratio": (
+                        _weighted_mean(subset["case"], subset["weight"])
+                        / _weighted_mean(subset["score"], subset["weight"])
+                        if _weighted_mean(subset["score"], subset["weight"]) > 0
+                        else float("nan")
+                    ),
+                }
+            )
+
+        # Top-k enrichment
+        sorted_eligible = eligible.sort_values("score", ascending=False).copy()
+        total_weight = float(sorted_eligible["weight"].sum())
+        total_cases_weight = float(
+            (sorted_eligible["case"] * sorted_eligible["weight"]).sum()
+        )
+        sorted_eligible["cum_weight"] = sorted_eligible["weight"].cumsum()
+        for frac in EXTENSION_THRESHOLD_FRACTIONS:
+            cutoff = frac * total_weight
+            top_subset = sorted_eligible[sorted_eligible["cum_weight"] <= cutoff].copy()
+            if top_subset.empty and not sorted_eligible.empty:
+                top_subset = sorted_eligible.iloc[[0]].copy()
+            top_weight = float(top_subset["weight"].sum())
+            case_weight = float((top_subset["case"] * top_subset["weight"]).sum())
+            threshold_rows.append(
+                {
+                    "horizon_years": horizon,
+                    "threshold_fraction": frac,
+                    "threshold_label": f"top_{int(frac * 100)}pct",
+                    "n_exams": int(len(top_subset)),
+                    "n_patients": int(top_subset["patient_id"].astype(str).nunique()),
+                    "weight_total": top_weight,
+                    "weighted_case_capture": (
+                        case_weight / total_cases_weight
+                        if total_cases_weight > 0
+                        else float("nan")
+                    ),
+                    "weighted_ppv": (
+                        case_weight / top_weight if top_weight > 0 else float("nan")
+                    ),
+                    "mean_predicted_risk": _weighted_mean(
+                        top_subset["score"], top_subset["weight"]
+                    ),
+                }
+            )
+
+    # Risk-quantile cumulative incidence using 5-year Mirai risk
+    if 5 in pred_cols:
+        km_df = df_exam[
+            [
+                "patient_id",
+                "exam_id",
+                "years_to_cancer",
+                "years_to_last_followup",
+                pred_cols[5],
+            ]
+        ].copy()
+        km_df = km_df.rename(columns={pred_cols[5]: "score_5y"})
+        km_df["score_5y"] = pd.to_numeric(km_df["score_5y"], errors="coerce")
+        km_df["years_to_cancer"] = pd.to_numeric(
+            km_df["years_to_cancer"], errors="coerce"
+        )
+        km_df["years_to_last_followup"] = pd.to_numeric(
+            km_df["years_to_last_followup"], errors="coerce"
+        )
+        km_df = km_df[km_df["score_5y"].notna()].copy()
+        km_df["event"] = (
+            km_df["years_to_cancer"].notna()
+            & (km_df["years_to_cancer"] <= km_df["years_to_last_followup"])
+        ).astype(int)
+        km_df["duration"] = np.where(
+            km_df["event"].astype(bool),
+            km_df["years_to_cancer"],
+            km_df["years_to_last_followup"],
+        )
+        km_df = km_df[
+            km_df["duration"].notna()
+            & np.isfinite(km_df["duration"])
+            & (km_df["duration"] >= 0)
+        ].copy()
+        km_quantiles = _assign_equal_count_quantiles(km_df["score_5y"], 5)
+        km_df = km_df.assign(risk_quantile=km_quantiles)
+        unique_quantiles = sorted(q for q in km_df["risk_quantile"].dropna().unique())
+        labels = EXTENSION_QUANTILE_LABELS[: len(unique_quantiles)]
+        label_map = {int(q): labels[idx] for idx, q in enumerate(unique_quantiles)}
+        eval_times = [1, 2, 3, 4, 5]
+        for quantile, subset in km_df.groupby("risk_quantile"):
+            kmf = KaplanMeierFitter()
+            kmf.fit(
+                durations=subset["duration"].astype(float),
+                event_observed=subset["event"].astype(int),
+            )
+            for t in eval_times:
+                surv_t = float(kmf.predict(t))
+                km_rows.append(
+                    {
+                        "time_years": t,
+                        "risk_quantile": int(quantile) + 1,
+                        "risk_quantile_label": label_map[int(quantile)],
+                        "n_exams": int(len(subset)),
+                        "n_patients": int(subset["patient_id"].astype(str).nunique()),
+                        "n_events": int(subset["event"].sum()),
+                        "mean_predicted_5y_risk": float(subset["score_5y"].mean()),
+                        "cumulative_incidence": 1.0 - surv_t,
+                        "survival_probability": surv_t,
+                    }
+                )
+
+    calibration_df = pd.DataFrame(calibration_rows)
+    threshold_df = pd.DataFrame(threshold_rows)
+    km_df = pd.DataFrame(km_rows)
+    return {
+        "calibration": calibration_df,
+        "threshold_enrichment": threshold_df,
+        "risk_quantile_km": km_df,
+    }
+
+
+def plot_calibration_curves(calibration_df: pd.DataFrame, out_path: Path) -> None:
+    """Plot observed vs predicted risk by decile for each horizon."""
+    if calibration_df.empty:
+        return
+    fig, ax = plt.subplots(figsize=(7, 6))
+    for horizon, subset in calibration_df.groupby("horizon_years"):
+        ax.plot(
+            subset["mean_predicted_risk"],
+            subset["observed_event_rate"],
+            marker="o",
+            linewidth=1.6,
+            label=f"{int(horizon)}y",
+        )
+    limit = max(
+        calibration_df["mean_predicted_risk"].max(),
+        calibration_df["observed_event_rate"].max(),
+    )
+    if pd.notna(limit) and limit > 0:
+        ax.plot([0, limit], [0, limit], linestyle="--", color="black", linewidth=1)
+        ax.set_xlim(0, limit * 1.05)
+        ax.set_ylim(0, limit * 1.05)
+    ax.set_xlabel("Mean predicted risk")
+    ax.set_ylabel("Observed event rate")
+    ax.legend(title="Horizon")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_risk_quantile_km(km_df: pd.DataFrame, out_path: Path) -> None:
+    """Plot cumulative incidence over time within 5-year Mirai risk quantiles."""
+    if km_df.empty:
+        return
+    fig, ax = plt.subplots(figsize=(7, 6))
+    for label, subset in km_df.groupby("risk_quantile_label"):
+        ordered = subset.sort_values("time_years")
+        ax.plot(
+            ordered["time_years"],
+            ordered["cumulative_incidence"],
+            marker="o",
+            linewidth=1.6,
+            label=str(label),
+        )
+    ax.set_xlabel("Time (years)")
+    ax.set_ylabel("Cumulative incidence")
+    ax.legend(title="Risk quantile")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
 
 
 def compute_patient_examination_characteristics(
@@ -2461,8 +2937,9 @@ def main() -> None:
     checkpoint("Computed per-horizon summary")
     if cfg.out_json is not None:
         try:
-            views_path = cfg.pred_csv.parent.parent / "sot" / "views.parquet"
-            tags_path = cfg.pred_csv.parent.parent / "sot" / "dicom_tags.parquet"
+            sot_dir = _resolve_sot_dir(cfg.pred_csv)
+            views_path = sot_dir / "views.parquet"
+            tags_path = sot_dir / "dicom_tags.parquet"
             cutflow_df = _build_filter_cutflow_df(
                 exam_data.exam_level_unfiltered, cfg, views_path, tags_path
             )
@@ -2729,27 +3206,62 @@ def main() -> None:
             print(f"Model performance metrics saved to {performance_txt_path}")
 
             # generate HTML version with alternating row colors
+            n_patients = (
+                int(meta_exam["patient_id"].nunique())
+                if meta_exam is not None
+                else None
+            )
+            ci_description = (
+                "AUC confidence intervals use patient-level bootstrap resampling "
+                "(300 iterations) because this run uses patient-weighted AUC. "
+                "Each bootstrap sample resamples patients, then reuses all eligible "
+                "exams from each sampled patient under the same within-patient weighting rule. "
+                "Harrell C-index confidence intervals also use 300 bootstrap resamples. "
+                "For shared-control subgroup analyses, bootstrap is used as well."
+            )
+
             html_lines = [
                 "<!DOCTYPE html>",
                 "<html>",
                 "<head>",
                 "<meta charset='utf-8'>",
+                "<meta name='viewport' content='width=device-width, initial-scale=1'>",
                 "<title>discriminatory performance of mirai in chimec with stratified analysis</title>",
                 "<style>",
-                "  body { font-family: monospace; margin: 20px; }",
-                "  table { border-collapse: collapse; width: auto; min-width: 100%; }",
-                "  th { background-color: #e0e0e0; padding: 8px; text-align: left; border-bottom: 2px solid #333; white-space: nowrap; }",
-                "  td { padding: 6px 8px; white-space: nowrap; }",
-                "  pre { white-space: pre-wrap; background-color: #f6f8fa; padding: 10px; border: 1px solid #ddd; border-radius: 6px; }",
+                "  :root { color-scheme: light; }",
+                "  body { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; margin: 24px; color: #111827; background: #ffffff; line-height: 1.45; }",
+                "  h1, h2, h3, p, li, summary, div, td, th { color: #111827; }",
+                "  h1 { font-size: 20px; margin: 0 0 12px 0; }",
+                "  h2 { font-size: 16px; margin: 24px 0 8px 0; }",
+                "  p { margin: 8px 0; max-width: 1100px; }",
+                "  code { background-color: #f3f4f6; padding: 1px 4px; border-radius: 4px; color: #111827; }",
+                "  .meta { margin-bottom: 18px; padding: 14px 16px; background: #f8fafc; border: 1px solid #d1d5db; border-radius: 8px; }",
+                "  .meta-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px 18px; margin-top: 8px; }",
+                "  .table-wrap { overflow-x: auto; border: 1px solid #d1d5db; border-radius: 8px; }",
+                "  table { border-collapse: collapse; width: 100%; min-width: 1200px; font-size: 13px; }",
+                "  th { position: sticky; top: 0; background-color: #e5e7eb; padding: 10px 12px; text-align: left; border-bottom: 2px solid #6b7280; white-space: nowrap; }",
+                "  td { padding: 8px 12px; white-space: nowrap; vertical-align: top; border-bottom: 1px solid #e5e7eb; }",
+                "  td:first-child, td:nth-child(2), th:first-child, th:nth-child(2) { white-space: normal; }",
+                "  pre { white-space: pre-wrap; background-color: #f8fafc; padding: 12px; border: 1px solid #d1d5db; border-radius: 6px; color: #111827; }",
                 "  .row-group-0 { background-color: #ffffff; }",
-                "  .row-group-1 { background-color: #d4e4f7; }",
+                "  .row-group-1 { background-color: #edf4ff; }",
                 "  tr td { transition: background-color 120ms ease-in-out; }",
-                "  tr.row-group-0:hover td, tr.row-group-1:hover td { background-color: #fff3bf; }",
+                "  tr.row-group-0:hover td, tr.row-group-1:hover td { background-color: #fde68a; }",
+                "  .notes { margin-top: 18px; max-width: 1100px; }",
+                "  details { margin-top: 20px; }",
                 "</style>",
                 "</head>",
                 "<body>",
-                "<div style='margin-bottom: 16px;'>",
-                "<strong>report artifacts:</strong>",
+                "<h1>Discriminatory Performance of Mirai in ChiMEC</h1>",
+                "<div class='meta'>",
+                f"<p><strong>AUC mode:</strong> <code>{cfg.auc_mode}</code></p>",
+                f"<p><strong>Total patients in this analysis cohort:</strong> {n_patients:,}</p>"
+                if n_patients is not None
+                else "<p><strong>Total patients in this analysis cohort:</strong> unavailable</p>",
+                "<p><strong>Interpretation of n:</strong> the <code>n</code> column in the table is the number of examinations in that row's analysis subset, not the number of patients.</p>",
+                f"<p><strong>Confidence intervals:</strong> {ci_description}</p>",
+                "<div class='meta-grid'>",
+                "<div><strong>report artifacts</strong></div>",
             ]
             if cutflow_csv_path is not None:
                 html_lines.append(
@@ -2766,6 +3278,8 @@ def main() -> None:
             html_lines.extend(
                 [
                     "</div>",
+                    "</div>",
+                    "<div class='table-wrap'>",
                     "<table>",
                 ]
             )
@@ -2808,10 +3322,11 @@ def main() -> None:
                 group_idx += 1
 
             html_lines.append("</table>")
+            html_lines.append("</div>")
 
             # add notes if any
             if notes:
-                html_lines.append("<div style='margin-top: 20px;'>")
+                html_lines.append("<div class='notes'>")
                 for note in notes:
                     if note:
                         html_lines.append(f"<p>{note}</p>")
@@ -2856,6 +3371,56 @@ def main() -> None:
             )
             performance_html_path.write_text(html_content)
             print(f"Model performance metrics saved to {performance_html_path}")
+
+            checkpoint("Computing validation extension tables...")
+            extension_tables = compute_validation_extensions(cfg, exam_data)
+            checkpoint("Computed validation extension tables")
+            checkpoint("Computing calibration and threshold extension tables...")
+            calibration_tables = compute_calibration_tables(cfg, exam_data)
+            checkpoint("Computed calibration and threshold extension tables")
+            extension_dir = cfg.out_json.parent / "validation_extensions"
+            extension_dir.mkdir(parents=True, exist_ok=True)
+            extension_paths = {
+                "manufacturer": extension_dir / "manufacturer_auc_ttc6.csv",
+                "calendar_period": extension_dir / "calendar_period_auc_ttc6.csv",
+                "exam_selection": extension_dir / "exam_selection_auc_ttc6.csv",
+                "calibration": extension_dir / "calibration_deciles_ttc6.csv",
+                "threshold_enrichment": extension_dir / "threshold_enrichment_ttc6.csv",
+                "risk_quantile_km": extension_dir / "risk_quantile_km_ttc6.csv",
+            }
+            for key, df_ext in extension_tables.items():
+                df_ext.to_csv(extension_paths[key], index=False)
+            for key, df_ext in calibration_tables.items():
+                df_ext.to_csv(extension_paths[key], index=False)
+            plot_calibration_curves(
+                calibration_tables["calibration"],
+                extension_dir / "calibration_curves_ttc6.png",
+            )
+            plot_risk_quantile_km(
+                calibration_tables["risk_quantile_km"],
+                extension_dir / "risk_quantile_km_ttc6.png",
+            )
+            extension_readme = "\n".join(
+                [
+                    "# Mirai Validation Extensions",
+                    "",
+                    f"- Date: {time.strftime('%Y-%m-%d')}",
+                    "- Primary cohort restriction: `time to cancer >= 6 months`",
+                    "- Generated by `analysis/analyze_mirai.py`.",
+                    "",
+                    "Outputs:",
+                    "- `manufacturer_auc_ttc6.csv`",
+                    "- `calendar_period_auc_ttc6.csv`",
+                    "- `exam_selection_auc_ttc6.csv`",
+                    "- `calibration_deciles_ttc6.csv`",
+                    "- `threshold_enrichment_ttc6.csv`",
+                    "- `risk_quantile_km_ttc6.csv`",
+                    "- `calibration_curves_ttc6.png`",
+                    "- `risk_quantile_km_ttc6.png`",
+                ]
+            )
+            (extension_dir / "README.md").write_text(extension_readme + "\n")
+            print(f"Validation extension tables saved to {extension_dir}")
     except Exception as e:
         print(f"\n[warn] Could not compute model performance metrics: {e}")
 

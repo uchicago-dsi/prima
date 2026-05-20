@@ -128,6 +128,21 @@ There is no automated unit suite. Validate with targeted dry runs (for example, 
 
 Use short imperative commit subjects and land on `main` unless coordination demands a PR. Always run `ruff format .` and `ruff check --fix .` before staging changes. Bundle related code, cache notes, and environment tweaks together. If a PR is opened, mirror the commit summary, list datasets exercised, attach relevant plots, and reference tracking issues.
 
+## Reproducibility
+Make outputs easy to recreate without relying on shell history or memory.
+
+- When generating analysis artifacts or derived tables, write a short `README.md` or provenance text file in the output directory.
+- Record the exact command, key input paths, output paths, date, and any important environment assumptions.
+- If an output depends on multiple sequential commands, record them in order.
+- When changing a producer script, regenerate downstream derived files that depend on it or note clearly that they are stale.
+- Prefer deterministic scripts and explicit CLI arguments over one-off notebook state or ad hoc shell edits.
+
+## Key References
+
+- Omoleye / Woodard / Huo Radiology: AI Mirai validation paper reference is recorded at:
+  - [docs/papers/omoleye_2023_ryai_220299_reference.md](/gpfs/data/huo-lab/Image/annawoodard/prima/docs/papers/omoleye_2023_ryai_220299_reference.md)
+- This note stores the exact citation, DOI, RSNA full-text URL, and the paper-era cohort/results used in CHiMEC Mirai debugging.
+
 ## No Backward Compatibility
 
 **Do not add backward compatibility shims.** This is research code. When data formats change, delete old caches and regenerate rather than adding conditional logic to support multiple versions.

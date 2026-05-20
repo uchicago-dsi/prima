@@ -122,6 +122,7 @@ def create_sbatch_script(
 eval "$(micromamba shell hook -s bash)"
 micromamba activate prima
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+umask 002
 
 cd {shlex.quote(str(Path.cwd()))}
 mkdir -p logs snapshot

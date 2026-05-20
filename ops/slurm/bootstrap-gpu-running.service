@@ -1,0 +1,7 @@
+[Unit]
+Description=Refresh cached GPU bootstrap counts for Slurm job_submit.lua
+After=slurmctld.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/update_bootstrap_gpu_running.py --output /var/spool/slurm/bootstrap_gpu_running.tsv --partitions gpuq gpudev --bootstrap-qos gpu_bootstrap

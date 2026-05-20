@@ -242,6 +242,8 @@ The script:
 
 After exports are requested, files appear on a HIRO CIFS share. Use `ops/sync_local.py` to sync them to GPFS.
 
+Run the mount + sync workflow on `cri-datamover.cri.uchicago.edu`, which is the host where the HIRO share can be mounted and accessed.
+
 #### Mount the HIRO share
 
 ```bash
@@ -264,7 +266,14 @@ SRC_ROOT = Path("/mnt/uchad_samba/16352A/")
 DST_ROOT = Path("/gpfs/data/huo-lab/Image/ChiMEC/MG")
 ```
 
+Recommended: run the sync inside a `tmux` session so it survives disconnects.
+
 ```bash
+tmux new -s sync
+eval "$(micromamba shell hook -s bash)"
+micromamba activate prima
+cd /gpfs/data/huo-lab/Image/annawoodard/prima
+
 # dry run first (no files moved or transferred)
 python ops/sync_local.py --dry-run --no-auto-restart
 
@@ -276,6 +285,12 @@ python ops/sync_local.py --no-immediate-delete
 
 # single sync pass (default auto-restarts every 2 minutes)
 python ops/sync_local.py --no-auto-restart
+```
+
+Detach from tmux with `Ctrl-b d` and reattach later with:
+
+```bash
+tmux attach -t sync
 ```
 
 The script:
@@ -315,6 +330,35 @@ Outputs are written to `{raw}/sot/` and `{raw}/out/` by default:
 - `sot/dicom_tags.parquet` — all DICOM tags (wide format)
 - `out/manifest.parquet` — Zarr URIs for each view
 - `out/mirai_manifest.csv` — Mirai-compatible CSV with labels (auto-generated if --labels provided)
+
+### Sharded preprocessing
+
+For large MG runs, prefer the sharded launcher:
+
+```bash
+python pipelines/run_preprocess_sharded.py \
+  --raw /gpfs/data/huo-lab/Image/ChiMEC/MG \
+  --num_shards 32 \
+  --workers 32 \
+  --genotyped-only \
+  --no-wait
+```
+
+Or for all unique on-disk exams instead of only genotyped patients:
+
+```bash
+python pipelines/run_preprocess_sharded.py \
+  --raw /gpfs/data/huo-lab/Image/ChiMEC/MG \
+  --num_shards 32 \
+  --workers 32 \
+  --all-available \
+  --no-wait
+```
+
+When you use `--no-wait`, the launcher now auto-submits a dependent recover/merge job by default.
+That merge job runs `--recover` after all shards finish successfully and writes the final merged
+`sot/*.parquet`, `out/manifest.parquet`, and `out/mirai_manifest.csv`. Use
+`--no-auto-recover-job` only if you explicitly want to manage the merge yourself.
 
 ### Step 2: Generate Mirai CSV (if not done in step 1)
 
