@@ -53,7 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--dequant-down-proj-spec",
         type=str,
         default="all",
-        help='Layers whose expert down_proj weights should be cached in bf16. Default: all.',
+        help="Layers whose expert down_proj weights should be cached in bf16. Default: all.",
     )
     parser.add_argument(
         "--overwrite-cache",

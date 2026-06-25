@@ -272,7 +272,9 @@ def select_probe_few_shot_examples(
         if str(record["exam_id"]) != str(exclude_exam_id)
     ]
     target_positive = [
-        record for record in candidates if probe_tag in set(record.get("annotations", []))
+        record
+        for record in candidates
+        if probe_tag in set(record.get("annotations", []))
     ]
     selected = sorted(target_positive, key=lambda record: str(record["exam_id"]))[
         :max_examples
@@ -1205,17 +1207,18 @@ def patch_qwen35_fp8_eager_experts() -> None:
             if valid_expert_mask is not None:
                 _maybe_log_router_indices_once()
             if valid_expert_mask_cpu.any():
-                expert_hit = torch.unique(top_k_index_cpu[valid_expert_mask_cpu]).tolist()
+                expert_hit = torch.unique(
+                    top_k_index_cpu[valid_expert_mask_cpu]
+                ).tolist()
             else:
                 expert_hit = []
 
         for expert_idx in expert_hit:
             expert_routes_cpu = valid_expert_mask_cpu & (top_k_index_cpu == expert_idx)
             token_idx_cpu, top_k_pos_cpu = torch.where(expert_routes_cpu)
-            if (
-                (token_idx_cpu >= hidden_states.shape[0]).any()
-                or (top_k_pos_cpu >= top_k_weights.shape[1]).any()
-            ):
+            if (token_idx_cpu >= hidden_states.shape[0]).any() or (
+                top_k_pos_cpu >= top_k_weights.shape[1]
+            ).any():
                 raise RuntimeError(
                     "invalid FP8 expert route indices: "
                     f"hidden_states={tuple(hidden_states.shape)} "

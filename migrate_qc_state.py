@@ -64,7 +64,9 @@ def main() -> int:
     )
     qc_state = save_qc_state(output, qc_state)
 
-    status_count = sum(1 for record in qc_state.values() if record["status"] is not None)
+    status_count = sum(
+        1 for record in qc_state.values() if record["status"] is not None
+    )
     annotation_count = sum(1 for record in qc_state.values() if record["annotations"])
 
     print(f"wrote {len(qc_state):,} exam records to {output}")

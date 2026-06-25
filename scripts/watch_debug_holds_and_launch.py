@@ -125,13 +125,17 @@ def query_hold_state(job_id: str) -> tuple[str, str]:
     return "UNKNOWN", ""
 
 
-def wait_for_running_hold(job_id: str, poll_seconds: int, log_file: Path) -> tuple[str, str] | None:
+def wait_for_running_hold(
+    job_id: str, poll_seconds: int, log_file: Path
+) -> tuple[str, str] | None:
     while True:
         state, node = query_hold_state(job_id)
         append_log(log_file, f"job_id={job_id} state={state} node={node or '-'}")
         if state == "RUNNING":
             return state, node
-        if state.startswith(("CANCELLED", "FAILED", "TIMEOUT", "OUT_OF_MEMORY", "COMPLETED")):
+        if state.startswith(
+            ("CANCELLED", "FAILED", "TIMEOUT", "OUT_OF_MEMORY", "COMPLETED")
+        ):
             return None
         time.sleep(poll_seconds)
 
@@ -220,7 +224,10 @@ def main() -> int:
             log_file=args.log_file,
         )
         if result is None:
-            append_log(args.log_file, f"job_id={job_id} became unavailable before launch; skipping")
+            append_log(
+                args.log_file,
+                f"job_id={job_id} became unavailable before launch; skipping",
+            )
             continue
         _, node = result
         cache_root = args.cache_root_base / f"{job_id}_{hf_cache_mode}"

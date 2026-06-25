@@ -254,7 +254,8 @@ def merge_qc_state(
     annotations_map = annotations_map or {}
 
     all_exam_ids = {
-        str(exam_id) for exam_id in list(status_map.keys()) + list(annotations_map.keys())
+        str(exam_id)
+        for exam_id in list(status_map.keys()) + list(annotations_map.keys())
     }
     merged: dict[str, dict[str, Any]] = {}
     for exam_id in sorted(all_exam_ids):

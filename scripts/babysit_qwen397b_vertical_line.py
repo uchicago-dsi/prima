@@ -173,7 +173,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--log-file", type=Path, default=DEFAULT_LOG_FILE)
     parser.add_argument("--state-file", type=Path, default=DEFAULT_STATE_FILE)
-    parser.add_argument("--active-host-file", type=Path, default=DEFAULT_ACTIVE_HOST_FILE)
+    parser.add_argument(
+        "--active-host-file", type=Path, default=DEFAULT_ACTIVE_HOST_FILE
+    )
     parser.add_argument("--lockfile", type=Path, default=DEFAULT_LOCKFILE)
     parser.add_argument("--schema", type=Path, default=DEFAULT_SCHEMA)
     parser.add_argument("--prompt-template", type=Path, default=DEFAULT_PROMPT)

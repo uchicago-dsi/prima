@@ -58,6 +58,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from prima.qc_filters import compute_auto_filter_sets
+from prima.qc_state import (
+    canonical_annotation_tag,
+    load_qc_state,
+    qc_state_to_annotations_map,
+    qc_state_to_status_map,
+)
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -102,12 +108,6 @@ POSITIVE_MARKERS = {"pos", "positive", "1", "true", "yes", "y"}
 NEGATIVE_MARKERS = {"neg", "negative", "0", "false", "no", "n"}
 OMOLEYE_TARGET_HORIZONS = [1, 2, 3, 4, 5]
 
-LEGACY_ANNOTATION_TAG_ALIASES = {
-    "detector artifact - vertical line": "vertical line (detector artifact)",
-    "detector artifact - horizontal line": "horizontal line (detector artifact)",
-    "horizontal line (detector artifact": "horizontal line (detector artifact)",
-}
-
 
 @dataclass(frozen=True)
 class QCFilterConfig:
@@ -116,7 +116,6 @@ class QCFilterConfig:
     qc_file: Path | None
     include_statuses: tuple[str, ...] | None
     exclude_statuses: tuple[str, ...]
-    annotations_file: Path | None
     annotation_include_any: tuple[str, ...]
     annotation_include_all: tuple[str, ...]
     annotation_exclude_any: tuple[str, ...]
@@ -205,10 +204,9 @@ def _resolve_config_path(value: Any, config_dir: Path) -> Path | None:
 
 def _canonical_annotation_tag(tag: str) -> str:
     """normalize annotation tags to canonical labels used by QC server."""
-    stripped = str(tag).strip()
-    if not stripped:
+    canonical = canonical_annotation_tag(tag)
+    if not canonical:
         return ""
-    canonical = LEGACY_ANNOTATION_TAG_ALIASES.get(stripped, stripped)
     return canonical.lower()
 
 
@@ -487,18 +485,8 @@ def _load_auto_filter_names(qc_cfg: QCFilterConfig) -> list[str]:
 
 
 def _load_qc_status_map(qc_file: Path | None) -> dict[str, str]:
-    """load qc_status.json as exam_id -> normalized status."""
-    if qc_file is None or not qc_file.exists():
-        return {}
-    with open(qc_file) as f:
-        payload = json.load(f)
-    if not isinstance(payload, dict):
-        raise ValueError(f"QC file must contain a JSON object: {qc_file}")
-
-    out: dict[str, str] = {}
-    for exam_id, status in payload.items():
-        out[str(exam_id)] = str(status).strip().lower()
-    return out
+    """Load unified QC state and extract exam_id -> normalized status."""
+    return qc_state_to_status_map(load_qc_state(qc_file))
 
 
 def _normalize_annotation_filter(values: tuple[str, ...] | None) -> tuple[str, ...]:
@@ -513,29 +501,14 @@ def _normalize_annotation_filter(values: tuple[str, ...] | None) -> tuple[str, .
     return tuple(normalized)
 
 
-def _load_annotations_map(annotations_file: Path | None) -> dict[str, set[str]]:
-    """load annotations.json as exam_id -> normalized tag set."""
-    if annotations_file is None or not annotations_file.exists():
-        return {}
-    with open(annotations_file) as f:
-        payload = json.load(f)
-    if not isinstance(payload, dict):
-        raise ValueError(
-            f"annotations file must contain a JSON object: {annotations_file}"
-        )
-
-    out: dict[str, set[str]] = {}
-    for exam_id, tags in payload.items():
-        if not isinstance(tags, list):
-            continue
-        normalized_tags = {
-            _canonical_annotation_tag(tag)
-            for tag in tags
-            if _canonical_annotation_tag(tag)
-        }
-        if normalized_tags:
-            out[str(exam_id)] = normalized_tags
-    return out
+def _load_annotations_map(qc_file: Path | None) -> dict[str, set[str]]:
+    """Load unified QC state and extract exam_id -> normalized annotation tag set."""
+    annotation_map = qc_state_to_annotations_map(load_qc_state(qc_file))
+    return {
+        str(exam_id): {tag for tag in tags if tag}
+        for exam_id, tags in annotation_map.items()
+        if tags
+    }
 
 
 def _build_exam_filter(
@@ -603,7 +576,7 @@ def _build_exam_filter(
             f"qc_status:exclude={','.join(sorted(exclude_set))}", excluded_exam_ids
         )
 
-    annotation_map = _load_annotations_map(qc_cfg.annotations_file)
+    annotation_map = _load_annotations_map(qc_cfg.qc_file)
     include_any = set(qc_cfg.annotation_include_any)
     include_all = set(qc_cfg.annotation_include_all)
     exclude_any = set(qc_cfg.annotation_exclude_any)
@@ -735,7 +708,7 @@ def _build_filter_cutflow_df(
             excluded_exam_ids,
         )
 
-    annotation_map = _load_annotations_map(qc_cfg.annotations_file)
+    annotation_map = _load_annotations_map(qc_cfg.qc_file)
     include_any = set(qc_cfg.annotation_include_any)
     include_all = set(qc_cfg.annotation_include_all)
     exclude_any = set(qc_cfg.annotation_exclude_any)
@@ -1101,11 +1074,6 @@ def _load_config(config_path: Path) -> Config:
         exclude_statuses = tuple()
 
     qc_file = _resolve_config_path(qc_cfg_raw.get("qc_file"), config_dir)
-    annotations_file = _resolve_config_path(
-        qc_cfg_raw.get("annotations_file"), config_dir
-    )
-    if annotations_file is None and qc_file is not None:
-        annotations_file = qc_file.parent / "annotations.json"
 
     include_any = _normalize_annotation_filter(
         _normalize_string_tuple(qc_cfg_raw.get("annotation_include_any"))
@@ -1135,7 +1103,6 @@ def _load_config(config_path: Path) -> Config:
         qc_file=qc_file,
         include_statuses=include_statuses,
         exclude_statuses=exclude_statuses,
-        annotations_file=annotations_file,
         annotation_include_any=include_any,
         annotation_include_all=include_all,
         annotation_exclude_any=exclude_any,
@@ -1162,7 +1129,6 @@ def _load_config(config_path: Path) -> Config:
             if include_statuses is not None
             else None,
             "exclude_statuses": list(exclude_statuses),
-            "annotations_file": str(annotations_file) if annotations_file else None,
             "annotation_include_any": list(include_any),
             "annotation_include_all": list(include_all),
             "annotation_exclude_any": list(exclude_any),

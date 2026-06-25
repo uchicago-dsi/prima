@@ -16,7 +16,9 @@ from prima.qc_state import (
 )
 
 
-def repair_qc_state_defaults(qc_state: dict[str, dict]) -> tuple[dict[str, dict], dict[str, object]]:
+def repair_qc_state_defaults(
+    qc_state: dict[str, dict],
+) -> tuple[dict[str, dict], dict[str, object]]:
     """Drop obviously injected default tags and flag ambiguous legacy cases."""
     default_tags = set(DEFAULT_ANNOTATION_TAGS)
     repaired: dict[str, dict] = {}
@@ -37,12 +39,16 @@ def repair_qc_state_defaults(qc_state: dict[str, dict]) -> tuple[dict[str, dict]
 
         if extras:
             new_annotations = extras
-            dropped_default_count += len([tag for tag in annotations if tag in default_tags])
+            dropped_default_count += len(
+                [tag for tag in annotations if tag in default_tags]
+            )
             repaired_exam_count += 1
             repaired[exam_id] = {
                 **record,
                 "annotations": new_annotations,
-                "annotation_meta": normalize_annotation_meta(annotation_meta, new_annotations),
+                "annotation_meta": normalize_annotation_meta(
+                    annotation_meta, new_annotations
+                ),
             }
             continue
 

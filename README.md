@@ -120,7 +120,6 @@ ruff format .
 ruff check --fix .
 ```
 
-
 ### Qwen3.5 397B FP8 Repair Overlay
 
 `Qwen3.5-397B-A17B-FP8` currently needs a PRIMA repair overlay on this stack. The repair does two things:
@@ -131,7 +130,11 @@ ruff check --fix .
 Build the repaired wrapper once:
 
 ```bash
-micromamba run -p /net/projects2/annawoodard/micromamba/envs/prima   python scripts/build_qwen35_fp8_repair.py   --base-model-path /net/projects2/annawoodard/models/Qwen3.5-397B-A17B-FP8   --output-model-path /net/projects2/annawoodard/models/Qwen3.5-397B-A17B-FP8-prima-repair
+micromamba run -p /net/projects2/annawoodard/micromamba/envs/prima \
+  python scripts/build_qwen35_fp8_repair.py \
+  --base-model-path /net/projects2/annawoodard/models/Qwen3.5-397B-A17B-FP8 \
+  --output-model-path /net/projects2/annawoodard/models/Qwen3.5-397B-A17B-FP8-prima-repair \
+  --force-bf16-experts
 ```
 
 That creates:
@@ -142,14 +145,21 @@ That creates:
 Use the repaired wrapper path directly for inference:
 
 ```bash
-micromamba run -p /net/projects2/annawoodard/micromamba/envs/prima   python submit_auto_qc.py   --gpuspec h200 --ngpus 4 --no-wait   --views /net/projects2/annawoodard/qc_export/views_for_qc.parquet   --export-dir /net/projects2/annawoodard/qc_export   --run-file /net/projects2/annawoodard/qc_redo/auto_qc_runs/qwen397b_fp8_bb_probe.json   --model-path /net/projects2/annawoodard/models/Qwen3.5-397B-A17B-FP8-prima-repair   --prompt-mode binary_tag_probe --probe-tag BB --few-shot-examples 0
+micromamba run -p /net/projects2/annawoodard/micromamba/envs/prima \
+  env PRIMA_QWEN35_FP8_FORCE_BF16_EXPERTS=1 \
+  python submit_auto_qc.py \
+  --gpuspec h200 --ngpus 4 --no-wait \
+  --views /net/projects2/annawoodard/qc_export/views_for_qc.parquet \
+  --export-dir /net/projects2/annawoodard/qc_export \
+  --run-file /net/projects2/annawoodard/qc_redo/auto_qc_runs/qwen397b_fp8_bb_probe.json \
+  --model-path /net/projects2/annawoodard/models/Qwen3.5-397B-A17B-FP8-prima-repair \
+  --prompt-mode binary_tag_probe --probe-tag BB --few-shot-examples 0
 ```
 
 Cost model:
 
 - first build: expensive one-time repair/dequantize work for the requested layers
 - later inference: reuses the cached repaired tensors, but still pays model load plus cache-load time on each run
-
 
 ---
 
@@ -575,7 +585,7 @@ python qc/qc_gallery.py --serve --max-exams 100 --prioritize-errors \
 **Analyze patterns:**
 ```bash
 # After QC'ing 20-50 exams, analyze what makes bad exams bad
-python analysis/analyze_qc_patterns.py --qc-file data/qc_status.json
+python analysis/analyze_qc_patterns.py --qc-file data/qc_state.json
 
 # This will print:
 # - DICOM tags that differ between bad and good exams
@@ -638,12 +648,12 @@ With server running, you can also dynamically test filters:
 - If validated → add to `qc_auto_exclude.json`
 
 **Standard QC controls:**
-1. Mark exams using keyboard shortcuts: `G` = Good, `R` = Needs review, `B` = Bad, Arrow keys = Navigate
-2. QC status auto-saves to `data/qc_status.json`
-3. Re-run the script to continue — by default, exams marked "good" or "bad" are automatically skipped
+1. Mark exams using keyboard shortcuts: `G` = Good, `A` = Annotate findings, Arrow keys = Navigate
+2. QC state auto-saves to `data/qc_state.json`
+3. Re-run the script to continue — by default, exams marked "good", annotated, or auto-excluded are automatically skipped
 4. Apply QC filters in downstream analysis via `analysis/analyze_mirai.py <config.yaml>` (see below)
 
-**Default behavior**: Future QC runs skip exams marked as "good" (already approved) or "bad" (already rejected), showing only "review" and unmarked exams.
+**Default behavior**: Future QC runs skip exams marked "good", annotated, or auto-excluded, showing only unmarked exams.
 
 #### Alternative: Random sampling (if no predictions yet)
 
@@ -661,11 +671,11 @@ python qc/qc_gallery.py --serve --port 8080
 # filter to specific patient
 python qc/qc_gallery.py --serve --patient 12345
 
-# re-visit exams previously marked as "bad"
-python qc/qc_gallery.py --serve --max-exams 100 --qc-skip-status good
+# re-visit previously annotated exams
+python qc/qc_gallery.py --serve --max-exams 100 --qc-skip-status good auto_excluded
 
 # only show completely unmarked exams (skip all QC'd exams)
-python qc/qc_gallery.py --serve --max-exams 100 --qc-skip-status good bad review
+python qc/qc_gallery.py --serve --max-exams 100 --qc-skip-status good annotated auto_excluded
 
 # use different prediction horizon for error scoring (default: 5 years)
 python qc/qc_gallery.py --serve --prioritize-errors --horizon 3 \
@@ -677,7 +687,7 @@ python qc/qc_gallery.py \
   --views /path/to/views.parquet \
   --raw /gpfs/data/huo-lab/Image/ChiMEC/MG \
   --output qc_output \
-  --qc-file /path/to/my_qc_status.json
+  --qc-file /path/to/my_qc_state.json
 ```
 
 #### Local mode (without server)
@@ -698,17 +708,17 @@ python analysis/analyze_mirai.py /tmp/analyze_mirai.yaml
 
 **QC filter behavior**:
 
-In future QC runs (default: `--qc-skip-status good bad`):
-- Exams marked `"good"` or `"bad"` are skipped (already decided)
-- Exams marked `"review"` or unmarked are shown (need attention)
-- To re-visit "bad" exams: `--qc-skip-status good`
+In future QC runs (default: `--qc-skip-status good annotated auto_excluded`):
+- Exams marked `"good"`, annotated, or `"auto_excluded"` are skipped (already decided)
+- Unmarked exams are shown (need attention)
+- To re-visit annotated exams: `--qc-skip-status good auto_excluded`
 
 In downstream analysis (`analysis/analyze_mirai.py <config.yaml>`):
 - Status filtering is controlled by `qc_filters.include_statuses` / `qc_filters.exclude_statuses`
 - Auto filters are controlled by `qc_filters.enable_auto_filters` and `qc_filters.auto_filters`
 - Annotation filters are controlled by `qc_filters.annotation_include_*` and `qc_filters.annotation_exclude_*`
 - Original `validation_output.csv` remains unchanged
-- QC decisions remain in `qc_status.json` / `annotations.json` and are applied at analysis time
+- QC decisions remain in `qc_state.json` and are applied at analysis time
 
 This design allows you to:
 - Efficiently QC by not showing already-decided exams

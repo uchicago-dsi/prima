@@ -70,7 +70,9 @@ def main() -> int:
             print(f"hold {job_id} reached planned sleep deadline; exiting", flush=True)
             return 0
 
-        running_jobs = list_running_group_jobs(user=user, group_prefix=args.group_prefix)
+        running_jobs = list_running_group_jobs(
+            user=user, group_prefix=args.group_prefix
+        )
         if running_jobs:
             newest_job_id, newest_job_name, newest_start_time = max(
                 running_jobs,
@@ -85,7 +87,9 @@ def main() -> int:
                 )
                 return 0
             older_job_ids = sorted(
-                row[0] for row in running_jobs if row[0] != job_id and row[0] not in cancelled_older_job_ids
+                row[0]
+                for row in running_jobs
+                if row[0] != job_id and row[0] not in cancelled_older_job_ids
             )
             if older_job_ids:
                 print(

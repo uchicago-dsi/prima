@@ -21,10 +21,8 @@ auc_mode: patient_weighted
 random_exam_seed: 42
 
 qc_filters:
-  # QC server status map (exam_id -> status)
-  qc_file: data/qc_status.json
-  # QC server annotations map (exam_id -> [tags]); defaults to qc_file sibling annotations.json
-  annotations_file: data/annotations.json
+  # Unified QC state map (exam_id -> {status, annotations})
+  qc_file: data/qc_state.json
 
   # Status filtering:
   # - include_statuses: keep only exams with one of these statuses (null = don't require status)

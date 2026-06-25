@@ -127,7 +127,9 @@ def main() -> int:
     print(f"submitted {len(submitted_job_ids)} hold jobs in mode={args.mode}")
     print(f"sleep_seconds={sleep_seconds}")
     for idx, job_id in enumerate(submitted_job_ids, start=1):
-        predecessor = submitted_job_ids[idx - 2] if args.mode == "chain" and idx > 1 else "-"
+        predecessor = (
+            submitted_job_ids[idx - 2] if args.mode == "chain" and idx > 1 else "-"
+        )
         print(f"{idx:02d} {job_id} afterany={predecessor}")
     return 0
 

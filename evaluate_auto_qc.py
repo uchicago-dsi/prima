@@ -6,7 +6,11 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from prima.auto_qc import auto_run_to_tag_map, compute_exam_level_tag_metrics, load_auto_run
+from prima.auto_qc import (
+    auto_run_to_tag_map,
+    compute_exam_level_tag_metrics,
+    load_auto_run,
+)
 from prima.qc_state import load_qc_state, qc_state_to_annotations_map
 
 
@@ -42,8 +46,7 @@ def main() -> int:
         for exam_id, tags in qc_state_to_annotations_map(qc_state).items()
     }
     pred_by_exam = {
-        exam_id: set(tags)
-        for exam_id, tags in auto_run_to_tag_map(auto_run).items()
+        exam_id: set(tags) for exam_id, tags in auto_run_to_tag_map(auto_run).items()
     }
     scored_exam_ids = {
         str(exam_id) for exam_id in auto_run.get("exam_suggestions", {}).keys()
@@ -71,7 +74,9 @@ def main() -> int:
         support = row["tp"] + row["fp"] + row["fn"]
         if support < args.min_support:
             continue
-        precision = "n/a" if row["precision"] is None else f"{row['precision'] * 100:6.1f}%"
+        precision = (
+            "n/a" if row["precision"] is None else f"{row['precision'] * 100:6.1f}%"
+        )
         recall = "n/a" if row["recall"] is None else f"{row['recall'] * 100:6.1f}%"
         print(
             f"{row['tag'][:40]:40} {row['tp']:4d} {row['fp']:4d} {row['fn']:4d} {row['tn']:6d} {precision:>8} {recall:>8}"
