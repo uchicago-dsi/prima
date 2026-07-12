@@ -101,7 +101,7 @@ HTML = r"""<!doctype html>
   <title>Single-target view QC</title>
   <style>
     :root { color-scheme: dark; font-family: system-ui, sans-serif; }
-    body { min-height: 100vh; margin: 0; overflow-y: auto; background: #101214; color: #f0f2f4; }
+    body { min-height: 100vh; margin: 0; overflow-y: auto; user-select: none; caret-color: transparent; background: #101214; color: #f0f2f4; }
     header { padding: 12px 18px; border-bottom: 1px solid #34383d; background: #171a1e; }
     #stats { font-variant-numeric: tabular-nums; font-weight: 650; }
     #context { color: #aeb6bf; margin-top: 5px; }
@@ -111,6 +111,8 @@ HTML = r"""<!doctype html>
     button { border: 1px solid #59616a; border-radius: 7px; padding: 10px 14px; color: white; background: #282d33; font-size: 16px; cursor: pointer; }
     button:hover { background: #343b43; }
     button.active { box-shadow: 0 0 0 3px #f4c542 inset; }
+    #save-status { min-width: 145px; color: #9fd8b8; font-weight: 650; }
+    #save-status.error { color: #ff9b9b; }
     .absent { background: #315d7d; }
     .present { background: #8a5b24; }
     .muted { color: #aeb6bf; }
@@ -129,6 +131,7 @@ HTML = r"""<!doctype html>
     <button id="clear">Clear [x]</button>
     <button id="next">Next →</button>
     <button id="pending">Next unreviewed</button>
+    <span id="save-status" role="status" aria-live="polite"></span>
   </div>
   <main><img id="image" alt="Mammography view"></main>
 <script>
@@ -136,6 +139,7 @@ let items = [];
 let labels = {};
 let index = 0;
 let target = '';
+let saving = false;
 
 function counts() {
   let absent = 0;
@@ -182,17 +186,44 @@ function render() {
 }
 
 async function setLabel(label) {
+  if (saving) return;
+  saving = true;
+  showStatus('Saving…');
   const item = items[index];
-  const response = await fetch('/api/label', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({view_id: item.view_id, label})
-  });
-  if (!response.ok) throw new Error(await response.text());
-  const payload = await response.json();
-  labels = payload.labels;
-  if (label !== null) nextUnreviewed(index + 1);
-  else render();
+  try {
+    const response = await fetch('/api/label', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({view_id: item.view_id, label})
+    });
+    if (!response.ok) throw new Error(await response.text());
+    const payload = await response.json();
+    labels = payload.labels;
+    const labelText = label === null ? 'Label cleared' :
+      label === 'absent' ? 'Saved: not present' :
+      label === 'present' ? 'Saved: present' : 'Saved: unsure';
+    showStatus(labelText);
+    if (label === null) {
+      render();
+    } else if (counts().remaining > 0) {
+      nextUnreviewed(index + 1);
+    } else if (index < items.length - 1) {
+      index += 1;
+      render();
+    } else {
+      render();
+    }
+  } catch (error) {
+    showStatus('Save failed: ' + error, true);
+  } finally {
+    saving = false;
+  }
+}
+
+function showStatus(message, isError = false) {
+  const status = document.getElementById('save-status');
+  status.textContent = message;
+  status.classList.toggle('error', isError);
 }
 
 function move(delta) {
@@ -220,12 +251,16 @@ document.getElementById('uncertain').onclick = () => setLabel('uncertain');
 document.getElementById('clear').onclick = () => setLabel(null);
 document.getElementById('pending').onclick = () => nextUnreviewed(index + 1);
 document.addEventListener('keydown', event => {
-  if (event.key === 'ArrowLeft') move(-1);
-  else if (event.key === 'ArrowRight') move(1);
-  else if (event.key.toLowerCase() === 'n') setLabel('absent');
-  else if (event.key.toLowerCase() === 'y') setLabel('present');
-  else if (event.key.toLowerCase() === 'u') setLabel('uncertain');
-  else if (event.key.toLowerCase() === 'x') setLabel(null);
+  if (event.metaKey || event.ctrlKey || event.altKey) return;
+  const key = event.key.toLowerCase();
+  if (!['arrowleft', 'arrowright', 'n', 'y', 'u', 'x'].includes(key)) return;
+  event.preventDefault();
+  if (key === 'arrowleft') move(-1);
+  else if (key === 'arrowright') move(1);
+  else if (key === 'n') setLabel('absent');
+  else if (key === 'y') setLabel('present');
+  else if (key === 'u') setLabel('uncertain');
+  else if (key === 'x') setLabel(null);
 });
 
 Promise.all([

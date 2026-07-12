@@ -132,6 +132,10 @@ def test_gallery_keeps_stable_port_and_smaller_image() -> None:
     assert "height: calc(100vh" not in HTML
     assert "overflow: hidden" not in HTML
     assert "overflow-y: auto" in HTML
+    assert "caret-color: transparent" in HTML
+    assert 'id="save-status"' in HTML
+    assert "event.preventDefault()" in HTML
+    assert "Saved: not present" in HTML
     assert "Not present [n]" in HTML
     assert "Present [y]" in HTML
     assert "Unsure [u]" in HTML
