@@ -12,6 +12,7 @@ from prima.view_qc import VIEW_QC_TARGET, normalize_view_id
 
 VIEW_AUTO_QC_SCHEMA_VERSION = 1
 VIEW_AUTO_QC_PROMPT_VERSION = "vertical_line_view_v1"
+VIEW_CONFIDENCE_LEVELS = ("low", "medium", "high")
 
 
 def normalize_view_suggestion_record(raw_record: Any) -> dict[str, Any]:
@@ -42,6 +43,25 @@ def normalize_view_suggestion_record(raw_record: Any) -> dict[str, Any]:
     if debug_dump_file:
         record["debug_dump_file"] = debug_dump_file
     return record
+
+
+def view_suggestion_meets_confidence(
+    record: Mapping[str, Any], *, minimum_confidence: str
+) -> bool:
+    """Return whether a binary suggestion meets an explicit reject threshold."""
+    minimum_confidence = str(minimum_confidence).strip().lower()
+    if minimum_confidence not in VIEW_CONFIDENCE_LEVELS:
+        raise ValueError(
+            f"unsupported minimum suggestion confidence: {minimum_confidence!r}"
+        )
+    normalized = normalize_view_suggestion_record(dict(record))
+    if not normalized["suggestions"]:
+        return False
+    confidence = normalized["suggestions"][0].get("confidence")
+    if confidence not in VIEW_CONFIDENCE_LEVELS:
+        raise ValueError("model suggestion is missing a valid confidence")
+    ranks = {level: index for index, level in enumerate(VIEW_CONFIDENCE_LEVELS)}
+    return ranks[confidence] >= ranks[minimum_confidence]
 
 
 def normalize_view_auto_run(payload: Any) -> dict[str, Any]:

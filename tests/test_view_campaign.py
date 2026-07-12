@@ -6,12 +6,17 @@ from pathlib import Path
 
 import pandas as pd
 from PIL import Image
+import pytest
 
 from prima.view_auto_qc import new_view_auto_run, save_view_auto_run
 from qc.merge_view_auto_qc import merge_view_runs
 from qc.prepare_view_candidate_inference import stable_render_shard
 from qc.validate_view_candidate_render import run_from_args as validate_render
-from qc.build_auto_qc_fallback_audit import audit_group_id
+from qc.build_auto_qc_fallback_audit import (
+    audit_group_id,
+    load_excluded_audit_group_ids,
+    sample_rows,
+)
 from qc.evaluate_auto_qc_fallback_audit import evaluate_group
 from submit_view_auto_qc_campaign import parse_partition_plan
 
@@ -42,17 +47,56 @@ def test_fallback_audit_group_ids_are_stable_and_deidentified() -> None:
     assert "exam-1" not in first
 
 
+def test_fallback_audit_excludes_prior_exact_slot_groups(tmp_path: Path) -> None:
+    source_manifest = tmp_path / "source.parquet"
+    pd.DataFrame(
+        {
+            "exam_id": ["exam-1", "exam-1"],
+            "laterality": ["L", "L"],
+            "view": ["CC", "CC"],
+        }
+    ).to_parquet(source_manifest, index=False)
+    hashed_manifest = tmp_path / "hashed.parquet"
+    pd.DataFrame({"audit_group_id": [audit_group_id("exam-2", "R", "MLO")]}).to_parquet(
+        hashed_manifest, index=False
+    )
+    assert load_excluded_audit_group_ids([source_manifest, hashed_manifest]) == {
+        audit_group_id("exam-1", "L", "CC"),
+        audit_group_id("exam-2", "R", "MLO"),
+    }
+
+    invalid_manifest = tmp_path / "invalid.parquet"
+    pd.DataFrame({"audit_group_id": [None]}).to_parquet(invalid_manifest, index=False)
+    with pytest.raises(ValueError, match="null group IDs"):
+        load_excluded_audit_group_ids([invalid_manifest])
+
+
+def test_fallback_audit_requires_requested_sample_size() -> None:
+    with pytest.raises(ValueError, match="only 1 are eligible"):
+        sample_rows(pd.DataFrame({"value": [1]}), count=2, seed=1)
+
+
 def test_fallback_audit_scores_ranked_replacement_sequence() -> None:
     rows = pd.DataFrame(
         {
             "stratum": ["alternate_pass", "alternate_pass", "alternate_pass"],
             "selection_rank": [1, 2, 3],
+            "candidate_count": [3, 3, 3],
             "human_positive": [True, True, False],
+            "model_positive": [True, True, False],
         }
     )
-    assert evaluate_group(rows)[0]
+    result = evaluate_group(rows)
+    assert result["decision_safe"]
+    assert result["decision_exact"]
     rows.loc[1, "human_positive"] = False
-    assert not evaluate_group(rows)[0]
+    result = evaluate_group(rows)
+    assert result["decision_safe"]
+    assert not result["decision_exact"]
+    rows.loc[2, "human_positive"] = True
+    result = evaluate_group(rows)
+    assert not result["decision_safe"]
+    assert not result["decision_exact"]
 
 
 def test_merge_view_runs_requires_exact_disjoint_coverage(tmp_path: Path) -> None:

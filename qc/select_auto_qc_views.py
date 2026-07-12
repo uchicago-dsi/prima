@@ -15,7 +15,11 @@ from prima.dicom_source import (
     require_source_columns,
     require_valid_sources,
 )
-from prima.view_auto_qc import load_view_auto_run
+from prima.view_auto_qc import (
+    VIEW_CONFIDENCE_LEVELS,
+    load_view_auto_run,
+    view_suggestion_meets_confidence,
+)
 from prima.view_fallback import (
     choose_exact_slot_views_from_outcomes,
     validate_candidate_table,
@@ -28,6 +32,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidates", type=Path, required=True)
     parser.add_argument("--view-auto-run", type=Path, required=True)
     parser.add_argument("--render-complete", type=Path, required=True)
+    parser.add_argument(
+        "--minimum-reject-confidence",
+        choices=VIEW_CONFIDENCE_LEVELS,
+        required=True,
+    )
     parser.add_argument("--decisions-output", type=Path, required=True)
     parser.add_argument("--selected-views-output", type=Path, required=True)
     return parser.parse_args()
@@ -76,7 +85,9 @@ def main() -> int:
     model_rejected = {
         view_id
         for view_id, record in run["view_suggestions"].items()
-        if record["suggestions"]
+        if view_suggestion_meets_confidence(
+            record, minimum_confidence=args.minimum_reject_confidence
+        )
     }
     decisions = choose_exact_slot_views_from_outcomes(
         candidates,
@@ -84,8 +95,16 @@ def main() -> int:
         rejected_view_ids=model_rejected | render_failures,
         context=str(candidates_path),
     )
+    decisions["minimum_reject_confidence"] = args.minimum_reject_confidence
     resolved = decisions[decisions["selected_view_id"].notna()][
-        ["exam_id", "laterality", "view", "selected_view_id", "fallback_status"]
+        [
+            "exam_id",
+            "laterality",
+            "view",
+            "selected_view_id",
+            "fallback_status",
+            "minimum_reject_confidence",
+        ]
     ]
     selected = resolved.merge(
         candidates,
@@ -111,6 +130,7 @@ def main() -> int:
     os.chmod(selected_path, 0o600)
     counts = decisions["fallback_status"].value_counts().sort_index().to_dict()
     print(f"wrote {len(decisions):,} exact-slot model decisions")
+    print(f"minimum reject confidence: {args.minimum_reject_confidence}")
     print(
         "status counts: " + ", ".join(f"{key}={value}" for key, value in counts.items())
     )

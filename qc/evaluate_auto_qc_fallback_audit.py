@@ -10,7 +10,11 @@ from pathlib import Path
 
 import pandas as pd
 
-from prima.view_auto_qc import load_view_auto_run
+from prima.view_auto_qc import (
+    VIEW_CONFIDENCE_LEVELS,
+    load_view_auto_run,
+    view_suggestion_meets_confidence,
+)
 from prima.view_qc import (
     VIEW_LABEL_VERTICAL_LINE,
     load_view_qc_state,
@@ -27,28 +31,47 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--hidden-model-run", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument(
+        "--minimum-reject-confidence",
+        choices=VIEW_CONFIDENCE_LEVELS,
+        required=True,
+    )
     return parser.parse_args()
 
 
-def evaluate_group(rows: pd.DataFrame) -> tuple[bool, str]:
+def evaluate_group(rows: pd.DataFrame) -> dict[str, object]:
+    """Evaluate model-driven selection over one complete candidate sequence."""
     strata = set(rows["stratum"].astype(str))
     if len(strata) != 1:
         raise ValueError("one audit group contains multiple strata")
-    stratum = next(iter(strata))
     rows = rows.sort_values("selection_rank", kind="stable")
-    human = rows["human_positive"].astype(bool).tolist()
-    if stratum == "alternate_pass":
-        correct = len(human) >= 2 and all(human[:-1]) and not human[-1]
-        rule = "all rejected predecessors positive and accepted alternate negative"
-    elif stratum == "no_passing_candidate":
-        correct = bool(human) and all(human)
-        rule = "every exhausted candidate positive"
-    elif stratum == "original_pass_control":
-        correct = len(human) == 1 and not human[0]
-        rule = "original model-pass control negative"
+    ranks = rows["selection_rank"].astype(int).tolist()
+    if ranks != list(range(1, len(rows) + 1)):
+        raise ValueError("audit group has a non-contiguous candidate sequence")
+    counts = set(rows["candidate_count"].astype(int))
+    if counts != {len(rows)}:
+        raise ValueError("audit group does not include its complete candidate sequence")
+
+    accepted = rows[~rows["model_positive"].astype(bool)]
+    if accepted.empty:
+        safe = bool(rows["human_positive"].astype(bool).all())
+        exact = safe
+        outcome = "safe_exhaustion" if safe else "false_exhaustion"
+        selected_rank = None
     else:
-        raise ValueError(f"unsupported fallback audit stratum: {stratum!r}")
-    return correct, rule
+        selected = accepted.iloc[0]
+        selected_rank = int(selected["selection_rank"])
+        selected_is_seam = bool(selected["human_positive"])
+        predecessors = rows[rows["selection_rank"].astype(int) < selected_rank]
+        safe = not selected_is_seam
+        exact = safe and bool(predecessors["human_positive"].astype(bool).all())
+        outcome = "selected_seam" if selected_is_seam else "selected_pass"
+    return {
+        "decision_safe": bool(safe),
+        "decision_exact": bool(exact),
+        "decision_outcome": outcome,
+        "selected_candidate_rank": selected_rank,
+    }
 
 
 def main() -> int:
@@ -67,7 +90,7 @@ def main() -> int:
 
     manifest = pd.read_parquet(manifest_path)
     validate_view_manifest_columns(manifest.columns, str(manifest_path))
-    required = {"stratum", "audit_group_id", "selection_rank"}
+    required = {"stratum", "audit_group_id", "selection_rank", "candidate_count"}
     missing = sorted(required - set(manifest.columns))
     if missing:
         raise ValueError(
@@ -90,32 +113,45 @@ def main() -> int:
         lambda view_id: labels[view_id]["label"] == VIEW_LABEL_VERTICAL_LINE
     )
     manifest["model_positive"] = manifest["view_id"].map(
-        lambda view_id: bool(run["view_suggestions"][view_id]["suggestions"])
+        lambda view_id: view_suggestion_meets_confidence(
+            run["view_suggestions"][view_id],
+            minimum_confidence=args.minimum_reject_confidence,
+        )
     )
     manifest["agreement"] = manifest["human_positive"] == manifest["model_positive"]
 
     group_rows = []
     for group_id, rows in manifest.groupby("audit_group_id", sort=True):
-        correct, rule = evaluate_group(rows)
+        result = evaluate_group(rows)
         group_rows.append(
             {
                 "audit_group_id": str(group_id),
                 "stratum": str(rows.iloc[0]["stratum"]),
                 "view_count": int(len(rows)),
-                "decision_correct": bool(correct),
-                "decision_rule": rule,
+                **result,
             }
         )
     groups = pd.DataFrame(group_rows)
     group_summary = {
         str(stratum): {
             "groups": int(len(rows)),
-            "correct": int(rows["decision_correct"].sum()),
-            "incorrect": int((~rows["decision_correct"]).sum()),
+            "safe": int(rows["decision_safe"].sum()),
+            "unsafe": int((~rows["decision_safe"]).sum()),
+            "exact": int(rows["decision_exact"].sum()),
+            "inexact": int((~rows["decision_exact"]).sum()),
+            "selected_pass": int((rows["decision_outcome"] == "selected_pass").sum()),
+            "selected_seam": int((rows["decision_outcome"] == "selected_seam").sum()),
+            "safe_exhaustion": int(
+                (rows["decision_outcome"] == "safe_exhaustion").sum()
+            ),
+            "false_exhaustion": int(
+                (rows["decision_outcome"] == "false_exhaustion").sum()
+            ),
         }
         for stratum, rows in groups.groupby("stratum", sort=True)
     }
     metrics = {
+        "minimum_reject_confidence": args.minimum_reject_confidence,
         "views": confusion_metrics(manifest),
         "views_by_stratum": {
             str(stratum): confusion_metrics(rows)
@@ -127,15 +163,26 @@ def main() -> int:
     metrics_path = out_dir / "metrics.json"
     view_failures_path = out_dir / "view_disagreements.parquet"
     group_failures_path = out_dir / "decision_failures.parquet"
+    group_inexact_path = out_dir / "decision_inexact.parquet"
+    group_decisions_path = out_dir / "group_decisions.parquet"
     metrics_path.write_text(json.dumps(metrics, indent=2) + "\n")
     manifest[~manifest["agreement"]].to_parquet(view_failures_path, index=False)
-    groups[~groups["decision_correct"]].to_parquet(group_failures_path, index=False)
-    for path in (metrics_path, view_failures_path, group_failures_path):
+    groups[~groups["decision_safe"]].to_parquet(group_failures_path, index=False)
+    groups[~groups["decision_exact"]].to_parquet(group_inexact_path, index=False)
+    groups.to_parquet(group_decisions_path, index=False)
+    for path in (
+        metrics_path,
+        view_failures_path,
+        group_failures_path,
+        group_inexact_path,
+        group_decisions_path,
+    ):
         os.chmod(path, 0o600)
     print(
         f"fallback audit evaluated: views={len(manifest)} groups={len(groups)} "
         f"view_disagreements={int((~manifest['agreement']).sum())} "
-        f"decision_failures={int((~groups['decision_correct']).sum())}"
+        f"unsafe_decisions={int((~groups['decision_safe']).sum())} "
+        f"inexact_decisions={int((~groups['decision_exact']).sum())}"
     )
     return 0
 

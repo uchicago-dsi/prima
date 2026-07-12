@@ -13,6 +13,7 @@ from prima.view_auto_qc import (
     new_view_auto_run,
     require_compatible_view_auto_run,
     save_view_auto_run,
+    view_suggestion_meets_confidence,
 )
 from qc.run_view_auto_qc import load_view_records
 from qc import evaluate_view_auto_qc
@@ -45,6 +46,38 @@ def test_view_prompt_removes_montage_cross_view_rule() -> None:
     )
     assert "single target view" in system
     assert "four-view" not in system
+
+
+def test_detector_boundary_prompt_defines_positive_and_negative_morphologies() -> None:
+    prompt = auto_annotate_qc.build_target_prompt_text(
+        prompt_mode="marker_classifier",
+        tag_catalog=["vertical line (detector artifact)"],
+        few_shot_examples=[],
+        probe_tag="vertical line (detector artifact)",
+        prompt_variant="detector_boundary_v2",
+        input_level="view",
+    )
+    assert "detector-panel boundary" in prompt
+    assert "repeated bright curved bands" in prompt
+    assert "surgical scar/incision marker" in prompt
+    assert "image-frame/crop borders" in prompt
+
+
+def test_view_suggestion_confidence_threshold_is_explicit() -> None:
+    record = {
+        "image_path": "images/view.png",
+        "suggestions": [
+            {
+                "tag": "vertical line (detector artifact)",
+                "confidence": "medium",
+            }
+        ],
+    }
+    assert view_suggestion_meets_confidence(record, minimum_confidence="medium")
+    assert not view_suggestion_meets_confidence(record, minimum_confidence="high")
+    record["suggestions"][0].pop("confidence")
+    with pytest.raises(ValueError, match="missing a valid confidence"):
+        view_suggestion_meets_confidence(record, minimum_confidence="high")
 
 
 def test_view_run_round_trip_and_resume_guard(tmp_path: Path) -> None:
@@ -144,6 +177,7 @@ def test_evaluator_refuses_partial_blinded_labels(
             state=state_path,
             run_file=run_path,
             out_dir=tmp_path / "evaluation",
+            minimum_reject_confidence="high",
         ),
     )
     with pytest.raises(RuntimeError, match="1 remain"):

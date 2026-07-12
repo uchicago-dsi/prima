@@ -1168,6 +1168,25 @@ def build_marker_classifier_prompt(
     )
     if input_level == "exam":
         vertical_evidence += ", often at a similar x-position across views"
+    if prompt_variant == "detector_boundary_v2":
+        if probe_tag.strip().lower() != "vertical line (detector artifact)":
+            raise ValueError(
+                "detector_boundary_v2 is only valid for the vertical detector-line tag"
+            )
+        return (
+            f"{example_text}"
+            f"Target {target} only: decide whether a vertical detector artifact is visually present in this {image_type}.\n"
+            "Answer YES for either of these detector-fixed patterns:\n"
+            "- a straight, narrow gray vertical seam or stripe; or\n"
+            "- a straight vertical detector-panel boundary that divides the image into different intensity regions and runs through nearly the full image height. This boundary may be broad or high-contrast and may have repeated bright curved bands beside it; that still counts as the target artifact.\n"
+            "Answer NO for a surgical scar/incision marker or wire within the breast, localization hardware, clips, vessels, skin folds, breast or pectoral edges, text labels, image-frame/crop borders, or normal film edges. Curved or tapered lines within anatomy are not detector seams.\n"
+            "Use high confidence only when one of the two positive detector-fixed patterns is unmistakable; use medium or low for a borderline appearance.\n"
+            "Answer in exactly four lines and nothing else:\n"
+            "EVIDENCE: <one short visual phrase, or none>\n"
+            "ANSWER: YES or ANSWER: NO\n"
+            "CONFIDENCE: high, medium, or low\n"
+            "REVIEW: YES or REVIEW: NO\n"
+        )
     if prompt_variant == "confidence_specificity":
         return (
             f"{example_text}"
@@ -1266,7 +1285,12 @@ def build_binary_probe_prefix_allowed_tokens_fn(
     return _prefix_allowed_tokens_fn
 
 
-PROMPT_VARIANTS = ("baseline", "recall_tilted", "confidence_specificity")
+PROMPT_VARIANTS = (
+    "baseline",
+    "recall_tilted",
+    "confidence_specificity",
+    "detector_boundary_v2",
+)
 
 
 def build_recall_tilted_rule(probe_tag: str | None = None) -> str:

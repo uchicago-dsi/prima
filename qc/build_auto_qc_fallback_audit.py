@@ -31,6 +31,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--render-complete", type=Path, required=True)
     parser.add_argument("--campaign-dir", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument(
+        "--exclude-manifest",
+        type=Path,
+        action="append",
+        default=[],
+        help="Prior review manifest whose exact-slot groups must not be resampled",
+    )
     parser.add_argument("--alternate-slots", type=int, default=50)
     parser.add_argument("--no-pass-slots", type=int, default=25)
     parser.add_argument("--original-pass-views", type=int, default=50)
@@ -42,14 +49,61 @@ def parse_args() -> argparse.Namespace:
 def sample_rows(rows: pd.DataFrame, count: int, seed: int) -> pd.DataFrame:
     if count < 0:
         raise ValueError("audit sample sizes cannot be negative")
-    if rows.empty or count == 0:
+    if count == 0:
         return rows.iloc[0:0].copy()
-    return rows.sample(n=min(count, len(rows)), random_state=seed).copy()
+    if len(rows) < count:
+        raise ValueError(
+            f"audit requested {count} rows but only {len(rows)} are eligible"
+        )
+    return rows.sample(n=count, random_state=seed).copy()
 
 
 def audit_group_id(exam_id: object, laterality: object, view: object) -> str:
     payload = f"{exam_id}|{laterality}|{view}".encode()
     return hashlib.sha256(payload).hexdigest()
+
+
+def load_excluded_audit_group_ids(paths: list[Path]) -> set[str]:
+    """Load deidentified exact-slot group IDs from prior review manifests."""
+    excluded: set[str] = set()
+    for raw_path in paths:
+        path = raw_path.resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"excluded audit manifest not found: {path}")
+        manifest = pd.read_parquet(path)
+        if manifest.empty:
+            raise ValueError(f"excluded audit manifest is empty: {path}")
+        if "audit_group_id" in manifest.columns:
+            if manifest["audit_group_id"].isna().any():
+                raise ValueError(f"excluded audit manifest has null group IDs: {path}")
+            values = manifest["audit_group_id"].astype(str).str.strip()
+            if (values == "").any():
+                raise ValueError(f"excluded audit manifest has blank group IDs: {path}")
+            excluded.update(values)
+            continue
+        required = {"exam_id", "laterality", "view"}
+        missing = sorted(required - set(manifest.columns))
+        if missing:
+            raise ValueError(
+                f"excluded audit manifest cannot identify exact-slot groups: {path}; "
+                f"missing {', '.join(missing)}"
+            )
+        if manifest[list(required)].isna().any(axis=None):
+            raise ValueError(f"excluded audit manifest has null slot fields: {path}")
+        if (
+            manifest[list(required)]
+            .astype(str)
+            .apply(lambda values: values.str.strip().eq(""))
+            .any(axis=None)
+        ):
+            raise ValueError(f"excluded audit manifest has blank slot fields: {path}")
+        excluded.update(
+            audit_group_id(exam_id, laterality, view)
+            for exam_id, laterality, view in manifest[
+                ["exam_id", "laterality", "view"]
+            ].itertuples(index=False, name=None)
+        )
+    return excluded
 
 
 def main() -> int:
@@ -60,6 +114,7 @@ def main() -> int:
     render_complete_path = args.render_complete.resolve()
     campaign_dir = args.campaign_dir.resolve()
     out_dir = args.out_dir.resolve()
+    excluded_group_ids = load_excluded_audit_group_ids(args.exclude_manifest)
     for path in (candidates_path, decisions_path, run_path, render_complete_path):
         if not path.is_file():
             raise FileNotFoundError(f"required fallback audit input not found: {path}")
@@ -117,7 +172,16 @@ def main() -> int:
             decisions[["exam_id", "laterality", "view"]].to_numpy(),
         )
     )
-    visually_auditable = decisions[~decisions["_group_key"].isin(failed_group_keys)]
+    decisions["_audit_group_id"] = [
+        audit_group_id(exam_id, laterality, view)
+        for exam_id, laterality, view in decisions[
+            ["exam_id", "laterality", "view"]
+        ].itertuples(index=False, name=None)
+    ]
+    visually_auditable = decisions[
+        ~decisions["_group_key"].isin(failed_group_keys)
+        & ~decisions["_audit_group_id"].isin(excluded_group_ids)
+    ]
 
     alternate = sample_rows(
         visually_auditable[visually_auditable["fallback_status"] == "alternate_pass"],
@@ -158,11 +222,6 @@ def main() -> int:
                 str(decision["view"]),
             )
             rows = keyed_candidates[key]
-            if stratum == "alternate_pass":
-                selected_rank = int(decision["selected_candidate_rank"])
-                rows = rows[rows["selection_rank"] <= selected_rank]
-            elif stratum == "original_pass_control":
-                rows = rows.iloc[[0]]
             group_id = audit_group_id(*key)
             for row in rows.to_dict("records"):
                 audit_records.append(
@@ -171,6 +230,7 @@ def main() -> int:
                         "laterality": str(row["laterality"]),
                         "view": str(row["view"]),
                         "selection_rank": int(row["selection_rank"]),
+                        "candidate_count": int(len(rows)),
                         "audit_group_id": group_id,
                         "stratum": stratum,
                     }
@@ -222,10 +282,13 @@ def main() -> int:
                 f"- sampled no-passing-candidate slots: `{len(no_pass)}`",
                 f"- sampled original-pass controls: `{len(controls)}`",
                 f"- deterministic render-failure slots excluded: `{len(failed_group_keys)}`",
+                f"- prior exact-slot groups excluded: `{len(excluded_group_ids)}`",
                 f"- seed: `{args.seed}`",
                 "",
                 "The gallery exposes only individual views. Sampling strata, candidate",
                 "ranks, group hashes, and the hidden model run remain server-side.",
+                "Every candidate in each sampled exact-slot group is included so selection",
+                "and exhaustion decisions can be evaluated without an unseen tail.",
                 "",
             ]
         )

@@ -12,7 +12,11 @@ from typing import Any
 
 import pandas as pd
 
-from prima.view_auto_qc import load_view_auto_run
+from prima.view_auto_qc import (
+    VIEW_CONFIDENCE_LEVELS,
+    load_view_auto_run,
+    view_suggestion_meets_confidence,
+)
 from prima.view_qc import (
     VIEW_LABEL_VERTICAL_LINE,
     VIEW_QC_TARGET,
@@ -29,6 +33,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--run-file", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument(
+        "--minimum-reject-confidence",
+        choices=VIEW_CONFIDENCE_LEVELS,
+        required=True,
+    )
     return parser.parse_args()
 
 
@@ -117,15 +126,16 @@ def main() -> int:
         lambda view_id: labels[view_id]["label"] == VIEW_LABEL_VERTICAL_LINE
     )
     manifest["model_positive"] = manifest["view_id"].map(
-        lambda view_id: any(
-            suggestion["tag"] == VIEW_QC_TARGET
-            for suggestion in predictions[view_id]["suggestions"]
+        lambda view_id: view_suggestion_meets_confidence(
+            predictions[view_id],
+            minimum_confidence=args.minimum_reject_confidence,
         )
     )
     manifest["agreement"] = manifest["human_positive"] == manifest["model_positive"]
 
     metrics = {
         "target": VIEW_QC_TARGET,
+        "minimum_reject_confidence": args.minimum_reject_confidence,
         "manifest_rows": int(len(manifest)),
         "overall": confusion_metrics(manifest),
         "by_stratum": {
