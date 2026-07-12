@@ -38,6 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eligibility-audit", type=Path, required=True)
     parser.add_argument("--candidates", type=Path, required=True)
     parser.add_argument("--rendered-manifest", type=Path, required=True)
+    parser.add_argument("--exclude-manifest", type=Path, action="append", default=[])
     parser.add_argument("--raw-root", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--temp-root", type=Path, required=True)
@@ -96,6 +97,7 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
     audit_path = args.eligibility_audit.resolve()
     candidates_path = args.candidates.resolve()
     rendered_manifest_path = args.rendered_manifest.resolve()
+    exclude_manifest_paths = [path.resolve() for path in args.exclude_manifest]
     raw_root = args.raw_root.resolve()
     out_dir = args.out_dir.resolve()
     temp_root = args.temp_root.resolve()
@@ -106,6 +108,7 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
         audit_path,
         candidates_path,
         rendered_manifest_path,
+        *exclude_manifest_paths,
     ):
         if not path.is_file():
             raise FileNotFoundError(f"eligibility repair input not found: {path}")
@@ -181,10 +184,18 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
     if rendered["view_id"].duplicated().any():
         raise ValueError("rendered manifest contains duplicate view IDs")
     rendered_ids = set(rendered["view_id"])
+    excluded_replacement_ids: set[str] = set()
+    for path in exclude_manifest_paths:
+        excluded_manifest = pd.read_parquet(path)
+        validate_view_manifest_columns(excluded_manifest.columns, str(path))
+        excluded_replacement_ids.update(
+            excluded_manifest["view_id"].map(normalize_view_id)
+        )
 
     replacement_pool = candidates[
         candidates["exam_id"].isin(set(seeds["exam_id"]))
         & ~candidates["view_id"].isin(manifest_ids)
+        & ~candidates["view_id"].isin(excluded_replacement_ids)
         & candidates["view_id"].isin(rendered_ids)
     ].copy()
     if replacement_pool.empty:
@@ -227,6 +238,7 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
             reserve_pool = candidates[
                 ~candidates["exam_id"].isin(original_exam_ids)
                 & candidates["view_id"].isin(rendered_ids)
+                & ~candidates["view_id"].isin(excluded_replacement_ids)
             ].copy()
             for column in reserve_match_columns:
                 reserve_pool = reserve_pool[reserve_pool[column] == seed[column]]
@@ -365,6 +377,9 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
         "preserved_human_labels": int(len(repaired_state["labels"])),
         "preserved_model_scores": int(len(repaired_run["view_suggestions"])),
         "reserve_exam_replacements": int(reserve_replacements),
+        "explicitly_excluded_replacement_views": int(
+            len(excluded_replacement_ids - manifest_ids)
+        ),
     }
     restricted_json(out_dir / "repair_metadata.json", metadata)
     readme = out_dir / "README.md"
