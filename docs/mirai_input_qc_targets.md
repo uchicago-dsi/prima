@@ -16,6 +16,10 @@ These requirements imply the following QC layers:
 
 - structural exam checks for exact four-view completeness and valid
   laterality/projection;
+- source-header checks that each slot is an unmodified, non-partial CC or MLO
+  view. A DICOM whose primary `ViewPosition` is CC/MLO is still non-standard
+  when `ViewModifierCodeSequence` says Implant Displaced, rolled, spot
+  compression, magnification, or another modifier;
 - metadata checks for For Presentation mode;
 - a visual check for burned-in CAD or human markup;
 - a view-level check that a selected CC/MLO image is not actually a
@@ -31,7 +35,9 @@ proof that the Mirai executable cannot produce a score for such images.
 
 - `visible breast implant`: label at view level, aggregate with ANY across the
   exam, and route the exam outside the paper-comparable analysis until implant
-  performance is validated. Do not search for a same-exam non-implant fallback.
+  performance is validated. Implant-displaced views are not valid substitutes
+  for the four standard Mirai slots. Do not search for a same-exam non-implant
+  fallback merely to erase an exam-level implant finding.
 - `large foreign device obscuring the mammogram`: keep separate from implants
   and from small clips. Define and validate this target before using it.
 - `burned-in CAD or human markup`: exclude the affected input and seek an

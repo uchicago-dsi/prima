@@ -108,6 +108,7 @@ from prima.dicom_source import (
 from prima.view_selection import (
     estimate_magnification_factor,
     estimate_pixel_spacing_mm,
+    nonstandard_mirai_view_reasons,
     view_selection_key,
 )
 
@@ -412,6 +413,9 @@ def infer_view_fields(ds: FileDataset) -> Tuple[str, str]:
         raise ValueError(f"unexpected laterality: {lat}")
     if vp not in {"CC", "MLO"}:
         raise ValueError(f"unexpected view position: {vp}")
+    nonstandard_reasons = nonstandard_mirai_view_reasons(ds)
+    if nonstandard_reasons:
+        raise ValueError("non-standard Mirai view: " + "; ".join(nonstandard_reasons))
     return lat, vp
 
 

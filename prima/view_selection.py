@@ -1,9 +1,46 @@
 """Shared mammography view selection utilities for preprocess and QC."""
 
+from __future__ import annotations
+
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
 from pydicom.dataset import FileDataset
+
+
+def view_modifier_code_meanings(ds: FileDataset) -> tuple[str, ...]:
+    """Return explicit mammography view modifiers from either DICOM location."""
+    modifier_items = list(ds.get("ViewModifierCodeSequence", []) or [])
+    for view_item in ds.get("ViewCodeSequence", []) or []:
+        modifier_items.extend(view_item.get("ViewModifierCodeSequence", []) or [])
+
+    meanings: list[str] = []
+    for item in modifier_items:
+        meaning = str(item.get("CodeMeaning", "") or "").strip()
+        code_value = str(item.get("CodeValue", "") or "").strip()
+        label = meaning or code_value or "unspecified view modifier"
+        if label not in meanings:
+            meanings.append(label)
+    return tuple(meanings)
+
+
+def nonstandard_mirai_view_reasons(ds: FileDataset) -> tuple[str, ...]:
+    """Explain why a DICOM is not an unmodified full-field CC/MLO view."""
+    reasons: list[str] = []
+    view_position = str(ds.get("ViewPosition", "") or "").strip().upper()
+    if view_position not in {"CC", "MLO"}:
+        reasons.append(f"unsupported ViewPosition {view_position or '<missing>'}")
+    if str(ds.get("PartialView", "") or "").strip().upper() == "YES":
+        reasons.append("PartialView is YES")
+    modifiers = view_modifier_code_meanings(ds)
+    if modifiers:
+        reasons.append("view modifier: " + ", ".join(modifiers))
+    return tuple(reasons)
+
+
+def is_standard_mirai_view(ds: FileDataset) -> bool:
+    """Return whether a DICOM is an unmodified full-field CC or MLO view."""
+    return not nonstandard_mirai_view_reasons(ds)
 
 
 def to_float(value: object) -> Optional[float]:
@@ -51,6 +88,9 @@ def view_selection_key_from_dataset(
     ds: FileDataset, source_key: Union[str, Path]
 ) -> Tuple[float, int, float, str]:
     """Build a canonical view-selection key directly from a parsed DICOM dataset."""
+    reasons = nonstandard_mirai_view_reasons(ds)
+    if reasons:
+        raise ValueError("cannot select non-standard Mirai view: " + "; ".join(reasons))
     presentation_intent = (
         str(ds.get("PresentationIntentType", "") or "").strip().upper()
     )
