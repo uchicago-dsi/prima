@@ -1,0 +1,13 @@
+Target view only: decide whether the visual target "non-standard spot-compression or magnification view" is present in this mammogram.
+
+Answer YES when this is visibly a focal diagnostic view rather than a routine full-field screening CC or MLO view. Positive evidence includes a small or localized portion of breast compressed under a focal paddle, a conspicuous circular or rectangular spot-compression boundary within the field, tight collimation around a limited tissue region, or a magnification setup that produces a localized enlarged view rather than a standard whole-breast view.
+
+Answer NO for an ordinary full-field CC or MLO view, even when the breast is compressed, a normal paddle or detector edge is visible at the image border, the breast is small, positioning is imperfect, or the image contains implants, clips, markers, text, film borders, or detector artifacts. Do not infer the target from metadata or image scale alone; require visual evidence that the acquisition is a focal diagnostic spot-compression or magnification view.
+
+Use high confidence only when the focal diagnostic geometry is unmistakable. Use medium or low confidence when limited breast coverage could instead reflect positioning or cropping, and set REVIEW: YES for genuinely ambiguous cases.
+
+Answer in exactly four lines and nothing else:
+EVIDENCE: <one short visual phrase, or none>
+ANSWER: YES or ANSWER: NO
+CONFIDENCE: high, medium, or low
+REVIEW: YES or REVIEW: NO
