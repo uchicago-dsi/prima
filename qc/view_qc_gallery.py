@@ -131,6 +131,7 @@ HTML = r"""<!doctype html>
     <button id="clear">Clear [x]</button>
     <button id="next">Next →</button>
     <button id="pending">Next unreviewed</button>
+    <button id="review-unsure">Review unsure (0)</button>
     <span id="save-status" role="status" aria-live="polite"></span>
   </div>
   <main><img id="image" alt="Mammography view"></main>
@@ -140,6 +141,12 @@ let labels = {};
 let index = 0;
 let target = '';
 let saving = false;
+let unsureReviewQueue = [];
+let unsureReviewPosition = -1;
+
+function unsureReviewActive() {
+  return unsureReviewPosition >= 0 && unsureReviewQueue.length > 0;
+}
 
 function counts() {
   let absent = 0;
@@ -164,9 +171,16 @@ function render() {
   }
   document.getElementById('image').src = item.image_url;
   const instruction = 'Target: ' + target + '. Decide only whether this target is present; ignore every other finding.';
-  document.getElementById('context').textContent = summary.remaining === 0
-    ? instruction + ' Review complete — all labels are saved. Use Previous or the arrow keys to inspect them.'
-    : item.laterality + ' ' + item.view + ' | ' + instruction;
+  let context = item.laterality + ' ' + item.view + ' | ' + instruction;
+  if (unsureReviewActive()) {
+    context += ' Unsure review pass ' + (unsureReviewPosition + 1) + '/' + unsureReviewQueue.length + '.';
+  } else if (summary.remaining === 0) {
+    context = instruction + ' Review complete — all labels are saved.';
+    context += summary.uncertain > 0
+      ? ' Use Review unsure to revisit the unsure labels.'
+      : ' Use Previous or the arrow keys to inspect them.';
+  }
+  document.getElementById('context').textContent = context;
   document.getElementById('stats').textContent =
     'position ' + (index + 1) + '/' + items.length +
     ' | reviewed ' + summary.reviewed + '/' + items.length +
@@ -174,15 +188,29 @@ function render() {
     ' | absent ' + summary.absent +
     ' | present ' + summary.present +
     ' | unsure ' + summary.uncertain +
+    (unsureReviewActive() ? ' | unsure pass ' + (unsureReviewPosition + 1) + '/' + unsureReviewQueue.length : '') +
     (summary.remaining === 0 ? ' | COMPLETE' : '');
   const active = labels[item.view_id]?.label;
   document.getElementById('absent').classList.toggle('active', active === 'absent');
   document.getElementById('present').classList.toggle('active', active === 'present');
   document.getElementById('uncertain').classList.toggle('active', active === 'uncertain');
-  document.getElementById('previous').disabled = index === 0;
-  const atEnd = index === items.length - 1;
+  const reviewingUnsure = unsureReviewActive();
+  document.getElementById('previous').disabled = reviewingUnsure
+    ? unsureReviewPosition === 0
+    : index === 0;
+  const atEnd = reviewingUnsure
+    ? unsureReviewPosition === unsureReviewQueue.length - 1
+    : index === items.length - 1;
   document.getElementById('next').disabled = atEnd;
-  document.getElementById('next').textContent = atEnd ? 'End reached' : 'Next →';
+  document.getElementById('next').textContent = atEnd
+    ? (reviewingUnsure ? 'Unsure review end' : 'End reached')
+    : (reviewingUnsure ? 'Next unsure →' : 'Next →');
+  const reviewUnsure = document.getElementById('review-unsure');
+  reviewUnsure.disabled = !reviewingUnsure && summary.uncertain === 0;
+  reviewUnsure.classList.toggle('active', reviewingUnsure);
+  reviewUnsure.textContent = reviewingUnsure
+    ? 'Exit unsure review (' + (unsureReviewPosition + 1) + '/' + unsureReviewQueue.length + ')'
+    : 'Review unsure (' + summary.uncertain + ')';
 }
 
 async function setLabel(label) {
@@ -205,6 +233,8 @@ async function setLabel(label) {
     showStatus(labelText);
     if (label === null) {
       render();
+    } else if (unsureReviewActive()) {
+      advanceUnsureReview(labelText);
     } else if (counts().remaining > 0) {
       nextUnreviewed(index + 1);
     } else if (index < items.length - 1) {
@@ -227,7 +257,49 @@ function showStatus(message, isError = false) {
 }
 
 function move(delta) {
+  if (unsureReviewActive()) {
+    unsureReviewPosition = Math.max(
+      0,
+      Math.min(unsureReviewQueue.length - 1, unsureReviewPosition + delta)
+    );
+    index = items.findIndex(item => item.view_id === unsureReviewQueue[unsureReviewPosition]);
+    render();
+    return;
+  }
   index = Math.max(0, Math.min(items.length - 1, index + delta));
+  render();
+}
+
+function exitUnsureReview() {
+  unsureReviewQueue = [];
+  unsureReviewPosition = -1;
+}
+
+function startUnsureReview() {
+  unsureReviewQueue = items
+    .filter(item => labels[item.view_id]?.label === 'uncertain')
+    .map(item => item.view_id);
+  if (unsureReviewQueue.length === 0) {
+    unsureReviewPosition = -1;
+    showStatus('No unsure labels to review');
+    render();
+    return;
+  }
+  unsureReviewPosition = 0;
+  index = items.findIndex(item => item.view_id === unsureReviewQueue[0]);
+  showStatus('Reviewing ' + unsureReviewQueue.length + ' unsure labels');
+  render();
+}
+
+function advanceUnsureReview(labelText) {
+  if (unsureReviewPosition < unsureReviewQueue.length - 1) {
+    unsureReviewPosition += 1;
+    index = items.findIndex(item => item.view_id === unsureReviewQueue[unsureReviewPosition]);
+    render();
+    return;
+  }
+  exitUnsureReview();
+  showStatus(labelText + ' — unsure review pass complete');
   render();
 }
 
@@ -249,7 +321,18 @@ document.getElementById('absent').onclick = () => setLabel('absent');
 document.getElementById('present').onclick = () => setLabel('present');
 document.getElementById('uncertain').onclick = () => setLabel('uncertain');
 document.getElementById('clear').onclick = () => setLabel(null);
-document.getElementById('pending').onclick = () => nextUnreviewed(index + 1);
+document.getElementById('pending').onclick = () => {
+  exitUnsureReview();
+  nextUnreviewed(index + 1);
+};
+document.getElementById('review-unsure').onclick = () => {
+  if (unsureReviewActive()) {
+    exitUnsureReview();
+    render();
+  } else {
+    startUnsureReview();
+  }
+};
 document.addEventListener('keydown', event => {
   if (event.metaKey || event.ctrlKey || event.altKey) return;
   const key = event.key.toLowerCase();

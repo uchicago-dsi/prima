@@ -125,6 +125,10 @@ def test_gallery_has_explicit_completion_state() -> None:
     assert "Review complete" in HTML
     assert "| COMPLETE" in HTML
     assert "End reached" in HTML
+    assert 'id="review-unsure"' in HTML
+    assert "Review unsure (" in HTML
+    assert "function startUnsureReview()" in HTML
+    assert "unsure review pass complete" in HTML
 
 
 def test_gallery_keeps_stable_port_and_smaller_image() -> None:
