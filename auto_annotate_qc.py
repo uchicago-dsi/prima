@@ -5,17 +5,30 @@ from __future__ import annotations
 
 import argparse
 import ast
+import base64
 from collections import Counter
 from collections import defaultdict
+from contextlib import contextmanager
+import fcntl
+from importlib import metadata
 import json
 import logging
 import os
 import re
+import signal
+import socket
+import time
+import traceback
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from prima.auto_qc import AUTO_QC_PROMPT_VERSION, save_auto_run, utc_now_iso
+from prima.auto_qc import (
+    AUTO_QC_PROMPT_VERSION,
+    load_auto_run,
+    save_auto_run,
+    utc_now_iso,
+)
 from prima.qc_state import (
     DEFAULT_ANNOTATION_TAGS,
     load_qc_state,
@@ -33,6 +46,91 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+REPO_ROOT = Path(__file__).resolve().parent
+DEFAULT_VLLM_MODEL_REGISTRY = REPO_ROOT / "qc" / "auto_qc_models.json"
+DEFAULT_MODELS_DIR = Path("/gpfs/data/huo-lab/Image/annawoodard/models")
+
+_SHUTDOWN_REQUESTED = False
+
+TRANSFORMERS_FP8_KERNEL_REVISIONS = {
+    "finegrained-fp8": "061130fedf845f320c56de4425f7404f6512c87e",
+    "deep-gemm": "9590415046fa95a187af7ea03391d4782047170d",
+}
+
+
+def request_shutdown(signum: int, _frame: Any) -> None:
+    """Record a scheduler/user shutdown request without interrupting CUDA work."""
+    global _SHUTDOWN_REQUESTED
+    _SHUTDOWN_REQUESTED = True
+    logger.warning("received signal %s; stopping after the current exam", signum)
+
+
+def install_shutdown_handlers() -> None:
+    """Install lightweight handlers so opportunistic jobs can checkpoint cleanly."""
+    signal.signal(signal.SIGTERM, request_shutdown)
+    signal.signal(signal.SIGINT, request_shutdown)
+
+
+def shutdown_requested() -> bool:
+    """Return whether the current process should stop after a safe checkpoint."""
+    return _SHUTDOWN_REQUESTED
+
+
+def pin_transformers_fp8_kernel_revisions() -> None:
+    """Avoid Hub version lookups for cached FP8 kernels on compute nodes."""
+    try:
+        from transformers.integrations import hub_kernels
+    except Exception as exc:  # pragma: no cover - depends on optional imports
+        logger.debug("could not inspect Transformers hub kernel mapping: %s", exc)
+        return
+
+    mapping = getattr(hub_kernels, "_HUB_KERNEL_MAPPING", {})
+    module_mapping = getattr(hub_kernels, "_KERNEL_MODULE_MAPPING", {})
+    changed: list[str] = []
+    for kernel_name, revision in TRANSFORMERS_FP8_KERNEL_REVISIONS.items():
+        entry = mapping.get(kernel_name)
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("revision") == revision and "version" not in entry:
+            continue
+        entry["revision"] = revision
+        entry.pop("version", None)
+        module_mapping.pop(kernel_name, None)
+        changed.append(f"{kernel_name}@{revision[:12]}")
+    if changed:
+        logger.info(
+            "pinned Transformers FP8 hub kernel revisions for compute-node cache use: %s",
+            ", ".join(changed),
+        )
+
+
+def patch_torch_cuda_get_device_properties_default(torch_module: Any) -> None:
+    """Handle Transformers FP8 code that calls get_device_properties with no device."""
+    original_get_device_properties = torch_module.cuda.get_device_properties
+    if getattr(
+        original_get_device_properties,
+        "_prima_default_device_patch",
+        False,
+    ):
+        return
+    try:
+        original_get_device_properties()
+        return
+    except TypeError as exc:
+        if "missing 1 required positional argument" not in str(exc):
+            raise
+
+    def patched_get_device_properties(device: Any = None) -> Any:
+        if device is None:
+            device = torch_module.cuda.current_device()
+        return original_get_device_properties(device)
+
+    patched_get_device_properties._prima_default_device_patch = True
+    torch_module.cuda.get_device_properties = patched_get_device_properties
+    logger.info(
+        "patched torch.cuda.get_device_properties default device for Transformers FP8 compatibility"
+    )
 
 
 def load_tag_catalog(tags_file: Path | None) -> list[str]:
@@ -338,7 +436,7 @@ def load_exam_records(
             exam_id=str(source_exam_id),
         )
         if not montage_path.exists():
-            logger.warning("missing cached montage, skipping: %s", montage_path)
+            logger.warning("missing cached montage; skipping one exam")
             continue
         if (
             skip_existing_annotations
@@ -359,20 +457,650 @@ def load_exam_records(
     return records
 
 
-def build_system_prompt() -> str:
-    """System prompt for the multimodal QC model."""
-    return (
-        "You are a strict mammography QC tagger. "
-        "You are given cached four-view mammography montages for one labeled reference set and one target exam. "
-        "Use the labeled references as visual examples of the accepted QC tags. "
-        "Return JSON only. Do not mention patient identity. "
-        "Only output tags that are visually evident in the montage itself."
+def build_inference_settings(
+    *,
+    args: argparse.Namespace,
+    model_spec: Any = None,
+) -> dict[str, Any]:
+    """Capture every invocation setting that can change saved predictions."""
+    settings: dict[str, Any] = {
+        "few_shot_examples": int(args.few_shot_examples),
+        "few_shot_qc_file": (
+            str(args.few_shot_qc_file.resolve())
+            if args.few_shot_qc_file
+            else (str(args.qc_file.resolve()) if args.qc_file else None)
+        )
+        if args.few_shot_examples > 0
+        else None,
+        "max_new_tokens": int(args.max_new_tokens),
+        "target_prompt_override": args.target_prompt_override.strip()
+        if args.target_prompt_override
+        else None,
+        "text_only_prompt": args.text_only_prompt.strip()
+        if args.text_only_prompt
+        else None,
+        "thinking_disabled": True
+        if args.backend == "vllm"
+        else bool(args.disable_thinking),
+    }
+    if args.backend == "vllm":
+        if model_spec is None:
+            raise ValueError("vLLM inference settings require a resolved model spec")
+        settings.update(
+            {
+                "model_key": model_spec.key,
+                "model_revision": model_spec.revision,
+                "request_timeout_seconds": int(args.vllm_request_timeout_seconds),
+                "runtime_versions": {
+                    package: metadata.version(package)
+                    for package in ("dsi-local-llms", "openai", "vllm")
+                },
+                "serve_environment": dict(model_spec.environment),
+                "serve_extra_args": list(model_spec.extra_args),
+                "structured_output": {
+                    "tagger_json": "json_schema",
+                    "binary_tag_probe": "choice",
+                }.get(args.prompt_mode),
+                "temperature": 0.0,
+            }
+        )
+    return settings
+
+
+def build_run_payload(
+    *,
+    run_id: str,
+    model_label: str,
+    args: argparse.Namespace,
+    tag_catalog: list[str],
+    model_spec: Any = None,
+    created_at: str | None = None,
+    exam_suggestions: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build the normalized auto-QC run payload for this invocation."""
+    payload: dict[str, Any] = {
+        "run_id": run_id,
+        "model": model_label,
+        "backend": f"{args.backend}_local",
+        "created_at": created_at or utc_now_iso(),
+        "prompt_version": AUTO_QC_PROMPT_VERSION,
+        "prompt_mode": args.prompt_mode,
+        "prompt_variant": args.prompt_variant,
+        "inference_settings": build_inference_settings(
+            args=args,
+            model_spec=model_spec,
+        ),
+        "tag_catalog": tag_catalog,
+        "exam_suggestions": exam_suggestions or {},
+    }
+    if args.probe_tag:
+        payload["probe_tag"] = args.probe_tag
+    return payload
+
+
+def validate_auto_run_compatible(
+    *,
+    existing: dict[str, Any],
+    current: dict[str, Any],
+    run_file: Path,
+) -> None:
+    """Fail early when a resume target belongs to a different run setup."""
+    existing_suggestions = existing.get("exam_suggestions", {})
+    if not existing_suggestions:
+        return
+
+    mismatches: list[str] = []
+    for field in (
+        "model",
+        "backend",
+        "prompt_version",
+        "prompt_mode",
+        "prompt_variant",
+    ):
+        if str(existing.get(field, "")) != str(current.get(field, "")):
+            mismatches.append(
+                f"{field}: existing={existing.get(field)!r} current={current.get(field)!r}"
+            )
+    if existing.get("probe_tag") and current.get("probe_tag"):
+        if str(existing["probe_tag"]) != str(current["probe_tag"]):
+            mismatches.append(
+                f"probe_tag: existing={existing.get('probe_tag')!r} current={current.get('probe_tag')!r}"
+            )
+    if list(existing.get("tag_catalog", [])) != list(current.get("tag_catalog", [])):
+        mismatches.append("tag_catalog differs")
+    if existing.get("inference_settings", {}) != current.get("inference_settings", {}):
+        mismatches.append("inference_settings differ")
+
+    if mismatches:
+        mismatch_text = "; ".join(mismatches)
+        raise ValueError(
+            f"refusing to resume incompatible auto-QC run file {run_file}: "
+            f"{mismatch_text}. Use a new --run-file or --force-rescore."
+        )
+
+
+@contextmanager
+def locked_auto_run(run_file: Path) -> Any:
+    """Take an advisory lock around run-file load/merge/save operations."""
+    lock_path = run_file.with_suffix(f"{run_file.suffix}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as lock_handle:
+        fcntl.flock(lock_handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_handle, fcntl.LOCK_UN)
+
+
+def save_run_progress(
+    *,
+    run_file: Path,
+    payload: dict[str, Any],
+    merge_existing: bool = True,
+) -> dict[str, Any]:
+    """Save progress, merging concurrent completed exams under a file lock."""
+    with locked_auto_run(run_file):
+        if merge_existing and run_file.exists():
+            existing = load_auto_run(run_file)
+            if existing:
+                validate_auto_run_compatible(
+                    existing=existing,
+                    current=payload,
+                    run_file=run_file,
+                )
+                merged_exam_suggestions = dict(existing.get("exam_suggestions", {}))
+                merged_exam_suggestions.update(payload.get("exam_suggestions", {}))
+                payload = {
+                    **payload,
+                    "run_id": existing.get("run_id") or payload.get("run_id"),
+                    "created_at": existing.get("created_at")
+                    or payload.get("created_at"),
+                    "exam_suggestions": merged_exam_suggestions,
+                }
+                if not payload.get("probe_tag") and existing.get("probe_tag"):
+                    payload["probe_tag"] = existing["probe_tag"]
+        return save_auto_run(run_file, payload)
+
+
+def load_or_initialize_run_payload(
+    *,
+    run_file: Path,
+    model_label: str,
+    args: argparse.Namespace,
+    tag_catalog: list[str],
+    model_spec: Any = None,
+) -> dict[str, Any]:
+    """Load a compatible run file or initialize a new empty one."""
+    run_id = f"{utc_now_iso().replace(':', '').replace('+00:00', 'Z')}_{model_label}"
+    current = build_run_payload(
+        run_id=run_id,
+        model_label=model_label,
+        args=args,
+        tag_catalog=tag_catalog,
+        model_spec=model_spec,
     )
+    if args.force_rescore or not run_file.exists():
+        return save_run_progress(
+            run_file=run_file,
+            payload=current,
+            merge_existing=False,
+        )
+
+    existing = load_auto_run(run_file, persist_normalized=True)
+    if not existing:
+        return save_run_progress(
+            run_file=run_file,
+            payload=current,
+            merge_existing=False,
+        )
+    if not existing.get("exam_suggestions"):
+        current["run_id"] = existing.get("run_id") or current["run_id"]
+        current["created_at"] = existing.get("created_at") or current["created_at"]
+        return save_run_progress(
+            run_file=run_file,
+            payload=current,
+            merge_existing=False,
+        )
+    validate_auto_run_compatible(existing=existing, current=current, run_file=run_file)
+    if current.get("probe_tag") and not existing.get("probe_tag"):
+        existing["probe_tag"] = current["probe_tag"]
+    return save_run_progress(
+        run_file=run_file,
+        payload=existing,
+        merge_existing=False,
+    )
+
+
+def make_exam_suggestion_record(
+    *,
+    record: dict[str, str],
+    result: dict[str, Any],
+    model_label: str,
+) -> dict[str, Any]:
+    """Convert one annotator result to the saved run-record schema."""
+    return {
+        "image_path": str(record["image_path"]),
+        "model": model_label,
+        "few_shot_example_exam_ids": result["few_shot_example_exam_ids"],
+        "suggestions": result["suggestions"],
+        "prompt_mode": result["prompt_mode"],
+        "prompt_variant": result["prompt_variant"],
+        "debug_dump_file": result["debug_dump_file"],
+    }
+
+
+def score_exam_records(
+    *,
+    exam_records: list[dict[str, str]],
+    annotator: "LocalVisionAnnotator",
+    tag_catalog: list[str],
+    model_label: str,
+    run_file: Path,
+    payload: dict[str, Any],
+    force_rescore: bool,
+    desc: str,
+) -> tuple[dict[str, Any], dict[str, int | bool]]:
+    """Score records with per-exam checkpointing and resume skips."""
+    stats: dict[str, int | bool] = {
+        "scored": 0,
+        "skipped_existing": 0,
+        "interrupted": False,
+    }
+    exam_suggestions = dict(payload.get("exam_suggestions", {}))
+    for record in tqdm(exam_records, desc=desc):
+        if shutdown_requested():
+            stats["interrupted"] = True
+            break
+        exam_id = str(record["exam_id"])
+        if not force_rescore and exam_id in exam_suggestions:
+            stats["skipped_existing"] = int(stats["skipped_existing"]) + 1
+            continue
+
+        image_path = Path(record["image_path"])
+        result = annotator.annotate(
+            exam_id=exam_id,
+            image_path=image_path,
+            tag_catalog=tag_catalog,
+        )
+        exam_suggestions[exam_id] = make_exam_suggestion_record(
+            record=record,
+            result=result,
+            model_label=model_label,
+        )
+        payload = {**payload, "exam_suggestions": exam_suggestions}
+        saved = save_run_progress(run_file=run_file, payload=payload)
+        payload = saved
+        exam_suggestions = dict(saved.get("exam_suggestions", {}))
+        stats["scored"] = int(stats["scored"]) + 1
+
+    saved = save_run_progress(run_file=run_file, payload=payload)
+    return saved, stats
+
+
+def pilot_queue_dirs(queue_dir: Path) -> dict[str, Path]:
+    """Return and create the standard pilot queue directories."""
+    dirs = {name: queue_dir / name for name in ("pending", "running", "done", "failed")}
+    for path in dirs.values():
+        path.mkdir(parents=True, exist_ok=True)
+    return dirs
+
+
+def read_exam_ids_file(path: Path) -> list[str]:
+    """Read unique exam IDs from a plain text file."""
+    exam_ids: list[str] = []
+    seen: set[str] = set()
+    with open(path) as handle:
+        for line in handle:
+            exam_id = line.strip()
+            if not exam_id or exam_id.startswith("#") or exam_id in seen:
+                continue
+            seen.add(exam_id)
+            exam_ids.append(exam_id)
+    return exam_ids
+
+
+def load_pilot_task_exam_ids(task_path: Path) -> list[str]:
+    """Load exam IDs from a JSON or text pilot task."""
+    if task_path.suffix.lower() != ".json":
+        return read_exam_ids_file(task_path)
+
+    with open(task_path) as handle:
+        payload = json.load(handle)
+    if isinstance(payload, list):
+        raw_exam_ids = payload
+    elif isinstance(payload, dict):
+        if "exam_ids" in payload:
+            raw_exam_ids = payload["exam_ids"]
+        elif "exam_id" in payload:
+            raw_exam_ids = [payload["exam_id"]]
+        elif "exam_list" in payload:
+            exam_list_path = Path(str(payload["exam_list"]))
+            if not exam_list_path.is_absolute():
+                exam_list_path = task_path.parent / exam_list_path
+            return read_exam_ids_file(exam_list_path)
+        else:
+            raise ValueError(
+                f"pilot task {task_path} must contain exam_ids, exam_id, or exam_list"
+            )
+    else:
+        raise ValueError(f"unsupported pilot task payload in {task_path}")
+
+    exam_ids: list[str] = []
+    seen: set[str] = set()
+    for raw_exam_id in raw_exam_ids:
+        exam_id = str(raw_exam_id).strip()
+        if exam_id and exam_id not in seen:
+            seen.add(exam_id)
+            exam_ids.append(exam_id)
+    return exam_ids
+
+
+def claim_next_pilot_task(queue_dirs: dict[str, Path]) -> Path | None:
+    """Atomically claim one pending pilot task."""
+    for task_path in sorted(queue_dirs["pending"].iterdir()):
+        if not task_path.is_file() or task_path.name.startswith("."):
+            continue
+        claimed_path = queue_dirs["running"] / task_path.name
+        try:
+            task_path.replace(claimed_path)
+            return claimed_path
+        except FileNotFoundError:
+            continue
+        except OSError:
+            logger.exception("failed to claim a pilot task")
+            continue
+    return None
+
+
+def move_task_with_collision(task_path: Path, destination_dir: Path) -> Path:
+    """Move a task to a terminal directory without overwriting old attempts."""
+    destination = destination_dir / task_path.name
+    if destination.exists():
+        timestamp = utc_now_iso().replace(":", "").replace("+00:00", "Z")
+        destination = (
+            destination_dir / f"{task_path.stem}.{timestamp}{task_path.suffix}"
+        )
+    task_path.replace(destination)
+    return destination
+
+
+def write_pilot_status(
+    *,
+    task_path: Path,
+    status: str,
+    pilot_id: str,
+    payload: dict[str, Any],
+) -> None:
+    """Write a small sidecar status for a pilot task transition."""
+    status_path = task_path.with_suffix(f"{task_path.suffix}.status.json")
+    status_payload = {
+        "task_file": str(task_path),
+        "status": status,
+        "pilot_id": pilot_id,
+        "updated_at": utc_now_iso(),
+        **payload,
+    }
+    with open(status_path, "w") as handle:
+        json.dump(status_payload, handle, indent=2)
+        handle.write("\n")
+
+
+def requeue_stale_running_tasks(
+    *,
+    queue_dirs: dict[str, Path],
+    stale_seconds: int | None,
+) -> int:
+    """Return stale running tasks to pending so a restarted pilot can resume."""
+    if stale_seconds is None or stale_seconds <= 0:
+        return 0
+    now = time.time()
+    requeued = 0
+    for task_path in sorted(queue_dirs["running"].iterdir()):
+        if not task_path.is_file() or task_path.name.startswith("."):
+            continue
+        age_seconds = now - task_path.stat().st_mtime
+        if age_seconds < stale_seconds:
+            continue
+        destination = queue_dirs["pending"] / task_path.name
+        if destination.exists():
+            timestamp = utc_now_iso().replace(":", "").replace("+00:00", "Z")
+            destination = (
+                queue_dirs["pending"]
+                / f"{task_path.stem}.requeued_{timestamp}{task_path.suffix}"
+            )
+        task_path.replace(destination)
+        requeued += 1
+        logger.warning(
+            "requeued one stale pilot task after %.0f seconds",
+            age_seconds,
+        )
+    return requeued
+
+
+def records_for_exam_ids(
+    *,
+    exam_ids: list[str],
+    exam_index: dict[str, dict[str, str]],
+) -> list[dict[str, str]]:
+    """Resolve pilot task exam IDs to cached-montage records."""
+    records: list[dict[str, str]] = []
+    missing: list[str] = []
+    for exam_id in exam_ids:
+        record = exam_index.get(str(exam_id))
+        if record is None:
+            missing.append(str(exam_id))
+            continue
+        records.append(record)
+    if missing:
+        logger.warning(
+            "pilot task references %d exams without cached montages",
+            len(missing),
+        )
+    return records
+
+
+def default_pilot_id() -> str:
+    """Build a stable-enough identifier for pilot logs and status sidecars."""
+    job_id = os.environ.get("SLURM_JOB_ID", "no_slurm_job")
+    raw = f"{socket.gethostname()}_{job_id}_{os.getpid()}"
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", raw)
+
+
+def run_pilot_loop(
+    *,
+    args: argparse.Namespace,
+    views_df: pd.DataFrame,
+    export_dir: Path,
+    annotator: "LocalVisionAnnotator",
+    tag_catalog: list[str],
+    model_label: str,
+    run_file: Path,
+    payload: dict[str, Any],
+) -> int:
+    """Keep a loaded model alive and process file-queue tasks."""
+    queue_dir = args.pilot_queue_dir.resolve()
+    queue_dirs = pilot_queue_dirs(queue_dir)
+    pilot_id = args.pilot_id or default_pilot_id()
+    stop_file = args.pilot_stop_file.resolve() if args.pilot_stop_file else None
+    poll_seconds = max(1, int(args.pilot_poll_seconds))
+    idle_timeout_seconds = int(args.pilot_idle_timeout_seconds)
+    max_tasks = args.pilot_max_tasks
+    max_exams = args.pilot_max_exams
+    exam_index = build_exam_montage_index(views_df, export_dir=export_dir)
+    logger.info(
+        "starting auto-QC pilot %s queue=%s indexed_montages=%d",
+        pilot_id,
+        queue_dir,
+        len(exam_index),
+    )
+
+    tasks_completed = 0
+    exams_scored = 0
+    idle_since: float | None = None
+    while True:
+        if shutdown_requested():
+            logger.warning("pilot %s stopping because shutdown was requested", pilot_id)
+            break
+        if stop_file is not None and stop_file.exists():
+            logger.info(
+                "pilot %s stopping because stop file exists: %s", pilot_id, stop_file
+            )
+            break
+        if max_tasks is not None and tasks_completed >= max_tasks:
+            logger.info("pilot %s reached --pilot-max-tasks=%d", pilot_id, max_tasks)
+            break
+        if max_exams is not None and exams_scored >= max_exams:
+            logger.info("pilot %s reached --pilot-max-exams=%d", pilot_id, max_exams)
+            break
+
+        requeue_stale_running_tasks(
+            queue_dirs=queue_dirs,
+            stale_seconds=args.pilot_reclaim_stale_seconds,
+        )
+        task_path = claim_next_pilot_task(queue_dirs)
+        if task_path is None:
+            if idle_since is None:
+                idle_since = time.monotonic()
+                logger.info("pilot %s is idle; waiting for new tasks", pilot_id)
+            idle_seconds = time.monotonic() - idle_since
+            if idle_timeout_seconds > 0 and idle_seconds >= idle_timeout_seconds:
+                logger.info(
+                    "pilot %s exiting after %.0f idle seconds",
+                    pilot_id,
+                    idle_seconds,
+                )
+                break
+            time.sleep(poll_seconds)
+            continue
+
+        idle_since = None
+        task_started_at = utc_now_iso()
+        try:
+            task_exam_ids = load_pilot_task_exam_ids(task_path)
+            task_records = records_for_exam_ids(
+                exam_ids=task_exam_ids,
+                exam_index=exam_index,
+            )
+            if max_exams is not None:
+                remaining_exam_budget = max(0, max_exams - exams_scored)
+                task_records = task_records[:remaining_exam_budget]
+            logger.info(
+                "pilot %s claimed a task with %d requested exams, %d cached records",
+                pilot_id,
+                len(task_exam_ids),
+                len(task_records),
+            )
+            task_path.touch()
+            payload, stats = score_exam_records(
+                exam_records=task_records,
+                annotator=annotator,
+                tag_catalog=tag_catalog,
+                model_label=model_label,
+                run_file=run_file,
+                payload=payload,
+                force_rescore=args.force_rescore,
+                desc=f"pilot:{task_path.stem}",
+            )
+            task_path.touch()
+            exams_scored += int(stats["scored"])
+            if stats["interrupted"] or shutdown_requested():
+                requeued_path = move_task_with_collision(
+                    task_path, queue_dirs["pending"]
+                )
+                write_pilot_status(
+                    task_path=requeued_path,
+                    status="requeued_after_shutdown",
+                    pilot_id=pilot_id,
+                    payload={
+                        "started_at": task_started_at,
+                        "stats": stats,
+                        "run_file": str(run_file),
+                    },
+                )
+                break
+
+            completed_path = move_task_with_collision(task_path, queue_dirs["done"])
+            tasks_completed += 1
+            write_pilot_status(
+                task_path=completed_path,
+                status="done",
+                pilot_id=pilot_id,
+                payload={
+                    "started_at": task_started_at,
+                    "stats": stats,
+                    "run_file": str(run_file),
+                },
+            )
+        except Exception as exc:
+            logger.exception("pilot %s failed a task", pilot_id)
+            failed_path = move_task_with_collision(task_path, queue_dirs["failed"])
+            write_pilot_status(
+                task_path=failed_path,
+                status="failed",
+                pilot_id=pilot_id,
+                payload={
+                    "started_at": task_started_at,
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                    "run_file": str(run_file),
+                },
+            )
+            if not args.pilot_continue_on_task_error:
+                return 1
+
+    saved = save_run_progress(run_file=run_file, payload=payload)
+    suggested_exam_count = sum(
+        1 for record in saved["exam_suggestions"].values() if record["suggestions"]
+    )
+    total_suggestions = sum(
+        len(record["suggestions"]) for record in saved["exam_suggestions"].values()
+    )
+    print(f"pilot wrote auto-QC run to {run_file}")
+    print(f"  tasks completed this process: {tasks_completed:,}")
+    print(f"  exams scored this process: {exams_scored:,}")
+    print(f"  total exams in run file: {len(saved['exam_suggestions']):,}")
+    print(f"  exams with >=1 suggestion: {suggested_exam_count:,}")
+    print(f"  total suggested tags: {total_suggestions:,}")
+    return 0
+
+
+def build_system_prompt(prompt_mode: str, input_level: str = "exam") -> str:
+    """System prompt for the multimodal QC model."""
+    if input_level == "exam":
+        image_context = (
+            "You are given cached four-view mammography montages for one labeled "
+            "reference set and one target exam. Only output tags that are visually "
+            "evident in the target montage itself."
+        )
+    elif input_level == "view":
+        image_context = (
+            "You are given individual mammography views. Only output tags that are "
+            "visually evident in the single target view itself."
+        )
+    else:
+        raise ValueError(f"unsupported input level: {input_level}")
+    base = (
+        "You are a strict mammography QC tagger. "
+        f"{image_context} "
+        "Use labeled references only as visual examples of the accepted QC tags. "
+        "Do not mention patient identity or transcribe visible identifiers."
+    )
+    mode_rules = {
+        "tagger_json": " Return only the requested JSON object.",
+        "binary_tag_probe": " Return only yes or no.",
+        "marker_classifier": " Follow the requested labeled-line response format exactly.",
+        "what_is_this": " Answer in concise plain language without JSON.",
+    }
+    try:
+        return base + mode_rules[prompt_mode]
+    except KeyError as exc:
+        raise ValueError(f"unsupported prompt mode: {prompt_mode}") from exc
 
 
 def build_debug_describe_prompt(
     *,
     few_shot_examples: list[dict[str, Any]],
+    input_level: str = "exam",
 ) -> str:
     """Simple freeform debug prompt to test whether the model sees the montage at all."""
     example_text = ""
@@ -381,9 +1109,10 @@ def build_debug_describe_prompt(
             f"You are also given {len(few_shot_examples)} labeled reference examples before the target exam. "
             "Use them only as loose visual context.\n\n"
         )
+    target = "target exam" if input_level == "exam" else "target view"
     return (
         f"{example_text}"
-        "This is the target exam.\n"
+        f"This is the {target}.\n"
         "What is this image? Identify the modality and layout first.\n"
         "Then describe what is visually present in plain language, including any obvious markers, clips, implants, truncation, inversion, low contrast, lines, calcifications, or other unusual findings.\n"
         "Be concrete and visual. Do not output JSON."
@@ -394,6 +1123,7 @@ def build_binary_probe_prompt(
     *,
     probe_tag: str,
     few_shot_examples: list[dict[str, Any]],
+    input_level: str = "exam",
 ) -> str:
     """Binary yes/no prompt for one QC tag."""
     example_text = ""
@@ -402,9 +1132,11 @@ def build_binary_probe_prompt(
             f"You are also given {len(few_shot_examples)} labeled reference examples before the target exam. "
             "Use them only as loose visual context.\n\n"
         )
+    target = "exam" if input_level == "exam" else "view"
+    image_type = "mammography montage" if input_level == "exam" else "mammogram"
     return (
         f"{example_text}"
-        f"Target exam only: is the QC tag '{probe_tag}' visually present in this mammography montage?\n"
+        f"Target {target} only: is the QC tag '{probe_tag}' visually present in this {image_type}?\n"
         "Answer only yes or no.\n"
     )
 
@@ -414,6 +1146,7 @@ def build_marker_classifier_prompt(
     probe_tag: str,
     few_shot_examples: list[dict[str, Any]],
     prompt_variant: str,
+    input_level: str = "exam",
 ) -> str:
     """Short classifier prompt that asks for evidence plus an explicit answer line."""
     example_text = ""
@@ -427,11 +1160,19 @@ def build_marker_classifier_prompt(
         if probe_tag.strip().lower() == "bb"
         else f"the QC tag '{probe_tag}'"
     )
+    target = "exam" if input_level == "exam" else "view"
+    image_type = "mammography montage" if input_level == "exam" else "mammogram"
+    vertical_evidence = (
+        "a straight, narrow, low-contrast gray vertical seam or stripe running "
+        "top-to-bottom"
+    )
+    if input_level == "exam":
+        vertical_evidence += ", often at a similar x-position across views"
     if prompt_variant == "confidence_specificity":
         return (
             f"{example_text}"
-            f"Target exam only: decide whether {target_description} is visually present anywhere in this mammography montage.\n"
-            "For a vertical line detector artifact, look for a straight, narrow, low-contrast gray vertical seam or stripe running top-to-bottom, often at a similar x-position across views.\n"
+            f"Target {target} only: decide whether {target_description} is visually present anywhere in this {image_type}.\n"
+            f"For a vertical line detector artifact, look for {vertical_evidence}.\n"
             "The artifact must be vertical. Answer NO if the main finding is horizontal compression hardware, horizontal compression artifact, paddle/bar edges, or clamp edges.\n"
             "Be specific. Do not answer YES for breast edges, skin folds, compression boundaries, text labels, markers, anatomy, or normal montage seams.\n"
             "Use CONFIDENCE: high only when the visual evidence is unmistakable; use medium or low for borderline appearances.\n"
@@ -443,7 +1184,7 @@ def build_marker_classifier_prompt(
         )
     return (
         f"{example_text}"
-        f"Target exam only: decide whether {target_description} is visually present anywhere in this mammography montage.\n"
+        f"Target {target} only: decide whether {target_description} is visually present anywhere in this {image_type}.\n"
         "Answer in exactly two lines and nothing else:\n"
         "EVIDENCE: <one short visual phrase, or none>\n"
         "ANSWER: YES or ANSWER: NO\n"
@@ -571,19 +1312,41 @@ def build_user_prompt(
     )
 
 
-def build_few_shot_assistant_payload(annotations: list[str]) -> str:
-    """Render a labeled exemplar as the assistant's canonical JSON response."""
-    payload = {
-        "suggestions": [
-            {
-                "tag": tag,
-                "score": 1.0,
-                "rationale": "accepted human QC label",
-            }
-            for tag in annotations
-        ]
-    }
-    return json.dumps(payload, separators=(",", ":"))
+def build_few_shot_assistant_payload(
+    annotations: list[str],
+    *,
+    prompt_mode: str,
+    probe_tag: str | None,
+) -> str:
+    """Render a human-labeled exemplar in the active target output format."""
+    if prompt_mode == "tagger_json":
+        payload = {
+            "suggestions": [
+                {
+                    "tag": tag,
+                    "score": 1.0,
+                    "rationale": "accepted human QC label",
+                }
+                for tag in annotations
+            ]
+        }
+        return json.dumps(payload, separators=(",", ":"))
+    if prompt_mode in {"binary_tag_probe", "marker_classifier"}:
+        if not probe_tag:
+            raise ValueError(f"{prompt_mode} few-shot output requires probe_tag")
+        present = probe_tag in annotations
+        if prompt_mode == "binary_tag_probe":
+            return "yes" if present else "no"
+        return (
+            "EVIDENCE: human-reviewed reference label\n"
+            f"ANSWER: {'YES' if present else 'NO'}\n"
+            "CONFIDENCE: high\n"
+            "REVIEW: NO"
+        )
+    if prompt_mode == "what_is_this":
+        label_text = ", ".join(annotations) if annotations else "none"
+        return f"Human-reviewed QC labels: {label_text}."
+    raise ValueError(f"unsupported prompt mode: {prompt_mode}")
 
 
 def build_target_prompt_text(
@@ -593,6 +1356,7 @@ def build_target_prompt_text(
     few_shot_examples: list[dict[str, Any]],
     probe_tag: str | None,
     prompt_variant: str,
+    input_level: str = "exam",
 ) -> str:
     """Build the target prompt text for the chosen debug or tagging mode."""
     if prompt_variant not in PROMPT_VARIANTS:
@@ -609,10 +1373,12 @@ def build_target_prompt_text(
         return build_binary_probe_prompt(
             probe_tag=probe_tag,
             few_shot_examples=few_shot_examples,
+            input_level=input_level,
         )
     if prompt_mode == "what_is_this":
         return build_debug_describe_prompt(
             few_shot_examples=few_shot_examples,
+            input_level=input_level,
         )
     if prompt_mode == "marker_classifier":
         if not probe_tag:
@@ -621,6 +1387,7 @@ def build_target_prompt_text(
             probe_tag=probe_tag,
             few_shot_examples=few_shot_examples,
             prompt_variant=prompt_variant,
+            input_level=input_level,
         )
         if prompt_variant == "recall_tilted":
             prompt += "\nAdditional decision rule:\n"
@@ -808,6 +1575,75 @@ def coerce_marker_classifier_payload(text: str) -> dict[str, Any] | None:
 def infer_model_label(model_path: Path) -> str:
     """Use the local checkpoint directory name as the run model label."""
     return model_path.name
+
+
+def image_data_url(image_path: Path) -> str:
+    """Encode a local QC image for the loopback OpenAI-compatible API."""
+    media_types = {
+        ".jpeg": "image/jpeg",
+        ".jpg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+    }
+    if not image_path.is_file():
+        raise FileNotFoundError("QC montage file is missing")
+    try:
+        media_type = media_types[image_path.suffix.lower()]
+    except KeyError as exc:
+        raise ValueError(
+            f"unsupported QC image type for vLLM: {image_path.suffix!r}"
+        ) from exc
+    try:
+        image_bytes = image_path.read_bytes()
+    except OSError:
+        raise RuntimeError("failed to read QC montage") from None
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    return f"data:{media_type};base64,{encoded}"
+
+
+def sanitized_vllm_request_error(exc: Exception) -> RuntimeError:
+    """Remove request bodies and image data from client-facing API failures."""
+    status_code = getattr(exc, "status_code", None)
+    status_text = f", status={int(status_code)}" if isinstance(status_code, int) else ""
+    return RuntimeError(
+        f"vLLM request failed ({type(exc).__name__}{status_text}); "
+        "inspect the request-logging-disabled server log"
+    )
+
+
+def tagger_json_response_format(tag_catalog: list[str]) -> dict[str, Any]:
+    """Return the strict structured-output schema for multi-label tagging."""
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "prima_auto_qc_suggestions",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "suggestions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "tag": {"type": "string", "enum": tag_catalog},
+                                "score": {
+                                    "type": "number",
+                                    "minimum": 0.0,
+                                    "maximum": 1.0,
+                                },
+                                "rationale": {"type": "string"},
+                            },
+                            "required": ["tag", "score", "rationale"],
+                            "additionalProperties": False,
+                        },
+                    }
+                },
+                "required": ["suggestions"],
+                "additionalProperties": False,
+            },
+        },
+    }
 
 
 def build_max_memory_map(
@@ -2450,6 +3286,7 @@ class LocalVisionAnnotator:
         except ImportError:  # pragma: no cover - depends on transformers build
             from transformers import AutoModelForVision2Seq as auto_vision_model
 
+        pin_transformers_fp8_kernel_revisions()
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         visible_gpus = torch.cuda.device_count()
         if expected_gpus is not None and visible_gpus != expected_gpus:
@@ -2458,6 +3295,7 @@ class LocalVisionAnnotator:
             )
         if visible_gpus <= 0:
             raise RuntimeError("no CUDA devices visible; run this on a GPU node")
+        patch_torch_cuda_get_device_properties_default(torch)
 
         max_memory = build_max_memory_map(
             num_visible_gpus=visible_gpus,
@@ -2615,7 +3453,9 @@ class LocalVisionAnnotator:
         messages: list[dict[str, Any]] = [
             {
                 "role": "system",
-                "content": [{"type": "text", "text": build_system_prompt()}],
+                "content": [
+                    {"type": "text", "text": build_system_prompt(self.prompt_mode)}
+                ],
             }
         ]
         for idx, exemplar in enumerate(few_shot_examples, start=1):
@@ -2644,7 +3484,9 @@ class LocalVisionAnnotator:
                         {
                             "type": "text",
                             "text": build_few_shot_assistant_payload(
-                                list(exemplar["annotations"])
+                                list(exemplar["annotations"]),
+                                prompt_mode=self.prompt_mode,
+                                probe_tag=self.probe_tag,
                             ),
                         }
                     ],
@@ -2772,8 +3614,7 @@ class LocalVisionAnnotator:
             except ValueError as exc:
                 parse_error = str(exc)
                 logger.warning(
-                    "exam %s: model response was not valid JSON; treating as no suggestions",
-                    exam_id,
+                    "model response was not valid JSON; treating as no suggestions"
                 )
             suggestions = normalize_model_suggestions(
                 response_payload, set(tag_catalog)
@@ -2786,8 +3627,7 @@ class LocalVisionAnnotator:
                 response_payload = coerce_binary_probe_payload(response_text)
                 if response_payload is None:
                     logger.warning(
-                        "exam %s: binary probe response was not parseable; treating as not present",
-                        exam_id,
+                        "binary probe response was not parseable; treating as not present"
                     )
             suggestions = normalize_binary_probe_response(
                 response_payload,
@@ -2798,8 +3638,7 @@ class LocalVisionAnnotator:
             response_payload = coerce_marker_classifier_payload(response_text)
             if response_payload is None:
                 logger.warning(
-                    "exam %s: marker classifier response was not parseable; treating as not present",
-                    exam_id,
+                    "marker classifier response was not parseable; treating as not present"
                 )
             suggestions = normalize_binary_probe_response(
                 response_payload,
@@ -2862,17 +3701,338 @@ class LocalVisionAnnotator:
         }
 
 
+class VLLMVisionAnnotator:
+    """Multimodal QC inference through a managed local vLLM service."""
+
+    def __init__(
+        self,
+        *,
+        model_spec: Any,
+        model_path: Path,
+        port: int,
+        server_log_path: Path,
+        startup_timeout_seconds: int,
+        request_timeout_seconds: int,
+        max_new_tokens: int,
+        few_shot_examples: int,
+        few_shot_exemplar_pool: list[dict[str, Any]],
+        prompt_mode: str,
+        prompt_variant: str,
+        probe_tag: str | None,
+        target_prompt_override: str | None,
+        text_only_prompt: str | None,
+        disable_thinking: bool,
+        debug_dump_dir: Path | None,
+        input_level: str = "exam",
+    ) -> None:
+        from openai import DefaultHttpxClient, OpenAI
+        import torch
+
+        from prima.vllm_server import ManagedVLLMServer
+
+        if request_timeout_seconds <= 0:
+            raise ValueError("vLLM request timeout must be positive")
+        self.model_spec = model_spec
+        self.model_path = model_path
+        self.max_new_tokens = max_new_tokens
+        self.few_shot_examples = few_shot_examples
+        self.few_shot_exemplar_pool = list(few_shot_exemplar_pool)
+        self.prompt_mode = prompt_mode
+        if prompt_variant not in PROMPT_VARIANTS:
+            raise ValueError(f"unsupported prompt variant: {prompt_variant}")
+        self.prompt_variant = prompt_variant
+        self.probe_tag = probe_tag
+        self.target_prompt_override = (
+            target_prompt_override.strip() if target_prompt_override else None
+        )
+        self.text_only_prompt = text_only_prompt.strip() if text_only_prompt else None
+        self.disable_thinking_requested = disable_thinking
+        self.disable_thinking = True
+        self.request_timeout_seconds = request_timeout_seconds
+        self.debug_dump_dir = debug_dump_dir
+        if input_level not in {"exam", "view"}:
+            raise ValueError(f"unsupported input level: {input_level}")
+        self.input_level = input_level
+        if self.debug_dump_dir is not None:
+            self.debug_dump_dir.mkdir(parents=True, exist_ok=True)
+        visible_gpus = torch.cuda.device_count()
+        if visible_gpus != model_spec.tensor_parallel_size:
+            raise RuntimeError(
+                f"vLLM model {model_spec.key!r} requires "
+                f"{model_spec.tensor_parallel_size} visible GPUs, found {visible_gpus}"
+            )
+
+        self.server = ManagedVLLMServer(
+            spec=model_spec,
+            model_path=model_path,
+            port=port,
+            log_path=server_log_path,
+            startup_timeout_seconds=startup_timeout_seconds,
+        )
+        self.client: Any = None
+        try:
+            self.server.start()
+            self.client = OpenAI(
+                base_url=self.server.base_url,
+                api_key="not-needed",
+                timeout=request_timeout_seconds,
+                http_client=DefaultHttpxClient(trust_env=False),
+            )
+        except Exception:
+            self.server.stop()
+            raise
+
+    def close(self) -> None:
+        """Release the vLLM process and its GPU workers."""
+        try:
+            if self.client is not None:
+                self.client.close()
+                self.client = None
+        finally:
+            self.server.stop()
+
+    def _select_few_shot_examples(self, exam_id: str) -> list[dict[str, Any]]:
+        if self.prompt_mode == "marker_classifier" and self.probe_tag:
+            examples = select_probe_few_shot_examples(
+                exemplar_pool=self.few_shot_exemplar_pool,
+                max_examples=self.few_shot_examples,
+                probe_tag=str(self.probe_tag),
+                exclude_exam_id=exam_id,
+            )
+        else:
+            examples = select_few_shot_examples(
+                exemplar_pool=self.few_shot_exemplar_pool,
+                max_examples=self.few_shot_examples,
+                exclude_exam_id=exam_id,
+            )
+        return [] if self.text_only_prompt is not None else examples
+
+    def _build_messages(
+        self,
+        *,
+        image_path: Path,
+        target_prompt_text: str,
+        few_shot_examples: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        messages: list[dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": build_system_prompt(
+                    self.prompt_mode, input_level=self.input_level
+                ),
+            }
+        ]
+        for idx, exemplar in enumerate(few_shot_examples, start=1):
+            messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": image_data_url(Path(exemplar["image_path"]))
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                f"Labeled reference example {idx}. "
+                                "Return the accepted QC labels for this montage."
+                            ),
+                        },
+                    ],
+                }
+            )
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": build_few_shot_assistant_payload(
+                        list(exemplar["annotations"]),
+                        prompt_mode=self.prompt_mode,
+                        probe_tag=self.probe_tag,
+                    ),
+                }
+            )
+        if self.text_only_prompt is not None:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": target_prompt_text}],
+                }
+            )
+        else:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_data_url(image_path)},
+                        },
+                        {"type": "text", "text": target_prompt_text},
+                    ],
+                }
+            )
+        return messages
+
+    def _parse_response(
+        self,
+        *,
+        response_text: str,
+        tag_catalog: list[str],
+    ) -> tuple[Any, list[dict[str, Any]]]:
+        if not response_text.strip():
+            raise RuntimeError("vLLM returned empty response content")
+        if self.prompt_mode == "tagger_json":
+            response_payload = extract_json_payload(response_text)
+            return response_payload, normalize_model_suggestions(
+                response_payload, set(tag_catalog)
+            )
+        if self.prompt_mode == "binary_tag_probe":
+            try:
+                response_payload = extract_json_payload(response_text)
+            except ValueError:
+                response_payload = coerce_binary_probe_payload(response_text)
+            if response_payload is None:
+                raise ValueError("vLLM binary response was not parseable")
+            return response_payload, normalize_binary_probe_response(
+                response_payload,
+                probe_tag=str(self.probe_tag),
+                allowed_tags=set(tag_catalog),
+            )
+        if self.prompt_mode == "marker_classifier":
+            response_payload = coerce_marker_classifier_payload(response_text)
+            if response_payload is None:
+                raise ValueError("vLLM marker response was not parseable")
+            return response_payload, normalize_binary_probe_response(
+                response_payload,
+                probe_tag=str(self.probe_tag),
+                allowed_tags=set(tag_catalog),
+            )
+        return None, []
+
+    def annotate(
+        self,
+        *,
+        exam_id: str,
+        image_path: Path,
+        tag_catalog: list[str],
+    ) -> dict[str, Any]:
+        """Send one target montage and optional references to local vLLM."""
+        if self.client is None:
+            raise RuntimeError("vLLM annotator is closed")
+        few_shot_examples = self._select_few_shot_examples(exam_id)
+        target_prompt_text = build_target_prompt_text(
+            prompt_mode=self.prompt_mode,
+            tag_catalog=tag_catalog,
+            few_shot_examples=few_shot_examples,
+            probe_tag=self.probe_tag,
+            prompt_variant=self.prompt_variant,
+            input_level=self.input_level,
+        )
+        if self.target_prompt_override is not None:
+            target_prompt_text = self.target_prompt_override
+        if self.text_only_prompt is not None:
+            target_prompt_text = self.text_only_prompt
+        messages = self._build_messages(
+            image_path=image_path,
+            target_prompt_text=target_prompt_text,
+            few_shot_examples=few_shot_examples,
+        )
+
+        request: dict[str, Any] = {
+            "model": self.model_spec.served_model_name,
+            "messages": messages,
+            "temperature": 0,
+            "max_tokens": self.max_new_tokens,
+            "timeout": self.request_timeout_seconds,
+        }
+        extra_body: dict[str, Any] = {}
+        if self.disable_thinking:
+            extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+        if self.prompt_mode == "binary_tag_probe":
+            extra_body["structured_outputs"] = {"choice": ["yes", "no"]}
+        if extra_body:
+            request["extra_body"] = extra_body
+        if self.prompt_mode == "tagger_json":
+            request["response_format"] = tagger_json_response_format(tag_catalog)
+        try:
+            response = self.client.chat.completions.create(**request)
+        except Exception as exc:
+            raise sanitized_vllm_request_error(exc) from None
+        response_text = response.choices[0].message.content or ""
+        response_payload, suggestions = self._parse_response(
+            response_text=response_text,
+            tag_catalog=tag_catalog,
+        )
+
+        debug_dump_file = None
+        if self.debug_dump_dir is not None:
+            usage = getattr(response, "usage", None)
+            debug_payload = {
+                "exam_id": str(exam_id),
+                "image_file": image_path.name,
+                "backend": "vllm_local",
+                "input_level": self.input_level,
+                "model_key": self.model_spec.key,
+                "served_model_name": self.model_spec.served_model_name,
+                "model_revision": self.model_spec.revision,
+                "prompt_mode": self.prompt_mode,
+                "prompt_variant": self.prompt_variant,
+                "probe_tag": self.probe_tag,
+                "target_prompt_override": self.target_prompt_override,
+                "text_only_prompt": self.text_only_prompt,
+                "disable_thinking_requested": self.disable_thinking_requested,
+                "disable_thinking_effective": self.disable_thinking,
+                "few_shot_example_exam_ids": [
+                    str(example["exam_id"]) for example in few_shot_examples
+                ],
+                "few_shot_examples": [
+                    {
+                        "exam_id": str(example["exam_id"]),
+                        "annotations": list(example["annotations"]),
+                    }
+                    for example in few_shot_examples
+                ],
+                "tag_catalog": list(tag_catalog),
+                "target_prompt_text": target_prompt_text,
+                "raw_response_text": response_text,
+                "parsed_response_payload": response_payload,
+                "normalized_suggestions": suggestions,
+                "response_id": getattr(response, "id", None),
+                "usage": usage.model_dump() if usage is not None else None,
+            }
+            debug_dump_file = f"{exam_id}.json"
+            debug_path = self.debug_dump_dir / debug_dump_file
+            temporary_path = debug_path.with_suffix(".json.tmp")
+            try:
+                temporary_path.write_text(json.dumps(debug_payload, indent=2) + "\n")
+                temporary_path.replace(debug_path)
+            except OSError:
+                raise RuntimeError("failed to write vLLM debug record") from None
+
+        return {
+            "suggestions": suggestions,
+            "few_shot_example_exam_ids": [
+                str(example["exam_id"]) for example in few_shot_examples
+            ],
+            "debug_dump_file": debug_dump_file,
+            "prompt_mode": self.prompt_mode,
+            "prompt_variant": self.prompt_variant,
+        }
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """Construct the CLI parser so submitit can reuse the same arguments."""
     parser = argparse.ArgumentParser(
         description="Run a local multimodal model over cached mammography QC montages.",
         epilog=(
-            "Run this directly on a GPU node, or submit it with submit_auto_qc.py.\n\n"
-            "Example on a 4xH200 node:\n"
+            "Run this directly from the pinned vLLM environment on a GPU node, "
+            "or submit it with submit_auto_qc.py.\n\n"
+            "Example using the configured 4xH200 Qwen3.5 service:\n"
             "  python auto_annotate_qc.py --views /path/views_for_qc.parquet "
             "--export-dir /path/qc_export --run-file /path/auto_qc_run.json "
-            "--model-path /path/Qwen3.5-397B-A17B-FP8 --expected-gpus 4 "
-            "--max-memory-per-gpu 135GiB --cpu-max-memory 128GiB"
+            "--backend vllm --model-key qwen35_397b_fp8 --expected-gpus 4"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -2895,10 +4055,58 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Path to write the normalized auto-QC run JSON",
     )
     parser.add_argument(
+        "--backend",
+        choices=["vllm", "transformers"],
+        default="vllm",
+        help="Inference backend (default: vllm)",
+    )
+    parser.add_argument(
+        "--model-key",
+        type=str,
+        default="qwen35_397b_fp8",
+        help="Configured key in --model-registry for the vLLM backend",
+    )
+    parser.add_argument(
+        "--model-registry",
+        type=Path,
+        default=DEFAULT_VLLM_MODEL_REGISTRY,
+        help=f"vLLM model registry (default: {DEFAULT_VLLM_MODEL_REGISTRY})",
+    )
+    parser.add_argument(
+        "--models-dir",
+        type=Path,
+        default=DEFAULT_MODELS_DIR,
+        help=f"Root containing local model snapshots (default: {DEFAULT_MODELS_DIR})",
+    )
+    parser.add_argument(
         "--model-path",
         type=Path,
-        required=True,
-        help="Local checkpoint directory for the multimodal model",
+        default=None,
+        help="Local checkpoint directory (required only for --backend=transformers)",
+    )
+    parser.add_argument(
+        "--vllm-port",
+        type=int,
+        default=0,
+        help="Loopback port for vLLM; 0 selects a free job-local port (default: 0)",
+    )
+    parser.add_argument(
+        "--vllm-server-log",
+        type=Path,
+        default=None,
+        help="vLLM server log; defaults beside --run-file with the Slurm job ID",
+    )
+    parser.add_argument(
+        "--vllm-startup-timeout-seconds",
+        type=int,
+        default=1800,
+        help="Maximum wait for the vLLM health endpoint (default: 1800)",
+    )
+    parser.add_argument(
+        "--vllm-request-timeout-seconds",
+        type=int,
+        default=600,
+        help="Per-exam OpenAI-compatible request timeout (default: 600)",
     )
     parser.add_argument(
         "--tags-file",
@@ -2934,6 +4142,67 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Maximum number of exams to score",
+    )
+    parser.add_argument(
+        "--force-rescore",
+        action="store_true",
+        help="Overwrite any existing run file and rescore selected exams",
+    )
+    parser.add_argument(
+        "--pilot-queue-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional filesystem queue directory. When set, the model stays loaded "
+            "and claims task files from <queue>/pending until idle, stopped, or preempted."
+        ),
+    )
+    parser.add_argument(
+        "--pilot-id",
+        type=str,
+        default=None,
+        help="Optional pilot ID for queue status sidecars",
+    )
+    parser.add_argument(
+        "--pilot-poll-seconds",
+        type=int,
+        default=30,
+        help="Seconds to sleep between pilot queue polls when idle (default: 30)",
+    )
+    parser.add_argument(
+        "--pilot-idle-timeout-seconds",
+        type=int,
+        default=1800,
+        help="Exit after this many idle seconds in pilot mode; use 0 to wait until walltime/preemption",
+    )
+    parser.add_argument(
+        "--pilot-stop-file",
+        type=Path,
+        default=None,
+        help="Optional file path that asks a pilot to exit after the current task",
+    )
+    parser.add_argument(
+        "--pilot-reclaim-stale-seconds",
+        type=int,
+        default=7200,
+        help="Move running pilot tasks back to pending after this many stale seconds; use 0 to disable",
+    )
+    parser.add_argument(
+        "--pilot-max-tasks",
+        type=int,
+        default=None,
+        help="Optional maximum number of pilot tasks to complete before exiting",
+    )
+    parser.add_argument(
+        "--pilot-max-exams",
+        type=int,
+        default=None,
+        help="Optional maximum number of newly scored exams in pilot mode before exiting",
+    )
+    parser.add_argument(
+        "--pilot-continue-on-task-error",
+        action="store_true",
+        help="Keep polling after a task failure instead of exiting the pilot with code 1",
     )
     parser.add_argument(
         "--max-new-tokens",
@@ -2991,7 +4260,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--disable-thinking",
         action="store_true",
-        help="Disable Qwen3.5 thinking mode via the chat template when supported.",
+        help="Disable thinking for Transformers; vLLM QC always disables it.",
     )
     parser.add_argument(
         "--debug-dump-dir",
@@ -3027,10 +4296,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def run_from_args(args: argparse.Namespace) -> int:
     """Execute local auto annotation from parsed arguments."""
+    install_shutdown_handlers()
     export_dir = args.export_dir.resolve()
     views_path = args.views.resolve()
     run_file = args.run_file.resolve()
-    model_path = args.model_path.resolve()
+    model_path = args.model_path.resolve() if args.model_path else None
     qc_file = args.qc_file.resolve() if args.qc_file else None
     few_shot_qc_file = (
         args.few_shot_qc_file.resolve() if args.few_shot_qc_file else qc_file
@@ -3048,12 +4318,58 @@ def run_from_args(args: argparse.Namespace) -> int:
         raise FileNotFoundError(f"export dir not found: {export_dir}")
     if not views_path.exists():
         raise FileNotFoundError(f"views parquet not found: {views_path}")
-    if not model_path.exists():
-        raise FileNotFoundError(f"model checkpoint not found: {model_path}")
     if args.skip_existing_annotations and qc_file is None:
         raise ValueError("--skip-existing-annotations requires --qc-file")
     if args.few_shot_examples < 0:
         raise ValueError("--few-shot-examples must be non-negative")
+    if args.pilot_poll_seconds <= 0:
+        raise ValueError("--pilot-poll-seconds must be positive")
+    if args.pilot_max_tasks is not None and args.pilot_max_tasks <= 0:
+        raise ValueError("--pilot-max-tasks must be positive")
+    if args.pilot_max_exams is not None and args.pilot_max_exams <= 0:
+        raise ValueError("--pilot-max-exams must be positive")
+    if args.vllm_startup_timeout_seconds <= 0:
+        raise ValueError("--vllm-startup-timeout-seconds must be positive")
+    if args.vllm_request_timeout_seconds <= 0:
+        raise ValueError("--vllm-request-timeout-seconds must be positive")
+    if not 0 <= args.vllm_port <= 65535:
+        raise ValueError("--vllm-port must be between 0 and 65535")
+
+    model_spec: Any = None
+    if args.backend == "vllm":
+        from prima.vllm_server import (
+            resolve_model_path,
+            select_model_spec,
+            validate_vllm_runtime,
+        )
+
+        if model_path is not None:
+            raise ValueError(
+                "--backend=vllm selects a pinned registry entry; do not pass --model-path"
+            )
+
+        model_registry = args.model_registry.resolve()
+        models_dir = args.models_dir.resolve()
+        validate_vllm_runtime()
+        model_spec = select_model_spec(model_registry, args.model_key)
+        model_path = resolve_model_path(model_spec, models_dir)
+        if (
+            args.expected_gpus is not None
+            and args.expected_gpus != model_spec.tensor_parallel_size
+        ):
+            raise ValueError(
+                f"model {model_spec.key!r} requires "
+                f"{model_spec.tensor_parallel_size} GPUs, but --expected-gpus="
+                f"{args.expected_gpus}"
+            )
+        revision_suffix = f"@{model_spec.revision[:12]}" if model_spec.revision else ""
+        model_label = f"{model_spec.served_model_name}{revision_suffix}"
+    else:
+        if model_path is None:
+            raise ValueError("--backend=transformers requires --model-path")
+        if not model_path.exists():
+            raise FileNotFoundError(f"model checkpoint not found: {model_path}")
+        model_label = infer_model_label(model_path)
 
     tag_catalog = load_tag_catalog(tags_file)
     if args.prompt_mode in {"binary_tag_probe", "marker_classifier"}:
@@ -3064,17 +4380,19 @@ def run_from_args(args: argparse.Namespace) -> int:
                 f"--probe-tag must be one of the allowed tags; got {args.probe_tag!r}"
             )
     views_df = load_views_df(views_path)
-    exam_records = load_exam_records(
-        views_df=views_df,
-        export_dir=export_dir,
-        exam_list_path=exam_list_path,
-        exam_id=args.exam,
-        max_exams=args.max_exams,
-        skip_existing_annotations=args.skip_existing_annotations,
-        qc_file=qc_file,
-    )
-    if not exam_records:
-        raise RuntimeError("no exams matched the requested selection")
+    exam_records: list[dict[str, str]] = []
+    if args.pilot_queue_dir is None:
+        exam_records = load_exam_records(
+            views_df=views_df,
+            export_dir=export_dir,
+            exam_list_path=exam_list_path,
+            exam_id=args.exam,
+            max_exams=args.max_exams,
+            skip_existing_annotations=args.skip_existing_annotations,
+            qc_file=qc_file,
+        )
+        if not exam_records:
+            raise RuntimeError("no exams matched the requested selection")
 
     exemplar_pool = load_few_shot_exemplars(
         qc_file=few_shot_qc_file,
@@ -3090,67 +4408,103 @@ def run_from_args(args: argparse.Namespace) -> int:
             few_shot_qc_file,
         )
 
-    model_label = infer_model_label(model_path)
-    annotator = LocalVisionAnnotator(
-        model_path=model_path,
-        expected_gpus=args.expected_gpus,
-        max_memory_per_gpu=args.max_memory_per_gpu,
-        cpu_max_memory=args.cpu_max_memory,
-        max_new_tokens=args.max_new_tokens,
-        few_shot_examples=args.few_shot_examples,
-        few_shot_exemplar_pool=exemplar_pool,
-        prompt_mode=args.prompt_mode,
-        prompt_variant=args.prompt_variant,
-        probe_tag=args.probe_tag,
-        target_prompt_override=args.target_prompt_override,
-        text_only_prompt=args.text_only_prompt,
-        disable_thinking=args.disable_thinking,
-        debug_dump_dir=debug_dump_dir,
-        trust_remote_code=args.trust_remote_code,
+    payload = load_or_initialize_run_payload(
+        run_file=run_file,
+        model_label=model_label,
+        args=args,
+        tag_catalog=tag_catalog,
+        model_spec=model_spec,
     )
+    if args.backend == "vllm":
+        from prima.vllm_server import find_available_loopback_port
 
-    run_id = f"{utc_now_iso().replace(':', '').replace('+00:00', 'Z')}_{model_label}"
-    exam_suggestions: dict[str, dict[str, Any]] = {}
-    for record in tqdm(exam_records, desc="auto-qc"):
-        image_path = Path(record["image_path"])
-        result = annotator.annotate(
-            exam_id=str(record["exam_id"]),
-            image_path=image_path,
-            tag_catalog=tag_catalog,
+        assert model_spec is not None
+        assert model_path is not None
+        if args.vllm_server_log is not None:
+            server_log_path = args.vllm_server_log.resolve()
+        else:
+            process_label = os.environ.get("SLURM_JOB_ID") or str(os.getpid())
+            server_log_path = run_file.with_name(
+                f"{run_file.stem}.vllm_{process_label}.log"
+            )
+        annotator: Any = VLLMVisionAnnotator(
+            model_spec=model_spec,
+            model_path=model_path,
+            port=args.vllm_port or find_available_loopback_port(),
+            server_log_path=server_log_path,
+            startup_timeout_seconds=args.vllm_startup_timeout_seconds,
+            request_timeout_seconds=args.vllm_request_timeout_seconds,
+            max_new_tokens=args.max_new_tokens,
+            few_shot_examples=args.few_shot_examples,
+            few_shot_exemplar_pool=exemplar_pool,
+            prompt_mode=args.prompt_mode,
+            prompt_variant=args.prompt_variant,
+            probe_tag=args.probe_tag,
+            target_prompt_override=args.target_prompt_override,
+            text_only_prompt=args.text_only_prompt,
+            disable_thinking=args.disable_thinking,
+            debug_dump_dir=debug_dump_dir,
         )
-        exam_suggestions[record["exam_id"]] = {
-            "image_path": str(image_path),
-            "model": model_label,
-            "few_shot_example_exam_ids": result["few_shot_example_exam_ids"],
-            "suggestions": result["suggestions"],
-            "prompt_mode": result["prompt_mode"],
-            "prompt_variant": result["prompt_variant"],
-            "debug_dump_file": result["debug_dump_file"],
-        }
+    else:
+        assert model_path is not None
+        annotator = LocalVisionAnnotator(
+            model_path=model_path,
+            expected_gpus=args.expected_gpus,
+            max_memory_per_gpu=args.max_memory_per_gpu,
+            cpu_max_memory=args.cpu_max_memory,
+            max_new_tokens=args.max_new_tokens,
+            few_shot_examples=args.few_shot_examples,
+            few_shot_exemplar_pool=exemplar_pool,
+            prompt_mode=args.prompt_mode,
+            prompt_variant=args.prompt_variant,
+            probe_tag=args.probe_tag,
+            target_prompt_override=args.target_prompt_override,
+            text_only_prompt=args.text_only_prompt,
+            disable_thinking=args.disable_thinking,
+            debug_dump_dir=debug_dump_dir,
+            trust_remote_code=args.trust_remote_code,
+        )
 
-    payload = {
-        "run_id": run_id,
-        "model": model_label,
-        "backend": "transformers_local",
-        "created_at": utc_now_iso(),
-        "prompt_version": AUTO_QC_PROMPT_VERSION,
-        "prompt_mode": args.prompt_mode,
-        "prompt_variant": args.prompt_variant,
-        "tag_catalog": tag_catalog,
-        "exam_suggestions": exam_suggestions,
-    }
-    saved = save_auto_run(run_file, payload)
-    suggested_exam_count = sum(
-        1 for record in saved["exam_suggestions"].values() if record["suggestions"]
-    )
-    total_suggestions = sum(
-        len(record["suggestions"]) for record in saved["exam_suggestions"].values()
-    )
-    print(f"wrote auto-QC run to {run_file}")
-    print(f"  exams scored: {len(saved['exam_suggestions']):,}")
-    print(f"  exams with >=1 suggestion: {suggested_exam_count:,}")
-    print(f"  total suggested tags: {total_suggestions:,}")
-    return 0
+    try:
+        if args.pilot_queue_dir is not None:
+            return run_pilot_loop(
+                args=args,
+                views_df=views_df,
+                export_dir=export_dir,
+                annotator=annotator,
+                tag_catalog=tag_catalog,
+                model_label=model_label,
+                run_file=run_file,
+                payload=payload,
+            )
+
+        saved, stats = score_exam_records(
+            exam_records=exam_records,
+            annotator=annotator,
+            tag_catalog=tag_catalog,
+            model_label=model_label,
+            run_file=run_file,
+            payload=payload,
+            force_rescore=args.force_rescore,
+            desc="auto-qc",
+        )
+        suggested_exam_count = sum(
+            1 for record in saved["exam_suggestions"].values() if record["suggestions"]
+        )
+        total_suggestions = sum(
+            len(record["suggestions"]) for record in saved["exam_suggestions"].values()
+        )
+        print(f"wrote auto-QC run to {run_file}")
+        print(f"  exams newly scored: {int(stats['scored']):,}")
+        print(f"  exams skipped from existing run: {int(stats['skipped_existing']):,}")
+        print(f"  exams scored: {len(saved['exam_suggestions']):,}")
+        print(f"  exams with >=1 suggestion: {suggested_exam_count:,}")
+        print(f"  total suggested tags: {total_suggestions:,}")
+        return 130 if stats["interrupted"] else 0
+    finally:
+        close_annotator = getattr(annotator, "close", None)
+        if close_annotator is not None:
+            close_annotator()
 
 
 def main() -> int:

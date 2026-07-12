@@ -210,6 +210,7 @@ def merge_shard_outputs(
     import pandas as pd
 
     views_dfs = []
+    candidate_dfs = []
     exams_dfs = []
     tags_dfs = []
     cohort_dfs = []
@@ -220,6 +221,7 @@ def merge_shard_outputs(
         shard_dir = sot_dir / f"shard_{i:03d}"
         required_paths = [
             shard_dir / "views.parquet",
+            shard_dir / "view_candidates.parquet",
             shard_dir / "exams.parquet",
             shard_dir / "dicom_tags.parquet",
             shard_dir / "cohort.parquet",
@@ -238,6 +240,15 @@ def merge_shard_outputs(
             str(shard_dir / "views.parquet"),
         )
         views_dfs.append(shard_views)
+        shard_candidates = pd.read_parquet(shard_dir / "view_candidates.parquet")
+        require_source_columns(
+            shard_candidates.columns, str(shard_dir / "view_candidates.parquet")
+        )
+        require_valid_sources(
+            shard_candidates[list(SOURCE_COLUMNS)].to_dict("records"),
+            str(shard_dir / "view_candidates.parquet"),
+        )
+        candidate_dfs.append(shard_candidates)
         exams_dfs.append(pd.read_parquet(shard_dir / "exams.parquet"))
         tags_dfs.append(pd.read_parquet(shard_dir / "dicom_tags.parquet"))
         cohort_dfs.append(pd.read_parquet(shard_dir / "cohort.parquet"))
@@ -258,6 +269,14 @@ def merge_shard_outputs(
         require_source_columns(combined.columns, str(sot_dir / "views.parquet"))
         combined.to_parquet(sot_dir / "views.parquet", index=False)
         print(f"  Merged views.parquet: {len(combined):,} rows")
+    if candidate_dfs:
+        combined = pd.concat(candidate_dfs, ignore_index=True)
+        combined = combined.drop_duplicates(subset=["exam_id", "sop_instance_uid"])
+        require_source_columns(
+            combined.columns, str(sot_dir / "view_candidates.parquet")
+        )
+        combined.to_parquet(sot_dir / "view_candidates.parquet", index=False)
+        print(f"  Merged view_candidates.parquet: {len(combined):,} rows")
     if exams_dfs:
         combined = pd.concat(exams_dfs, ignore_index=True)
         combined = combined.drop_duplicates(subset=["patient_id", "exam_id"])

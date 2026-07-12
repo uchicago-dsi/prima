@@ -240,6 +240,11 @@ VIEWS_COLS = [
     "accession_number",
 ]
 
+VIEW_CANDIDATES_COLS = VIEWS_COLS + [
+    "selection_rank",
+    "is_selected",
+]
+
 # DICOM tags are stored in wide format (one column per tag keyword)
 # No fixed column list needed - dynamically determined from data
 
@@ -675,6 +680,7 @@ def _process_exam_dir(
             )
             return {
                 "rows": [],
+                "candidate_rows": [],
                 "tag_rows": [],
                 "exam_status": "path_not_found",
                 "total_files": 0,
@@ -689,6 +695,7 @@ def _process_exam_dir(
         logger.error(f"Error in exam setup for {path_log_id(exam_path)}: {e}")
         return {
             "rows": [],
+            "candidate_rows": [],
             "tag_rows": [],
             "exam_status": "setup_error",
             "total_files": 0,
@@ -888,6 +895,7 @@ def _process_exam_dir(
             # return empty rows and exam status
             return {
                 "rows": [],
+                "candidate_rows": [],
                 "tag_rows": [],
                 "exam_status": "no_valid_dicoms",
                 "total_files": len(dcm_files),
@@ -901,6 +909,7 @@ def _process_exam_dir(
 
         # select canonical full quad inside the worker so archived exams only need one materialization
         selected_rows = _select_full_quad_rows(rows)
+        candidate_rows = _rank_view_candidate_rows(rows, selected_rows)
         selected_sop_uids = {r["sop_instance_uid"] for r in selected_rows}
         selected_tag_rows = [
             tag_row
@@ -946,10 +955,17 @@ def _process_exam_dir(
             persisted_row.pop("_materialized_dicom_path")
             persisted_rows.append(persisted_row)
 
+        persisted_candidate_rows = []
+        for row in candidate_rows:
+            persisted_row = dict(row)
+            persisted_row.pop("_materialized_dicom_path")
+            persisted_candidate_rows.append(persisted_row)
+
         # return successful exam data
         log_memory_usage(f"end_exam_{path_log_id(exam_path)}")
         return {
             "rows": persisted_rows,
+            "candidate_rows": persisted_candidate_rows,
             "tag_rows": selected_tag_rows,
             "exam_status": "success",
             "total_files": len(dcm_files),
@@ -969,6 +985,7 @@ def _process_exam_dir(
         log_memory_usage(f"error_exam_{path_log_id(exam_path)}")
         return {
             "rows": [],
+            "candidate_rows": [],
             "tag_rows": [],
             "exam_status": "processing_error",
             "total_files": 0,
@@ -1116,7 +1133,7 @@ def resume_from_checkpoint(
     logger.info(f"resuming from checkpoint: {checkpoint_file}")
 
     try:
-        views_df, tags_df, _, _, _ = discover_dicoms(
+        views_df, candidates_df, tags_df, _, _, _ = discover_dicoms(
             raw_dir=raw_dir,
             max_exams=max_exams,
             workers=workers,
@@ -1125,7 +1142,8 @@ def resume_from_checkpoint(
             resume_from_checkpoint=True,
         )
         logger.info(
-            f"resumed processing completed, collected {len(views_df)} views and {len(tags_df)} tag records"
+            f"resumed processing completed, collected {len(views_df)} selected views, "
+            f"{len(candidates_df)} candidates, and {len(tags_df)} tag records"
         )
     except Exception as e:
         logger.error(f"failed to resume processing: {e}")
@@ -1495,7 +1513,14 @@ def discover_dicoms(
     exam_dir_filter: Optional[set] = None,
     checkpoint_dir: Optional[Path] = None,
     zarr_root: Optional[Path] = None,
-) -> Tuple[pd.DataFrame, pd.DataFrame, List[Dict], List[Dict], List[ExamRecord]]:
+) -> Tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    List[Dict],
+    List[Dict],
+    List[ExamRecord],
+]:
     """Scan a mixed raw/archive tree and process each exam once.
 
     Assumes:
@@ -1597,6 +1622,9 @@ def discover_dicoms(
         logger.info("all exams already processed, loading from staging files")
         # combine all staging files
         views_df = _combine_staging_files(staging_dir, "views_chunk_*.parquet")
+        candidates_df = _combine_staging_files(
+            staging_dir, "candidates_chunk_*.parquet"
+        )
         tags_df = _combine_staging_files(staging_dir, "tags_chunk_*.parquet")
         manifest_df = _combine_staging_files(staging_dir, "manifest_chunk_*.parquet")
         failures_df = _combine_staging_files(
@@ -1604,6 +1632,7 @@ def discover_dicoms(
         )
         return (
             views_df,
+            candidates_df,
             tags_df,
             manifest_df.to_dict("records"),
             failures_df.to_dict("records"),
@@ -1648,6 +1677,9 @@ def discover_dicoms(
             )
             save_checkpoint()
             views_df = _combine_staging_files(staging_dir, "views_chunk_*.parquet")
+            candidates_df = _combine_staging_files(
+                staging_dir, "candidates_chunk_*.parquet"
+            )
             tags_df = _combine_staging_files(staging_dir, "tags_chunk_*.parquet")
             manifest_df = _combine_staging_files(
                 staging_dir, "manifest_chunk_*.parquet"
@@ -1657,6 +1689,7 @@ def discover_dicoms(
             )
             return (
                 views_df,
+                candidates_df,
                 tags_df,
                 manifest_df.to_dict("records"),
                 failures_df.to_dict("records"),
@@ -1675,6 +1708,7 @@ def discover_dicoms(
 
         # accumulate rows for this chunk only
         chunk_rows = []
+        chunk_candidate_rows = []
         chunk_tag_rows = []
         chunk_manifest_rows = []
         chunk_zarr_failures = []
@@ -1711,6 +1745,7 @@ def discover_dicoms(
                         continue
 
                     chunk_rows.extend(result["rows"])
+                    chunk_candidate_rows.extend(result["candidate_rows"])
                     chunk_tag_rows.extend(result["tag_rows"])
                     chunk_manifest_rows.extend(result.get("manifest_rows", []))
                     if result.get("zarr_error") is not None:
@@ -1755,9 +1790,13 @@ def discover_dicoms(
         # write chunk data to staging files
         if chunk_rows:
             chunk_views_df = pd.DataFrame(chunk_rows)
+            chunk_candidates_df = pd.DataFrame(chunk_candidate_rows)
             chunk_tags_df = pd.DataFrame(chunk_tag_rows)
 
             views_file = staging_dir / f"views_chunk_{chunk_counter:04d}.parquet"
+            candidates_file = (
+                staging_dir / f"candidates_chunk_{chunk_counter:04d}.parquet"
+            )
             tags_file = staging_dir / f"tags_chunk_{chunk_counter:04d}.parquet"
             manifest_file = staging_dir / f"manifest_chunk_{chunk_counter:04d}.parquet"
             failures_file = (
@@ -1765,12 +1804,14 @@ def discover_dicoms(
             )
 
             chunk_views_df.to_parquet(views_file, index=False)
+            chunk_candidates_df.to_parquet(candidates_file, index=False)
             chunk_tags_df.to_parquet(tags_file, index=False)
             pd.DataFrame(chunk_manifest_rows).to_parquet(manifest_file, index=False)
             pd.DataFrame(chunk_zarr_failures).to_parquet(failures_file, index=False)
 
             logger.info(
-                f"wrote chunk {chunk_counter} to staging: {len(chunk_rows)} views, {len(chunk_tag_rows)} tags"
+                f"wrote chunk {chunk_counter} to staging: {len(chunk_rows)} selected views, "
+                f"{len(chunk_candidate_rows)} candidates, {len(chunk_tag_rows)} tags"
             )
         all_manifest_rows.extend(chunk_manifest_rows)
         all_zarr_failures.extend(chunk_zarr_failures)
@@ -1794,12 +1835,14 @@ def discover_dicoms(
     # combine all staging files
     logger.info("combining staging files...")
     views_df = _combine_staging_files(staging_dir, "views_chunk_*.parquet")
+    candidates_df = _combine_staging_files(staging_dir, "candidates_chunk_*.parquet")
     tags_df = _combine_staging_files(staging_dir, "tags_chunk_*.parquet")
     manifest_df = _combine_staging_files(staging_dir, "manifest_chunk_*.parquet")
     failures_df = _combine_staging_files(staging_dir, "zarr_failures_chunk_*.parquet")
 
     logger.info(
-        f"loaded {len(views_df)} views and {len(tags_df)} DICOM tag records from staging"
+        f"loaded {len(views_df)} selected views, {len(candidates_df)} candidates, "
+        f"and {len(tags_df)} DICOM tag records from staging"
     )
 
     # print summary statistics
@@ -1843,6 +1886,7 @@ def discover_dicoms(
 
     return (
         views_df,
+        candidates_df,
         tags_df,
         manifest_df.to_dict("records"),
         failures_df.to_dict("records"),
@@ -1906,6 +1950,69 @@ def _select_full_quad_rows(rows: List[Dict]) -> List[Dict]:
     if out.empty:
         return []
     return out.to_dict("records")
+
+
+def _rank_view_candidate_rows(
+    rows: List[Dict], selected_rows: List[Dict]
+) -> List[Dict]:
+    """Return every standard-view candidate for selected full-quad exams.
+
+    Candidates retain the same deterministic ordering used to choose the
+    canonical view. ``selection_rank == 1`` is therefore the selected source
+    for each exact ``(exam_id, laterality, view)`` slot.
+    """
+    if not rows or not selected_rows:
+        return []
+
+    selected_exam_ids = {str(row["exam_id"]) for row in selected_rows}
+    selected_sop_uids = {str(row["sop_instance_uid"]) for row in selected_rows}
+    candidates = pd.DataFrame(rows)
+    candidates = candidates[
+        candidates["exam_id"].astype(str).isin(selected_exam_ids)
+        & candidates["for_presentation"].astype(bool)
+        & candidates["laterality"].isin(["L", "R"])
+        & candidates["view"].isin(["CC", "MLO"])
+    ].copy()
+    if candidates.empty:
+        raise RuntimeError("selected full-quad exam has no persisted view candidates")
+
+    candidates["_view_selection_key"] = [
+        view_selection_key(
+            for_presentation=bool(row.get("for_presentation")),
+            estimated_magnification_factor=row.get("estimated_magnification_factor"),
+            pixel_spacing_mm=row.get("pixel_spacing_mm"),
+            source_key=row.get(SOURCE_MEMBER_COLUMN),
+        )
+        for row in candidates.to_dict("records")
+    ]
+    candidates = candidates.sort_values(
+        by=["exam_id", "laterality", "view", "_view_selection_key"],
+        kind="stable",
+    )
+    candidates["selection_rank"] = (
+        candidates.groupby(["exam_id", "laterality", "view"], sort=False)
+        .cumcount()
+        .add(1)
+        .astype(int)
+    )
+    candidates["is_selected"] = (
+        candidates["sop_instance_uid"].astype(str).isin(selected_sop_uids)
+    )
+
+    rank_one = candidates[candidates["selection_rank"] == 1]
+    if set(rank_one["sop_instance_uid"].astype(str)) != selected_sop_uids:
+        raise RuntimeError(
+            "candidate rank disagrees with canonical full-quad selection"
+        )
+    selected_per_slot = candidates.groupby(
+        ["exam_id", "laterality", "view"], sort=False
+    )["is_selected"].sum()
+    if not (selected_per_slot == 1).all():
+        raise RuntimeError(
+            "each exact view slot must have exactly one selected candidate"
+        )
+
+    return candidates.drop(columns=["_view_selection_key"]).to_dict("records")
 
 
 # ------------- Zarr writing -------------
@@ -2027,6 +2134,12 @@ def preprocess(cfg: PreprocessConfig) -> None:
 
     if cfg.incremental and (sot / "views.parquet").exists():
         logger.info("incremental mode: loading existing views...")
+        existing_candidates_path = sot / "view_candidates.parquet"
+        if not existing_candidates_path.exists():
+            raise FileNotFoundError(
+                "incremental preprocessing requires view_candidates.parquet; "
+                "rebuild the SoT with the current preprocessor"
+            )
         existing_views = pd.read_parquet(sot / "views.parquet")
         require_source_columns(existing_views.columns, str(sot / "views.parquet"))
         require_valid_sources(
@@ -2037,18 +2150,23 @@ def preprocess(cfg: PreprocessConfig) -> None:
         logger.info(f"found {len(existing_exam_ids)} existing exams")
 
         # discover new DICOMs
-        views_df, tags_df, manifest_rows, failed_exams, processed_exam_records = (
-            discover_dicoms(
-                raw,
-                max_exams=cfg.max_exams,
-                workers=cfg.workers,
-                debug_dir=cfg.debug_dir,
-                chunk_size=cfg.chunk_size,
-                resume_from_checkpoint=not cfg.no_resume,
-                exam_dir_filter=cfg.exam_dir_filter,
-                checkpoint_dir=cfg.checkpoint_dir,
-                zarr_root=None if cfg.summary else prep_dir,
-            )
+        (
+            views_df,
+            candidates_df,
+            tags_df,
+            manifest_rows,
+            failed_exams,
+            processed_exam_records,
+        ) = discover_dicoms(
+            raw,
+            max_exams=cfg.max_exams,
+            workers=cfg.workers,
+            debug_dir=cfg.debug_dir,
+            chunk_size=cfg.chunk_size,
+            resume_from_checkpoint=not cfg.no_resume,
+            exam_dir_filter=cfg.exam_dir_filter,
+            checkpoint_dir=cfg.checkpoint_dir,
+            zarr_root=None if cfg.summary else prep_dir,
         )
 
         # filter out already processed exams
@@ -2068,22 +2186,30 @@ def preprocess(cfg: PreprocessConfig) -> None:
             return
 
         views_df = new_views
+        candidates_df = candidates_df[
+            candidates_df["exam_id"].isin(set(new_views["exam_id"]))
+        ]
         # filter tags to match filtered views
         new_sop_uids = set(new_views["sop_instance_uid"])
         tags_df = tags_df[tags_df["sop_instance_uid"].isin(new_sop_uids)]
     else:
-        views_df, tags_df, manifest_rows, failed_exams, processed_exam_records = (
-            discover_dicoms(
-                raw,
-                max_exams=cfg.max_exams,
-                workers=cfg.workers,
-                debug_dir=cfg.debug_dir,
-                chunk_size=cfg.chunk_size,
-                resume_from_checkpoint=not cfg.no_resume,
-                exam_dir_filter=cfg.exam_dir_filter,
-                checkpoint_dir=cfg.checkpoint_dir,
-                zarr_root=None if cfg.summary else prep_dir,
-            )
+        (
+            views_df,
+            candidates_df,
+            tags_df,
+            manifest_rows,
+            failed_exams,
+            processed_exam_records,
+        ) = discover_dicoms(
+            raw,
+            max_exams=cfg.max_exams,
+            workers=cfg.workers,
+            debug_dir=cfg.debug_dir,
+            chunk_size=cfg.chunk_size,
+            resume_from_checkpoint=not cfg.no_resume,
+            exam_dir_filter=cfg.exam_dir_filter,
+            checkpoint_dir=cfg.checkpoint_dir,
+            zarr_root=None if cfg.summary else prep_dir,
         )
         logger.info(f"found {len(views_df)} DICOM files")
 
@@ -2091,6 +2217,9 @@ def preprocess(cfg: PreprocessConfig) -> None:
     sel_df = views_df
     logger.info(
         f"one-pass worker emitted {len(sel_df)} selected views from full quad exams"
+    )
+    logger.info(
+        f"one-pass worker emitted {len(candidates_df)} exact-slot candidate views"
     )
 
     # exams table
@@ -2129,6 +2258,14 @@ def preprocess(cfg: PreprocessConfig) -> None:
             str(sot / "views.parquet"),
         )
         existing_exams = pd.read_parquet(sot / "exams.parquet")
+        existing_candidates = pd.read_parquet(sot / "view_candidates.parquet")
+        require_source_columns(
+            existing_candidates.columns, str(sot / "view_candidates.parquet")
+        )
+        require_valid_sources(
+            existing_candidates[list(SOURCE_COLUMNS)].to_dict("records"),
+            str(sot / "view_candidates.parquet"),
+        )
 
         # combine new and existing data
         combined_views = pd.concat(
@@ -2136,6 +2273,10 @@ def preprocess(cfg: PreprocessConfig) -> None:
         )
         combined_exams = pd.concat(
             [existing_exams, exams[EXAMS_COLS]], ignore_index=True
+        )
+        combined_candidates = pd.concat(
+            [existing_candidates, candidates_df[VIEW_CANDIDATES_COLS]],
+            ignore_index=True,
         )
 
         # remove duplicates (in case of re-processing)
@@ -2145,8 +2286,12 @@ def preprocess(cfg: PreprocessConfig) -> None:
         combined_exams = combined_exams.drop_duplicates(
             subset=["patient_id", "exam_id"]
         )
+        combined_candidates = combined_candidates.drop_duplicates(
+            subset=["exam_id", "sop_instance_uid"]
+        )
 
         combined_views.to_parquet(sot / "views.parquet", index=False)
+        combined_candidates.to_parquet(sot / "view_candidates.parquet", index=False)
         combined_exams.to_parquet(sot / "exams.parquet", index=False)
 
         # append tags
@@ -2164,11 +2309,15 @@ def preprocess(cfg: PreprocessConfig) -> None:
         ]
         cohort.to_parquet(sot / "cohort.parquet", index=False)
         logger.info(
-            "updated views.parquet, exams.parquet, dicom_tags.parquet, cohort.parquet"
+            "updated views.parquet, view_candidates.parquet, exams.parquet, "
+            "dicom_tags.parquet, cohort.parquet"
         )
     else:
         # write new tables
         sel_df[VIEWS_COLS].to_parquet(sot / "views.parquet", index=False)
+        candidates_df[VIEW_CANDIDATES_COLS].to_parquet(
+            sot / "view_candidates.parquet", index=False
+        )
         exams[EXAMS_COLS].to_parquet(sot / "exams.parquet", index=False)
         tags_df.to_parquet(sot / "dicom_tags.parquet", index=False)
 
@@ -2178,7 +2327,8 @@ def preprocess(cfg: PreprocessConfig) -> None:
         ]
         cohort.to_parquet(sot / "cohort.parquet", index=False)
         logger.info(
-            "wrote views.parquet, exams.parquet, dicom_tags.parquet, cohort.parquet"
+            "wrote views.parquet, view_candidates.parquet, exams.parquet, "
+            "dicom_tags.parquet, cohort.parquet"
         )
 
     # if summary-only, stop here
@@ -3731,7 +3881,7 @@ def main() -> None:
         if emit_path is None and args.labels is not None:
             emit_path = cfg.out_dir / "mirai_manifest.csv"
 
-        if emit_path is not None and cfg.manifest_output is None:
+        if emit_path is not None and cfg.manifest_output is None and not cfg.summary:
             logger.info("generating Mirai CSV…")
             if args.labels is None:
                 raise ValueError("need labels CSV to write Mirai CSV; pass --labels")

@@ -28,7 +28,8 @@ The end-to-end workflow for training/inference is:
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │ STEP 1: PREPROCESSING (pipelines/preprocess.py)                             │
 │   Scans disk DICOMs → extracts metadata from DICOM headers                  │
-│   Outputs: sot/views.parquet, sot/exams.parquet, out/manifest.parquet       │
+│   Outputs: sot/views.parquet, sot/view_candidates.parquet,                 │
+│            sot/exams.parquet, out/manifest.parquet                         │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
@@ -328,6 +329,8 @@ Outputs are written to `{raw}/sot/` and `{raw}/out/` by default:
 - `sot/views.parquet` — individual DICOM views with metadata and durable
   `source_archive_relpath` + `source_archive_member` lineage; SOP Instance UID
   and SHA-256 verify the exact original member
+- `sot/view_candidates.parquet` — every eligible same-slot source, with
+  deterministic `selection_rank` and the authoritative `is_selected` row
 - `sot/exams.parquet` — exam-level aggregated metadata
 - `sot/dicom_tags.parquet` — all DICOM tags (wide format)
 - `out/manifest.parquet` — Zarr URIs for each view

@@ -26,6 +26,7 @@ fingerprints/
 plots/
 qc_export/
 qc_output/
+qc_redo/
 debug_viz/
 
 # Local scratch artifacts

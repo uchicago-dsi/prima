@@ -18,13 +18,15 @@ Today the preprocessing path is:
    - scans `raw_dir/patient_id/exam_id/`
    - runs `_process_exam_dir()` in parallel
    - emits:
-     - `views_df`
+     - `views_df` (one selected source per exact L/R CC/MLO slot)
+     - `candidates_df` (every eligible source for those slots)
      - `tags_df`
 2. `select_full_quad(views_df)`
    - keeps only presentation 4-view exams
 3. `preprocess()`
    - writes SoT tables:
      - `views.parquet`
+     - `view_candidates.parquet`
      - `exams.parquet`
      - `dicom_tags.parquet`
      - `cohort.parquet`
@@ -80,6 +82,17 @@ The same locator also resolves an exam that is still unpacked. A centralized
 reader validates the schema, chooses the unpacked member or archive, and fails
 if the member or SOP identity disagrees. Mixed path-only and archive/member
 schemas are unsupported; rebuild the SoT and downstream QC sidecars together.
+
+`view_candidates.parquet` uses the same durable source columns and adds:
+
+- `selection_rank`: deterministic preference within one exact
+  `(exam_id, laterality, view)` slot
+- `is_selected`: exactly one rank-1 source per slot, matching the authoritative
+  row in `views.parquet`
+
+View-level QC may advance to the first explicitly passing candidate in the same
+slot. It may never substitute another laterality or projection. Unreviewed
+candidates remain unresolved rather than implicitly passing.
 
 No persistent manifest is required for state.
 

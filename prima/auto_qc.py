@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from prima.qc_state import normalize_annotation_tag_catalog, normalize_annotation_tags
 
-AUTO_QC_PROMPT_VERSION = "qc_multilabel_v1"
+AUTO_QC_PROMPT_VERSION = "qc_multimodal_v2"
 
 
 def utc_now_iso() -> str:
@@ -143,8 +144,18 @@ def normalize_auto_run(payload: Any) -> dict[str, Any]:
     )
     prompt_mode = str(payload.get("prompt_mode", "")).strip() or "tagger_json"
     prompt_variant = str(payload.get("prompt_variant", "")).strip() or "baseline"
+    probe_tag = str(payload.get("probe_tag", "")).strip()
+    inference_settings = payload.get("inference_settings", {})
+    if not isinstance(inference_settings, dict):
+        raise ValueError("inference_settings must be a JSON object")
+    if not all(isinstance(key, str) for key in inference_settings):
+        raise ValueError("inference_settings keys must be strings")
+    try:
+        inference_settings = json.loads(json.dumps(inference_settings, sort_keys=True))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("inference_settings must contain JSON values") from exc
 
-    return {
+    normalized = {
         "run_id": run_id or created_at.replace(":", "").replace("+00:00", "Z"),
         "model": model,
         "backend": backend,
@@ -152,9 +163,13 @@ def normalize_auto_run(payload: Any) -> dict[str, Any]:
         "prompt_version": prompt_version,
         "prompt_mode": prompt_mode,
         "prompt_variant": prompt_variant,
+        "inference_settings": inference_settings,
         "tag_catalog": tag_catalog,
         "exam_suggestions": exam_suggestions,
     }
+    if probe_tag:
+        normalized["probe_tag"] = probe_tag
+    return normalized
 
 
 def load_auto_run(
@@ -185,8 +200,11 @@ def save_auto_run(path: Path, payload: Any) -> dict[str, Any]:
         "exam_suggestions": stable_exam_suggestions,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with open(tmp_path, "w") as f:
         json.dump(stable_payload, f, indent=2)
+        f.write("\n")
+    tmp_path.replace(path)
     return stable_payload
 
 

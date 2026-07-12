@@ -1,0 +1,66 @@
+{
+  "qwen35_397b_fp8": {
+    "repo_id": "Qwen/Qwen3.5-397B-A17B-FP8",
+    "revision": "ea5b4f81096f3901c91dea97f81324302495781d",
+    "directory_name": "Qwen3.5-397B-A17B-FP8",
+    "served_model_name": "qwen35_397b_fp8",
+    "tensor_parallel_size": 4,
+    "extra_args": [
+      "--max-model-len",
+      "32768",
+      "--max-num-seqs",
+      "1",
+      "--gpu-memory-utilization",
+      "0.95",
+      "--safetensors-load-strategy",
+      "prefetch",
+      "--generation-config",
+      "vllm",
+      "--limit-mm-per-prompt",
+      "{\"image\": 16}",
+      "--mm-processor-kwargs",
+      "{\"max_pixels\": 2097152}",
+      "--mm-processor-cache-gb",
+      "0",
+      "--reasoning-parser",
+      "qwen3",
+      "--default-chat-template-kwargs",
+      "{\"enable_thinking\": false}"
+    ]
+  },
+  "qwen35_27b_fp8": {
+    "repo_id": "Qwen/Qwen3.5-27B-FP8",
+    "revision": "97f5941bf617e31c5e237364a8602ce3f03a551a",
+    "directory_name": "Qwen3.5-27B-FP8",
+    "served_model_name": "qwen35_27b_fp8",
+    "tensor_parallel_size": 1,
+    "environment": {
+      "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER": "0",
+      "VLLM_USE_FLASHINFER_SAMPLER": "0"
+    },
+    "extra_args": [
+      "--max-model-len",
+      "32768",
+      "--max-num-seqs",
+      "1",
+      "--gpu-memory-utilization",
+      "0.9",
+      "--safetensors-load-strategy",
+      "prefetch",
+      "--generation-config",
+      "vllm",
+      "--limit-mm-per-prompt",
+      "{\"image\": 16}",
+      "--mm-processor-kwargs",
+      "{\"max_pixels\": 2097152}",
+      "--mm-processor-cache-gb",
+      "2",
+      "--gdn-prefill-backend",
+      "triton",
+      "--reasoning-parser",
+      "qwen3",
+      "--default-chat-template-kwargs",
+      "{\"enable_thinking\": false}"
+    ]
+  }
+}

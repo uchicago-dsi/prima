@@ -5177,7 +5177,8 @@ def generate_gallery(
                     '<img src="' + exam.path + '" alt="Exam ' + exam.exam_id + '">' +
                 '</div>';
             
-            let statsText = (currentIndex + 1) + '/' + filteredExams.length;
+            const shownReviewed = qcCounts.good + qcCounts.annotated;
+            let statsText = 'position ' + (currentIndex + 1) + '/' + filteredExams.length + ' shown';
             if (document.getElementById('searchBox').value.trim() !== '') {{
                 statsText += ' (filtered)';
             }}
@@ -5192,11 +5193,12 @@ def generate_gallery(
                 if (etaMin < 1) etaStr = '<1 min';
                 else if (etaMin < 60) etaStr = Math.round(etaMin) + ' min';
                 else etaStr = (etaMin / 60).toFixed(1) + ' hr';
-                rateText = ' | ' + rate.toFixed(1) + '/min, ETA ' + etaStr + ' (' + remainingNow + ' remaining)';
+                rateText = ' | ' + rate.toFixed(1) + '/min, dataset ETA ' + etaStr;
             }}
             
-            statsText += ' | ' + displayRemaining + ' remaining | ' +
-                         'qc: ' + qcCounts.good + ' good, ' + qcCounts.annotated + ' annotated, ' + 
+            statsText += ' | dataset: ' + displayRemaining + ' remaining | ' +
+                         'shown: ' + shownReviewed + '/' + allExams.length + ' reviewed (' +
+                         qcCounts.good + ' good, ' + qcCounts.annotated + ' annotated), ' +
                          qcCounts.pending + ' pending | auto: ' + qcCounts.auto_suggested + ' suggested' +
                          rateText;
             stats.textContent = statsText;

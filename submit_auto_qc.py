@@ -31,13 +31,17 @@ def build_submit_parser() -> argparse.ArgumentParser:
             "Any additional arguments after the Slurm flags are passed through to "
             "auto_annotate_qc.py.\n\n"
             "Example (4xH200):\n"
-            "  python submit_auto_qc.py --gpuspec h200 --ngpus 4 --no-wait "
+            "  python submit_auto_qc.py --partition catherineq --qos opportunistic "
+            "--gpuspec nvidia_h200-141gb --ngpus 4 --no-wait "
+            "--mem-gb 900 "
             "--views /path/views_for_qc.parquet --export-dir /path/qc_export "
-            "--run-file /path/auto_qc_run.json --model-path /path/Qwen3.5-397B-A17B-FP8\n\n"
+            "--run-file /path/auto_qc_run.json --backend vllm "
+            "--model-key qwen35_397b_fp8\n\n"
             "Example (8xA100):\n"
             "  python submit_auto_qc.py --constraint a100 --gpuspec a100 --ngpus 8 --mem-gb 900 --no-wait "
             "--views /path/views_for_qc.parquet --export-dir /path/qc_export "
-            "--run-file /path/auto_qc_run.json --model-path /path/Qwen3.5-397B-A17B-FP8"
+            "--run-file /path/auto_qc_run.json --backend transformers "
+            "--model-path /path/Qwen3.5-397B-A17B-FP8"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -118,6 +122,11 @@ def build_submit_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Submit and exit without waiting for completion",
     )
+    parser.add_argument(
+        "--no-srun",
+        action="store_true",
+        help="Ask submitit to run the Python process directly in the sbatch script instead of through nested srun",
+    )
     return parser
 
 
@@ -159,12 +168,34 @@ def main() -> int:
         raise ValueError("--ngpus must be positive")
     if auto_qc_args.expected_gpus is None:
         auto_qc_args.expected_gpus = submit_args.ngpus
-    if auto_qc_args.max_memory_per_gpu is None:
+    if (
+        auto_qc_args.backend == "transformers"
+        and auto_qc_args.max_memory_per_gpu is None
+    ):
         auto_qc_args.max_memory_per_gpu = default_max_memory_per_gpu(
             submit_args.gpuspec
         )
-    if auto_qc_args.cpu_max_memory is None:
+    if auto_qc_args.backend == "transformers" and auto_qc_args.cpu_max_memory is None:
         auto_qc_args.cpu_max_memory = "128GiB"
+
+    if auto_qc_args.backend == "vllm":
+        from prima.vllm_server import (
+            resolve_model_path,
+            select_model_spec,
+            validate_vllm_runtime,
+        )
+
+        validate_vllm_runtime()
+
+        spec = select_model_spec(
+            auto_qc_args.model_registry.resolve(), auto_qc_args.model_key
+        )
+        if spec.tensor_parallel_size != submit_args.ngpus:
+            raise ValueError(
+                f"model {spec.key!r} requires {spec.tensor_parallel_size} GPUs, "
+                f"but --ngpus={submit_args.ngpus}"
+            )
+        resolve_model_path(spec, auto_qc_args.models_dir.resolve())
     exclude_nodes = [
         str(node).strip() for node in submit_args.exclude if str(node).strip()
     ]
@@ -179,7 +210,12 @@ def main() -> int:
     auto_qc_args = copy.deepcopy(auto_qc_args)
     auto_qc_args.views = auto_qc_args.views.resolve()
     auto_qc_args.export_dir = auto_qc_args.export_dir.resolve()
-    auto_qc_args.model_path = auto_qc_args.model_path.resolve()
+    if auto_qc_args.model_path:
+        auto_qc_args.model_path = auto_qc_args.model_path.resolve()
+    auto_qc_args.model_registry = auto_qc_args.model_registry.resolve()
+    auto_qc_args.models_dir = auto_qc_args.models_dir.resolve()
+    if auto_qc_args.vllm_server_log:
+        auto_qc_args.vllm_server_log = auto_qc_args.vllm_server_log.resolve()
     auto_qc_args.run_file = auto_qc_args.run_file.resolve()
     if auto_qc_args.qc_file:
         auto_qc_args.qc_file = auto_qc_args.qc_file.resolve()
@@ -187,6 +223,10 @@ def main() -> int:
         auto_qc_args.tags_file = auto_qc_args.tags_file.resolve()
     if auto_qc_args.exam_list:
         auto_qc_args.exam_list = auto_qc_args.exam_list.resolve()
+    if auto_qc_args.pilot_queue_dir:
+        auto_qc_args.pilot_queue_dir = auto_qc_args.pilot_queue_dir.resolve()
+    if auto_qc_args.pilot_stop_file:
+        auto_qc_args.pilot_stop_file = auto_qc_args.pilot_stop_file.resolve()
 
     executor = submitit.AutoExecutor(folder=str(log_folder))
     executor.update_parameters(
@@ -202,6 +242,7 @@ def main() -> int:
         slurm_comment=submit_args.comment or None,
         slurm_exclude=exclude_spec,
         slurm_gres=slurm_gres_spec(submit_args.gpuspec, submit_args.ngpus),
+        slurm_use_srun=not submit_args.no_srun,
     )
 
     job = executor.submit(AutoQCJob(auto_qc_args))

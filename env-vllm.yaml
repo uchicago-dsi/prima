@@ -1,0 +1,19 @@
+name: prima-vllm
+channels:
+  - nvidia
+  - conda-forge
+channel_priority: strict
+dependencies:
+  - python=3.11
+  - pip
+  - uv
+  - pandas
+  - pyarrow
+  - pillow
+  - tqdm
+  - submitit
+  - huggingface_hub
+  - cuda-nvcc=13.0.88
+# vLLM/OpenAI/Torch and dsi-local-llms are installed with the pinned uv/pip
+# commands in docs/auto_qc_vllm.md. The current dsi-local-llms source is a
+# checksummed local wheel until its feature branch is pushed and reviewed.
