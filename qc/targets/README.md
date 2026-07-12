@@ -1,0 +1,35 @@
+# Single-target view QC prompts
+
+Each file defines one visual target for one model run. Shared QC code treats the
+target only as present or absent; `uncertain` is reserved for human review and
+never counts as a target-absent fallback candidate.
+
+A target prompt must:
+
+- ask about exactly one visible finding in one mammography view;
+- define positive evidence and important negative look-alikes;
+- say how borderline appearances should be handled;
+- end with the exact `EVIDENCE`, `ANSWER`, `CONFIDENCE`, and `REVIEW` fields
+  required by `qc/run_view_auto_qc.py`.
+
+Pass the same concise target name to `--target` whenever the prompt is used.
+Start a new human state and model run when either the target definition or
+prompt changes. The run records the exact prompt text and its SHA-256 digest.
+
+Initialize a fresh human review without changing a target-specific builder:
+
+```bash
+python qc/init_view_qc_review.py \
+  --manifest /path/to/manifest.parquet \
+  --state /path/to/view_qc_state.json \
+  --target 'the visual finding being reviewed'
+```
+
+Example:
+
+```bash
+python submit_view_auto_qc.py \
+  --target 'vertical detector seam' \
+  --target-prompt-file qc/targets/vertical_detector_seam_v1.txt \
+  ...
+```

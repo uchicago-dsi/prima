@@ -1,4 +1,4 @@
-"""Canonical state and manifest helpers for binary view-level QC."""
+"""Canonical state and manifest helpers for single-target view-level QC."""
 
 from __future__ import annotations
 
@@ -13,11 +13,15 @@ from typing import Any, Iterable, Mapping
 import numpy as np
 from PIL import Image
 
-VIEW_QC_SCHEMA_VERSION = 1
-VIEW_QC_TARGET = "vertical line (detector artifact)"
-VIEW_LABEL_PASS = "pass"
-VIEW_LABEL_VERTICAL_LINE = "vertical_line"
-VALID_VIEW_LABELS = {VIEW_LABEL_PASS, VIEW_LABEL_VERTICAL_LINE}
+VIEW_QC_SCHEMA_VERSION = 2
+VIEW_LABEL_PRESENT = "present"
+VIEW_LABEL_ABSENT = "absent"
+VIEW_LABEL_UNCERTAIN = "uncertain"
+VALID_VIEW_LABELS = {
+    VIEW_LABEL_PRESENT,
+    VIEW_LABEL_ABSENT,
+    VIEW_LABEL_UNCERTAIN,
+}
 
 VIEW_MANIFEST_REQUIRED_COLUMNS = {
     "view_id",
@@ -36,6 +40,18 @@ def normalize_view_id(value: object) -> str:
     return view_id
 
 
+def normalize_view_qc_target(value: object) -> str:
+    """Return a concise nonempty visual QC target or fail loudly."""
+    if not isinstance(value, str):
+        raise ValueError("view QC target must be a string")
+    target = " ".join(value.split())
+    if not target:
+        raise ValueError("view QC target cannot be empty")
+    if len(target) > 200:
+        raise ValueError("view QC target cannot exceed 200 characters")
+    return target
+
+
 def validate_view_manifest_columns(columns: Iterable[str], context: str) -> None:
     """Require the current view-review manifest schema."""
     available = set(columns)
@@ -46,11 +62,11 @@ def validate_view_manifest_columns(columns: Iterable[str], context: str) -> None
         )
 
 
-def empty_view_qc_state() -> dict[str, Any]:
-    """Build a new empty state for the frozen binary target."""
+def empty_view_qc_state(target: object) -> dict[str, Any]:
+    """Build a new empty state for one frozen visual QC target."""
     return {
         "schema_version": VIEW_QC_SCHEMA_VERSION,
-        "target": VIEW_QC_TARGET,
+        "target": normalize_view_qc_target(target),
         "labels": {},
     }
 
@@ -63,8 +79,7 @@ def normalize_view_qc_state(payload: Any) -> dict[str, Any]:
         raise ValueError(
             "view QC state schema is unsupported; start a fresh view-level review"
         )
-    if payload.get("target") != VIEW_QC_TARGET:
-        raise ValueError("view QC state target does not match the frozen target")
+    target = normalize_view_qc_target(payload.get("target"))
     raw_labels = payload.get("labels")
     if not isinstance(raw_labels, dict):
         raise ValueError("view QC state labels must be a JSON object")
@@ -91,16 +106,16 @@ def normalize_view_qc_state(payload: Any) -> dict[str, Any]:
 
     return {
         "schema_version": VIEW_QC_SCHEMA_VERSION,
-        "target": VIEW_QC_TARGET,
+        "target": target,
         "labels": labels,
     }
 
 
 def load_view_qc_state(path: Path) -> dict[str, Any]:
-    """Load a view-level QC state, returning an empty state when absent."""
+    """Load a required single-target view-QC state."""
     path = Path(path)
-    if not path.exists():
-        return empty_view_qc_state()
+    if not path.is_file():
+        raise FileNotFoundError(f"view QC state not found: {path}")
     with path.open() as handle:
         payload = json.load(handle)
     return normalize_view_qc_state(payload)
@@ -167,18 +182,20 @@ def summarize_view_qc_state(
     if foreign:
         raise ValueError("view QC state contains labels outside this manifest")
     labels = normalized["labels"]
-    passed = sum(record["label"] == VIEW_LABEL_PASS for record in labels.values())
-    vertical = sum(
-        record["label"] == VIEW_LABEL_VERTICAL_LINE for record in labels.values()
+    present = sum(record["label"] == VIEW_LABEL_PRESENT for record in labels.values())
+    absent = sum(record["label"] == VIEW_LABEL_ABSENT for record in labels.values())
+    uncertain = sum(
+        record["label"] == VIEW_LABEL_UNCERTAIN for record in labels.values()
     )
-    reviewed = passed + vertical
+    reviewed = present + absent + uncertain
     total = len(manifest_ids)
     return {
         "total": total,
         "reviewed": reviewed,
         "remaining": total - reviewed,
-        "pass": passed,
-        "vertical_line": vertical,
+        "present": present,
+        "absent": absent,
+        "uncertain": uncertain,
     }
 
 

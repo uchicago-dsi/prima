@@ -42,6 +42,10 @@ def main() -> int:
     submit_args, view_args = parse_args()
     if submit_args.ngpus <= 0:
         raise ValueError("--ngpus must be positive")
+    view_args.target = run_view_auto_qc.normalize_view_qc_target(view_args.target)
+    run_view_auto_qc.load_target_prompt(
+        view_args.target_prompt_file, target=view_args.target
+    )
     validate_vllm_runtime()
     spec = select_model_spec(view_args.model_registry.resolve(), view_args.model_key)
     if spec.tensor_parallel_size != submit_args.ngpus:
@@ -61,6 +65,7 @@ def main() -> int:
     view_args = copy.deepcopy(view_args)
     view_args.manifest = view_args.manifest.resolve()
     view_args.run_file = view_args.run_file.resolve()
+    view_args.target_prompt_file = view_args.target_prompt_file.resolve()
     view_args.model_registry = view_args.model_registry.resolve()
     view_args.models_dir = view_args.models_dir.resolve()
     if view_args.vllm_server_log:

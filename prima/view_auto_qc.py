@@ -8,15 +8,15 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from prima.auto_qc import normalize_auto_suggestion_entry, utc_now_iso
-from prima.view_qc import VIEW_QC_TARGET, normalize_view_id
+from prima.view_qc import normalize_view_id, normalize_view_qc_target
 
-VIEW_AUTO_QC_SCHEMA_VERSION = 1
-VIEW_AUTO_QC_PROMPT_VERSION = "vertical_line_view_v1"
+VIEW_AUTO_QC_SCHEMA_VERSION = 2
+VIEW_AUTO_QC_PROMPT_VERSION = "single_target_view_v1"
 VIEW_CONFIDENCE_LEVELS = ("low", "medium", "high")
 
 
-def normalize_view_suggestion_record(raw_record: Any) -> dict[str, Any]:
-    """Normalize one model record for the frozen view-level target."""
+def normalize_view_suggestion_record(raw_record: Any, *, target: str) -> dict[str, Any]:
+    """Normalize one model record for a frozen view-level target."""
     if not isinstance(raw_record, dict):
         raise ValueError("each view suggestion record must be a JSON object")
     raw_suggestions = raw_record.get("suggestions", [])
@@ -25,12 +25,12 @@ def normalize_view_suggestion_record(raw_record: Any) -> dict[str, Any]:
     suggestions = []
     for raw_suggestion in raw_suggestions:
         normalized = normalize_auto_suggestion_entry(
-            raw_suggestion, allowed_tags={VIEW_QC_TARGET}
+            raw_suggestion, allowed_tags={target}
         )
         if normalized is not None:
             suggestions.append(normalized)
     if len(suggestions) > 1:
-        raise ValueError("binary view QC may contain at most one suggestion")
+        raise ValueError("single-target view QC may contain at most one suggestion")
 
     image_path = str(raw_record.get("image_path", "")).strip()
     if not image_path:
@@ -45,16 +45,18 @@ def normalize_view_suggestion_record(raw_record: Any) -> dict[str, Any]:
     return record
 
 
-def view_suggestion_meets_confidence(
-    record: Mapping[str, Any], *, minimum_confidence: str
+def view_suggestion_is_target_present(
+    record: Mapping[str, Any], *, target: str, minimum_confidence: str
 ) -> bool:
-    """Return whether a binary suggestion meets an explicit reject threshold."""
+    """Return whether the model marks the target present at the threshold."""
     minimum_confidence = str(minimum_confidence).strip().lower()
     if minimum_confidence not in VIEW_CONFIDENCE_LEVELS:
         raise ValueError(
             f"unsupported minimum suggestion confidence: {minimum_confidence!r}"
         )
-    normalized = normalize_view_suggestion_record(dict(record))
+    normalized = normalize_view_suggestion_record(
+        dict(record), target=normalize_view_qc_target(target)
+    )
     if not normalized["suggestions"]:
         return False
     confidence = normalized["suggestions"][0].get("confidence")
@@ -72,15 +74,16 @@ def normalize_view_auto_run(payload: Any) -> dict[str, Any]:
         raise ValueError("unsupported view auto-QC schema")
     if payload.get("input_level") != "view":
         raise ValueError("view auto-QC run must have input_level='view'")
-    if payload.get("target") != VIEW_QC_TARGET:
-        raise ValueError("view auto-QC target does not match the frozen target")
+    target = normalize_view_qc_target(payload.get("target"))
     if payload.get("prompt_version") != VIEW_AUTO_QC_PROMPT_VERSION:
         raise ValueError("view auto-QC prompt version does not match current code")
     suggestions_raw = payload.get("view_suggestions")
     if not isinstance(suggestions_raw, dict):
         raise ValueError("view_suggestions must be a JSON object")
     view_suggestions = {
-        normalize_view_id(view_id): normalize_view_suggestion_record(record)
+        normalize_view_id(view_id): normalize_view_suggestion_record(
+            record, target=target
+        )
         for view_id, record in suggestions_raw.items()
     }
     inference_settings = payload.get("inference_settings")
@@ -90,7 +93,7 @@ def normalize_view_auto_run(payload: Any) -> dict[str, Any]:
     return {
         "schema_version": VIEW_AUTO_QC_SCHEMA_VERSION,
         "input_level": "view",
-        "target": VIEW_QC_TARGET,
+        "target": target,
         "run_id": str(payload.get("run_id", "")).strip(),
         "model": str(payload.get("model", "")).strip(),
         "backend": str(payload.get("backend", "")).strip(),
@@ -105,6 +108,7 @@ def normalize_view_auto_run(payload: Any) -> dict[str, Any]:
 
 def new_view_auto_run(
     *,
+    target: str,
     model: str,
     prompt_variant: str,
     inference_settings: Mapping[str, Any],
@@ -115,7 +119,7 @@ def new_view_auto_run(
         {
             "schema_version": VIEW_AUTO_QC_SCHEMA_VERSION,
             "input_level": "view",
-            "target": VIEW_QC_TARGET,
+            "target": normalize_view_qc_target(target),
             "run_id": f"{created_at.replace(':', '').replace('+00:00', 'Z')}_view_qc",
             "model": model,
             "backend": "vllm_local",

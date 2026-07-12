@@ -5,14 +5,16 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from PIL import Image
+import pytest
 
 from prima.view_fallback import (
     align_candidates_to_selected_views,
     choose_exact_slot_views,
 )
 from prima.view_qc import (
-    VIEW_LABEL_PASS,
-    VIEW_LABEL_VERTICAL_LINE,
+    VIEW_LABEL_ABSENT,
+    VIEW_LABEL_PRESENT,
+    VIEW_LABEL_UNCERTAIN,
     empty_view_qc_state,
     load_view_qc_state,
     render_dicom_view_png,
@@ -22,6 +24,7 @@ from prima.view_qc import (
     validate_rendered_view_png,
 )
 from qc.build_view_qc_pilot import sample_views
+from qc.init_view_qc_review import initialize_review
 from qc.view_qc_gallery import DEFAULT_REVIEW_PORT, HTML, load_review_items
 
 
@@ -31,20 +34,31 @@ def view_id(index: int) -> str:
 
 def test_view_qc_state_uses_one_manifest_denominator(tmp_path: Path) -> None:
     path = tmp_path / "state.json"
-    state = empty_view_qc_state()
-    state = set_view_label(state, view_id(1), VIEW_LABEL_PASS)
-    state = set_view_label(state, view_id(2), VIEW_LABEL_VERTICAL_LINE)
+    state = empty_view_qc_state("test artifact")
+    state = set_view_label(state, view_id(1), VIEW_LABEL_ABSENT)
+    state = set_view_label(state, view_id(2), VIEW_LABEL_PRESENT)
+    state = set_view_label(state, view_id(3), VIEW_LABEL_UNCERTAIN)
     save_view_qc_state(path, state)
 
     loaded = load_view_qc_state(path)
-    assert summarize_view_qc_state(loaded, [view_id(1), view_id(2), view_id(3)]) == {
-        "total": 3,
-        "reviewed": 2,
+    assert summarize_view_qc_state(
+        loaded, [view_id(1), view_id(2), view_id(3), view_id(4)]
+    ) == {
+        "total": 4,
+        "reviewed": 3,
         "remaining": 1,
-        "pass": 1,
-        "vertical_line": 1,
+        "present": 1,
+        "absent": 1,
+        "uncertain": 1,
     }
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_view_qc_target_is_required() -> None:
+    with pytest.raises(ValueError, match="must be a string"):
+        empty_view_qc_state(None)
+    with pytest.raises(ValueError, match="cannot be empty"):
+        empty_view_qc_state("  ")
 
 
 def test_gallery_exposes_no_exam_or_patient_identifiers(tmp_path: Path) -> None:
@@ -79,6 +93,32 @@ def test_gallery_exposes_no_exam_or_patient_identifiers(tmp_path: Path) -> None:
     assert images[view_id(1)].is_file()
 
 
+def test_generic_review_initializer_binds_target_and_refuses_overwrite(
+    tmp_path: Path,
+) -> None:
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    Image.new("L", (8, 8)).save(image_dir / f"{view_id(1)}.png")
+    manifest_path = tmp_path / "manifest.parquet"
+    pd.DataFrame(
+        [
+            {
+                "view_id": view_id(1),
+                "image_path": f"images/{view_id(1)}.png",
+                "laterality": "L",
+                "view": "CC",
+                "review_order": 1,
+            }
+        ]
+    ).to_parquet(manifest_path, index=False)
+    state_path = tmp_path / "state.json"
+
+    assert initialize_review(manifest_path, state_path, "  test   artifact ") == 1
+    assert load_view_qc_state(state_path) == empty_view_qc_state("test artifact")
+    with pytest.raises(FileExistsError, match="refusing to replace"):
+        initialize_review(manifest_path, state_path, "another artifact")
+
+
 def test_gallery_has_explicit_completion_state() -> None:
     assert "Review complete" in HTML
     assert "| COMPLETE" in HTML
@@ -87,7 +127,11 @@ def test_gallery_has_explicit_completion_state() -> None:
 
 def test_gallery_keeps_stable_port_and_smaller_image() -> None:
     assert DEFAULT_REVIEW_PORT == 8767
-    assert "max-width: 92%; max-height: 92%" in HTML
+    assert "max-width: 82%; max-height: 82%" in HTML
+    assert "Not present [n]" in HTML
+    assert "Present [y]" in HTML
+    assert "Unsure [u]" in HTML
+    assert "Target: " in HTML
 
 
 def test_view_sampling_is_disjoint_and_one_per_exam() -> None:
@@ -166,19 +210,41 @@ def test_fallback_never_crosses_exact_view_slots() -> None:
     decisions = choose_exact_slot_views(
         candidates,
         {
-            view_id(1): VIEW_LABEL_VERTICAL_LINE,
-            view_id(2): VIEW_LABEL_PASS,
-            view_id(3): VIEW_LABEL_PASS,
+            view_id(1): VIEW_LABEL_PRESENT,
+            view_id(2): VIEW_LABEL_ABSENT,
+            view_id(3): VIEW_LABEL_ABSENT,
         },
     ).set_index(["laterality", "view"])
 
     left = decisions.loc[("L", "CC")]
     right = decisions.loc[("R", "CC")]
-    assert left["fallback_status"] == "alternate_pass"
+    assert left["fallback_status"] == "alternate_target_absent"
     assert left["selected_view_id"] == view_id(2)
     assert left["selected_candidate_rank"] == 2
-    assert right["fallback_status"] == "original_pass"
+    assert right["fallback_status"] == "original_target_absent"
     assert right["selected_view_id"] == view_id(3)
+
+
+def test_uncertain_target_label_keeps_slot_unresolved() -> None:
+    candidates = pd.DataFrame(
+        [
+            {
+                "exam_id": "exam-1",
+                "laterality": "L",
+                "view": "CC",
+                "sop_instance_uid": "sop-1",
+                "sha256": view_id(1),
+                "selection_rank": 1,
+                "is_selected": True,
+            }
+        ]
+    )
+    decision = choose_exact_slot_views(
+        candidates, {view_id(1): VIEW_LABEL_UNCERTAIN}
+    ).iloc[0]
+    assert decision["fallback_status"] == "unresolved_candidates"
+    assert pd.isna(decision["selected_view_id"])
+    assert decision["reviewed_candidate_count"] == 0
 
 
 def test_candidate_alignment_promotes_authoritative_source() -> None:

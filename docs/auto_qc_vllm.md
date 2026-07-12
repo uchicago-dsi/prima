@@ -142,32 +142,56 @@ or raw model responses into tracked logs. vLLM binds to `127.0.0.1`, request and
 access logging are disabled, and the OpenAI client ignores proxy environment
 variables so image payloads stay on-node.
 
-## View-level vertical-line validation
+## Single-target view-level validation
 
 Exam-level montage tags cannot identify which exact L/R CC/MLO source failed
 and therefore cannot drive same-slot fallback. The active validation path uses:
 
-- a SHA-keyed individual-view manifest and fresh binary human state;
+- a SHA-keyed individual-view manifest and a fresh human state tied to one
+  named visual target;
 - `qc/view_qc_gallery.py`, which reports one explicit
   `reviewed / total / remaining` denominator and never exposes sampling strata
-  or model suggestions;
+  or model suggestions. Labels are `present`, `absent`, or `uncertain`, and
+  unrelated findings are deliberately ignored;
 - `qc/run_view_auto_qc.py` and `submit_view_auto_qc.py`, which write a separate
-  `view_suggestions` schema and use a single-view prompt without the old
-  cross-view seam cue;
+  `view_suggestions` schema and require both the target name and a versioned
+  target prompt file;
 - `view_candidates.parquet` plus `qc/select_auto_qc_views.py`, which may choose
-  only a model-passing candidate in the same laterality and projection slot and
+  only a target-absent candidate in the same laterality and projection slot and
   writes new restricted outputs rather than mutating the production SoT.
 
-The frozen 160-view panel contains 80 heuristic-enriched and 80 random views,
-one per exam. Model inference is completed before labels are revealed, but its
-run file must not be loaded during human review.
+The engine does not define a vertical seam, old-film appearance, compression
+artifact, or implant in shared code. Each run supplies that definition in a
+versioned file under `qc/targets/`. The target name is persisted in human state,
+model output, evaluations, and fallback decisions; incompatible targets fail
+instead of being merged. To add a target, write one prompt that defines visible
+positive evidence, explicit look-alikes that count as negative, borderline
+review behavior, and the required four-line output contract. Do not reuse a
+human state or model run from another target.
+
+For an already prepared view manifest, initialize a new review without editing
+a target-specific builder:
+
+```bash
+micromamba run -p /gpfs/data/huo-lab/Image/annawoodard/micromamba/envs/prima \
+  python qc/init_view_qc_review.py \
+  --manifest /path/to/manifest.parquet \
+  --state /path/to/view_qc_state.json \
+  --target 'the visual finding being reviewed'
+```
+
+The vertical detector seam is the first concrete target. Its artifact-specific
+definition is in `qc/targets/vertical_detector_seam_v1.txt`; this example does
+not change the generic state or inference schema. Model inference is completed
+before labels are revealed, and its run file must not be loaded during human
+review.
 
 ```bash
 micromamba run -p /gpfs/data/huo-lab/Image/annawoodard/micromamba/envs/prima \
   python qc/view_qc_gallery.py \
   --manifest qc_redo/review_batches/vertical_line_view_review/manifest.parquet \
   --state qc_redo/review_batches/vertical_line_view_review/view_qc_state.json \
-  --port 8765
+  --port 8767
 ```
 
 After all labels exist, `qc/evaluate_view_auto_qc.py` computes overall and
@@ -221,13 +245,16 @@ micromamba run -p /gpfs/data/huo-lab/Image/annawoodard/micromamba/envs/prima-vll
   --gpuspec nvidia_h200-141gb \
   --dependency-job-id RENDER_VALIDATION_JOB \
   --model-key qwen35_27b_fp8 \
+  --target 'vertical detector seam' \
+  --target-prompt-file qc/targets/vertical_detector_seam_v1.txt \
   --no-wait
 ```
 
 After all inference shards complete, merge exact coverage, apply rank-ordered
 same-slot fallback, and build a separate blinded audit. The audit samples the
 decisions that matter: failed originals preceding an accepted alternate, all
-candidates in sampled exhausted slots, and random original-pass controls.
+candidates in sampled exhausted slots, and random original-target-absent
+controls.
 
 ```bash
 micromamba run -p /gpfs/data/huo-lab/Image/annawoodard/micromamba/envs/prima \
@@ -241,6 +268,7 @@ micromamba run -p /gpfs/data/huo-lab/Image/annawoodard/micromamba/envs/prima \
   --candidates /gpfs/data/huo-lab/Image/ChiMEC/MG/sot/view_candidates.parquet \
   --view-auto-run /scratch/annawoodard/prima_view_auto_qc/vertical_line_candidates/merged_run.json \
   --render-complete /scratch/annawoodard/prima_view_auto_qc/vertical_line_candidates/render_complete.json \
+  --minimum-present-confidence high \
   --decisions-output /scratch/annawoodard/prima_view_auto_qc/vertical_line_candidates/fallback_decisions.parquet \
   --selected-views-output /scratch/annawoodard/prima_view_auto_qc/vertical_line_candidates/selected_views.parquet
 
@@ -258,13 +286,14 @@ Do not promote `selected_views.parquet` into production until the targeted
 fallback audit is reviewed. A complete run can still be wrong systematically;
 Slurm success and exact coverage are operational checks, not scientific ones.
 Sources whose SOP/SHA identity is valid but whose pixel payload cannot be
-decoded are recorded as deterministic non-passing candidates in
+decoded are recorded as deterministically unavailable candidates in
 `render_complete.json`. They are excluded from model inference rather than
-being misrepresented as vertical-seam predictions.
+being misrepresented as predictions about the active target.
 After the blinded audit is complete,
 `qc/evaluate_auto_qc_fallback_audit.py` reports both view confusion metrics and
 slot-level decision correctness. For an accepted alternate, every preceding
-candidate must be human-positive and the chosen candidate human-negative.
+candidate must be human-target-present and the chosen candidate
+human-target-absent.
 
 ## Validation decision
 

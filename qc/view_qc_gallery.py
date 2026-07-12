@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Serve a blinded binary reviewer for individual mammography views."""
+"""Serve a blinded single-target reviewer for individual mammography views."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ DEFAULT_REVIEW_PORT = 8767
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Serve a blinded view-level vertical-line QC review."
+        description="Serve a blinded single-target view-level QC review."
     )
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--state", type=Path, required=True)
@@ -98,7 +98,7 @@ HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>View-level vertical-line QC</title>
+  <title>Single-target view QC</title>
   <style>
     :root { color-scheme: dark; font-family: system-ui, sans-serif; }
     body { margin: 0; background: #101214; color: #f0f2f4; }
@@ -106,27 +106,28 @@ HTML = r"""<!doctype html>
     #stats { font-variant-numeric: tabular-nums; font-weight: 650; }
     #context { color: #aeb6bf; margin-top: 5px; }
     main { height: calc(100vh - 160px); display: grid; place-items: center; padding: 12px; }
-    img { max-width: 92%; max-height: 92%; object-fit: contain; background: black; }
+    img { max-width: 82%; max-height: 82%; object-fit: contain; background: black; }
     footer { height: 82px; display: flex; gap: 10px; align-items: center; justify-content: center; border-top: 1px solid #34383d; }
     button { border: 1px solid #59616a; border-radius: 7px; padding: 12px 18px; color: white; background: #282d33; font-size: 16px; cursor: pointer; }
     button:hover { background: #343b43; }
     button.active { box-shadow: 0 0 0 3px #f4c542 inset; }
-    .pass { background: #1e6b45; }
-    .fail { background: #9a3434; }
+    .absent { background: #315d7d; }
+    .present { background: #8a5b24; }
     .muted { color: #aeb6bf; }
   </style>
 </head>
 <body>
   <header>
     <div id="stats">Loading…</div>
-    <div id="context">Binary target only: vertical detector seam in this view.</div>
+    <div id="context">Loading target…</div>
   </header>
   <main><img id="image" alt="Mammography view"></main>
   <footer>
     <button id="previous">← Previous</button>
-    <button id="pass" class="pass">Pass [g]</button>
-    <button id="vertical" class="fail">Vertical seam [v]</button>
-    <button id="clear">Clear [u]</button>
+    <button id="absent" class="absent">Not present [n]</button>
+    <button id="present" class="present">Present [y]</button>
+    <button id="uncertain">Unsure [u]</button>
+    <button id="clear">Clear [x]</button>
     <button id="next">Next →</button>
     <button id="pending">Next unreviewed</button>
   </footer>
@@ -134,17 +135,20 @@ HTML = r"""<!doctype html>
 let items = [];
 let labels = {};
 let index = 0;
+let target = '';
 
 function counts() {
-  let pass = 0;
-  let vertical = 0;
+  let absent = 0;
+  let present = 0;
+  let uncertain = 0;
   for (const item of items) {
     const label = labels[item.view_id]?.label;
-    if (label === 'pass') pass += 1;
-    if (label === 'vertical_line') vertical += 1;
+    if (label === 'absent') absent += 1;
+    if (label === 'present') present += 1;
+    if (label === 'uncertain') uncertain += 1;
   }
-  const reviewed = pass + vertical;
-  return {pass, vertical, reviewed, remaining: items.length - reviewed};
+  const reviewed = absent + present + uncertain;
+  return {absent, present, uncertain, reviewed, remaining: items.length - reviewed};
 }
 
 function render() {
@@ -155,19 +159,22 @@ function render() {
     return;
   }
   document.getElementById('image').src = item.image_url;
+  const instruction = 'Target: ' + target + '. Decide only whether this target is present; ignore every other finding.';
   document.getElementById('context').textContent = summary.remaining === 0
-    ? 'Review complete — all labels are saved. Use Previous or the arrow keys to inspect them.'
-    : item.laterality + ' ' + item.view + ' | Binary target only: vertical detector seam in this view.';
+    ? instruction + ' Review complete — all labels are saved. Use Previous or the arrow keys to inspect them.'
+    : item.laterality + ' ' + item.view + ' | ' + instruction;
   document.getElementById('stats').textContent =
     'position ' + (index + 1) + '/' + items.length +
     ' | reviewed ' + summary.reviewed + '/' + items.length +
     ' | remaining ' + summary.remaining +
-    ' | pass ' + summary.pass +
-    ' | vertical seam ' + summary.vertical +
+    ' | absent ' + summary.absent +
+    ' | present ' + summary.present +
+    ' | unsure ' + summary.uncertain +
     (summary.remaining === 0 ? ' | COMPLETE' : '');
   const active = labels[item.view_id]?.label;
-  document.getElementById('pass').classList.toggle('active', active === 'pass');
-  document.getElementById('vertical').classList.toggle('active', active === 'vertical_line');
+  document.getElementById('absent').classList.toggle('active', active === 'absent');
+  document.getElementById('present').classList.toggle('active', active === 'present');
+  document.getElementById('uncertain').classList.toggle('active', active === 'uncertain');
   document.getElementById('previous').disabled = index === 0;
   const atEnd = index === items.length - 1;
   document.getElementById('next').disabled = atEnd;
@@ -207,16 +214,18 @@ function nextUnreviewed(start = 0) {
 
 document.getElementById('previous').onclick = () => move(-1);
 document.getElementById('next').onclick = () => move(1);
-document.getElementById('pass').onclick = () => setLabel('pass');
-document.getElementById('vertical').onclick = () => setLabel('vertical_line');
+document.getElementById('absent').onclick = () => setLabel('absent');
+document.getElementById('present').onclick = () => setLabel('present');
+document.getElementById('uncertain').onclick = () => setLabel('uncertain');
 document.getElementById('clear').onclick = () => setLabel(null);
 document.getElementById('pending').onclick = () => nextUnreviewed(index + 1);
 document.addEventListener('keydown', event => {
   if (event.key === 'ArrowLeft') move(-1);
   else if (event.key === 'ArrowRight') move(1);
-  else if (event.key.toLowerCase() === 'g') setLabel('pass');
-  else if (event.key.toLowerCase() === 'v') setLabel('vertical_line');
-  else if (event.key.toLowerCase() === 'u') setLabel(null);
+  else if (event.key.toLowerCase() === 'n') setLabel('absent');
+  else if (event.key.toLowerCase() === 'y') setLabel('present');
+  else if (event.key.toLowerCase() === 'u') setLabel('uncertain');
+  else if (event.key.toLowerCase() === 'x') setLabel(null);
 });
 
 Promise.all([
@@ -225,6 +234,7 @@ Promise.all([
 ]).then(([loadedItems, state]) => {
   items = loadedItems;
   labels = state.labels;
+  target = state.target;
   nextUnreviewed(0);
 }).catch(error => {
   document.getElementById('stats').textContent = 'Failed to load review: ' + error;

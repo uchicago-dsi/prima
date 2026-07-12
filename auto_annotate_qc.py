@@ -1162,38 +1162,13 @@ def build_marker_classifier_prompt(
     )
     target = "exam" if input_level == "exam" else "view"
     image_type = "mammography montage" if input_level == "exam" else "mammogram"
-    vertical_evidence = (
-        "a straight, narrow, low-contrast gray vertical seam or stripe running "
-        "top-to-bottom"
-    )
-    if input_level == "exam":
-        vertical_evidence += ", often at a similar x-position across views"
-    if prompt_variant == "detector_boundary_v2":
-        if probe_tag.strip().lower() != "vertical line (detector artifact)":
-            raise ValueError(
-                "detector_boundary_v2 is only valid for the vertical detector-line tag"
-            )
-        return (
-            f"{example_text}"
-            f"Target {target} only: decide whether a vertical detector artifact is visually present in this {image_type}.\n"
-            "Answer YES for either of these detector-fixed patterns:\n"
-            "- a straight, narrow gray vertical seam or stripe; or\n"
-            "- a straight vertical detector-panel boundary that divides the image into different intensity regions and runs through nearly the full image height. This boundary may be broad or high-contrast and may have repeated bright curved bands beside it; that still counts as the target artifact.\n"
-            "Answer NO for a surgical scar/incision marker or wire within the breast, localization hardware, clips, vessels, skin folds, breast or pectoral edges, text labels, image-frame/crop borders, or normal film edges. Curved or tapered lines within anatomy are not detector seams.\n"
-            "Use high confidence only when one of the two positive detector-fixed patterns is unmistakable; use medium or low for a borderline appearance.\n"
-            "Answer in exactly four lines and nothing else:\n"
-            "EVIDENCE: <one short visual phrase, or none>\n"
-            "ANSWER: YES or ANSWER: NO\n"
-            "CONFIDENCE: high, medium, or low\n"
-            "REVIEW: YES or REVIEW: NO\n"
-        )
     if prompt_variant == "confidence_specificity":
         return (
             f"{example_text}"
             f"Target {target} only: decide whether {target_description} is visually present anywhere in this {image_type}.\n"
-            f"For a vertical line detector artifact, look for {vertical_evidence}.\n"
-            "The artifact must be vertical. Answer NO if the main finding is horizontal compression hardware, horizontal compression artifact, paddle/bar edges, or clamp edges.\n"
-            "Be specific. Do not answer YES for breast edges, skin folds, compression boundaries, text labels, markers, anatomy, or normal montage seams.\n"
+            "Use direct visible evidence of the named target only. Do not infer it "
+            "from text labels, metadata, patient age, or unrelated findings. "
+            "Answer NO when the named target is not visibly present.\n"
             "Use CONFIDENCE: high only when the visual evidence is unmistakable; use medium or low for borderline appearances.\n"
             "Answer in exactly four lines and nothing else:\n"
             "EVIDENCE: <one short visual phrase, or none>\n"
@@ -1289,17 +1264,16 @@ PROMPT_VARIANTS = (
     "baseline",
     "recall_tilted",
     "confidence_specificity",
-    "detector_boundary_v2",
 )
 
 
 def build_recall_tilted_rule(probe_tag: str | None = None) -> str:
-    """Instruction for high-recall artifact triage without changing tag names."""
-    tag_text = f" for '{probe_tag}'" if probe_tag else ""
+    """Instruction for generic high-recall target triage."""
+    target_text = f"the target '{probe_tag}'" if probe_tag else "an allowed QC target"
     return (
-        f"- High-recall artifact triage{tag_text}: tag a detector-line artifact when any persistent straight detector-line artifact is visible, even if subtle or only present in part of the montage.\n"
-        "- Do not tag normal anatomy, breast edge, skin fold, compression boundary, text labels, or markers as detector-line artifacts.\n"
-        "- If the evidence is ambiguous but visually consistent with a detector-line artifact, prefer tagging it and explain the visible line briefly.\n"
+        f"- High-recall target triage: mark {target_text} present whenever direct visual evidence is consistent with it, even if subtle.\n"
+        "- Do not use unrelated findings, text labels, metadata, or patient characteristics as evidence.\n"
+        f"- If direct visual evidence is ambiguous but consistent with {target_text}, prefer marking it present and explain the visible evidence briefly.\n"
     )
 
 
@@ -4261,7 +4235,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--prompt-variant",
         choices=PROMPT_VARIANTS,
         default="baseline",
-        help="Prompt decision policy variant. Use recall_tilted for high-recall detector-line triage.",
+        help="Prompt decision policy variant. Use recall_tilted for high-recall target triage.",
     )
     parser.add_argument(
         "--probe-tag",

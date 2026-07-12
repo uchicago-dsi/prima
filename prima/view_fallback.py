@@ -7,7 +7,12 @@ from typing import Any
 
 import pandas as pd
 
-from prima.view_qc import VIEW_LABEL_PASS, VALID_VIEW_LABELS, normalize_view_id
+from prima.view_qc import (
+    VALID_VIEW_LABELS,
+    VIEW_LABEL_ABSENT,
+    VIEW_LABEL_PRESENT,
+    normalize_view_id,
+)
 
 REQUIRED_CANDIDATE_COLUMNS = {
     "exam_id",
@@ -58,7 +63,7 @@ def validate_candidate_table(candidates: pd.DataFrame, context: str) -> None:
 
 
 def normalize_view_labels(labels: Mapping[object, object]) -> dict[str, str]:
-    """Normalize a view_id -> binary QC label mapping."""
+    """Normalize a view_id -> single-target QC label mapping."""
     normalized: dict[str, str] = {}
     for raw_view_id, raw_label in labels.items():
         view_id = normalize_view_id(raw_view_id)
@@ -151,23 +156,27 @@ def choose_exact_slot_views(
     *,
     context: str = "view_candidates.parquet",
 ) -> pd.DataFrame:
-    """Choose the first explicitly passing candidate within every exact slot.
+    """Choose the first candidate where the target is explicitly absent.
 
-    An unreviewed original or alternate never counts as a pass. The function
-    records unresolved and exhausted slots rather than substituting another
-    laterality or projection.
+    An unreviewed or uncertain original or alternate never counts as target-absent.
+    The function records unresolved and exhausted slots rather than substituting
+    another laterality or projection.
     """
     normalized_labels = normalize_view_labels(labels)
-    passing = {
+    target_absent = {
         view_id
         for view_id, label in normalized_labels.items()
-        if label == VIEW_LABEL_PASS
+        if label == VIEW_LABEL_ABSENT
     }
-    rejected = set(normalized_labels) - passing
+    target_present = {
+        view_id
+        for view_id, label in normalized_labels.items()
+        if label == VIEW_LABEL_PRESENT
+    }
     return choose_exact_slot_views_from_outcomes(
         candidates,
-        passing_view_ids=passing,
-        rejected_view_ids=rejected,
+        target_absent_view_ids=target_absent,
+        target_present_view_ids=target_present,
         context=context,
     )
 
@@ -175,28 +184,37 @@ def choose_exact_slot_views(
 def choose_exact_slot_views_from_outcomes(
     candidates: pd.DataFrame,
     *,
-    passing_view_ids: set[object],
-    rejected_view_ids: set[object],
+    target_absent_view_ids: set[object],
+    target_present_view_ids: set[object],
+    unavailable_view_ids: set[object] | None = None,
     context: str = "view_candidates.parquet",
 ) -> pd.DataFrame:
-    """Choose exact-slot views from explicit pass and non-pass outcomes."""
+    """Choose exact-slot views from explicit target and availability outcomes."""
     validate_candidate_table(candidates, context)
-    passing = {normalize_view_id(value) for value in passing_view_ids}
-    rejected = {normalize_view_id(value) for value in rejected_view_ids}
-    if passing & rejected:
-        raise ValueError("one view cannot be both passing and rejected")
+    target_absent = {normalize_view_id(value) for value in target_absent_view_ids}
+    target_present = {normalize_view_id(value) for value in target_present_view_ids}
+    unavailable = {
+        normalize_view_id(value) for value in (unavailable_view_ids or set())
+    }
+    if (
+        target_absent & target_present
+        or target_absent & unavailable
+        or target_present & unavailable
+    ):
+        raise ValueError("one view cannot have multiple QC outcomes")
     work = candidates.copy()
     work["view_id"] = work["sha256"].map(normalize_view_id)
     candidate_ids = set(work["view_id"])
-    foreign = (passing | rejected) - candidate_ids
+    foreign = (target_absent | target_present | unavailable) - candidate_ids
     if foreign:
         raise ValueError("view outcomes contain IDs outside the candidate table")
     work["selection_rank"] = pd.to_numeric(
         work["selection_rank"], errors="raise"
     ).astype(int)
     work["qc_label"] = None
-    work.loc[work["view_id"].isin(passing), "qc_label"] = VIEW_LABEL_PASS
-    work.loc[work["view_id"].isin(rejected), "qc_label"] = "reject"
+    work.loc[work["view_id"].isin(target_absent), "qc_label"] = VIEW_LABEL_ABSENT
+    work.loc[work["view_id"].isin(target_present), "qc_label"] = VIEW_LABEL_PRESENT
+    work.loc[work["view_id"].isin(unavailable), "qc_label"] = "unavailable"
 
     result_rows: list[dict[str, Any]] = []
     for (exam_id, laterality, view), rows in work.groupby(
@@ -204,18 +222,18 @@ def choose_exact_slot_views_from_outcomes(
     ):
         rows = rows.sort_values("selection_rank", kind="stable")
         original = rows.iloc[0]
-        passing = rows[rows["qc_label"] == VIEW_LABEL_PASS]
+        absent = rows[rows["qc_label"] == VIEW_LABEL_ABSENT]
         reviewed_count = int(rows["qc_label"].notna().sum())
-        if original["qc_label"] == VIEW_LABEL_PASS:
+        if original["qc_label"] == VIEW_LABEL_ABSENT:
             chosen = original
-            status = "original_pass"
-        elif not passing.empty:
-            chosen = passing.iloc[0]
-            status = "alternate_pass"
+            status = "original_target_absent"
+        elif not absent.empty:
+            chosen = absent.iloc[0]
+            status = "alternate_target_absent"
         else:
             chosen = None
             status = (
-                "no_passing_candidate"
+                "no_target_absent_candidate"
                 if reviewed_count == len(rows)
                 else "unresolved_candidates"
             )

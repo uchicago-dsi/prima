@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Select passing mammography views within exact L/R CC/MLO slots."""
+"""Select target-absent mammography views within exact L/R CC/MLO slots."""
 
 from __future__ import annotations
 
@@ -50,6 +50,7 @@ def main() -> int:
     selections = choose_exact_slot_views(
         candidates, labels, context=str(candidates_path)
     )
+    selections["qc_target"] = state["target"]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     selections.to_parquet(output_path, index=False)
     os.chmod(output_path, 0o600)

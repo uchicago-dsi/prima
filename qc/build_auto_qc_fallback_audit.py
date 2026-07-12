@@ -38,9 +38,9 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Prior review manifest whose exact-slot groups must not be resampled",
     )
-    parser.add_argument("--alternate-slots", type=int, default=50)
-    parser.add_argument("--no-pass-slots", type=int, default=25)
-    parser.add_argument("--original-pass-views", type=int, default=50)
+    parser.add_argument("--alternate-target-absent-slots", type=int, default=50)
+    parser.add_argument("--no-target-absent-slots", type=int, default=25)
+    parser.add_argument("--original-target-absent-views", type=int, default=50)
     parser.add_argument("--seed", type=int, default=20260712)
     parser.add_argument("--max-render-pixels", type=int, default=2_000_000)
     return parser.parse_args()
@@ -138,6 +138,7 @@ def main() -> int:
         "selected_view_id",
         "selected_candidate_rank",
         "fallback_status",
+        "qc_target",
     }
     missing = sorted(required_decisions - set(decisions.columns))
     if missing:
@@ -145,6 +146,9 @@ def main() -> int:
             "fallback decisions are missing columns: " + ", ".join(missing)
         )
     run = load_view_auto_run(run_path)
+    decision_targets = set(decisions["qc_target"].astype(str))
+    if decision_targets != {run["target"]}:
+        raise RuntimeError("fallback decisions and model run use different targets")
     render_complete = json.loads(render_complete_path.read_text())
     render_failures = {
         normalize_view_id(view_id)
@@ -184,20 +188,24 @@ def main() -> int:
     ]
 
     alternate = sample_rows(
-        visually_auditable[visually_auditable["fallback_status"] == "alternate_pass"],
-        args.alternate_slots,
+        visually_auditable[
+            visually_auditable["fallback_status"] == "alternate_target_absent"
+        ],
+        args.alternate_target_absent_slots,
         args.seed,
     )
-    no_pass = sample_rows(
+    no_absent = sample_rows(
         visually_auditable[
-            visually_auditable["fallback_status"] == "no_passing_candidate"
+            visually_auditable["fallback_status"] == "no_target_absent_candidate"
         ],
-        args.no_pass_slots,
+        args.no_target_absent_slots,
         args.seed + 1,
     )
     controls = sample_rows(
-        visually_auditable[visually_auditable["fallback_status"] == "original_pass"],
-        args.original_pass_views,
+        visually_auditable[
+            visually_auditable["fallback_status"] == "original_target_absent"
+        ],
+        args.original_target_absent_views,
         args.seed + 2,
     )
 
@@ -211,9 +219,9 @@ def main() -> int:
     }
     audit_records: list[dict[str, object]] = []
     for stratum, sampled in (
-        ("alternate_pass", alternate),
-        ("no_passing_candidate", no_pass),
-        ("original_pass_control", controls),
+        ("alternate_target_absent", alternate),
+        ("no_target_absent_candidate", no_absent),
+        ("original_target_absent_control", controls),
     ):
         for decision in sampled.to_dict("records"):
             key = (
@@ -262,7 +270,7 @@ def main() -> int:
     hidden_run_path = out_dir / "hidden_model_run.json"
     manifest.to_parquet(manifest_path, index=False)
     os.chmod(manifest_path, 0o600)
-    save_view_qc_state(state_path, empty_view_qc_state())
+    save_view_qc_state(state_path, empty_view_qc_state(run["target"]))
     subset_run = {
         **run,
         "run_id": str(run["run_id"]) + "_fallback_audit",
@@ -277,10 +285,11 @@ def main() -> int:
             [
                 "# Blinded model-fallback audit",
                 "",
+                f"- target: `{run['target']}`",
                 f"- total audit views: `{len(manifest)}`",
-                f"- sampled alternate-pass slots: `{len(alternate)}`",
-                f"- sampled no-passing-candidate slots: `{len(no_pass)}`",
-                f"- sampled original-pass controls: `{len(controls)}`",
+                f"- sampled alternate-target-absent slots: `{len(alternate)}`",
+                f"- sampled no-target-absent-candidate slots: `{len(no_absent)}`",
+                f"- sampled original-target-absent controls: `{len(controls)}`",
                 f"- deterministic render-failure slots excluded: `{len(failed_group_keys)}`",
                 f"- prior exact-slot groups excluded: `{len(excluded_group_ids)}`",
                 f"- seed: `{args.seed}`",

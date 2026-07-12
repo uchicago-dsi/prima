@@ -18,7 +18,7 @@ from prima.dicom_source import (
 from prima.view_auto_qc import (
     VIEW_CONFIDENCE_LEVELS,
     load_view_auto_run,
-    view_suggestion_meets_confidence,
+    view_suggestion_is_target_present,
 )
 from prima.view_fallback import (
     choose_exact_slot_views_from_outcomes,
@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--view-auto-run", type=Path, required=True)
     parser.add_argument("--render-complete", type=Path, required=True)
     parser.add_argument(
-        "--minimum-reject-confidence",
+        "--minimum-present-confidence",
         choices=VIEW_CONFIDENCE_LEVELS,
         required=True,
     )
@@ -82,20 +82,24 @@ def main() -> int:
             f"expected={len(expected)} model={len(model_ids)} "
             f"render_failures={len(render_failures)}"
         )
-    model_rejected = {
+    model_target_present = {
         view_id
         for view_id, record in run["view_suggestions"].items()
-        if view_suggestion_meets_confidence(
-            record, minimum_confidence=args.minimum_reject_confidence
+        if view_suggestion_is_target_present(
+            record,
+            target=run["target"],
+            minimum_confidence=args.minimum_present_confidence,
         )
     }
     decisions = choose_exact_slot_views_from_outcomes(
         candidates,
-        passing_view_ids=model_ids - model_rejected,
-        rejected_view_ids=model_rejected | render_failures,
+        target_absent_view_ids=model_ids - model_target_present,
+        target_present_view_ids=model_target_present,
+        unavailable_view_ids=render_failures,
         context=str(candidates_path),
     )
-    decisions["minimum_reject_confidence"] = args.minimum_reject_confidence
+    decisions["minimum_present_confidence"] = args.minimum_present_confidence
+    decisions["qc_target"] = run["target"]
     resolved = decisions[decisions["selected_view_id"].notna()][
         [
             "exam_id",
@@ -103,7 +107,8 @@ def main() -> int:
             "view",
             "selected_view_id",
             "fallback_status",
-            "minimum_reject_confidence",
+            "minimum_present_confidence",
+            "qc_target",
         ]
     ]
     selected = resolved.merge(
@@ -130,7 +135,7 @@ def main() -> int:
     os.chmod(selected_path, 0o600)
     counts = decisions["fallback_status"].value_counts().sort_index().to_dict()
     print(f"wrote {len(decisions):,} exact-slot model decisions")
-    print(f"minimum reject confidence: {args.minimum_reject_confidence}")
+    print(f"minimum target-present confidence: {args.minimum_present_confidence}")
     print(
         "status counts: " + ", ".join(f"{key}={value}" for key, value in counts.items())
     )

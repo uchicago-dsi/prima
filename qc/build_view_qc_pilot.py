@@ -20,13 +20,10 @@ from prima.dicom_source import (
     require_valid_sources,
 )
 from prima.view_render import render_source_rows
-from prima.view_qc import (
-    VIEW_QC_TARGET,
-    empty_view_qc_state,
-    save_view_qc_state,
-)
+from prima.view_qc import empty_view_qc_state, save_view_qc_state
 
 VIEW_ORDER = [("L", "CC"), ("R", "CC"), ("L", "MLO"), ("R", "MLO")]
+VERTICAL_DETECTOR_SEAM_TARGET = "vertical detector seam"
 
 
 def parse_args() -> argparse.Namespace:
@@ -243,7 +240,7 @@ def write_provenance(
             [
                 "# View-level vertical-line QC pilot",
                 "",
-                f"- target: `{VIEW_QC_TARGET}`",
+                f"- target: `{VERTICAL_DETECTOR_SEAM_TARGET}`",
                 f"- authoritative selected views: `{views_path}`",
                 f"- cached montage export: `{export_dir}`",
                 f"- total views: `{total_views}`",
@@ -263,7 +260,7 @@ def write_provenance(
                 "Continue view-level model development only if sensitivity and",
                 "specificity are each at least 0.90 and disagreement review does not",
                 "show a repeated missed morphology. This pilot never authorizes an",
-                "automatic deployment-grade pass/reject gate.",
+                "automatic deployment-grade target-present/target-absent gate.",
                 "",
                 "Review command:",
                 "",
@@ -272,7 +269,7 @@ def write_provenance(
                 "  python qc/view_qc_gallery.py \\",
                 "  --manifest qc_redo/review_batches/vertical_line_view_review/manifest.parquet \\",
                 "  --state qc_redo/review_batches/vertical_line_view_review/view_qc_state.json \\",
-                "  --port 8765",
+                "  --port 8767",
                 "```",
                 "",
             ]
@@ -336,7 +333,7 @@ def main() -> int:
     manifest.to_parquet(manifest_path, index=False)
     os.chmod(scores_path, 0o600)
     os.chmod(manifest_path, 0o600)
-    save_view_qc_state(state_path, empty_view_qc_state())
+    save_view_qc_state(state_path, empty_view_qc_state(VERTICAL_DETECTOR_SEAM_TARGET))
     write_provenance(
         out_dir,
         views_path=views_path,

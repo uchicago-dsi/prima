@@ -79,21 +79,25 @@ def test_fallback_audit_requires_requested_sample_size() -> None:
 def test_fallback_audit_scores_ranked_replacement_sequence() -> None:
     rows = pd.DataFrame(
         {
-            "stratum": ["alternate_pass", "alternate_pass", "alternate_pass"],
+            "stratum": [
+                "alternate_target_absent",
+                "alternate_target_absent",
+                "alternate_target_absent",
+            ],
             "selection_rank": [1, 2, 3],
             "candidate_count": [3, 3, 3],
-            "human_positive": [True, True, False],
-            "model_positive": [True, True, False],
+            "human_target_present": [True, True, False],
+            "model_target_present": [True, True, False],
         }
     )
     result = evaluate_group(rows)
     assert result["decision_safe"]
     assert result["decision_exact"]
-    rows.loc[1, "human_positive"] = False
+    rows.loc[1, "human_target_present"] = False
     result = evaluate_group(rows)
     assert result["decision_safe"]
     assert not result["decision_exact"]
-    rows.loc[2, "human_positive"] = True
+    rows.loc[2, "human_target_present"] = True
     result = evaluate_group(rows)
     assert not result["decision_safe"]
     assert not result["decision_exact"]
@@ -115,6 +119,7 @@ def test_merge_view_runs_requires_exact_disjoint_coverage(tmp_path: Path) -> Non
     manifest_path = tmp_path / "manifest.parquet"
     manifest.to_parquet(manifest_path, index=False)
     base = new_view_auto_run(
+        target="test artifact",
         model="model@revision",
         prompt_variant="confidence_specificity",
         inference_settings={"frozen": True},

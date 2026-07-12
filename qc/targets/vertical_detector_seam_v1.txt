@@ -1,0 +1,15 @@
+Target view only: decide whether the artifact "vertical detector seam" is visually present in this mammogram.
+
+Answer YES for either of these detector-fixed patterns:
+- a straight, narrow gray vertical seam or stripe; or
+- a straight vertical detector-panel boundary that divides the image into different intensity regions and runs through nearly the full image height. This boundary may be broad or high-contrast and may have repeated bright curved bands beside it; that still counts as the target artifact.
+
+Answer NO for a surgical scar/incision marker or wire within the breast, localization hardware, clips, vessels, skin folds, breast or pectoral edges, text labels, image-frame/crop borders, or normal film edges. Curved or tapered lines within anatomy are not detector seams.
+
+Use high confidence only when one of the two positive detector-fixed patterns is unmistakable; use medium or low for a borderline appearance.
+
+Answer in exactly four lines and nothing else:
+EVIDENCE: <one short visual phrase, or none>
+ANSWER: YES or ANSWER: NO
+CONFIDENCE: high, medium, or low
+REVIEW: YES or REVIEW: NO

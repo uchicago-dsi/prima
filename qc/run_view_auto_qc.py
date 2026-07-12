@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Run frozen Qwen vertical-line inference over individual mammography views."""
+"""Run frozen single-target inference over individual mammography views."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 from importlib import metadata
 from pathlib import Path
@@ -27,8 +28,8 @@ from prima.view_auto_qc import (
     save_view_auto_run,
 )
 from prima.view_qc import (
-    VIEW_QC_TARGET,
     normalize_view_id,
+    normalize_view_qc_target,
     validate_view_manifest_columns,
 )
 from prima.vllm_server import (
@@ -45,6 +46,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--run-file", type=Path, required=True)
+    parser.add_argument("--target", required=True)
+    parser.add_argument("--target-prompt-file", type=Path, required=True)
     parser.add_argument("--model-key", default="qwen35_27b_fp8")
     parser.add_argument(
         "--model-registry", type=Path, default=DEFAULT_VLLM_MODEL_REGISTRY
@@ -64,6 +67,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--force-rescore", action="store_true")
     parser.add_argument("--expected-gpus", type=int, default=None)
     return parser
+
+
+def load_target_prompt(path: Path, *, target: str) -> str:
+    """Load one explicit target prompt and validate its output contract."""
+    target = normalize_view_qc_target(target)
+    path = path.resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"target prompt file not found: {path}")
+    prompt = path.read_text().strip()
+    if not prompt:
+        raise ValueError("target prompt file is empty")
+    if len(prompt) > 20_000:
+        raise ValueError("target prompt file exceeds 20,000 characters")
+    required_lines = ("EVIDENCE:", "ANSWER:", "CONFIDENCE:", "REVIEW:")
+    missing = [line for line in required_lines if line not in prompt]
+    if missing:
+        raise ValueError(
+            "target prompt is missing output fields: " + ", ".join(missing)
+        )
+    normalized_prompt = " ".join(prompt.split()).casefold()
+    if target.casefold() not in normalized_prompt:
+        raise ValueError("target prompt does not name --target exactly")
+    return prompt
 
 
 def load_view_records(manifest_path: Path) -> list[dict[str, str]]:
@@ -99,7 +125,7 @@ def load_view_records(manifest_path: Path) -> list[dict[str, str]]:
 
 
 def build_inference_settings(
-    args: argparse.Namespace, model_spec: Any
+    args: argparse.Namespace, model_spec: Any, target_prompt: str
 ) -> dict[str, Any]:
     return {
         "model_key": model_spec.key,
@@ -114,6 +140,8 @@ def build_inference_settings(
         "max_new_tokens": int(args.max_new_tokens),
         "temperature": 0.0,
         "thinking_disabled": True,
+        "target_prompt_sha256": hashlib.sha256(target_prompt.encode()).hexdigest(),
+        "target_prompt_text": target_prompt,
     }
 
 
@@ -122,6 +150,8 @@ def run_from_args(args: argparse.Namespace) -> int:
     validate_vllm_runtime()
     manifest_path = args.manifest.resolve()
     run_file = args.run_file.resolve()
+    target = normalize_view_qc_target(args.target)
+    target_prompt = load_target_prompt(args.target_prompt_file, target=target)
     if not manifest_path.is_file():
         raise FileNotFoundError(f"view manifest not found: {manifest_path}")
     if not 0 <= args.vllm_port <= 65535:
@@ -142,9 +172,10 @@ def run_from_args(args: argparse.Namespace) -> int:
     records = load_view_records(manifest_path)
     model_label = f"{model_spec.served_model_name}@{model_spec.revision[:12]}"
     current = new_view_auto_run(
+        target=target,
         model=model_label,
         prompt_variant=args.prompt_variant,
-        inference_settings=build_inference_settings(args, model_spec),
+        inference_settings=build_inference_settings(args, model_spec, target_prompt),
     )
     existing = load_view_auto_run(run_file)
     if existing and not args.force_rescore:
@@ -171,8 +202,8 @@ def run_from_args(args: argparse.Namespace) -> int:
         few_shot_exemplar_pool=[],
         prompt_mode="marker_classifier",
         prompt_variant=args.prompt_variant,
-        probe_tag=VIEW_QC_TARGET,
-        target_prompt_override=None,
+        probe_tag=target,
+        target_prompt_override=target_prompt,
         text_only_prompt=None,
         disable_thinking=True,
         debug_dump_dir=debug_dir,
@@ -191,7 +222,7 @@ def run_from_args(args: argparse.Namespace) -> int:
             result = annotator.annotate(
                 exam_id=view_id,
                 image_path=Path(record["image_path"]),
-                tag_catalog=[VIEW_QC_TARGET],
+                tag_catalog=[target],
             )
             view_suggestions[view_id] = {
                 "image_path": record["saved_image_path"],

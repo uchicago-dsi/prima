@@ -13,11 +13,13 @@ from pathlib import Path
 import submitit
 
 from auto_annotate_qc import DEFAULT_MODELS_DIR, DEFAULT_VLLM_MODEL_REGISTRY
+from prima.view_qc import normalize_view_qc_target
 from prima.vllm_server import (
     resolve_model_path,
     select_model_spec,
     validate_vllm_runtime,
 )
+from qc.run_view_auto_qc import load_target_prompt
 from submit_auto_qc import slurm_gres_spec
 from submit_view_auto_qc import ViewAutoQCJob
 
@@ -62,6 +64,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout-min", type=int, default=360)
     parser.add_argument("--dependency-job-id", default="")
     parser.add_argument("--model-key", default="qwen35_27b_fp8")
+    parser.add_argument("--target", required=True)
+    parser.add_argument("--target-prompt-file", type=Path, required=True)
     parser.add_argument(
         "--model-registry", type=Path, default=DEFAULT_VLLM_MODEL_REGISTRY
     )
@@ -127,6 +131,9 @@ def main() -> int:
 
     model_registry = args.model_registry.resolve()
     models_dir = args.models_dir.resolve()
+    target = normalize_view_qc_target(args.target)
+    target_prompt_file = args.target_prompt_file.resolve()
+    load_target_prompt(target_prompt_file, target=target)
     model_spec = select_model_spec(model_registry, args.model_key)
     if model_spec.tensor_parallel_size != args.ngpus:
         raise ValueError(
@@ -163,6 +170,8 @@ def main() -> int:
         job_args = argparse.Namespace(
             manifest=manifest,
             run_file=run_file,
+            target=target,
+            target_prompt_file=target_prompt_file,
             model_key=args.model_key,
             model_registry=model_registry,
             models_dir=models_dir,
@@ -186,6 +195,8 @@ def main() -> int:
         "qos": args.qos,
         "gpuspec": args.gpuspec,
         "model_key": args.model_key,
+        "target": target,
+        "target_prompt_file": str(target_prompt_file),
         "jobs": [
             {
                 "shard_index": index,
