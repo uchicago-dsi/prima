@@ -124,7 +124,9 @@ def test_generic_review_initializer_binds_target_and_refuses_overwrite(
 def test_gallery_has_explicit_completion_state() -> None:
     assert "Review complete" in HTML
     assert "| COMPLETE" in HTML
-    assert "End reached" in HTML
+    assert 'id="end-marker"' in HTML
+    assert "✓ End of batch" in HTML
+    assert "End reached" not in HTML
     assert 'id="review-unsure"' in HTML
     assert "Review unsure (" in HTML
     assert "function startUnsureReview()" in HTML

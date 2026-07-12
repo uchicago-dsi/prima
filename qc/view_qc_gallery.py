@@ -111,6 +111,7 @@ HTML = r"""<!doctype html>
     button { border: 1px solid #59616a; border-radius: 7px; padding: 10px 14px; color: white; background: #282d33; font-size: 16px; cursor: pointer; }
     button:hover { background: #343b43; }
     button.active { box-shadow: 0 0 0 3px #f4c542 inset; }
+    #end-marker { border-left: 4px solid #66c58c; padding: 8px 12px; color: #b9e9ca; background: #193226; font-size: 16px; font-weight: 750; }
     #save-status { min-width: 145px; color: #9fd8b8; font-weight: 650; }
     #save-status.error { color: #ff9b9b; }
     .absent { background: #315d7d; }
@@ -130,6 +131,7 @@ HTML = r"""<!doctype html>
     <button id="uncertain">Unsure [u]</button>
     <button id="clear">Clear [x]</button>
     <button id="next">Next →</button>
+    <span id="end-marker" role="status" hidden>✓ End of batch</span>
     <button id="pending">Next unreviewed</button>
     <button id="review-unsure">Review unsure (0)</button>
     <span id="save-status" role="status" aria-live="polite"></span>
@@ -201,10 +203,12 @@ function render() {
   const atEnd = reviewingUnsure
     ? unsureReviewPosition === unsureReviewQueue.length - 1
     : index === items.length - 1;
-  document.getElementById('next').disabled = atEnd;
-  document.getElementById('next').textContent = atEnd
-    ? (reviewingUnsure ? 'Unsure review end' : 'End reached')
-    : (reviewingUnsure ? 'Next unsure →' : 'Next →');
+  const next = document.getElementById('next');
+  const endMarker = document.getElementById('end-marker');
+  next.hidden = atEnd;
+  next.textContent = reviewingUnsure ? 'Next unsure →' : 'Next →';
+  endMarker.hidden = !atEnd;
+  endMarker.textContent = reviewingUnsure ? '✓ End of unsure review' : '✓ End of batch';
   const reviewUnsure = document.getElementById('review-unsure');
   reviewUnsure.disabled = !reviewingUnsure && summary.uncertain === 0;
   reviewUnsure.classList.toggle('active', reviewingUnsure);
