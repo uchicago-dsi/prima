@@ -14,8 +14,9 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import pydicom
 from scipy import ndimage
+
+from prima.dicom_source import read_dicom_source, require_source_columns
 
 
 def detect_vertical_line_simple(pixel_array: np.ndarray, threshold: float = 4.0):
@@ -165,6 +166,7 @@ def main():
 
     print(f"Loading exam {args.exam_id}...")
     views = pd.read_parquet(args.raw / "sot" / "views.parquet")
+    require_source_columns(views.columns, "views.parquet")
     exam_views = views[views["exam_id"] == args.exam_id]
 
     if len(exam_views) == 0:
@@ -176,8 +178,7 @@ def main():
 
     for _, row in exam_views.iterrows():
         try:
-            path = args.raw / row["dicom_path"]
-            ds = pydicom.dcmread(str(path))
+            ds = read_dicom_source(row, args.raw)
             pixels = ds.pixel_array.astype(np.float32)
 
             lines = detect_vertical_line_simple(pixels, threshold=args.threshold)
@@ -197,7 +198,7 @@ def main():
                     }
                 )
         except Exception as e:
-            print(f"Error loading {row['dicom_path']}: {e}")
+            raise RuntimeError("failed to load a source-linked DICOM") from e
 
     if len(view_results) == 0:
         print("No artifacts detected in this exam")

@@ -95,6 +95,16 @@ from numcodecs import Blosc
 from pydicom import config
 from pydicom.dataset import FileDataset
 from pydicom.pixel_data_handlers import gdcm_handler, numpy_handler, pillow_handler
+from prima.dicom_source import (
+    ARCHIVE_SUFFIX,
+    DicomSource,
+    SOURCE_ARCHIVE_COLUMN,
+    SOURCE_COLUMNS,
+    SOURCE_MEMBER_COLUMN,
+    read_dicom_source,
+    require_source_columns,
+    require_valid_sources,
+)
 from prima.view_selection import (
     estimate_magnification_factor,
     estimate_pixel_spacing_mm,
@@ -139,6 +149,10 @@ logger = logging.getLogger(__name__)
 
 # global flag for graceful shutdown
 shutdown_requested = False
+
+
+def path_log_id(path: Path) -> str:
+    return hashlib.sha256(str(path).encode()).hexdigest()[:12]
 
 
 def signal_handler(signum, frame):
@@ -209,7 +223,8 @@ VIEWS_COLS = [
     "sop_instance_uid",
     "laterality",
     "view",
-    "dicom_path",
+    SOURCE_ARCHIVE_COLUMN,
+    SOURCE_MEMBER_COLUMN,
     "rows",
     "cols",
     "photometric_interpretation",
@@ -282,6 +297,10 @@ class ExamRecord:
     @property
     def record_id(self) -> str:
         return f"{self.patient_id}/{self.exam_id}"
+
+    @property
+    def log_id(self) -> str:
+        return hashlib.sha256(self.record_id.encode()).hexdigest()[:12]
 
 
 # ------------- DICOM helpers -------------
@@ -540,9 +559,7 @@ def _save_debug_figure(
 
         # collect tag info
         tag_lines = [
-            f"File: {path.name}",
-            f"Exam: {path.parent.name}",
-            f"Patient: {path.parent.parent.name}",
+            f"Source: {path_log_id(path)}",
             f"Status: {status}",
         ]
 
@@ -563,23 +580,8 @@ def _save_debug_figure(
                 f"  (0x0018,0x5101) ViewPosition: {get_tag(ds, (0x0018, 0x5101), 'MISSING')}",
                 f"  (0x0008,0x0068) PresentationIntentType: {get_tag(ds, (0x0008, 0x0068), 'MISSING')}",
                 f"  (0x0008,0x0069) Presentation Intent Type: {get_tag(ds, (0x0008, 0x0069), 'MISSING')}",
-                "",
-                "ALL TAGS IN THIS FILE:",
-                "-" * 60,
             ]
         )
-
-        for elem in ds:
-            if elem.VR == "SQ":
-                tag_lines.append(f"{elem.tag} {elem.name}: <sequence>")
-            else:
-                try:
-                    value_str = str(elem.value)
-                    if len(value_str) > 80:
-                        value_str = value_str[:80] + "..."
-                    tag_lines.append(f"{elem.tag} {elem.name}: {value_str}")
-                except Exception:
-                    tag_lines.append(f"{elem.tag} {elem.name}: <cannot display>")
 
         # render text
         text_content = "\n".join(tag_lines)
@@ -640,20 +642,20 @@ def _save_debug_figure(
         plt.savefig(out_path, dpi=75, bbox_inches="tight", optimize=True)
         plt.close(fig)
 
-        if status == "SUCCESS":
-            logger.debug(
-                f"    Saved debug figure: success/{patient_id}/{accession_number}/{out_name}"
-            )
-        else:
-            logger.debug(
-                f"    Saved debug figure: failed/{patient_id}/{clean_reason}/{exam_id}/{out_name}"
-            )
+        logger.debug(
+            "saved debug figure for source %s with status %s",
+            path_log_id(path),
+            status,
+        )
     except Exception as e:
-        logger.warning(f"    Failed to save debug figure for {path.name}: {e}")
+        logger.warning(
+            f"failed to save debug figure for source {path_log_id(path)}: {e}"
+        )
 
 
 def _process_exam_dir(
     exam_path: Path,
+    source_archive_relpath: Path,
     debug_dir: Optional[Path] = None,
     zarr_root: Optional[Path] = None,
 ) -> Tuple[List[Dict], List[Dict]]:
@@ -662,13 +664,15 @@ def _process_exam_dir(
     walks subdirectories under exam_path to find all .dcm files
     """
     try:
-        log_memory_usage(f"start_exam_{exam_path.name}")
+        log_memory_usage(f"start_exam_{path_log_id(exam_path)}")
         if debug_dir:
-            logger.info(f"\n=== Processing exam: {exam_path} ===")
+            logger.info(f"\n=== Processing exam source: {path_log_id(exam_path)} ===")
 
         # check if exam path still exists (race condition protection)
         if not exam_path.exists():
-            logger.warning(f"Exam path {exam_path} no longer exists, skipping")
+            logger.warning(
+                f"Exam source {path_log_id(exam_path)} no longer exists, skipping"
+            )
             return {
                 "rows": [],
                 "tag_rows": [],
@@ -682,7 +686,7 @@ def _process_exam_dir(
                 "has_four_views": False,
             }
     except Exception as e:
-        logger.error(f"Error in exam setup for {exam_path}: {e}")
+        logger.error(f"Error in exam setup for {path_log_id(exam_path)}: {e}")
         return {
             "rows": [],
             "tag_rows": [],
@@ -803,7 +807,9 @@ def _process_exam_dir(
                     "sop_instance_uid": sop_uid,
                     "laterality": lat,
                     "view": vp,
-                    "dicom_path": str(p.resolve()),
+                    SOURCE_ARCHIVE_COLUMN: source_archive_relpath.as_posix(),
+                    SOURCE_MEMBER_COLUMN: p.relative_to(exam_path.parent).as_posix(),
+                    "_materialized_dicom_path": str(p.resolve()),
                     "rows": int(ds.Rows),
                     "cols": int(ds.Columns),
                     "photometric_interpretation": str(
@@ -871,27 +877,13 @@ def _process_exam_dir(
 
         # if we got NO valid rows, log the issue but don't raise an error
         if not rows and debug_dir:
-            logger.warning(f"\n=== NO VALID DICOMs found in exam {exam_path} ===")
-            logger.warning("Dumping first failed DICOM for debugging:")
+            logger.warning(
+                f"\n=== NO VALID DICOMs found in source {path_log_id(exam_path)} ==="
+            )
             if failed_files:
                 p, reason, ds = failed_files[0]
-                logger.warning(f"File: {p}")
+                logger.warning(f"Source: {path_log_id(p)}")
                 logger.warning(f"Reason: {reason}")
-                if ds is not None:
-                    logger.warning("\nAll DICOM tags:")
-                    for elem in ds:
-                        if elem.VR == "SQ":
-                            logger.warning(f"  {elem.tag} {elem.name}: <sequence>")
-                            continue
-                        try:
-                            value_str = str(elem.value)
-                            if len(value_str) > 100:
-                                value_str = value_str[:100] + "..."
-                            logger.warning(f"  {elem.tag} {elem.name}: {value_str}")
-                        except Exception:
-                            logger.warning(
-                                f"  {elem.tag} {elem.name}: <cannot display>"
-                            )
 
             # return empty rows and exam status
             return {
@@ -948,10 +940,16 @@ def _process_exam_dir(
                     "error_message": str(e),
                 }
 
+        persisted_rows = []
+        for row in selected_rows:
+            persisted_row = dict(row)
+            persisted_row.pop("_materialized_dicom_path")
+            persisted_rows.append(persisted_row)
+
         # return successful exam data
-        log_memory_usage(f"end_exam_{exam_path.name}")
+        log_memory_usage(f"end_exam_{path_log_id(exam_path)}")
         return {
-            "rows": selected_rows,
+            "rows": persisted_rows,
             "tag_rows": selected_tag_rows,
             "exam_status": "success",
             "total_files": len(dcm_files),
@@ -965,8 +963,10 @@ def _process_exam_dir(
             "zarr_error": zarr_error,
         }
     except Exception as e:
-        logger.error(f"Unexpected error processing exam {exam_path}: {e}")
-        log_memory_usage(f"error_exam_{exam_path.name}")
+        logger.error(
+            f"Unexpected error processing source {path_log_id(exam_path)}: {e}"
+        )
+        log_memory_usage(f"error_exam_{path_log_id(exam_path)}")
         return {
             "rows": [],
             "tag_rows": [],
@@ -1296,9 +1296,6 @@ def build_genotyped_exam_dir_filter(
     return build_unique_exam_dir_filter(fingerprint_path, genotyped_ids)
 
 
-ARCHIVE_SUFFIX = ".tar.zst"
-
-
 def archive_path_for_exam(raw_exam_dir: Path) -> Path:
     return raw_exam_dir.with_name(f"{raw_exam_dir.name}{ARCHIVE_SUFFIX}")
 
@@ -1312,10 +1309,9 @@ def _run_tar_command(args: List[str], *, cwd: Optional[Path] = None) -> None:
         check=False,
     )
     if result.returncode != 0:
+        operation_id = hashlib.sha256("\0".join(args).encode()).hexdigest()[:12]
         raise RuntimeError(
-            f"tar command failed ({result.returncode}): {' '.join(args)}\n"
-            f"stdout:\n{result.stdout}\n"
-            f"stderr:\n{result.stderr}"
+            f"tar operation {operation_id} failed with exit code {result.returncode}"
         )
 
 
@@ -1328,10 +1324,9 @@ def _run_shell_pipeline(command: str, *, cwd: Optional[Path] = None) -> None:
         check=False,
     )
     if result.returncode != 0:
+        operation_id = hashlib.sha256(command.encode()).hexdigest()[:12]
         raise RuntimeError(
-            f"shell pipeline failed ({result.returncode}): {command}\n"
-            f"stdout:\n{result.stdout}\n"
-            f"stderr:\n{result.stderr}"
+            f"shell operation {operation_id} failed with exit code {result.returncode}"
         )
 
 
@@ -1425,7 +1420,7 @@ def materialize_exam(
         return staging_exam_dir, True
 
     staging_exam_dir.parent.mkdir(parents=True, exist_ok=True)
-    logger.info(f"extracting archived exam {record.record_id} to staging")
+    logger.info(f"extracting archived exam source {record.log_id} to staging")
     _run_shell_pipeline(
         f"zstd -dc {shlex.quote(str(record.archive_path))} | tar -xf - -C {shlex.quote(str(staging_exam_dir.parent))}"
     )
@@ -1443,7 +1438,7 @@ def archive_exam_dir(raw_exam_dir: Path, archive_path: Path) -> None:
     tmp_archive = archive_path.with_suffix(f"{archive_path.suffix}.tmp")
     if tmp_archive.exists():
         tmp_archive.unlink()
-    logger.info(f"archiving raw exam {raw_exam_dir} -> {archive_path}")
+    logger.info(f"archiving raw exam source {path_log_id(raw_exam_dir)}")
     _run_shell_pipeline(
         f"tar -cf - {shlex.quote(raw_exam_dir.name)} | zstd -T0 -o {shlex.quote(str(tmp_archive))}",
         cwd=raw_exam_dir.parent,
@@ -1689,6 +1684,7 @@ def discover_dicoms(
                 executor.submit(
                     _process_exam_dir,
                     materialize_exam(record, archive_staging_dir)[0],
+                    record.archive_path.relative_to(raw_dir),
                     debug_dir,
                     zarr_root,
                 ): record
@@ -1710,7 +1706,7 @@ def discover_dicoms(
 
                     # handle case where result might be None
                     if result is None:
-                        logger.error(f"got None result for {record.record_id}")
+                        logger.error(f"got None result for source {record.log_id}")
                         exam_stats["failed_exams"] += 1
                         continue
 
@@ -1742,14 +1738,14 @@ def discover_dicoms(
                     chunk_max_mem = max(chunk_max_mem, current_mem)
 
                 except TimeoutError:
-                    logger.error(f"timeout processing {record.record_id}")
+                    logger.error(f"timeout processing source {record.log_id}")
                     exam_stats["failed_exams"] += 1
                     processed_exams.add(
                         record.record_id
                     )  # mark as processed to avoid retry
                     processed_records_this_run.append(record)
                 except Exception as e:
-                    logger.error(f"failed to process {record.record_id}: {e}")
+                    logger.error(f"failed to process source {record.log_id}: {e}")
                     exam_stats["failed_exams"] += 1
                     processed_exams.add(
                         record.record_id
@@ -1870,13 +1866,13 @@ def select_full_quad(df_views: pd.DataFrame) -> pd.DataFrame:
             for_presentation=bool(for_presentation),
             estimated_magnification_factor=mag,
             pixel_spacing_mm=pixel_spacing_mm,
-            dicom_path=dicom_path,
+            source_key=source_member,
         )
-        for for_presentation, mag, pixel_spacing_mm, dicom_path in zip(
+        for for_presentation, mag, pixel_spacing_mm, source_member in zip(
             df["for_presentation"],
             df["estimated_magnification_factor"],
             df["pixel_spacing_mm"],
-            df["dicom_path"],
+            df[SOURCE_MEMBER_COLUMN],
         )
     ]
     view_counts = df.groupby(["exam_id", "laterality", "view"]).size()
@@ -1959,7 +1955,7 @@ def write_exam_zarr(
 
     for _, r in exam_rows.iterrows():
         key = VIEWS[(r["laterality"], r["view"])]
-        ds = read_dicom(Path(r["dicom_path"]))
+        ds = read_dicom(Path(r["_materialized_dicom_path"]))
         arr16 = to_uint16_minmax(ds)
         arr16 = resize_uint16(arr16, IMG_W, IMG_H)
         # write chunks ~half-size tiles for balance
@@ -2032,6 +2028,11 @@ def preprocess(cfg: PreprocessConfig) -> None:
     if cfg.incremental and (sot / "views.parquet").exists():
         logger.info("incremental mode: loading existing views...")
         existing_views = pd.read_parquet(sot / "views.parquet")
+        require_source_columns(existing_views.columns, str(sot / "views.parquet"))
+        require_valid_sources(
+            existing_views[list(SOURCE_COLUMNS)].to_dict("records"),
+            str(sot / "views.parquet"),
+        )
         existing_exam_ids = set(existing_views["exam_id"].unique())
         logger.info(f"found {len(existing_exam_ids)} existing exams")
 
@@ -2097,14 +2098,14 @@ def preprocess(cfg: PreprocessConfig) -> None:
         sel_df.groupby(["patient_id", "exam_id"], as_index=False)
         .agg(
             {
-                "dicom_path": "count",
+                "sop_instance_uid": "count",
                 "device_manufacturer": "first",
                 "device_model": "first",
                 "study_date": "first",
                 "accession_number": "first",
             }
         )
-        .rename(columns={"dicom_path": "n_views_present"})
+        .rename(columns={"sop_instance_uid": "n_views_present"})
     )
     exams["has_full_quad"] = exams["n_views_present"] == 4
     exams["patient_hash"] = exams["patient_id"].apply(
@@ -2122,6 +2123,11 @@ def preprocess(cfg: PreprocessConfig) -> None:
         # append to existing tables
         logger.info("appending to existing SoT tables...")
         existing_views = pd.read_parquet(sot / "views.parquet")
+        require_source_columns(existing_views.columns, str(sot / "views.parquet"))
+        require_valid_sources(
+            existing_views[list(SOURCE_COLUMNS)].to_dict("records"),
+            str(sot / "views.parquet"),
+        )
         existing_exams = pd.read_parquet(sot / "exams.parquet")
 
         # combine new and existing data
@@ -2312,12 +2318,6 @@ def _diagnose_join(man: pd.DataFrame, lab: pd.DataFrame) -> None:
         lab["patient_id"].nunique(),
         lab["exam_id"].nunique(),
     )
-
-    # sample values for visual inspection
-    logger.info("manifest sample patient_ids: %s", list(man["patient_id"].head(5)))
-    logger.info("labels sample patient_ids: %s", list(lab["patient_id"].head(5)))
-    logger.info("manifest sample exam_ids: %s", list(man["exam_id"].head(5)))
-    logger.info("labels sample exam_ids: %s", list(lab["exam_id"].head(5)))
 
     # check for whitespace issues
     man_pid_ws = man["patient_id"].astype(str).str.strip() != man["patient_id"].astype(
@@ -2892,13 +2892,7 @@ def _save_four_view_figure(
 
         if first_view_ds:
             metadata_lines = [
-                f"Patient: {patient_id}",
-                f"Exam: {exam_id}",
-                f"Accession: {accession_number}",
-                "",
                 "Key DICOM Tags:",
-                f"  Study Date: {get_tag(first_view_ds, (0x0008, 0x0020), 'N/A')}",
-                f"  Study UID: {get_tag(first_view_ds, (0x0020, 0x000D), 'N/A')}",
                 f"  Manufacturer: {get_tag(first_view_ds, (0x0008, 0x0070), 'N/A')}",
                 f"  Modality: {get_tag(first_view_ds, (0x0008, 0x0060), 'N/A')}",
                 "",
@@ -2937,12 +2931,13 @@ def _save_four_view_figure(
         plt.savefig(out_path, dpi=75, bbox_inches="tight")
         plt.close(fig)
 
-        logger.debug(f"    Saved combined 4-view figure: {out_path.name}")
+        logger.debug(f"saved combined 4-view figure for source {path_log_id(out_path)}")
         return True
 
     except Exception as e:
         logger.warning(
-            f"    Failed to save combined 4-view figure for exam {exam_id}: {e}"
+            f"failed to save combined 4-view figure for source "
+            f"{hashlib.sha256(str(exam_id).encode()).hexdigest()[:12]}: {e}"
         )
         return False
 
@@ -2961,7 +2956,7 @@ def generate_debug_visualizations(
     """generate debug visualizations from already-processed DICOMs.
 
     Args:
-        views_parquet: path to views.parquet with dicom_path column
+        views_parquet: path to views.parquet with durable DICOM source columns
         raw_dir: root directory where DICOMs are stored
         debug_dir: output directory for debug figures
         max_exams: limit number of exams to visualize
@@ -2973,6 +2968,10 @@ def generate_debug_visualizations(
     """
     logger.info(f"loading views from {views_parquet}")
     views_df = pd.read_parquet(views_parquet)
+    require_source_columns(views_df.columns, str(views_parquet))
+    require_valid_sources(
+        views_df[list(SOURCE_COLUMNS)].to_dict("records"), str(views_parquet)
+    )
     logger.info(
         f"loaded {len(views_df)} views from {views_df['exam_id'].nunique()} exams"
     )
@@ -2981,12 +2980,13 @@ def generate_debug_visualizations(
     if patient_id:
         views_df = views_df[views_df["patient_id"] == patient_id]
         logger.info(
-            f"filtered to patient {patient_id}: {len(views_df)} views from {views_df['exam_id'].nunique()} exams"
+            f"applied patient filter: {len(views_df)} views from "
+            f"{views_df['exam_id'].nunique()} exams"
         )
 
     if exam_id:
         views_df = views_df[views_df["exam_id"] == exam_id]
-        logger.info(f"filtered to exam {exam_id}: {len(views_df)} views")
+        logger.info(f"applied exam filter: {len(views_df)} views")
 
     if len(views_df) == 0:
         logger.error("no views to visualize after filtering")
@@ -3027,25 +3027,16 @@ def generate_debug_visualizations(
         views_df.iterrows(), total=len(views_df), desc="loading DICOMs"
     ):
         try:
-            # construct full path to DICOM
-            dicom_path = Path(row["dicom_path"])
-            if not dicom_path.is_absolute():
-                dicom_path = raw_dir / dicom_path
-
-            if not dicom_path.exists():
-                logger.warning(f"DICOM not found: {dicom_path}")
-                error_count += 1
-                continue
-
-            # load DICOM
-            ds = pydicom.dcmread(str(dicom_path))
+            source = DicomSource.from_row(row)
+            source_label = Path(source.archive_member.name)
+            ds = read_dicom_source(row, raw_dir)
 
             # generate individual debug figure only if requested
             if per_view:
                 view_label = f"{row['laterality']} {row['view']}"
                 _save_debug_figure(
                     ds,
-                    dicom_path,
+                    source_label,
                     "SUCCESS",
                     view_label,
                     debug_dir,
@@ -3065,10 +3056,11 @@ def generate_debug_visualizations(
                 }
 
             view_key = f"{row['laterality']}_{row['view']}"
-            exam_view_cache[exam_key]["views"][view_key] = (ds, dicom_path)
+            exam_view_cache[exam_key]["views"][view_key] = (ds, source_label)
 
         except Exception as e:
-            logger.error(f"error processing {row.get('dicom_path', 'unknown')}: {e}")
+            source_id = DicomSource.from_row(row).source_id
+            logger.error(f"error processing DICOM source {source_id}: {e}")
             error_count += 1
 
     # generate combined 4-view figures for each exam

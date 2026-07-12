@@ -325,7 +325,9 @@ python pipelines/preprocess.py preprocess \
 ```
 
 Outputs are written to `{raw}/sot/` and `{raw}/out/` by default:
-- `sot/views.parquet` — individual DICOM views with metadata
+- `sot/views.parquet` — individual DICOM views with metadata and durable
+  `source_archive_relpath` + `source_archive_member` lineage; SOP Instance UID
+  and SHA-256 verify the exact original member
 - `sot/exams.parquet` — exam-level aggregated metadata
 - `sot/dicom_tags.parquet` — all DICOM tags (wide format)
 - `out/manifest.parquet` — Zarr URIs for each view
@@ -342,6 +344,19 @@ python pipelines/run_preprocess_sharded.py \
   --workers 32 \
   --genotyped-only \
   --no-wait
+```
+
+Add `--summary` for a metadata-only SoT rebuild. Transient extracted `.dcm`
+paths are never part of the persisted schema; consumers resolve the structured
+archive/member locator through `prima.dicom_source`.
+
+Audit the persisted mapping, including a deterministic SOP UID and SHA-256
+sample, with:
+
+```bash
+python ops/audit_dicom_lineage.py \
+  --raw /gpfs/data/huo-lab/Image/ChiMEC/MG \
+  --verify-count 100
 ```
 
 Or for all unique on-disk exams instead of only genotyped patients:

@@ -63,6 +63,24 @@ State is computed on the fly from deterministic filesystem layout:
 - else archive exists:
   - `MG/<patient_id>/<exam_id>.tar.zst`
 
+### Durable Per-DICOM Lineage
+
+The physical `.dcm` path used while processing is temporary: raw exam
+directories are archived after success, and archived inputs are extracted into
+staging. It must never be persisted in `views.parquet`.
+
+Each view instead stores:
+
+- `source_archive_relpath`: archive path relative to the raw root
+- `source_archive_member`: exact DICOM member within that archive
+- `sop_instance_uid`: semantic identity check
+- `sha256`: byte-level identity check
+
+The same locator also resolves an exam that is still unpacked. A centralized
+reader validates the schema, chooses the unpacked member or archive, and fails
+if the member or SOP identity disagrees. Mixed path-only and archive/member
+schemas are unsupported; rebuild the SoT and downstream QC sidecars together.
+
 No persistent manifest is required for state.
 
 ### Why No Persistent Manifest

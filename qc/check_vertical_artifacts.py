@@ -9,8 +9,9 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import pydicom
 from tqdm import tqdm
+
+from prima.dicom_source import DicomSource, read_dicom_source, require_source_columns
 
 
 def has_vertical_line_artifact(pixel_array: np.ndarray, threshold: float = 4.0):
@@ -64,6 +65,7 @@ def main():
 
     print("Loading views...")
     views = pd.read_parquet(args.raw / "sot" / "views.parquet")
+    require_source_columns(views.columns, "views.parquet")
     views = views[views["for_presentation"]]
 
     # sample exams
@@ -85,8 +87,7 @@ def main():
 
         for _, row in exam_views.iterrows():
             try:
-                path = args.raw / row["dicom_path"]
-                ds = pydicom.dcmread(str(path))
+                ds = read_dicom_source(row, args.raw)
                 pixels = ds.pixel_array.astype(np.float32)
 
                 artifact, max_z = has_vertical_line_artifact(pixels, args.threshold)
@@ -96,7 +97,8 @@ def main():
                     has_artifact = True
                     break
             except Exception as e:
-                print(f"Error loading {row['dicom_path']}: {e}")
+                source_id = DicomSource.from_row(row).source_id
+                print(f"Error loading DICOM source {source_id}: {e}")
 
         max_z_scores.append(exam_max_z)
         if has_artifact:
@@ -110,11 +112,6 @@ def main():
         f"  Exams with vertical artifacts: {len(flagged_exams)} ({len(flagged_exams) / len(sampled_exams) * 100:.1f}%)"
     )
     print(f"  Max z-score across all exams: {max(max_z_scores):.2f}")
-    print()
-    print("Sample flagged exams:")
-    for exam_id in flagged_exams[:5]:
-        print(f"  {exam_id}")
-
     if len(flagged_exams) > 0:
         print()
         print("To review flagged exams, create a file with exam IDs and use:")

@@ -163,7 +163,8 @@ def build_view_identity(
                 "laterality",
                 "view",
                 "sop_instance_uid",
-                "dicom_path",
+                "source_archive_relpath",
+                "source_archive_member",
                 "sha256",
                 "current_file_path",
             ]

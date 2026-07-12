@@ -82,6 +82,7 @@ pydicom, pandas, matplotlib, tqdm
 
 import argparse
 import gc
+import hashlib
 import json
 import logging
 import re
@@ -98,6 +99,15 @@ import pydicom
 from prima.auto_qc import (
     auto_run_to_tag_map,
     load_auto_run,
+)
+from prima.dicom_source import (
+    DicomSource,
+    SOURCE_ARCHIVE_COLUMN,
+    SOURCE_COLUMNS,
+    materialize_dicom_sources,
+    require_source_columns,
+    require_valid_sources,
+    validate_materialized_source,
 )
 from prima.qc_state import (
     DEFAULT_ANNOTATION_TAGS,
@@ -127,6 +137,10 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+
+def _log_id(value: object) -> str:
+    return hashlib.sha256(str(value).encode()).hexdigest()[:12]
 
 
 # global variables for HTTP server
@@ -1583,9 +1597,7 @@ def _save_debug_figure(
 
         # collect tag info
         tag_lines = [
-            f"File: {path.name}",
-            f"Exam: {path.parent.name}",
-            f"Patient: {path.parent.parent.name}",
+            f"Source: {_log_id(path)}",
             f"Status: {status}",
         ]
 
@@ -1606,23 +1618,8 @@ def _save_debug_figure(
                 f"  (0x0018,0x5101) ViewPosition: {get_tag(ds, (0x0018, 0x5101), 'MISSING')}",
                 f"  (0x0008,0x0068) PresentationIntentType: {get_tag(ds, (0x0008, 0x0068), 'MISSING')}",
                 f"  (0x0008,0x0069) Presentation Intent Type: {get_tag(ds, (0x0008, 0x0069), 'MISSING')}",
-                "",
-                "ALL TAGS IN THIS FILE:",
-                "-" * 60,
             ]
         )
-
-        for elem in ds:
-            if elem.VR == "SQ":
-                tag_lines.append(f"{elem.tag} {elem.name}: <sequence>")
-            else:
-                try:
-                    value_str = str(elem.value)
-                    if len(value_str) > 80:
-                        value_str = value_str[:80] + "..."
-                    tag_lines.append(f"{elem.tag} {elem.name}: {value_str}")
-                except Exception:
-                    tag_lines.append(f"{elem.tag} {elem.name}: <cannot display>")
 
         # render text
         text_content = "\n".join(tag_lines)
@@ -1673,10 +1670,10 @@ def _save_debug_figure(
         plt.savefig(out_path, dpi=100, bbox_inches="tight")
         plt.close(fig)
 
-        logger.debug(f"    Saved debug figure: {out_path.name}")
+        logger.debug("saved debug figure %s", _log_id(out_path))
 
     except Exception as e:
-        logger.warning(f"    Failed to save debug figure for {path.name}: {e}")
+        logger.warning("failed to save debug figure %s: %s", _log_id(path), e)
 
 
 def _save_four_view_figure(
@@ -1706,7 +1703,7 @@ def _save_four_view_figure(
 
     # if image already exists, skip regeneration
     if out_path.exists():
-        logger.debug(f"    Using cached 4-view figure: {out_path.name}")
+        logger.debug("using cached 4-view figure %s", _log_id(out_path))
         return True, True
 
     try:
@@ -1756,12 +1753,14 @@ def _save_four_view_figure(
         plt.savefig(out_path, dpi=75, bbox_inches="tight")
         plt.close(fig)
 
-        logger.debug(f"    Saved combined 4-view figure: {out_path.name}")
+        logger.debug("saved combined 4-view figure %s", _log_id(out_path))
         return True, False
 
     except Exception as e:
         logger.warning(
-            f"    Failed to save combined 4-view figure for exam {exam_id}: {e}"
+            "failed to save combined 4-view figure for source %s: %s",
+            _log_id(exam_id),
+            e,
         )
         return False, False
 
@@ -1922,6 +1921,10 @@ def estimate_qc_preprocess_disk(
         (n_exams, estimated_bytes)
     """
     views_df = pd.read_parquet(views_parquet)
+    require_source_columns(views_df.columns, str(views_parquet))
+    require_valid_sources(
+        views_df[list(SOURCE_COLUMNS)].to_dict("records"), str(views_parquet)
+    )
     views_df = views_df.assign(
         exam_id=views_df["exam_id"].astype(str),
         patient_id=views_df["patient_id"].astype(str),
@@ -1988,7 +1991,7 @@ def generate_gallery(
     """generate interactive HTML gallery from processed views.
 
     Args:
-        views_parquet: path to views.parquet with dicom_path column
+        views_parquet: path to views.parquet with durable DICOM source columns
         raw_dir: root directory where DICOMs are stored
         output_dir: output directory for figures and gallery
         max_exams: limit number of exams to visualize
@@ -2022,14 +2025,14 @@ def generate_gallery(
 
     report_progress(0.02, "Loading QC state...")
     logger.info(
-        "QC DEBUG generate_gallery args: max_exams=%s, random_sample=%s, prioritize_errors=%s, qc_skip_status=%s, patient_id=%s, exam_id=%s, exam_list_path=%s, qc_file=%s, auto_run_file=%s, serve=%s, preprocessed_only=%s",
+        "QC DEBUG generate_gallery args: max_exams=%s, random_sample=%s, prioritize_errors=%s, qc_skip_status=%s, patient_filter=%s, exam_filter=%s, exam_list=%s, qc_file=%s, auto_run_file=%s, serve=%s, preprocessed_only=%s",
         max_exams,
         random_sample,
         prioritize_errors,
         sorted(qc_skip_status),
-        patient_id,
-        exam_id,
-        exam_list_path,
+        patient_id is not None,
+        exam_id is not None,
+        exam_list_path is not None,
         qc_file,
         auto_run_file,
         serve,
@@ -2073,6 +2076,10 @@ def generate_gallery(
 
     logger.info(f"loading views from {views_parquet}")
     views_df = pd.read_parquet(views_parquet)
+    require_source_columns(views_df.columns, str(views_parquet))
+    require_valid_sources(
+        views_df[list(SOURCE_COLUMNS)].to_dict("records"), str(views_parquet)
+    )
     views_df = views_df.assign(
         exam_id=views_df["exam_id"].astype(str),
         patient_id=views_df["patient_id"].astype(str),
@@ -2144,12 +2151,14 @@ def generate_gallery(
     if patient_id:
         views_df = views_df[views_df["patient_id"] == str(patient_id)]
         logger.info(
-            f"filtered to patient {patient_id}: {len(views_df)} views from {views_df['exam_id'].nunique()} exams"
+            "applied patient filter: %d views from %d exams",
+            len(views_df),
+            views_df["exam_id"].nunique(),
         )
 
     if exam_id:
         views_df = views_df[views_df["exam_id"] == str(exam_id)]
-        logger.info(f"filtered to exam {exam_id}: {len(views_df)} views")
+        logger.info("applied exam filter: %d views", len(views_df))
 
     # filter by exam list if provided
     if exam_list_path:
@@ -2213,11 +2222,6 @@ def generate_gallery(
             len(annotated_exams) if "annotated" in qc_skip_status else 0,
             len(skip_in_pool),
         )
-        if skip_in_pool:
-            logger.info(
-                "QC DEBUG skip filter sample exam_ids: %s",
-                sorted(skip_in_pool)[:10],
-            )
         if skip_exams:
             before_count = views_df["exam_id"].nunique()
             views_df = views_df[~views_df["exam_id"].isin(skip_exams)]
@@ -2301,11 +2305,6 @@ def generate_gallery(
         selected_annotated,
         selected_counts["auto_excluded"],
         pending_count,
-    )
-    logger.info(
-        "QC DEBUG selected batch exam_ids (first %d): %s",
-        min(10, len(selected_exam_ids)),
-        selected_exam_ids[:10],
     )
     report_progress(0.5, "Selected exams and checking cached montages...")
 
@@ -2418,11 +2417,10 @@ def generate_gallery(
     exams_needing_list = sorted(exams_needing_generation)
     if len(exams_needing_list) > 0:
         if preprocessed_only:
-            sample_ids = ", ".join(exams_needing_list[:10])
             raise FileNotFoundError(
                 "preprocessed-only mode cannot generate missing montages; "
                 f"{len(exams_needing_list)} exams are missing cached PNGs in "
-                f"{output_dir / 'success'} (sample exam_ids: {sample_ids})"
+                f"{output_dir / 'success'}"
             )
         views_to_load = views_df[views_df["exam_id"].isin(exams_needing_generation)]
         n_batches = (len(exams_needing_list) + BATCH_SIZE - 1) // BATCH_SIZE
@@ -2446,58 +2444,80 @@ def generate_gallery(
             batch_views = views_to_load[views_to_load["exam_id"].isin(batch_exam_ids)]
             batch_cache = {}
 
-            for idx, row in batch_views.iterrows():
+            for _, archive_views in batch_views.groupby(
+                SOURCE_ARCHIVE_COLUMN, sort=False
+            ):
+                sources = [
+                    DicomSource.from_row(row) for _, row in archive_views.iterrows()
+                ]
                 try:
-                    dicom_path = Path(row["dicom_path"])
-                    if not dicom_path.is_absolute():
-                        dicom_path = raw_dir / dicom_path
+                    with materialize_dicom_sources(sources, raw_dir) as source_paths:
+                        for (_, row), source in zip(archive_views.iterrows(), sources):
+                            try:
+                                member = source.archive_member.as_posix()
+                                materialized_path = source_paths[member]
+                                ds = pydicom.dcmread(str(materialized_path), force=True)
+                                validate_materialized_source(
+                                    source, materialized_path, ds
+                                )
+                                source_label = Path(source.archive_member.name)
 
-                    if not dicom_path.exists():
-                        logger.warning(f"DICOM not found: {dicom_path}")
-                        error_count += 1
-                        continue
+                                if per_view:
+                                    view_label = f"{row['laterality']} {row['view']}"
+                                    _save_debug_figure(
+                                        ds,
+                                        source_label,
+                                        "SUCCESS",
+                                        view_label,
+                                        output_dir,
+                                        patient_id=row["patient_id"],
+                                        exam_id=row["exam_id"],
+                                        accession_number=row.get(
+                                            "accession_number", "unknown"
+                                        ),
+                                    )
+                                success_count += 1
 
-                    ds = pydicom.dcmread(str(dicom_path))
+                                exam_key = row["exam_id"]
+                                if exam_key not in batch_cache:
+                                    batch_cache[exam_key] = {
+                                        "patient_id": row["patient_id"],
+                                        "accession_number": row.get(
+                                            "accession_number", "unknown"
+                                        ),
+                                        "views": {},
+                                        "view_selection_keys": {},
+                                    }
 
-                    if per_view:
-                        view_label = f"{row['laterality']} {row['view']}"
-                        _save_debug_figure(
-                            ds,
-                            dicom_path,
-                            "SUCCESS",
-                            view_label,
-                            output_dir,
-                            patient_id=row["patient_id"],
-                            exam_id=row["exam_id"],
-                            accession_number=row.get("accession_number", "unknown"),
-                        )
-                    success_count += 1
-
-                    exam_key = row["exam_id"]
-                    if exam_key not in batch_cache:
-                        batch_cache[exam_key] = {
-                            "patient_id": row["patient_id"],
-                            "accession_number": row.get("accession_number", "unknown"),
-                            "views": {},
-                            "view_selection_keys": {},
-                        }
-
-                    view_key = f"{row['laterality']}_{row['view']}"
-                    candidate_key = view_selection_key_from_dataset(ds, dicom_path)
-                    current_key = batch_cache[exam_key]["view_selection_keys"].get(
-                        view_key
-                    )
-                    if current_key is None or candidate_key < current_key:
-                        batch_cache[exam_key]["view_selection_keys"][view_key] = (
-                            candidate_key
-                        )
-                        batch_cache[exam_key]["views"][view_key] = (ds, dicom_path)
-
+                                view_key = f"{row['laterality']}_{row['view']}"
+                                candidate_key = view_selection_key_from_dataset(
+                                    ds, source.archive_member.as_posix()
+                                )
+                                current_key = batch_cache[exam_key][
+                                    "view_selection_keys"
+                                ].get(view_key)
+                                if current_key is None or candidate_key < current_key:
+                                    batch_cache[exam_key]["view_selection_keys"][
+                                        view_key
+                                    ] = candidate_key
+                                    batch_cache[exam_key]["views"][view_key] = (
+                                        ds,
+                                        source_label,
+                                    )
+                            except Exception as e:
+                                logger.error(
+                                    "error processing DICOM source %s: %s",
+                                    source.source_id,
+                                    e,
+                                )
+                                error_count += 1
                 except Exception as e:
                     logger.error(
-                        f"error processing {row.get('dicom_path', 'unknown')}: {e}"
+                        "error materializing DICOM archive %s: %s",
+                        sources[0].source_id,
+                        e,
                     )
-                    error_count += 1
+                    error_count += len(archive_views)
 
             for exam_key, exam_data in batch_cache.items():
                 try:

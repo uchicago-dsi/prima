@@ -14,7 +14,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import pydicom
+
+from prima.dicom_source import read_dicom_source, require_source_columns
 
 
 def detect_vertical_lines(pixel_array: np.ndarray, threshold: float = 4.0):
@@ -145,8 +146,7 @@ def process_exam(exam_id: str, views_df: pd.DataFrame, raw_dir: Path, output_dir
 
     for _, row in exam_views.iterrows():
         try:
-            path = raw_dir / row["dicom_path"]
-            ds = pydicom.dcmread(str(path))
+            ds = read_dicom_source(row, raw_dir)
             pixels = ds.pixel_array.astype(np.float32)
 
             # detect lines
@@ -165,7 +165,7 @@ def process_exam(exam_id: str, views_df: pd.DataFrame, raw_dir: Path, output_dir
                     }
                 )
         except Exception as e:
-            print(f"Error processing {row['dicom_path']}: {e}")
+            raise RuntimeError("failed to load a source-linked DICOM") from e
 
     if len(results) == 0:
         return None
@@ -244,6 +244,7 @@ def main():
 
     print("Loading views...")
     views = pd.read_parquet(args.raw / "sot" / "views.parquet")
+    require_source_columns(views.columns, "views.parquet")
     views = views[views["for_presentation"]]
 
     # find exams with artifacts
@@ -269,20 +270,16 @@ def main():
         # quick check if this exam has artifacts
         has_artifact = False
         for _, row in exam_views.iterrows():
-            try:
-                path = args.raw / row["dicom_path"]
-                ds = pydicom.dcmread(str(path))
-                pixels = ds.pixel_array.astype(np.float32)
+            ds = read_dicom_source(row, args.raw)
+            pixels = ds.pixel_array.astype(np.float32)
 
-                lines = detect_vertical_lines(pixels, threshold=args.threshold)
-                if len(lines) > 0:
-                    has_artifact = True
-                    break
-            except Exception:
-                continue
+            lines = detect_vertical_lines(pixels, threshold=args.threshold)
+            if len(lines) > 0:
+                has_artifact = True
+                break
 
         if has_artifact:
-            print(f"  ✓ Found artifact in {exam_id}, processing...")
+            print("  found an artifact; processing the source-linked exam...")
             result = process_exam(exam_id, views, args.raw, args.output)
             if result:
                 tested_exams.append(result)

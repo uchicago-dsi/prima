@@ -14,13 +14,14 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import pydicom
 from tqdm import tqdm
 
+from prima.dicom_source import read_dicom_source, require_source_columns
 
-def read_dicom_pixels(path: Path) -> np.ndarray:
+
+def read_dicom_pixels(row: pd.Series, raw_root: Path) -> np.ndarray:
     """read DICOM and return pixel array"""
-    ds = pydicom.dcmread(str(path), force=True)
+    ds = read_dicom_source(row, raw_root)
     return ds.pixel_array.astype(np.float32)
 
 
@@ -64,6 +65,7 @@ def main():
 
     print("Loading views and tags...")
     views = pd.read_parquet(args.raw / "sot" / "views.parquet")
+    require_source_columns(views.columns, "views.parquet")
     tags = pd.read_parquet(args.raw / "sot" / "dicom_tags.parquet")
 
     # merge to get processing codes
@@ -94,22 +96,14 @@ def main():
     print("Loading GEMS images...")
     gems_pixels = []
     for _, row in tqdm(gems_sample.iterrows(), total=len(gems_sample)):
-        path = args.raw / row["dicom_path"]
-        try:
-            pixels = read_dicom_pixels(path)
-            gems_pixels.append(pixels)
-        except Exception as e:
-            print(f"  Failed to load {path}: {e}")
+        pixels = read_dicom_pixels(row, args.raw)
+        gems_pixels.append(pixels)
 
     print("Loading non-GEMS images...")
     non_gems_pixels = []
     for _, row in tqdm(non_gems_sample.iterrows(), total=len(non_gems_sample)):
-        path = args.raw / row["dicom_path"]
-        try:
-            pixels = read_dicom_pixels(path)
-            non_gems_pixels.append(pixels)
-        except Exception as e:
-            print(f"  Failed to load {path}: {e}")
+        pixels = read_dicom_pixels(row, args.raw)
+        non_gems_pixels.append(pixels)
 
     print("\nSuccessfully loaded:")
     print(f"  GEMS: {len(gems_pixels)} images")

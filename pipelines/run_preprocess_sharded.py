@@ -20,6 +20,11 @@ from pipelines.preprocess import (
     build_genotyped_exam_dir_filter,
     build_unique_exam_dir_filter,
 )
+from prima.dicom_source import (
+    SOURCE_COLUMNS,
+    require_source_columns,
+    require_valid_sources,
+)
 
 DEFAULT_FINGERPRINT = Path("fingerprints/chimec/disk_fingerprints.json")
 DEFAULT_PATIENTS = Path(
@@ -27,6 +32,7 @@ DEFAULT_PATIENTS = Path(
 )
 DEFAULT_KEY = Path("/gpfs/data/huo-lab/Image/ChiMEC/study-16352a.csv")
 PREPROCESS_SCRIPT = PROJECT_ROOT / "pipelines" / "preprocess.py"
+PYTHON_EXECUTABLE = Path(sys.executable).resolve()
 
 
 def partition_allowlist(allowlist: set, num_shards: int) -> list[list]:
@@ -51,6 +57,7 @@ def create_sbatch_script(
     partition: str,
     mem_gb: int,
     timeout_hours: int,
+    summary: bool,
 ) -> tuple[Path, Path]:
     """Generate sbatch script for a single preprocess shard."""
     script_path = work_dir / f"job_{shard_idx:03d}.sh"
@@ -61,7 +68,7 @@ def create_sbatch_script(
     shard_manifest = out_dir / f"manifest_shard_{shard_idx:03d}.parquet"
 
     cmd_parts = [
-        "python",
+        str(PYTHON_EXECUTABLE),
         "-u",
         "pipelines/preprocess.py",
         "preprocess",
@@ -83,6 +90,8 @@ def create_sbatch_script(
     ]
     if labels_path:
         cmd_parts.extend(["--labels", str(labels_path)])
+    if summary:
+        cmd_parts.append("--summary")
 
     script_content = f"""#!/bin/bash
 #SBATCH --job-name=preproc_shard_{shard_idx:03d}
@@ -96,9 +105,8 @@ def create_sbatch_script(
 set -eo pipefail
 
 cd {shlex.quote(str(Path.cwd()))}
-eval "$(micromamba shell hook -s bash)"
-micromamba activate prima
 export PYTHONUNBUFFERED=1
+export PYTHONNOUSERSITE=1
 umask 002
 
 echo "[shard {shard_idx}] starting at $(date)"
@@ -152,11 +160,10 @@ def submit_recover_job(
 set -eo pipefail
 
 cd {shlex.quote(str(repo_root))}
-eval "$(micromamba shell hook -s bash)"
-micromamba activate prima
+export PYTHONNOUSERSITE=1
 umask 002
 
-python pipelines/run_preprocess_sharded.py --recover {shlex.quote(str(metadata_path))} --num_shards 1
+{shlex.quote(str(PYTHON_EXECUTABLE))} pipelines/run_preprocess_sharded.py --recover {shlex.quote(str(metadata_path))} --num_shards 1
 """
     script_path.write_text(script_content)
     script_path.chmod(0o755)
@@ -196,7 +203,9 @@ def wait_for_jobs(job_ids: list[str], poll_interval: int = 60) -> None:
         time.sleep(poll_interval)
 
 
-def merge_shard_outputs(sot_dir: Path, out_dir: Path, num_shards: int) -> None:
+def merge_shard_outputs(
+    sot_dir: Path, out_dir: Path, num_shards: int, *, summary: bool = False
+) -> None:
     """Merge parquet files from sot/shard_*/ and manifest_shard_* into final outputs."""
     import pandas as pd
 
@@ -205,21 +214,40 @@ def merge_shard_outputs(sot_dir: Path, out_dir: Path, num_shards: int) -> None:
     tags_dfs = []
     cohort_dfs = []
     manifest_dfs = []
+    missing_outputs = 0
 
     for i in range(num_shards):
         shard_dir = sot_dir / f"shard_{i:03d}"
-        if shard_dir.exists():
-            if (shard_dir / "views.parquet").exists():
-                views_dfs.append(pd.read_parquet(shard_dir / "views.parquet"))
-            if (shard_dir / "exams.parquet").exists():
-                exams_dfs.append(pd.read_parquet(shard_dir / "exams.parquet"))
-            if (shard_dir / "dicom_tags.parquet").exists():
-                tags_dfs.append(pd.read_parquet(shard_dir / "dicom_tags.parquet"))
-            if (shard_dir / "cohort.parquet").exists():
-                cohort_dfs.append(pd.read_parquet(shard_dir / "cohort.parquet"))
+        required_paths = [
+            shard_dir / "views.parquet",
+            shard_dir / "exams.parquet",
+            shard_dir / "dicom_tags.parquet",
+            shard_dir / "cohort.parquet",
+        ]
         shard_manifest = out_dir / f"manifest_shard_{i:03d}.parquet"
-        if shard_manifest.exists():
+        if not summary:
+            required_paths.append(shard_manifest)
+        if any(not path.is_file() for path in required_paths):
+            missing_outputs += 1
+            continue
+
+        shard_views = pd.read_parquet(shard_dir / "views.parquet")
+        require_source_columns(shard_views.columns, str(shard_dir / "views.parquet"))
+        require_valid_sources(
+            shard_views[list(SOURCE_COLUMNS)].to_dict("records"),
+            str(shard_dir / "views.parquet"),
+        )
+        views_dfs.append(shard_views)
+        exams_dfs.append(pd.read_parquet(shard_dir / "exams.parquet"))
+        tags_dfs.append(pd.read_parquet(shard_dir / "dicom_tags.parquet"))
+        cohort_dfs.append(pd.read_parquet(shard_dir / "cohort.parquet"))
+        if not summary:
             manifest_dfs.append(pd.read_parquet(shard_manifest))
+
+    if missing_outputs:
+        raise RuntimeError(
+            f"{missing_outputs} of {num_shards} shards lack required merge outputs"
+        )
 
     sot_dir.mkdir(parents=True, exist_ok=True)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -227,6 +255,7 @@ def merge_shard_outputs(sot_dir: Path, out_dir: Path, num_shards: int) -> None:
     if views_dfs:
         combined = pd.concat(views_dfs, ignore_index=True)
         combined = combined.drop_duplicates(subset=["exam_id", "sop_instance_uid"])
+        require_source_columns(combined.columns, str(sot_dir / "views.parquet"))
         combined.to_parquet(sot_dir / "views.parquet", index=False)
         print(f"  Merged views.parquet: {len(combined):,} rows")
     if exams_dfs:
@@ -298,6 +327,12 @@ def main():
         action="store_true",
         help="Use all unique on-disk exams from the fingerprint cache, not just genotyped patients",
     )
+    parser.add_argument(
+        "--allowlist",
+        type=Path,
+        default=None,
+        help="Explicit JSON list of [patient_id, exam_dir] source records",
+    )
     parser.add_argument("--fingerprint", type=Path, default=DEFAULT_FINGERPRINT)
     parser.add_argument("--patients", type=Path, default=DEFAULT_PATIENTS)
     parser.add_argument("--key", type=Path, default=DEFAULT_KEY)
@@ -316,10 +351,21 @@ def main():
         "--no-wait", action="store_true", help="Submit and exit immediately"
     )
     parser.add_argument(
+        "--summary",
+        action="store_true",
+        help="Rebuild SoT metadata without writing Zarr or a Mirai manifest",
+    )
+    parser.add_argument(
         "--work-dir",
         type=Path,
         default=None,
         help="Work dir for shards (default: <raw>/preprocess_shards)",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        default=None,
+        help="Checkpoint/materialization root (default: data/discovery_checkpoints)",
     )
     parser.add_argument(
         "--no-auto-recover-job",
@@ -339,13 +385,18 @@ def main():
         sot_dir = Path(metadata["sot_dir"])
         out_dir = Path(metadata["out_dir"])
         num_shards = metadata["num_shards"]
-        raw_dir = sot_dir.parent
+        raw_dir = Path(metadata["raw_dir"])
         print(f"Recovering: merging {num_shards} shards from {work_dir}")
-        merge_shard_outputs(sot_dir, out_dir, num_shards)
+        merge_shard_outputs(
+            sot_dir,
+            out_dir,
+            num_shards,
+            summary=bool(metadata.get("summary")),
+        )
         labels_path = args.labels or (
             Path(metadata["labels"]) if metadata.get("labels") else None
         )
-        if labels_path and Path(labels_path).exists():
+        if not metadata.get("summary") and labels_path and Path(labels_path).exists():
             print("\nGenerating Mirai CSV...")
             subprocess.run(
                 [
@@ -375,12 +426,34 @@ def main():
     sot_dir = args.sot or raw_dir / "sot"
     out_dir = args.out or raw_dir / "out"
     work_dir = args.work_dir or raw_dir / "preprocess_shards"
-    checkpoint_base = Path("data/discovery_checkpoints")
+    checkpoint_base = args.checkpoint_dir or Path("data/discovery_checkpoints")
 
-    if args.genotyped_only == args.all_available:
-        parser.error("Choose exactly one of --genotyped-only or --all-available")
+    selection_modes = sum(
+        [args.genotyped_only, args.all_available, args.allowlist is not None]
+    )
+    if selection_modes != 1:
+        parser.error(
+            "Choose exactly one of --genotyped-only, --all-available, or --allowlist"
+        )
 
-    if args.genotyped_only:
+    if args.allowlist is not None:
+        if not args.allowlist.is_file():
+            raise FileNotFoundError("explicit allowlist JSON does not exist")
+        pairs = json.loads(args.allowlist.read_text())
+        if not isinstance(pairs, list) or any(
+            not isinstance(pair, list)
+            or len(pair) != 2
+            or not all(isinstance(value, str) and value for value in pair)
+            for pair in pairs
+        ):
+            raise ValueError(
+                "explicit allowlist must be a JSON list of two-string lists"
+            )
+        allowlist = {tuple(pair) for pair in pairs}
+        if len(allowlist) != len(pairs):
+            raise ValueError("explicit allowlist contains duplicate source records")
+        cohort_label = "explicit-allowlist"
+    elif args.genotyped_only:
         allowlist = build_genotyped_exam_dir_filter(
             args.fingerprint,
             args.patients,
@@ -412,6 +485,8 @@ def main():
 
     work_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_base.mkdir(parents=True, exist_ok=True)
+    work_dir.chmod(0o700)
+    checkpoint_base.chmod(0o700)
 
     # Write shard allowlists
     script_paths = []
@@ -422,6 +497,7 @@ def main():
         allowlist_path = work_dir / f"shard_{i:03d}_allowlist.json"
         with open(allowlist_path, "w") as f:
             json.dump(shard_pairs, f, indent=0)
+        allowlist_path.chmod(0o600)
         script_path, log_path = create_sbatch_script(
             shard_idx=i,
             shard_allowlist_path=allowlist_path,
@@ -435,6 +511,7 @@ def main():
             partition=args.partition,
             mem_gb=args.mem_gb,
             timeout_hours=args.timeout_hours,
+            summary=args.summary,
         )
         script_paths.append(script_path)
         log_paths.append(log_path)
@@ -443,15 +520,18 @@ def main():
 
     metadata = {
         "work_dir": str(work_dir),
+        "raw_dir": str(raw_dir),
         "job_ids": job_ids,
         "num_shards": args.num_shards,
         "sot_dir": str(sot_dir),
         "out_dir": str(out_dir),
         "labels": str(args.labels) if args.labels else None,
         "allowlist_mode": cohort_label,
+        "summary": args.summary,
     }
     metadata_path = work_dir / "job_metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2))
+    metadata_path.chmod(0o600)
     print(f"\nMetadata: {metadata_path}")
 
     if args.no_wait:
@@ -464,6 +544,7 @@ def main():
             )
             metadata["recover_job_id"] = recover_job_id
             metadata_path.write_text(json.dumps(metadata, indent=2))
+            metadata_path.chmod(0o600)
             print(f"Submitted dependent recover job: {recover_job_id}")
         else:
             print("Skipped dependent recover job (--no-auto-recover-job).")
@@ -472,9 +553,9 @@ def main():
 
     wait_for_jobs(job_ids)
     print("\nMerging shard outputs...")
-    merge_shard_outputs(sot_dir, out_dir, args.num_shards)
+    merge_shard_outputs(sot_dir, out_dir, args.num_shards, summary=args.summary)
     # Emit Mirai CSV after merge (shards skip this; manifest.parquet exists now)
-    if args.labels and args.labels.exists():
+    if not args.summary and args.labels and args.labels.exists():
         print("\nGenerating Mirai CSV...")
         subprocess.run(
             [
