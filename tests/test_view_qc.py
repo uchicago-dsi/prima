@@ -127,9 +127,11 @@ def test_gallery_has_explicit_completion_state() -> None:
 
 def test_gallery_keeps_stable_port_and_smaller_image() -> None:
     assert DEFAULT_REVIEW_PORT == 8767
-    assert "max-width: 70%; max-height: 70%" in HTML
+    assert "max-width: 70vw; max-height: 65vh" in HTML
     assert HTML.index('id="controls"') < HTML.index("<main>")
     assert "height: calc(100vh" not in HTML
+    assert "overflow: hidden" not in HTML
+    assert "overflow-y: auto" in HTML
     assert "Not present [n]" in HTML
     assert "Present [y]" in HTML
     assert "Unsure [u]" in HTML

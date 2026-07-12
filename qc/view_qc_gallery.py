@@ -101,13 +101,13 @@ HTML = r"""<!doctype html>
   <title>Single-target view QC</title>
   <style>
     :root { color-scheme: dark; font-family: system-ui, sans-serif; }
-    body { height: 100vh; margin: 0; display: flex; flex-direction: column; overflow: hidden; background: #101214; color: #f0f2f4; }
-    header { flex: 0 0 auto; padding: 12px 18px; border-bottom: 1px solid #34383d; background: #171a1e; }
+    body { min-height: 100vh; margin: 0; overflow-y: auto; background: #101214; color: #f0f2f4; }
+    header { padding: 12px 18px; border-bottom: 1px solid #34383d; background: #171a1e; }
     #stats { font-variant-numeric: tabular-nums; font-weight: 650; }
     #context { color: #aeb6bf; margin-top: 5px; }
-    #controls { flex: 0 0 auto; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: center; padding: 10px 12px; border-bottom: 1px solid #34383d; background: #171a1e; }
-    main { flex: 1 1 auto; min-height: 0; display: grid; place-items: center; padding: 12px; }
-    img { max-width: 70%; max-height: 70%; object-fit: contain; background: black; }
+    #controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: center; padding: 10px 12px; border-bottom: 1px solid #34383d; background: #171a1e; }
+    main { display: flex; align-items: flex-start; justify-content: center; padding: 16px; }
+    img { display: block; width: auto; height: auto; max-width: 70vw; max-height: 65vh; object-fit: contain; background: black; }
     button { border: 1px solid #59616a; border-radius: 7px; padding: 10px 14px; color: white; background: #282d33; font-size: 16px; cursor: pointer; }
     button:hover { background: #343b43; }
     button.active { box-shadow: 0 0 0 3px #f4c542 inset; }
