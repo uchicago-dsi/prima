@@ -154,19 +154,23 @@ function render() {
     return;
   }
   document.getElementById('image').src = item.image_url;
-  document.getElementById('context').textContent =
-    item.laterality + ' ' + item.view + ' | Binary target only: vertical detector seam in this view.';
+  document.getElementById('context').textContent = summary.remaining === 0
+    ? 'Review complete — all labels are saved. Use Previous or the arrow keys to inspect them.'
+    : item.laterality + ' ' + item.view + ' | Binary target only: vertical detector seam in this view.';
   document.getElementById('stats').textContent =
     'position ' + (index + 1) + '/' + items.length +
     ' | reviewed ' + summary.reviewed + '/' + items.length +
     ' | remaining ' + summary.remaining +
     ' | pass ' + summary.pass +
-    ' | vertical seam ' + summary.vertical;
+    ' | vertical seam ' + summary.vertical +
+    (summary.remaining === 0 ? ' | COMPLETE' : '');
   const active = labels[item.view_id]?.label;
   document.getElementById('pass').classList.toggle('active', active === 'pass');
   document.getElementById('vertical').classList.toggle('active', active === 'vertical_line');
   document.getElementById('previous').disabled = index === 0;
-  document.getElementById('next').disabled = index === items.length - 1;
+  const atEnd = index === items.length - 1;
+  document.getElementById('next').disabled = atEnd;
+  document.getElementById('next').textContent = atEnd ? 'End reached' : 'Next →';
 }
 
 async function setLabel(label) {

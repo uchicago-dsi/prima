@@ -154,8 +154,9 @@ and therefore cannot drive same-slot fallback. The active validation path uses:
 - `qc/run_view_auto_qc.py` and `submit_view_auto_qc.py`, which write a separate
   `view_suggestions` schema and use a single-view prompt without the old
   cross-view seam cue;
-- `view_candidates.parquet` plus `qc/select_qc_views.py`, which may choose only
-  an explicitly passing candidate in the same laterality and projection slot.
+- `view_candidates.parquet` plus `qc/select_auto_qc_views.py`, which may choose
+  only a model-passing candidate in the same laterality and projection slot and
+  writes new restricted outputs rather than mutating the production SoT.
 
 The frozen 160-view panel contains 80 heuristic-enriched and 80 random views,
 one per exam. Model inference is completed before labels are revealed, but its
@@ -174,6 +175,96 @@ stratum-specific confusion matrices and writes every disagreement for visual
 adjudication. The continuation gate is sensitivity and specificity of at least
 0.90 with no repeated missed morphology. Passing that research gate does not
 authorize automatic deployment-grade exclusion.
+
+## Full candidate campaign
+
+After the blinded gate passes, score every ranked exact-slot candidate once.
+Rendering uses the general `prima` environment on CPU nodes. Every source is
+resolved through durable archive/member lineage and verified by SOP identity
+and SHA-256 before an atomic, owner-only PNG is installed. A dependent validator
+requires exact manifest/image coverage before any GPU job may start.
+
+```bash
+micromamba run -p /gpfs/data/huo-lab/Image/annawoodard/micromamba/envs/prima \
+  python qc/prepare_view_candidate_inference.py \
+  --candidates /gpfs/data/huo-lab/Image/ChiMEC/MG/sot/view_candidates.parquet \
+  --out-dir /scratch/annawoodard/prima_view_auto_qc/vertical_line_candidates \
+  --render-shards 16 \
+  --inference-shards 16 \
+  --max-render-pixels 2000000
+
+micromamba run -p /gpfs/data/huo-lab/Image/annawoodard/micromamba/envs/prima \
+  python submit_view_candidate_render.py \
+  --campaign-dir /scratch/annawoodard/prima_view_auto_qc/vertical_line_candidates \
+  --raw-root /gpfs/data/huo-lab/Image/ChiMEC/MG \
+  --log-dir /scratch/annawoodard/prima_view_auto_qc/submitit_runs \
+  --partition tier1q \
+  --temp-root /scratch/annawoodard/tmp/prima-view-render \
+  --no-wait
+```
+
+Submit the frozen 27B model from `prima-vllm`. Replace `RENDER_VALIDATION_JOB`
+with the dependent validation job printed by the render submitter. Each view is
+checkpointed independently, so opportunistic requeue resumes the shard rather
+than rescoring completed views.
+
+```bash
+TMPDIR=/scratch/annawoodard/tmp/prima-vllm-runtime \
+PYTHONNOUSERSITE=1 \
+micromamba run -p /gpfs/data/huo-lab/Image/annawoodard/micromamba/envs/prima-vllm \
+  python submit_view_auto_qc_campaign.py \
+  --campaign-dir /scratch/annawoodard/prima_view_auto_qc/vertical_line_candidates \
+  --run-dir /scratch/annawoodard/prima_view_auto_qc/vertical_line_candidates/runs \
+  --log-dir /scratch/annawoodard/prima_view_auto_qc/submitit_runs \
+  --partition-plan siweiq:4,catherineq:4,zhoulabq:8 \
+  --qos opportunistic \
+  --gpuspec nvidia_h200-141gb \
+  --dependency-job-id RENDER_VALIDATION_JOB \
+  --model-key qwen35_27b_fp8 \
+  --no-wait
+```
+
+After all inference shards complete, merge exact coverage, apply rank-ordered
+same-slot fallback, and build a separate blinded audit. The audit samples the
+decisions that matter: failed originals preceding an accepted alternate, all
+candidates in sampled exhausted slots, and random original-pass controls.
+
+```bash
+micromamba run -p /gpfs/data/huo-lab/Image/annawoodard/micromamba/envs/prima \
+  python qc/merge_view_auto_qc.py \
+  --manifest /scratch/annawoodard/prima_view_auto_qc/vertical_line_candidates/inference_manifest.parquet \
+  --run-dir /scratch/annawoodard/prima_view_auto_qc/vertical_line_candidates/runs \
+  --output /scratch/annawoodard/prima_view_auto_qc/vertical_line_candidates/merged_run.json
+
+micromamba run -p /gpfs/data/huo-lab/Image/annawoodard/micromamba/envs/prima \
+  python qc/select_auto_qc_views.py \
+  --candidates /gpfs/data/huo-lab/Image/ChiMEC/MG/sot/view_candidates.parquet \
+  --view-auto-run /scratch/annawoodard/prima_view_auto_qc/vertical_line_candidates/merged_run.json \
+  --render-complete /scratch/annawoodard/prima_view_auto_qc/vertical_line_candidates/render_complete.json \
+  --decisions-output /scratch/annawoodard/prima_view_auto_qc/vertical_line_candidates/fallback_decisions.parquet \
+  --selected-views-output /scratch/annawoodard/prima_view_auto_qc/vertical_line_candidates/selected_views.parquet
+
+micromamba run -p /gpfs/data/huo-lab/Image/annawoodard/micromamba/envs/prima \
+  python qc/build_auto_qc_fallback_audit.py \
+  --candidates /gpfs/data/huo-lab/Image/ChiMEC/MG/sot/view_candidates.parquet \
+  --decisions /scratch/annawoodard/prima_view_auto_qc/vertical_line_candidates/fallback_decisions.parquet \
+  --view-auto-run /scratch/annawoodard/prima_view_auto_qc/vertical_line_candidates/merged_run.json \
+  --render-complete /scratch/annawoodard/prima_view_auto_qc/vertical_line_candidates/render_complete.json \
+  --campaign-dir /scratch/annawoodard/prima_view_auto_qc/vertical_line_candidates \
+  --out-dir /scratch/annawoodard/prima_view_auto_qc/vertical_line_fallback_audit
+```
+
+Do not promote `selected_views.parquet` into production until the targeted
+fallback audit is reviewed. A complete run can still be wrong systematically;
+Slurm success and exact coverage are operational checks, not scientific ones.
+Sources whose SOP/SHA identity is valid but whose pixel payload cannot be
+decoded are recorded as deterministic non-passing candidates in
+`render_complete.json`. They are excluded from model inference rather than
+being misrepresented as vertical-seam predictions.
+After the blinded audit is complete,
+`qc/evaluate_auto_qc_fallback_audit.py` reports both view confusion metrics and
+slot-level decision correctness. For an accepted alternate, every preceding
+candidate must be human-positive and the chosen candidate human-negative.
 
 ## Validation decision
 

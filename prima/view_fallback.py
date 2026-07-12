@@ -157,14 +157,46 @@ def choose_exact_slot_views(
     records unresolved and exhausted slots rather than substituting another
     laterality or projection.
     """
-    validate_candidate_table(candidates, context)
     normalized_labels = normalize_view_labels(labels)
+    passing = {
+        view_id
+        for view_id, label in normalized_labels.items()
+        if label == VIEW_LABEL_PASS
+    }
+    rejected = set(normalized_labels) - passing
+    return choose_exact_slot_views_from_outcomes(
+        candidates,
+        passing_view_ids=passing,
+        rejected_view_ids=rejected,
+        context=context,
+    )
+
+
+def choose_exact_slot_views_from_outcomes(
+    candidates: pd.DataFrame,
+    *,
+    passing_view_ids: set[object],
+    rejected_view_ids: set[object],
+    context: str = "view_candidates.parquet",
+) -> pd.DataFrame:
+    """Choose exact-slot views from explicit pass and non-pass outcomes."""
+    validate_candidate_table(candidates, context)
+    passing = {normalize_view_id(value) for value in passing_view_ids}
+    rejected = {normalize_view_id(value) for value in rejected_view_ids}
+    if passing & rejected:
+        raise ValueError("one view cannot be both passing and rejected")
     work = candidates.copy()
     work["view_id"] = work["sha256"].map(normalize_view_id)
+    candidate_ids = set(work["view_id"])
+    foreign = (passing | rejected) - candidate_ids
+    if foreign:
+        raise ValueError("view outcomes contain IDs outside the candidate table")
     work["selection_rank"] = pd.to_numeric(
         work["selection_rank"], errors="raise"
     ).astype(int)
-    work["qc_label"] = work["view_id"].map(normalized_labels)
+    work["qc_label"] = None
+    work.loc[work["view_id"].isin(passing), "qc_label"] = VIEW_LABEL_PASS
+    work.loc[work["view_id"].isin(rejected), "qc_label"] = "reject"
 
     result_rows: list[dict[str, Any]] = []
     for (exam_id, laterality, view), rows in work.groupby(

@@ -212,4 +212,36 @@ def render_dicom_view_png(dataset: Any, output_path: Path, max_pixels: int) -> N
         image = image.resize(size, Image.LANCZOS)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    image.save(output_path, format="PNG", optimize=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{output_path.name}.", suffix=".tmp", dir=str(output_path.parent)
+    )
+    os.close(fd)
+    temporary_path = Path(temporary_name)
+    try:
+        image.save(temporary_path, format="PNG", optimize=True)
+        validate_rendered_view_png(temporary_path, max_pixels=max_pixels)
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, output_path)
+        os.chmod(output_path, 0o600)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def validate_rendered_view_png(path: Path, max_pixels: int) -> tuple[int, int]:
+    """Validate one current-format rendered view and return its dimensions."""
+    path = Path(path)
+    if max_pixels <= 0:
+        raise ValueError("max_pixels must be positive")
+    if not path.is_file():
+        raise FileNotFoundError(f"rendered view is missing: {path}")
+    with Image.open(path) as image:
+        image.load()
+        if image.format != "PNG":
+            raise ValueError("rendered view must be PNG")
+        if image.mode != "L":
+            raise ValueError("rendered view must be 8-bit grayscale")
+        width, height = image.size
+    if width <= 0 or height <= 0 or width * height > max_pixels:
+        raise ValueError("rendered view violates the pixel budget")
+    return width, height

@@ -19,9 +19,10 @@ from prima.view_qc import (
     save_view_qc_state,
     set_view_label,
     summarize_view_qc_state,
+    validate_rendered_view_png,
 )
 from qc.build_view_qc_pilot import sample_views
-from qc.view_qc_gallery import load_review_items
+from qc.view_qc_gallery import HTML, load_review_items
 
 
 def view_id(index: int) -> str:
@@ -78,6 +79,12 @@ def test_gallery_exposes_no_exam_or_patient_identifiers(tmp_path: Path) -> None:
     assert images[view_id(1)].is_file()
 
 
+def test_gallery_has_explicit_completion_state() -> None:
+    assert "Review complete" in HTML
+    assert "| COMPLETE" in HTML
+    assert "End reached" in HTML
+
+
 def test_view_sampling_is_disjoint_and_one_per_exam() -> None:
     rows = []
     for exam_index in range(10):
@@ -115,6 +122,8 @@ def test_render_dicom_view_png_respects_pixel_budget(tmp_path: Path) -> None:
     with Image.open(output) as image:
         assert image.width * image.height <= 5_000
         assert image.mode == "L"
+    assert output.stat().st_mode & 0o777 == 0o600
+    assert validate_rendered_view_png(output, max_pixels=5_000)
 
 
 def test_fallback_never_crosses_exact_view_slots() -> None:

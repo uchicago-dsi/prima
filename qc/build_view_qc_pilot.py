@@ -11,23 +11,18 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-import pydicom
 from PIL import Image
 from tqdm import tqdm
 
 from prima.dicom_source import (
-    SOURCE_ARCHIVE_COLUMN,
     SOURCE_COLUMNS,
-    DicomSource,
-    materialize_dicom_sources,
     require_source_columns,
     require_valid_sources,
-    validate_materialized_source,
 )
+from prima.view_render import render_source_rows
 from prima.view_qc import (
     VIEW_QC_TARGET,
     empty_view_qc_state,
-    render_dicom_view_png,
     save_view_qc_state,
 )
 
@@ -222,25 +217,14 @@ def render_selected_views(
     *,
     overwrite: bool = False,
 ) -> None:
-    image_dir = out_dir / "images"
-    image_dir.mkdir(parents=True, exist_ok=overwrite)
-    for _archive, archive_rows in tqdm(
-        manifest.groupby(SOURCE_ARCHIVE_COLUMN, sort=True),
-        desc="rendering source views",
-    ):
-        row_records = archive_rows.to_dict("records")
-        sources = [DicomSource.from_row(row) for row in row_records]
-        with materialize_dicom_sources(sources, raw_root) as materialized:
-            for row, source in zip(row_records, sources):
-                source_path = materialized[source.archive_member.as_posix()]
-                dataset = pydicom.dcmread(str(source_path), force=True)
-                validate_materialized_source(
-                    source, source_path, dataset, verify_sha256=True
-                )
-                output_path = out_dir / str(row["image_path"])
-                if output_path.exists() and not overwrite:
-                    raise FileExistsError("refusing to overwrite a view QC image")
-                render_dicom_view_png(dataset, output_path, max_pixels=max_pixels)
+    (out_dir / "images").mkdir(parents=True, exist_ok=overwrite)
+    render_source_rows(
+        manifest,
+        raw_root=raw_root,
+        out_dir=out_dir,
+        max_pixels=max_pixels,
+        resume=overwrite,
+    )
 
 
 def write_provenance(
