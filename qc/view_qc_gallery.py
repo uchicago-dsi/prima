@@ -25,6 +25,7 @@ from prima.view_qc import (
 )
 
 MAX_REQUEST_BYTES = 4096
+DEFAULT_REVIEW_PORT = 8767
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--port", type=int, default=DEFAULT_REVIEW_PORT)
     return parser.parse_args()
 
 
@@ -105,7 +106,7 @@ HTML = r"""<!doctype html>
     #stats { font-variant-numeric: tabular-nums; font-weight: 650; }
     #context { color: #aeb6bf; margin-top: 5px; }
     main { height: calc(100vh - 160px); display: grid; place-items: center; padding: 12px; }
-    img { max-width: 100%; max-height: 100%; object-fit: contain; background: black; }
+    img { max-width: 92%; max-height: 92%; object-fit: contain; background: black; }
     footer { height: 82px; display: flex; gap: 10px; align-items: center; justify-content: center; border-top: 1px solid #34383d; }
     button { border: 1px solid #59616a; border-radius: 7px; padding: 12px 18px; color: white; background: #282d33; font-size: 16px; cursor: pointer; }
     button:hover { background: #343b43; }

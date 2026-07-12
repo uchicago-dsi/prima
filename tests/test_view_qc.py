@@ -22,7 +22,7 @@ from prima.view_qc import (
     validate_rendered_view_png,
 )
 from qc.build_view_qc_pilot import sample_views
-from qc.view_qc_gallery import HTML, load_review_items
+from qc.view_qc_gallery import DEFAULT_REVIEW_PORT, HTML, load_review_items
 
 
 def view_id(index: int) -> str:
@@ -83,6 +83,11 @@ def test_gallery_has_explicit_completion_state() -> None:
     assert "Review complete" in HTML
     assert "| COMPLETE" in HTML
     assert "End reached" in HTML
+
+
+def test_gallery_keeps_stable_port_and_smaller_image() -> None:
+    assert DEFAULT_REVIEW_PORT == 8767
+    assert "max-width: 92%; max-height: 92%" in HTML
 
 
 def test_view_sampling_is_disjoint_and_one_per_exam() -> None:
