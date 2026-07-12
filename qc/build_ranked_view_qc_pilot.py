@@ -16,7 +16,9 @@ import pandas as pd
 
 from prima.view_fallback import validate_candidate_table
 from prima.view_qc import (
+    default_view_qc_events_path,
     empty_view_qc_state,
+    initialize_view_qc_event_log,
     normalize_view_id,
     normalize_view_qc_target,
     save_view_qc_state,
@@ -224,7 +226,8 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
     metadata_path = out_dir / "sampling_metadata.json"
     manifest.to_parquet(manifest_path, index=False)
     os.chmod(manifest_path, 0o600)
-    save_view_qc_state(state_path, empty_view_qc_state(target))
+    state = save_view_qc_state(state_path, empty_view_qc_state(target))
+    initialize_view_qc_event_log(default_view_qc_events_path(state_path), state)
     metadata = {
         "schema_version": 1,
         "created_at": datetime.now(timezone.utc).isoformat(),

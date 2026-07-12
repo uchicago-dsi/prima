@@ -152,7 +152,9 @@ and therefore cannot drive same-slot fallback. The active validation path uses:
 - `qc/view_qc_gallery.py`, which reports one explicit
   `reviewed / total / remaining` denominator and never exposes sampling strata
   or model suggestions. Labels are `present`, `absent`, or `uncertain`, and
-  unrelated findings are deliberately ignored;
+  unrelated findings are deliberately ignored. Every change is appended to a
+  reviewer-attributed, hash-chained `view_qc_events.jsonl`; the JSON state is a
+  recoverable current-state projection of that audit history;
 - `qc/run_view_auto_qc.py` and `submit_view_auto_qc.py`, which write a separate
   `view_suggestions` schema and require both the target name and a versioned
   target prompt file;
@@ -191,8 +193,31 @@ micromamba run -p /gpfs/data/huo-lab/Image/annawoodard/micromamba/envs/prima \
   python qc/view_qc_gallery.py \
   --manifest qc_redo/review_batches/vertical_line_view_review/manifest.parquet \
   --state qc_redo/review_batches/vertical_line_view_review/view_qc_state.json \
+  --reviewer annawoodard \
   --port 8767
 ```
+
+Do not edit the state or event log by hand. The gallery verifies the complete
+event hash chain before reads and writes, fails on divergent state, and repairs
+only the narrow crash case where the state is an older exact prefix of committed
+events. Completed campaigns can be frozen with checksums and owner-read-only
+permissions:
+
+```bash
+python qc/archive_view_qc_campaign.py create \
+  --source-dir /restricted/path/to/completed_campaign \
+  --archive-root qc_redo/annotation_archive \
+  --campaign-name target_reference \
+  --disposition canonical-reference \
+  --notes 'Completed blinded reference panel.'
+
+python qc/archive_view_qc_campaign.py verify \
+  --archive-dir qc_redo/annotation_archive/target_reference
+```
+
+Historical campaigns are preserved exactly. Archive metadata says explicitly
+when their click history predates `view_qc_events.jsonl`; their final human
+state is not reconstructed into fictitious events.
 
 After all labels exist, `qc/evaluate_view_auto_qc.py` computes overall and
 stratum-specific confusion matrices and writes every disagreement for visual

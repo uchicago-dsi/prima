@@ -18,6 +18,8 @@ from prima.dicom_source import SOURCE_COLUMNS, require_source_columns
 from prima.view_auto_qc import load_view_auto_run, save_view_auto_run
 from prima.view_fallback import validate_candidate_table
 from prima.view_qc import (
+    default_view_qc_events_path,
+    initialize_view_qc_event_log,
     load_view_qc_state,
     normalize_view_id,
     save_view_qc_state,
@@ -341,7 +343,13 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
             if view_id in kept_ids
         },
     }
-    save_view_qc_state(out_dir / "view_qc_state.json", repaired_state)
+    repaired_state_path = out_dir / "view_qc_state.json"
+    saved_repaired_state = save_view_qc_state(repaired_state_path, repaired_state)
+    initialize_view_qc_event_log(
+        default_view_qc_events_path(repaired_state_path),
+        saved_repaired_state,
+        import_reviewer="system:eligibility-repair",
+    )
     repaired_run = {
         **model_run,
         "view_suggestions": {

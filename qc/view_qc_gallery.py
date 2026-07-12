@@ -16,10 +16,14 @@ import pandas as pd
 
 from prima.view_qc import (
     VALID_VIEW_LABELS,
+    default_view_qc_events_path,
+    initialize_view_qc_event_log,
     load_view_qc_state,
+    load_view_qc_events,
     normalize_view_id,
-    save_view_qc_state,
-    set_view_label,
+    normalize_view_qc_reviewer,
+    reconcile_view_qc_campaign_state,
+    record_view_qc_label,
     summarize_view_qc_state,
     validate_view_manifest_columns,
 )
@@ -34,6 +38,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--state", type=Path, required=True)
+    parser.add_argument("--events", type=Path, default=None)
+    parser.add_argument("--reviewer", required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=DEFAULT_REVIEW_PORT)
     return parser.parse_args()
@@ -413,10 +419,13 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self._send_json(self.server.items)
             return
         if path == "/api/state":
-            state = load_view_qc_state(self.server.state_path)
-            summarize_view_qc_state(
-                state, [item["view_id"] for item in self.server.items]
-            )
+            with self.server.state_lock:
+                events = load_view_qc_events(self.server.events_path)
+                state = reconcile_view_qc_campaign_state(
+                    self.server.state_path,
+                    events,
+                    [item["view_id"] for item in self.server.items],
+                )
             self._send_json(state)
             return
         if path.startswith("/image/"):
@@ -456,12 +465,14 @@ class ReviewHandler(BaseHTTPRequestHandler):
             if label is not None and label not in VALID_VIEW_LABELS:
                 raise ValueError("invalid view label")
             with self.server.state_lock:
-                state = load_view_qc_state(self.server.state_path)
-                state = set_view_label(state, view_id, label)
-                summarize_view_qc_state(
-                    state, [item["view_id"] for item in self.server.items]
+                state = record_view_qc_label(
+                    state_path=self.server.state_path,
+                    events_path=self.server.events_path,
+                    manifest_view_ids=[item["view_id"] for item in self.server.items],
+                    view_id=view_id,
+                    label=label,
+                    reviewer=self.server.reviewer,
                 )
-                state = save_view_qc_state(self.server.state_path, state)
             self._send_json(state)
         except (ValueError, json.JSONDecodeError) as error:
             self._send_text(str(error), HTTPStatus.BAD_REQUEST)
@@ -476,18 +487,34 @@ def main() -> int:
 
     manifest_path = args.manifest.resolve()
     state_path = args.state.resolve()
+    events_path = (
+        args.events.resolve()
+        if args.events is not None
+        else default_view_qc_events_path(state_path)
+    )
+    reviewer = normalize_view_qc_reviewer(args.reviewer)
     if not manifest_path.is_file():
         raise FileNotFoundError(f"view QC manifest not found: {manifest_path}")
     items, images = load_review_items(manifest_path)
     state = load_view_qc_state(state_path)
+    if not events_path.exists():
+        if state["labels"]:
+            raise FileNotFoundError(
+                "nonempty view QC state has no event log; import it explicitly before review"
+            )
+        initialize_view_qc_event_log(events_path, state)
+    events = load_view_qc_events(events_path)
+    state = reconcile_view_qc_campaign_state(
+        state_path, events, [item["view_id"] for item in items]
+    )
     progress = summarize_view_qc_state(state, [item["view_id"] for item in items])
-    if not state_path.exists():
-        save_view_qc_state(state_path, state)
 
     server = ReviewServer((args.host, args.port), ReviewHandler)
     server.items = items
     server.images = images
     server.state_path = state_path
+    server.events_path = events_path
+    server.reviewer = reviewer
     server.state_lock = threading.Lock()
     print(
         "view QC ready: "

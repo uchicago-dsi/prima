@@ -20,7 +20,12 @@ from prima.dicom_source import (
     require_valid_sources,
 )
 from prima.view_render import render_source_rows
-from prima.view_qc import empty_view_qc_state, save_view_qc_state
+from prima.view_qc import (
+    default_view_qc_events_path,
+    empty_view_qc_state,
+    initialize_view_qc_event_log,
+    save_view_qc_state,
+)
 
 VIEW_ORDER = [("L", "CC"), ("R", "CC"), ("L", "MLO"), ("R", "MLO")]
 VERTICAL_DETECTOR_SEAM_TARGET = "vertical detector seam"
@@ -333,7 +338,10 @@ def main() -> int:
     manifest.to_parquet(manifest_path, index=False)
     os.chmod(scores_path, 0o600)
     os.chmod(manifest_path, 0o600)
-    save_view_qc_state(state_path, empty_view_qc_state(VERTICAL_DETECTOR_SEAM_TARGET))
+    state = save_view_qc_state(
+        state_path, empty_view_qc_state(VERTICAL_DETECTOR_SEAM_TARGET)
+    )
+    initialize_view_qc_event_log(default_view_qc_events_path(state_path), state)
     write_provenance(
         out_dir,
         views_path=views_path,

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from pydicom.dataset import Dataset
+from pydicom.dataset import Dataset, FileMetaDataset
 from pydicom.sequence import Sequence
 from pydicom.uid import ExplicitVRLittleEndian
 import pytest
@@ -101,7 +101,7 @@ def test_nonstandard_diagnostic_view_is_persisted_with_source_and_reason(
     dataset.StudyInstanceUID = "1.2.826.0.1.3680043.10.999.1"
     dataset.SOPInstanceUID = "1.2.826.0.1.3680043.10.999.2"
     dataset.SOPClassUID = "1.2.840.10008.5.1.4.1.1.1.2"
-    dataset.file_meta = Dataset()
+    dataset.file_meta = FileMetaDataset()
     dataset.file_meta.MediaStorageSOPClassUID = dataset.SOPClassUID
     dataset.file_meta.MediaStorageSOPInstanceUID = dataset.SOPInstanceUID
     dataset.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
@@ -114,7 +114,7 @@ def test_nonstandard_diagnostic_view_is_persisted_with_source_and_reason(
     dataset.SamplesPerPixel = 1
     dataset.PhotometricInterpretation = "MONOCHROME2"
     dataset.PixelData = b"\x00\x00" * 4
-    dataset.save_as(dicom_path, enforce_file_format=True)
+    dataset.save_as(dicom_path, write_like_original=False)
 
     result = _process_exam_dir(
         exam_dir,

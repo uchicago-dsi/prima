@@ -16,7 +16,9 @@ import pandas as pd
 from prima.view_auto_qc import load_view_auto_run, save_view_auto_run
 from prima.view_fallback import validate_candidate_table
 from prima.view_qc import (
+    default_view_qc_events_path,
     empty_view_qc_state,
+    initialize_view_qc_event_log,
     normalize_view_id,
     save_view_qc_state,
     validate_rendered_view_png,
@@ -270,7 +272,8 @@ def main() -> int:
     hidden_run_path = out_dir / "hidden_model_run.json"
     manifest.to_parquet(manifest_path, index=False)
     os.chmod(manifest_path, 0o600)
-    save_view_qc_state(state_path, empty_view_qc_state(run["target"]))
+    state = save_view_qc_state(state_path, empty_view_qc_state(run["target"]))
+    initialize_view_qc_event_log(default_view_qc_events_path(state_path), state)
     subset_run = {
         **run,
         "run_id": str(run["run_id"]) + "_fallback_audit",

@@ -25,6 +25,17 @@ python qc/init_view_qc_review.py \
   --target 'the visual finding being reviewed'
 ```
 
+Initialization creates both `view_qc_state.json` and the append-only
+`view_qc_events.jsonl`. Start the reviewer with a stable audit identity:
+
+```bash
+python qc/view_qc_gallery.py \
+  --manifest /path/to/manifest.parquet \
+  --state /path/to/view_qc_state.json \
+  --reviewer annawoodard \
+  --port 8767
+```
+
 Build a diagnostic-view target panel from the durable exclusion pool with
 metadata-enriched cases, other diagnostic exclusions as hard negatives, and
 standard-view controls:

@@ -22,7 +22,9 @@ from prima.dicom_source import (
     require_valid_sources,
 )
 from prima.view_qc import (
+    default_view_qc_events_path,
     empty_view_qc_state,
+    initialize_view_qc_event_log,
     normalize_view_id,
     normalize_view_qc_target,
     save_view_qc_state,
@@ -247,7 +249,8 @@ def write_outputs(
     manifest.to_parquet(manifest_path, index=False)
     source_manifest.to_parquet(source_path, index=False)
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
-    save_view_qc_state(state_path, empty_view_qc_state(target))
+    state = save_view_qc_state(state_path, empty_view_qc_state(target))
+    initialize_view_qc_event_log(default_view_qc_events_path(state_path), state)
     for path in (manifest_path, source_path, metadata_path):
         os.chmod(path, 0o600)
 

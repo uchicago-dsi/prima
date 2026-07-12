@@ -16,9 +16,15 @@ from prima.view_qc import (
     VIEW_LABEL_ABSENT,
     VIEW_LABEL_PRESENT,
     VIEW_LABEL_UNCERTAIN,
+    default_view_qc_events_path,
     empty_view_qc_state,
+    initialize_view_qc_event_log,
+    load_view_qc_events,
     load_view_qc_state,
+    reconcile_view_qc_campaign_state,
+    record_view_qc_label,
     render_dicom_view_png,
+    replay_view_qc_events,
     save_view_qc_state,
     set_view_label,
     summarize_view_qc_state,
@@ -117,8 +123,148 @@ def test_generic_review_initializer_binds_target_and_refuses_overwrite(
 
     assert initialize_review(manifest_path, state_path, "  test   artifact ") == 1
     assert load_view_qc_state(state_path) == empty_view_qc_state("test artifact")
+    events_path = default_view_qc_events_path(state_path)
+    assert events_path.is_file()
+    assert events_path.stat().st_mode & 0o777 == 0o600
+    assert load_view_qc_events(events_path) == []
     with pytest.raises(FileExistsError, match="refusing to replace"):
         initialize_review(manifest_path, state_path, "another artifact")
+
+
+def test_view_qc_event_log_is_append_only_hash_chained_and_replayable(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "view_qc_state.json"
+    events_path = default_view_qc_events_path(state_path)
+    manifest_ids = [view_id(1), view_id(2)]
+    state = save_view_qc_state(state_path, empty_view_qc_state("test artifact"))
+    initialize_view_qc_event_log(events_path, state)
+
+    state = record_view_qc_label(
+        state_path=state_path,
+        events_path=events_path,
+        manifest_view_ids=manifest_ids,
+        view_id=view_id(1),
+        label=VIEW_LABEL_PRESENT,
+        reviewer="reviewer-1",
+    )
+    state = record_view_qc_label(
+        state_path=state_path,
+        events_path=events_path,
+        manifest_view_ids=manifest_ids,
+        view_id=view_id(1),
+        label=VIEW_LABEL_ABSENT,
+        reviewer="reviewer-1",
+    )
+    state = record_view_qc_label(
+        state_path=state_path,
+        events_path=events_path,
+        manifest_view_ids=manifest_ids,
+        view_id=view_id(1),
+        label=None,
+        reviewer="reviewer-1",
+    )
+
+    events = load_view_qc_events(events_path)
+    assert len(events) == 3
+    assert [event["previous_label"] for event in events] == [
+        None,
+        VIEW_LABEL_PRESENT,
+        VIEW_LABEL_ABSENT,
+    ]
+    assert [event["label"] for event in events] == [
+        VIEW_LABEL_PRESENT,
+        VIEW_LABEL_ABSENT,
+        None,
+    ]
+    assert all(event["reviewer"] == "reviewer-1" for event in events)
+    assert replay_view_qc_events("test artifact", events) == state
+    assert state == empty_view_qc_state("test artifact")
+    assert events_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_view_qc_event_log_detects_tampering(tmp_path: Path) -> None:
+    state_path = tmp_path / "view_qc_state.json"
+    events_path = default_view_qc_events_path(state_path)
+    state = save_view_qc_state(state_path, empty_view_qc_state("test artifact"))
+    initialize_view_qc_event_log(events_path, state)
+    record_view_qc_label(
+        state_path=state_path,
+        events_path=events_path,
+        manifest_view_ids=[view_id(1)],
+        view_id=view_id(1),
+        label=VIEW_LABEL_PRESENT,
+        reviewer="reviewer-1",
+    )
+    text = events_path.read_text().replace('"label":"present"', '"label":"absent"')
+    events_path.write_text(text)
+
+    with pytest.raises(ValueError, match="event hash is invalid"):
+        load_view_qc_events(events_path)
+
+
+def test_imported_state_is_explicit_in_event_history(tmp_path: Path) -> None:
+    state = set_view_label(
+        empty_view_qc_state("test artifact"), view_id(1), VIEW_LABEL_UNCERTAIN
+    )
+    events_path = tmp_path / "events.jsonl"
+    events = initialize_view_qc_event_log(
+        events_path, state, import_reviewer="system:test-import"
+    )
+
+    assert len(events) == 1
+    assert events[0]["event_type"] == "state_import"
+    assert events[0]["reviewer"] == "system:test-import"
+    assert replay_view_qc_events("test artifact", events) == state
+
+
+def test_event_replay_recovers_state_after_interrupted_projection_write(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "view_qc_state.json"
+    events_path = default_view_qc_events_path(state_path)
+    manifest_ids = [view_id(1)]
+    empty = save_view_qc_state(state_path, empty_view_qc_state("test artifact"))
+    initialize_view_qc_event_log(events_path, empty)
+    committed = record_view_qc_label(
+        state_path=state_path,
+        events_path=events_path,
+        manifest_view_ids=manifest_ids,
+        view_id=view_id(1),
+        label=VIEW_LABEL_PRESENT,
+        reviewer="reviewer-1",
+    )
+
+    save_view_qc_state(state_path, empty)
+    recovered = reconcile_view_qc_campaign_state(
+        state_path, load_view_qc_events(events_path), manifest_ids
+    )
+
+    assert recovered == committed
+    assert load_view_qc_state(state_path) == committed
+
+
+def test_event_replay_refuses_divergent_state(tmp_path: Path) -> None:
+    state_path = tmp_path / "view_qc_state.json"
+    events_path = default_view_qc_events_path(state_path)
+    manifest_ids = [view_id(1)]
+    empty = save_view_qc_state(state_path, empty_view_qc_state("test artifact"))
+    initialize_view_qc_event_log(events_path, empty)
+    record_view_qc_label(
+        state_path=state_path,
+        events_path=events_path,
+        manifest_view_ids=manifest_ids,
+        view_id=view_id(1),
+        label=VIEW_LABEL_PRESENT,
+        reviewer="reviewer-1",
+    )
+    divergent = set_view_label(empty, view_id(1), VIEW_LABEL_ABSENT)
+    save_view_qc_state(state_path, divergent)
+
+    with pytest.raises(ValueError, match="state diverges"):
+        reconcile_view_qc_campaign_state(
+            state_path, load_view_qc_events(events_path), manifest_ids
+        )
 
 
 def test_gallery_has_explicit_completion_state() -> None:
