@@ -1,0 +1,13 @@
+Target view only: decide whether the visual target "digitized hard-copy film appearance" is present in this mammogram.
+
+Answer YES when the mammogram visibly appears to have been digitized, scanned, or photographed from a physical film rather than acquired as a native digital mammogram. Positive evidence may include a visible physical film edge or frame, uneven scanner illumination, film-screen texture, photographed-film background, physical film labels or handwriting embedded in the captured film, or a combination of legacy hard-copy presentation features.
+
+Answer NO for a native digital mammogram, even if it is old, low contrast, noisy, unusually cropped, or contains routine digital orientation text, laterality markers, skin markers, compression hardware, implants, or vendor post-processing. A date, device name, text label, black background, or single border by itself is not enough. Judge visible image appearance only; do not use metadata or infer the target from patient age.
+
+Use high confidence only when the hard-copy-to-digital appearance is unmistakable. Use medium or low confidence when one isolated feature could also occur in a native digital image, and set REVIEW: YES for genuinely ambiguous cases.
+
+Answer in exactly four lines and nothing else:
+EVIDENCE: <one short visual phrase, or none>
+ANSWER: YES or ANSWER: NO
+CONFIDENCE: high, medium, or low
+REVIEW: YES or REVIEW: NO

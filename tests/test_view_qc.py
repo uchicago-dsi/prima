@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -24,6 +25,7 @@ from prima.view_qc import (
     validate_rendered_view_png,
 )
 from qc.build_view_qc_pilot import sample_views
+from qc.build_ranked_view_qc_pilot import run_from_args as build_ranked_pilot
 from qc.init_view_qc_review import initialize_review
 from qc.view_qc_gallery import DEFAULT_REVIEW_PORT, HTML, load_review_items
 
@@ -164,6 +166,87 @@ def test_view_sampling_is_disjoint_and_one_per_exam() -> None:
     assert set(selected["stratum"]) == {"heuristic_top", "random"}
     assert sorted(selected["review_order"]) == list(range(1, 9))
     assert (selected["view_id"] == selected["sha256"]).all()
+
+
+def test_ranked_pilot_is_target_bound_and_deidentified(tmp_path: Path) -> None:
+    candidates = []
+    score_rows = []
+    rendered_rows = []
+    rendered_root = tmp_path / "rendered"
+    rendered_images = rendered_root / "images"
+    rendered_images.mkdir(parents=True)
+    slots = [("L", "CC"), ("R", "CC"), ("L", "MLO"), ("R", "MLO")]
+    for index, (laterality, view) in enumerate(slots, start=1):
+        identifier = view_id(index)
+        candidates.append(
+            {
+                "exam_id": f"exam-{index}",
+                "laterality": laterality,
+                "view": view,
+                "sop_instance_uid": f"sop-{index}",
+                "sha256": identifier,
+                "selection_rank": 1,
+                "is_selected": True,
+            }
+        )
+        score_rows.append(
+            {
+                "exam_id": f"exam-{index}",
+                "sop_instance_uid": f"sop-{index}",
+                "score_a": float(index),
+                "score_b": float(index * 2),
+                "load_error": None,
+                "laterality": "score-table-value-must-not-shadow-candidate",
+                "view": "score-table-value-must-not-shadow-candidate",
+            }
+        )
+        Image.new("L", (8, 8), color=index).save(rendered_images / f"{identifier}.png")
+        rendered_rows.append(
+            {
+                "view_id": identifier,
+                "image_path": f"images/{identifier}.png",
+                "laterality": laterality,
+                "view": view,
+                "review_order": index,
+            }
+        )
+    candidates_path = tmp_path / "candidates.parquet"
+    pd.DataFrame(candidates).to_parquet(candidates_path, index=False)
+    scores_path = tmp_path / "scores.csv"
+    pd.DataFrame(score_rows).to_csv(scores_path, index=False)
+    rendered_manifest = rendered_root / "manifest.parquet"
+    pd.DataFrame(rendered_rows).to_parquet(rendered_manifest, index=False)
+    out_dir = tmp_path / "pilot"
+
+    manifest = build_ranked_pilot(
+        SimpleNamespace(
+            scores=scores_path,
+            score_columns="score_a,score_b",
+            score_top_k=1,
+            candidates=candidates_path,
+            rendered_manifest=rendered_manifest,
+            out_dir=out_dir,
+            target="test artifact",
+            enriched_count=1,
+            random_count=1,
+            seed=7,
+            max_render_pixels=100,
+        )
+    )
+
+    assert set(manifest["stratum"]) == {"score_enriched", "random_control"}
+    assert set(manifest.columns) == {
+        "view_id",
+        "image_path",
+        "laterality",
+        "view",
+        "review_order",
+        "stratum",
+    }
+    assert load_view_qc_state(out_dir / "view_qc_state.json")["target"] == (
+        "test artifact"
+    )
+    assert all((out_dir / path).is_file() for path in manifest["image_path"])
 
 
 class FakeDataset(dict):
