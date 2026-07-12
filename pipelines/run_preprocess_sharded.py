@@ -21,7 +21,9 @@ from pipelines.preprocess import (
     build_unique_exam_dir_filter,
 )
 from prima.dicom_source import (
+    SOURCE_ARCHIVE_COLUMN,
     SOURCE_COLUMNS,
+    SOURCE_MEMBER_COLUMN,
     require_source_columns,
     require_valid_sources,
 )
@@ -211,6 +213,7 @@ def merge_shard_outputs(
 
     views_dfs = []
     candidate_dfs = []
+    exclusion_dfs = []
     exams_dfs = []
     tags_dfs = []
     cohort_dfs = []
@@ -222,6 +225,7 @@ def merge_shard_outputs(
         required_paths = [
             shard_dir / "views.parquet",
             shard_dir / "view_candidates.parquet",
+            shard_dir / "view_exclusions.parquet",
             shard_dir / "exams.parquet",
             shard_dir / "dicom_tags.parquet",
             shard_dir / "cohort.parquet",
@@ -249,6 +253,15 @@ def merge_shard_outputs(
             str(shard_dir / "view_candidates.parquet"),
         )
         candidate_dfs.append(shard_candidates)
+        shard_exclusions = pd.read_parquet(shard_dir / "view_exclusions.parquet")
+        require_source_columns(
+            shard_exclusions.columns, str(shard_dir / "view_exclusions.parquet")
+        )
+        require_valid_sources(
+            shard_exclusions[list(SOURCE_COLUMNS)].to_dict("records"),
+            str(shard_dir / "view_exclusions.parquet"),
+        )
+        exclusion_dfs.append(shard_exclusions)
         exams_dfs.append(pd.read_parquet(shard_dir / "exams.parquet"))
         tags_dfs.append(pd.read_parquet(shard_dir / "dicom_tags.parquet"))
         cohort_dfs.append(pd.read_parquet(shard_dir / "cohort.parquet"))
@@ -277,6 +290,16 @@ def merge_shard_outputs(
         )
         combined.to_parquet(sot_dir / "view_candidates.parquet", index=False)
         print(f"  Merged view_candidates.parquet: {len(combined):,} rows")
+    if exclusion_dfs:
+        combined = pd.concat(exclusion_dfs, ignore_index=True)
+        combined = combined.drop_duplicates(
+            subset=[SOURCE_ARCHIVE_COLUMN, SOURCE_MEMBER_COLUMN]
+        )
+        require_source_columns(
+            combined.columns, str(sot_dir / "view_exclusions.parquet")
+        )
+        combined.to_parquet(sot_dir / "view_exclusions.parquet", index=False)
+        print(f"  Merged view_exclusions.parquet: {len(combined):,} rows")
     if exams_dfs:
         combined = pd.concat(exams_dfs, ignore_index=True)
         combined = combined.drop_duplicates(subset=["patient_id", "exam_id"])

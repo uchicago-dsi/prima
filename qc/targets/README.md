@@ -25,6 +25,24 @@ python qc/init_view_qc_review.py \
   --target 'the visual finding being reviewed'
 ```
 
+Build a diagnostic-view target panel from the durable exclusion pool with
+metadata-enriched cases, other diagnostic exclusions as hard negatives, and
+standard-view controls:
+
+```bash
+python qc/build_view_exclusion_qc_pilot.py \
+  --exclusions /path/to/sot/view_exclusions.parquet \
+  --standard-views /path/to/sot/views.parquet \
+  --raw-root /path/to/raw-dicoms \
+  --out-dir /restricted/path/to/pilot \
+  --target 'non-standard spot-compression or magnification view' \
+  --enrichment-regex 'spot|magnif'
+```
+
+The browser reads the deidentified `manifest.parquet`. Exact DICOM lineage is
+kept separately in mode-600 `source_manifest.parquet`; enrichment strata are
+sampling aids and never reference labels.
+
 Example:
 
 ```bash

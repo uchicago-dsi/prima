@@ -109,6 +109,7 @@ from prima.view_selection import (
     estimate_magnification_factor,
     estimate_pixel_spacing_mm,
     nonstandard_mirai_view_reasons,
+    view_modifier_code_meanings,
     view_selection_key,
 )
 
@@ -245,6 +246,18 @@ VIEW_CANDIDATES_COLS = VIEWS_COLS + [
     "selection_rank",
     "is_selected",
 ]
+
+VIEW_EXCLUSIONS_COLS = VIEWS_COLS + [
+    "partial_view",
+    "partial_view_description",
+    "view_modifiers",
+    "paddle_description",
+    "estimated_magnification_factor",
+    "pixel_spacing_mm",
+    "exclusion_reasons",
+]
+
+DISCOVERY_CHECKPOINT_SCHEMA_VERSION = 2
 
 # DICOM tags are stored in wide format (one column per tag keyword)
 # No fixed column list needed - dynamically determined from data
@@ -398,11 +411,8 @@ def extract_all_tags(ds: FileDataset, sop_instance_uid: str) -> Dict[str, str]:
     return tag_dict
 
 
-def infer_view_fields(ds: FileDataset) -> Tuple[str, str]:
-    """Infer laterality (L/R) and view (CC/MLO) from standard tags.
-
-    raises if tags are missing or values are not in the allowed set.
-    """
+def infer_view_identity(ds: FileDataset) -> Tuple[str, str]:
+    """Read a diagnostic view's laterality and raw ViewPosition."""
     lat = get_tag(ds, (0x0020, 0x0062)) or get_tag(ds, (0x0020, 0x0060))
     vp = get_tag(ds, (0x0018, 0x5101))
     if lat is None or vp is None:
@@ -411,8 +421,12 @@ def infer_view_fields(ds: FileDataset) -> Tuple[str, str]:
     vp = vp.strip().upper()
     if lat not in {"L", "R"}:
         raise ValueError(f"unexpected laterality: {lat}")
-    if vp not in {"CC", "MLO"}:
-        raise ValueError(f"unexpected view position: {vp}")
+    return lat, vp
+
+
+def infer_view_fields(ds: FileDataset) -> Tuple[str, str]:
+    """Infer laterality (L/R) and a standard, unmodified CC/MLO view."""
+    lat, vp = infer_view_identity(ds)
     nonstandard_reasons = nonstandard_mirai_view_reasons(ds)
     if nonstandard_reasons:
         raise ValueError("non-standard Mirai view: " + "; ".join(nonstandard_reasons))
@@ -685,6 +699,7 @@ def _process_exam_dir(
             return {
                 "rows": [],
                 "candidate_rows": [],
+                "exclusion_rows": [],
                 "tag_rows": [],
                 "exam_status": "path_not_found",
                 "total_files": 0,
@@ -692,6 +707,7 @@ def _process_exam_dir(
                 "total_dicoms": 0,
                 "valid_dicoms": 0,
                 "for_presentation_dicoms": 0,
+                "excluded_nonstandard_dicoms": 0,
                 "valid_views": 0,
                 "has_four_views": False,
             }
@@ -700,6 +716,7 @@ def _process_exam_dir(
         return {
             "rows": [],
             "candidate_rows": [],
+            "exclusion_rows": [],
             "tag_rows": [],
             "exam_status": "setup_error",
             "total_files": 0,
@@ -707,6 +724,7 @@ def _process_exam_dir(
             "total_dicoms": 0,
             "valid_dicoms": 0,
             "for_presentation_dicoms": 0,
+            "excluded_nonstandard_dicoms": 0,
             "valid_views": 0,
             "has_four_views": False,
         }
@@ -723,6 +741,7 @@ def _process_exam_dir(
             logger.info(f"Found {len(dcm_files)} DICOM files in exam")
 
         rows = []
+        exclusion_rows = []
         tag_rows = []
         failed_files = []
 
@@ -772,9 +791,10 @@ def _process_exam_dir(
                         )
                     continue
 
-                # try to get laterality and view
+                # Read enough view identity to retain diagnostic views that are
+                # intentionally ineligible for Mirai's canonical full quad.
                 try:
-                    lat, vp = infer_view_fields(ds)
+                    lat, vp = infer_view_identity(ds)
                 except ValueError as e:
                     reason = str(e)
                     if debug_dir:
@@ -793,25 +813,8 @@ def _process_exam_dir(
                         )
                     continue
 
-                if debug_dir:
-                    logger.info(
-                        f"  OK: {p.name} - {lat} {vp}, for_presentation={present}"
-                    )
-
-                # save debug figure for successful DICOMs too
-                if debug_dir:
-                    _save_debug_figure(
-                        ds,
-                        p,
-                        "SUCCESS",
-                        f"{lat} {vp}",
-                        debug_dir,
-                        patient_id,
-                        study_uid,
-                        accession_number,
-                    )
-
-                # prepare base row data
+                # Prepare durable source lineage before standard-view filtering so
+                # excluded diagnostic images remain available for targeted QC.
                 row_data = {
                     "patient_id": patient_id,
                     "exam_id": study_uid,
@@ -846,6 +849,62 @@ def _process_exam_dir(
                     ),
                 }
 
+                nonstandard_reasons = nonstandard_mirai_view_reasons(ds)
+                if nonstandard_reasons:
+                    exclusion_row = dict(row_data)
+                    exclusion_row.pop("_materialized_dicom_path")
+                    exclusion_row.update(
+                        {
+                            "partial_view": (
+                                str(ds.get("PartialView", "") or "").strip().upper()
+                                == "YES"
+                            ),
+                            "partial_view_description": str(
+                                ds.get("PartialViewDescription", "") or ""
+                            ).strip(),
+                            "view_modifiers": json.dumps(
+                                list(view_modifier_code_meanings(ds))
+                            ),
+                            "paddle_description": str(
+                                ds.get("PaddleDescription", "") or ""
+                            ).strip(),
+                            "exclusion_reasons": json.dumps(list(nonstandard_reasons)),
+                        }
+                    )
+                    exclusion_rows.append(exclusion_row)
+                    if debug_dir:
+                        reason = "; ".join(nonstandard_reasons)
+                        logger.warning(f"  EXCLUDE: {p.name} - {reason}")
+                        _save_debug_figure(
+                            ds,
+                            p,
+                            "FAILED",
+                            reason,
+                            debug_dir,
+                            patient_id,
+                            study_uid,
+                            accession_number,
+                        )
+                    continue
+
+                if debug_dir:
+                    logger.info(
+                        f"  OK: {p.name} - {lat} {vp}, for_presentation={present}"
+                    )
+
+                # save debug figure for successful DICOMs too
+                if debug_dir:
+                    _save_debug_figure(
+                        ds,
+                        p,
+                        "SUCCESS",
+                        f"{lat} {vp}",
+                        debug_dir,
+                        patient_id,
+                        study_uid,
+                        accession_number,
+                    )
+
                 rows.append(row_data)
 
                 # extract all DICOM tags for this image (wide format: one dict per image)
@@ -859,6 +918,7 @@ def _process_exam_dir(
             logger.info("\nExam summary:")
             logger.info(f"  Total files: {len(dcm_files)}")
             logger.info(f"  Successfully processed: {len(rows)}")
+            logger.info(f"  Excluded diagnostic views: {len(exclusion_rows)}")
             logger.info(f"  Failed/skipped: {len(failed_files)}")
 
             # report failure reasons
@@ -886,27 +946,33 @@ def _process_exam_dir(
                     f"    {lat}-{vw}: {len(pres_list)} total, {for_pres} for_presentation"
                 )
 
-        # if we got NO valid rows, log the issue but don't raise an error
-        if not rows and debug_dir:
-            logger.warning(
-                f"\n=== NO VALID DICOMs found in source {path_log_id(exam_path)} ==="
-            )
-            if failed_files:
-                p, reason, ds = failed_files[0]
-                logger.warning(f"Source: {path_log_id(p)}")
-                logger.warning(f"Reason: {reason}")
+        # if we got NO standard rows, retain exclusions but do not attempt selection
+        if not rows:
+            if debug_dir:
+                logger.warning(
+                    "\n=== NO STANDARD DICOMs found in source "
+                    f"{path_log_id(exam_path)} ==="
+                )
+                if failed_files:
+                    p, reason, ds = failed_files[0]
+                    logger.warning(f"Source: {path_log_id(p)}")
+                    logger.warning(f"Reason: {reason}")
 
             # return empty rows and exam status
             return {
                 "rows": [],
                 "candidate_rows": [],
+                "exclusion_rows": exclusion_rows,
                 "tag_rows": [],
-                "exam_status": "no_valid_dicoms",
+                "exam_status": (
+                    "no_standard_dicoms" if exclusion_rows else "no_valid_dicoms"
+                ),
                 "total_files": len(dcm_files),
                 "failed_files": len(failed_files),
                 "total_dicoms": len(dcm_files),
                 "valid_dicoms": 0,
-                "for_presentation_dicoms": 0,
+                "for_presentation_dicoms": len(exclusion_rows),
+                "excluded_nonstandard_dicoms": len(exclusion_rows),
                 "valid_views": 0,
                 "has_four_views": False,
             }
@@ -970,13 +1036,17 @@ def _process_exam_dir(
         return {
             "rows": persisted_rows,
             "candidate_rows": persisted_candidate_rows,
+            "exclusion_rows": exclusion_rows,
             "tag_rows": selected_tag_rows,
             "exam_status": "success",
             "total_files": len(dcm_files),
             "failed_files": len(failed_files),
             "total_dicoms": len(dcm_files),
             "valid_dicoms": len(rows),
-            "for_presentation_dicoms": sum(r["for_presentation"] for r in rows),
+            "for_presentation_dicoms": (
+                sum(r["for_presentation"] for r in rows) + len(exclusion_rows)
+            ),
+            "excluded_nonstandard_dicoms": len(exclusion_rows),
             "valid_views": len(view_keys),
             "has_four_views": has_four_views,
             "manifest_rows": manifest_rows,
@@ -990,6 +1060,7 @@ def _process_exam_dir(
         return {
             "rows": [],
             "candidate_rows": [],
+            "exclusion_rows": [],
             "tag_rows": [],
             "exam_status": "processing_error",
             "total_files": 0,
@@ -997,6 +1068,7 @@ def _process_exam_dir(
             "total_dicoms": 0,
             "valid_dicoms": 0,
             "for_presentation_dicoms": 0,
+            "excluded_nonstandard_dicoms": 0,
             "valid_views": 0,
             "has_four_views": False,
         }
@@ -1137,7 +1209,7 @@ def resume_from_checkpoint(
     logger.info(f"resuming from checkpoint: {checkpoint_file}")
 
     try:
-        views_df, candidates_df, tags_df, _, _, _ = discover_dicoms(
+        views_df, candidates_df, exclusions_df, tags_df, _, _, _ = discover_dicoms(
             raw_dir=raw_dir,
             max_exams=max_exams,
             workers=workers,
@@ -1147,7 +1219,8 @@ def resume_from_checkpoint(
         )
         logger.info(
             f"resumed processing completed, collected {len(views_df)} selected views, "
-            f"{len(candidates_df)} candidates, and {len(tags_df)} tag records"
+            f"{len(candidates_df)} candidates, {len(exclusions_df)} diagnostic "
+            f"exclusions, and {len(tags_df)} tag records"
         )
     except Exception as e:
         logger.error(f"failed to resume processing: {e}")
@@ -1247,6 +1320,18 @@ def _combine_staging_files(staging_dir: Path, pattern: str) -> pd.DataFrame:
         dfs = [pd.read_parquet(f) for f in files]
 
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+
+
+def _require_view_exclusions_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """Return exclusions in canonical column order, including an empty table."""
+    if df.empty:
+        return pd.DataFrame(columns=VIEW_EXCLUSIONS_COLS)
+    missing = sorted(set(VIEW_EXCLUSIONS_COLS) - set(df.columns))
+    if missing:
+        raise ValueError(
+            "diagnostic view exclusions are missing columns: " + ", ".join(missing)
+        )
+    return df[VIEW_EXCLUSIONS_COLS]
 
 
 def build_unique_exam_dir_filter(
@@ -1521,6 +1606,7 @@ def discover_dicoms(
     pd.DataFrame,
     pd.DataFrame,
     pd.DataFrame,
+    pd.DataFrame,
     List[Dict],
     List[Dict],
     List[ExamRecord],
@@ -1590,6 +1676,7 @@ def discover_dicoms(
         "total_dicoms": 0,
         "valid_dicoms": 0,
         "for_presentation_dicoms": 0,
+        "excluded_nonstandard_dicoms": 0,
         "failed_dicoms": 0,
         "failed_exams": 0,
     }
@@ -1599,6 +1686,13 @@ def discover_dicoms(
         try:
             with open(checkpoint_file) as f:
                 checkpoint_data = json.load(f)
+            checkpoint_schema = checkpoint_data.get("schema_version")
+            if checkpoint_schema != DISCOVERY_CHECKPOINT_SCHEMA_VERSION:
+                raise RuntimeError(
+                    "discovery checkpoint schema mismatch: expected "
+                    f"{DISCOVERY_CHECKPOINT_SCHEMA_VERSION}, got {checkpoint_schema}; "
+                    "delete the checkpoint directory and rebuild"
+                )
             processed_exams = set(checkpoint_data.get("processed_exams", []))
             chunk_counter = checkpoint_data.get("chunk_counter", 0)
             # load previous stats but keep total_exams current
@@ -1611,6 +1705,8 @@ def discover_dicoms(
             logger.info(
                 f"resuming from checkpoint: {len(processed_exams)} exams already processed, at chunk {chunk_counter}"
             )
+        except RuntimeError:
+            raise
         except Exception as e:
             logger.warning(f"failed to load checkpoint: {e}, starting fresh")
 
@@ -1629,6 +1725,10 @@ def discover_dicoms(
         candidates_df = _combine_staging_files(
             staging_dir, "candidates_chunk_*.parquet"
         )
+        exclusions_df = _combine_staging_files(
+            staging_dir, "exclusions_chunk_*.parquet"
+        )
+        exclusions_df = _require_view_exclusions_schema(exclusions_df)
         tags_df = _combine_staging_files(staging_dir, "tags_chunk_*.parquet")
         manifest_df = _combine_staging_files(staging_dir, "manifest_chunk_*.parquet")
         failures_df = _combine_staging_files(
@@ -1637,6 +1737,7 @@ def discover_dicoms(
         return (
             views_df,
             candidates_df,
+            exclusions_df,
             tags_df,
             manifest_df.to_dict("records"),
             failures_df.to_dict("records"),
@@ -1649,6 +1750,7 @@ def discover_dicoms(
     def save_checkpoint():
         """save current progress to checkpoint file"""
         checkpoint_data = {
+            "schema_version": DISCOVERY_CHECKPOINT_SCHEMA_VERSION,
             "processed_exams": list(processed_exams),
             "chunk_counter": chunk_counter,
             "exam_stats": exam_stats,
@@ -1684,6 +1786,10 @@ def discover_dicoms(
             candidates_df = _combine_staging_files(
                 staging_dir, "candidates_chunk_*.parquet"
             )
+            exclusions_df = _combine_staging_files(
+                staging_dir, "exclusions_chunk_*.parquet"
+            )
+            exclusions_df = _require_view_exclusions_schema(exclusions_df)
             tags_df = _combine_staging_files(staging_dir, "tags_chunk_*.parquet")
             manifest_df = _combine_staging_files(
                 staging_dir, "manifest_chunk_*.parquet"
@@ -1694,6 +1800,7 @@ def discover_dicoms(
             return (
                 views_df,
                 candidates_df,
+                exclusions_df,
                 tags_df,
                 manifest_df.to_dict("records"),
                 failures_df.to_dict("records"),
@@ -1713,6 +1820,7 @@ def discover_dicoms(
         # accumulate rows for this chunk only
         chunk_rows = []
         chunk_candidate_rows = []
+        chunk_exclusion_rows = []
         chunk_tag_rows = []
         chunk_manifest_rows = []
         chunk_zarr_failures = []
@@ -1750,6 +1858,7 @@ def discover_dicoms(
 
                     chunk_rows.extend(result["rows"])
                     chunk_candidate_rows.extend(result["candidate_rows"])
+                    chunk_exclusion_rows.extend(result["exclusion_rows"])
                     chunk_tag_rows.extend(result["tag_rows"])
                     chunk_manifest_rows.extend(result.get("manifest_rows", []))
                     if result.get("zarr_error") is not None:
@@ -1758,6 +1867,9 @@ def discover_dicoms(
                     exam_stats["valid_dicoms"] += result["valid_dicoms"]
                     exam_stats["for_presentation_dicoms"] += result[
                         "for_presentation_dicoms"
+                    ]
+                    exam_stats["excluded_nonstandard_dicoms"] += result[
+                        "excluded_nonstandard_dicoms"
                     ]
                     exam_stats["failed_dicoms"] += result["failed_files"]
 
@@ -1817,6 +1929,17 @@ def discover_dicoms(
                 f"wrote chunk {chunk_counter} to staging: {len(chunk_rows)} selected views, "
                 f"{len(chunk_candidate_rows)} candidates, {len(chunk_tag_rows)} tags"
             )
+        if chunk_exclusion_rows:
+            exclusions_file = (
+                staging_dir / f"exclusions_chunk_{chunk_counter:04d}.parquet"
+            )
+            pd.DataFrame(chunk_exclusion_rows)[VIEW_EXCLUSIONS_COLS].to_parquet(
+                exclusions_file, index=False
+            )
+            logger.info(
+                f"wrote {len(chunk_exclusion_rows)} diagnostic view exclusions "
+                f"for chunk {chunk_counter}"
+            )
         all_manifest_rows.extend(chunk_manifest_rows)
         all_zarr_failures.extend(chunk_zarr_failures)
 
@@ -1840,13 +1963,16 @@ def discover_dicoms(
     logger.info("combining staging files...")
     views_df = _combine_staging_files(staging_dir, "views_chunk_*.parquet")
     candidates_df = _combine_staging_files(staging_dir, "candidates_chunk_*.parquet")
+    exclusions_df = _combine_staging_files(staging_dir, "exclusions_chunk_*.parquet")
+    exclusions_df = _require_view_exclusions_schema(exclusions_df)
     tags_df = _combine_staging_files(staging_dir, "tags_chunk_*.parquet")
     manifest_df = _combine_staging_files(staging_dir, "manifest_chunk_*.parquet")
     failures_df = _combine_staging_files(staging_dir, "zarr_failures_chunk_*.parquet")
 
     logger.info(
         f"loaded {len(views_df)} selected views, {len(candidates_df)} candidates, "
-        f"and {len(tags_df)} DICOM tag records from staging"
+        f"{len(exclusions_df)} diagnostic exclusions, and {len(tags_df)} DICOM "
+        "tag records from staging"
     )
 
     # print summary statistics
@@ -1871,6 +1997,10 @@ def discover_dicoms(
     logger.info(f"Total views processed: {exam_stats['total_dicoms']}")
     logger.info(f"  - Valid views (passed all checks): {exam_stats['valid_dicoms']}")
     logger.info(f"  - For presentation views: {exam_stats['for_presentation_dicoms']}")
+    logger.info(
+        "  - Excluded non-standard diagnostic views: "
+        f"{exam_stats['excluded_nonstandard_dicoms']}"
+    )
     logger.info(f"  - Failed views: {exam_stats['failed_dicoms']}")
 
     if not views_df.empty:
@@ -1891,6 +2021,7 @@ def discover_dicoms(
     return (
         views_df,
         candidates_df,
+        exclusions_df,
         tags_df,
         manifest_df.to_dict("records"),
         failures_df.to_dict("records"),
@@ -2144,6 +2275,12 @@ def preprocess(cfg: PreprocessConfig) -> None:
                 "incremental preprocessing requires view_candidates.parquet; "
                 "rebuild the SoT with the current preprocessor"
             )
+        existing_exclusions_path = sot / "view_exclusions.parquet"
+        if not existing_exclusions_path.exists():
+            raise FileNotFoundError(
+                "incremental preprocessing requires view_exclusions.parquet; "
+                "rebuild the SoT with the current preprocessor"
+            )
         existing_views = pd.read_parquet(sot / "views.parquet")
         require_source_columns(existing_views.columns, str(sot / "views.parquet"))
         require_valid_sources(
@@ -2157,6 +2294,7 @@ def preprocess(cfg: PreprocessConfig) -> None:
         (
             views_df,
             candidates_df,
+            exclusions_df,
             tags_df,
             manifest_rows,
             failed_exams,
@@ -2175,11 +2313,14 @@ def preprocess(cfg: PreprocessConfig) -> None:
 
         # filter out already processed exams
         new_views = views_df[~views_df["exam_id"].isin(existing_exam_ids)]
+        new_exclusions = exclusions_df[
+            ~exclusions_df["exam_id"].isin(existing_exam_ids)
+        ]
         logger.info(
             f"found {len(new_views)} new DICOM files from {new_views['exam_id'].nunique()} new exams"
         )
 
-        if len(new_views) == 0:
+        if len(new_views) == 0 and len(new_exclusions) == 0:
             logger.info("no new exams found, nothing to process")
             cleanup_materialized_archives(archive_staging_dir)
             cleanup_successful_checkpoint_state(
@@ -2190,6 +2331,7 @@ def preprocess(cfg: PreprocessConfig) -> None:
             return
 
         views_df = new_views
+        exclusions_df = new_exclusions
         candidates_df = candidates_df[
             candidates_df["exam_id"].isin(set(new_views["exam_id"]))
         ]
@@ -2200,6 +2342,7 @@ def preprocess(cfg: PreprocessConfig) -> None:
         (
             views_df,
             candidates_df,
+            exclusions_df,
             tags_df,
             manifest_rows,
             failed_exams,
@@ -2224,6 +2367,9 @@ def preprocess(cfg: PreprocessConfig) -> None:
     )
     logger.info(
         f"one-pass worker emitted {len(candidates_df)} exact-slot candidate views"
+    )
+    logger.info(
+        f"one-pass worker emitted {len(exclusions_df)} diagnostic view exclusions"
     )
 
     # exams table
@@ -2270,6 +2416,16 @@ def preprocess(cfg: PreprocessConfig) -> None:
             existing_candidates[list(SOURCE_COLUMNS)].to_dict("records"),
             str(sot / "view_candidates.parquet"),
         )
+        existing_exclusions = _require_view_exclusions_schema(
+            pd.read_parquet(sot / "view_exclusions.parquet")
+        )
+        require_source_columns(
+            existing_exclusions.columns, str(sot / "view_exclusions.parquet")
+        )
+        require_valid_sources(
+            existing_exclusions[list(SOURCE_COLUMNS)].to_dict("records"),
+            str(sot / "view_exclusions.parquet"),
+        )
 
         # combine new and existing data
         combined_views = pd.concat(
@@ -2280,6 +2436,10 @@ def preprocess(cfg: PreprocessConfig) -> None:
         )
         combined_candidates = pd.concat(
             [existing_candidates, candidates_df[VIEW_CANDIDATES_COLS]],
+            ignore_index=True,
+        )
+        combined_exclusions = pd.concat(
+            [existing_exclusions, exclusions_df[VIEW_EXCLUSIONS_COLS]],
             ignore_index=True,
         )
 
@@ -2293,9 +2453,13 @@ def preprocess(cfg: PreprocessConfig) -> None:
         combined_candidates = combined_candidates.drop_duplicates(
             subset=["exam_id", "sop_instance_uid"]
         )
+        combined_exclusions = combined_exclusions.drop_duplicates(
+            subset=[SOURCE_ARCHIVE_COLUMN, SOURCE_MEMBER_COLUMN]
+        )
 
         combined_views.to_parquet(sot / "views.parquet", index=False)
         combined_candidates.to_parquet(sot / "view_candidates.parquet", index=False)
+        combined_exclusions.to_parquet(sot / "view_exclusions.parquet", index=False)
         combined_exams.to_parquet(sot / "exams.parquet", index=False)
 
         # append tags
@@ -2313,14 +2477,18 @@ def preprocess(cfg: PreprocessConfig) -> None:
         ]
         cohort.to_parquet(sot / "cohort.parquet", index=False)
         logger.info(
-            "updated views.parquet, view_candidates.parquet, exams.parquet, "
-            "dicom_tags.parquet, cohort.parquet"
+            "updated views.parquet, view_candidates.parquet, "
+            "view_exclusions.parquet, exams.parquet, dicom_tags.parquet, "
+            "cohort.parquet"
         )
     else:
         # write new tables
         sel_df[VIEWS_COLS].to_parquet(sot / "views.parquet", index=False)
         candidates_df[VIEW_CANDIDATES_COLS].to_parquet(
             sot / "view_candidates.parquet", index=False
+        )
+        exclusions_df[VIEW_EXCLUSIONS_COLS].to_parquet(
+            sot / "view_exclusions.parquet", index=False
         )
         exams[EXAMS_COLS].to_parquet(sot / "exams.parquet", index=False)
         tags_df.to_parquet(sot / "dicom_tags.parquet", index=False)
@@ -2331,8 +2499,9 @@ def preprocess(cfg: PreprocessConfig) -> None:
         ]
         cohort.to_parquet(sot / "cohort.parquet", index=False)
         logger.info(
-            "wrote views.parquet, view_candidates.parquet, exams.parquet, "
-            "dicom_tags.parquet, cohort.parquet"
+            "wrote views.parquet, view_candidates.parquet, "
+            "view_exclusions.parquet, exams.parquet, dicom_tags.parquet, "
+            "cohort.parquet"
         )
 
     # if summary-only, stop here

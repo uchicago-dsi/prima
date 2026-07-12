@@ -331,6 +331,9 @@ Outputs are written to `{raw}/sot/` and `{raw}/out/` by default:
   and SHA-256 verify the exact original member
 - `sot/view_candidates.parquet` — every eligible same-slot source, with
   deterministic `selection_rank` and the authoritative `is_selected` row
+- `sot/view_exclusions.parquet` — rejected For Presentation diagnostic views
+  with durable original-DICOM lineage and structured exclusion context; use
+  this restricted table to enrich blinded visual-QC panels, not as label truth
 - `sot/exams.parquet` — exam-level aggregated metadata
 - `sot/dicom_tags.parquet` — all DICOM tags (wide format)
 - `out/manifest.parquet` — Zarr URIs for each view

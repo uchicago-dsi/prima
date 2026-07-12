@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from pydicom.dataset import Dataset
 from pydicom.sequence import Sequence
+from pydicom.uid import ExplicitVRLittleEndian
 import pytest
 
-from pipelines.preprocess import infer_view_fields
+from pipelines.preprocess import (
+    _process_exam_dir,
+    infer_view_fields,
+    infer_view_identity,
+)
 from prima.view_selection import (
     is_standard_mirai_view,
     nonstandard_mirai_view_reasons,
@@ -72,3 +80,55 @@ def test_top_level_view_modifier_is_detected() -> None:
     dataset.ViewModifierCodeSequence = Sequence([modifier])
     assert view_modifier_code_meanings(dataset) == ("Rolled Medial",)
     assert not is_standard_mirai_view(dataset)
+
+
+def test_nonstandard_view_identity_is_read_before_eligibility_filter() -> None:
+    dataset = standard_view("ML")
+    assert infer_view_identity(dataset) == ("L", "ML")
+    with pytest.raises(ValueError, match="unsupported ViewPosition ML"):
+        infer_view_fields(dataset)
+
+
+def test_nonstandard_diagnostic_view_is_persisted_with_source_and_reason(
+    tmp_path: Path,
+) -> None:
+    exam_dir = tmp_path / "patient" / "exam"
+    exam_dir.mkdir(parents=True)
+    dicom_path = exam_dir / "spot.dcm"
+
+    dataset = implant_displaced_view()
+    dataset.PatientID = "TEST_PATIENT"
+    dataset.StudyInstanceUID = "1.2.826.0.1.3680043.10.999.1"
+    dataset.SOPInstanceUID = "1.2.826.0.1.3680043.10.999.2"
+    dataset.SOPClassUID = "1.2.840.10008.5.1.4.1.1.1.2"
+    dataset.file_meta = Dataset()
+    dataset.file_meta.MediaStorageSOPClassUID = dataset.SOPClassUID
+    dataset.file_meta.MediaStorageSOPInstanceUID = dataset.SOPInstanceUID
+    dataset.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+    dataset.Rows = 2
+    dataset.Columns = 2
+    dataset.BitsAllocated = 16
+    dataset.BitsStored = 16
+    dataset.HighBit = 15
+    dataset.PixelRepresentation = 0
+    dataset.SamplesPerPixel = 1
+    dataset.PhotometricInterpretation = "MONOCHROME2"
+    dataset.PixelData = b"\x00\x00" * 4
+    dataset.save_as(dicom_path, enforce_file_format=True)
+
+    result = _process_exam_dir(
+        exam_dir,
+        Path("patient/exam.tar.zst"),
+    )
+
+    assert result["rows"] == []
+    assert result["exam_status"] == "no_standard_dicoms"
+    assert result["excluded_nonstandard_dicoms"] == 1
+    assert len(result["exclusion_rows"]) == 1
+    exclusion = result["exclusion_rows"][0]
+    assert exclusion["source_archive_relpath"] == "patient/exam.tar.zst"
+    assert exclusion["source_archive_member"] == "exam/spot.dcm"
+    assert json.loads(exclusion["view_modifiers"]) == ["Implant Displaced"]
+    assert json.loads(exclusion["exclusion_reasons"]) == [
+        "view modifier: Implant Displaced"
+    ]
