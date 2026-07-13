@@ -65,7 +65,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--models-dir", type=Path, default=DEFAULT_MODELS_DIR)
     parser.add_argument("--vllm-port", type=int, default=0)
     parser.add_argument("--vllm-server-log", type=Path, default=None)
-    parser.add_argument("--startup-timeout-seconds", type=int, default=1800)
+    parser.add_argument("--startup-timeout-seconds", type=int, default=3600)
     parser.add_argument("--request-timeout-seconds", type=int, default=600)
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument(

@@ -15,7 +15,7 @@ from prima.view_auto_qc import (
     save_view_auto_run,
     view_suggestion_is_target_present,
 )
-from qc.run_view_auto_qc import load_target_prompt, load_view_records
+from qc.run_view_auto_qc import build_arg_parser, load_target_prompt, load_view_records
 from qc import evaluate_view_auto_qc
 from qc.combine_view_auto_qc_runs import combine_view_runs
 from prima.view_qc import (
@@ -31,6 +31,23 @@ TARGET = "test artifact"
 
 def view_id(index: int) -> str:
     return f"{index:064x}"
+
+
+def test_view_auto_qc_allows_large_model_cold_start_by_default() -> None:
+    args = build_arg_parser().parse_args(
+        [
+            "--manifest",
+            "manifest.parquet",
+            "--run-file",
+            "run.json",
+            "--target",
+            TARGET,
+            "--target-prompt-file",
+            "target.txt",
+        ]
+    )
+
+    assert args.startup_timeout_seconds == 3600
 
 
 def test_shared_view_prompt_is_target_agnostic() -> None:
