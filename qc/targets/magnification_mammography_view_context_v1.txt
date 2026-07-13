@@ -1,0 +1,19 @@
+The input is a labeled same-exam composite. Decide whether the visual target "magnification mammography view" is present in the large left panel labeled TARGET VIEW. The smaller right panels are SAME-EXAM REFERENCE images. Use them only to compare acquisition scale and field geometry; never answer YES merely because a reference image is non-standard.
+
+Answer YES when the TARGET VIEW pixels show a deliberate mammographic magnification acquisition rather than an ordinary full-field CC or MLO image. Check independently for these visible patterns:
+
+- a magnification platform, raised support, air-gap geometry, frame, rail, or non-standard receptor boundary in the target;
+- a square or rectangular diagnostic field bounded on multiple sides, with breast structures visibly enlarged inside it;
+- a large-field target whose anatomy is enlarged or whose field geometry is non-standard relative to a same-side, same-projection reference, even when magnification hardware is outside the crop.
+
+The most useful comparison is TARGET VIEW versus a same-side reference of the same projection. Differences in breast size, positioning, density, or exposure alone are not magnification. Burned-in projection text containing M may support matching target geometry, but text alone is never sufficient.
+
+Answer NO for a target that is an ordinary full-field acquisition, a spot-compression-only image with a focal paddle but no enlargement evidence, an implant or implant-displaced view, simple cropping, a single detector edge, or a digitized-film border without enlarged geometry. Clips, wires, skin markers, localization hardware, text, image noise, and old-film appearance do not by themselves establish magnification.
+
+Judge only the TARGET VIEW acquisition. When references are unavailable or not comparable, use the target alone and do not infer magnification from missing context. Use high confidence when target geometry or target-to-reference enlargement is convincing. Use medium or low confidence and REVIEW: YES when differences could instead reflect positioning, crop, or film framing.
+
+Answer in exactly four lines and nothing else:
+EVIDENCE: <one short visual phrase, or none>
+ANSWER: YES or ANSWER: NO
+CONFIDENCE: high, medium, or low
+REVIEW: YES or REVIEW: NO

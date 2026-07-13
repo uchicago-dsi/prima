@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -142,5 +143,67 @@ def test_experiment_requires_a_completed_binary_campaign(tmp_path: Path) -> None
                 out_dir=tmp_path / "experiment",
                 target=TARGET,
                 example=[(1, "positive"), (2, "negative")],
+            )
+        )
+
+
+def test_build_component_bank_with_explicit_labels(tmp_path: Path) -> None:
+    campaign = tmp_path / "campaign"
+    campaign.mkdir()
+    _state_path, run_path = build_completed_campaign(campaign)
+    out_dir = tmp_path / "experiment"
+    component_target = "component artifact"
+
+    result = run_from_args(
+        SimpleNamespace(
+            campaign_dir=campaign,
+            baseline_run=run_path,
+            out_dir=out_dir,
+            target=component_target,
+            operational_target=TARGET,
+            example=[(1, "component negative"), (2, "component positive")],
+            example_label=[
+                (1, VIEW_LABEL_ABSENT),
+                (2, VIEW_LABEL_PRESENT),
+            ],
+        )
+    )
+
+    assert result == {"examples": 2, "evaluation": 2}
+    exemplars, _metadata = load_view_few_shot_manifest(
+        out_dir / "exemplars" / "manifest.parquet",
+        target=component_target,
+    )
+    assert exemplars[0]["annotations"] == []
+    assert exemplars[1]["annotations"] == [component_target]
+    evaluation_state = load_view_qc_state(
+        out_dir / "evaluation_inputs" / "view_qc_state.json"
+    )
+    assert evaluation_state["target"] == TARGET
+    baseline = load_view_auto_run(out_dir / "evaluation_inputs" / "baseline_run.json")
+    assert baseline["target"] == TARGET
+    provenance = json.loads((out_dir / "provenance.json").read_text())
+    assert provenance["target"] == component_target
+    assert provenance["operational_target"] == TARGET
+    assert provenance["example_label_source"] == "explicit_component_adjudication"
+
+
+def test_component_bank_requires_exact_explicit_label_coverage(
+    tmp_path: Path,
+) -> None:
+    campaign = tmp_path / "campaign"
+    campaign.mkdir()
+    _state_path, run_path = build_completed_campaign(campaign)
+
+    with pytest.raises(ValueError, match="one --example-label per --example"):
+        run_from_args(
+            SimpleNamespace(
+                campaign_dir=campaign,
+                baseline_run=run_path,
+                out_dir=tmp_path / "experiment",
+                target="component artifact",
+                operational_target=TARGET,
+                example=[(1, "positive"), (2, "negative")],
+                example_label=[(1, VIEW_LABEL_PRESENT)],
             )
         )

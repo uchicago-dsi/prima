@@ -55,6 +55,28 @@ def parse_example(value: str) -> tuple[int, str]:
     return review_order, role
 
 
+def parse_example_label(value: str) -> tuple[int, str]:
+    """Parse REVIEW_ORDER=LABEL for an explicitly adjudicated component target."""
+    raw_order, separator, raw_label = str(value).partition("=")
+    if not separator:
+        raise argparse.ArgumentTypeError("--example-label must use REVIEW_ORDER=LABEL")
+    try:
+        review_order = int(raw_order)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "example-label review order must be an integer"
+        ) from error
+    label = raw_label.strip().lower()
+    if review_order <= 0 or label not in {
+        VIEW_LABEL_PRESENT,
+        VIEW_LABEL_ABSENT,
+    }:
+        raise argparse.ArgumentTypeError(
+            "example-label requires a positive order and present or absent"
+        )
+    return review_order, label
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--campaign-dir", type=Path, required=True)
@@ -62,11 +84,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--target", required=True)
     parser.add_argument(
+        "--operational-target",
+        help=(
+            "completed campaign/baseline target when --target is one component "
+            "of a broader operational union"
+        ),
+    )
+    parser.add_argument(
         "--example",
         type=parse_example,
         action="append",
         required=True,
         help="repeat REVIEW_ORDER=ROLE in the intended prompt order",
+    )
+    parser.add_argument(
+        "--example-label",
+        type=parse_example_label,
+        action="append",
+        help=(
+            "repeat REVIEW_ORDER=present|absent for component-target examples; "
+            "required exactly once per --example with --operational-target"
+        ),
     )
     return parser.parse_args()
 
@@ -84,6 +122,12 @@ def run_from_args(args: argparse.Namespace) -> dict[str, int]:
     baseline_path = args.baseline_run.resolve()
     out_dir = args.out_dir.resolve()
     target = normalize_view_qc_target(args.target)
+    raw_operational_target = getattr(args, "operational_target", None)
+    operational_target = (
+        normalize_view_qc_target(raw_operational_target)
+        if raw_operational_target is not None
+        else None
+    )
     if out_dir.exists():
         raise FileExistsError(f"refusing to overwrite few-shot experiment: {out_dir}")
     manifest_path = campaign_dir / "manifest.parquet"
@@ -101,11 +145,14 @@ def run_from_args(args: argparse.Namespace) -> dict[str, int]:
     summary = summarize_view_qc_state(state, manifest["view_id"])
     if summary["remaining"] or summary["uncertain"]:
         raise ValueError("few-shot source campaign must be complete with binary labels")
-    if state["target"] != target:
-        raise ValueError("few-shot target does not match the human campaign")
+    source_target = operational_target or target
+    if state["target"] != source_target:
+        raise ValueError(
+            "few-shot operational target does not match the human campaign"
+        )
     baseline = load_view_auto_run(baseline_path)
-    if baseline["target"] != target:
-        raise ValueError("few-shot target does not match the baseline run")
+    if baseline["target"] != source_target:
+        raise ValueError("few-shot operational target does not match the baseline run")
     if set(baseline["view_suggestions"]) != set(manifest["view_id"]):
         raise ValueError("baseline run coverage does not match the campaign")
 
@@ -125,11 +172,28 @@ def run_from_args(args: argparse.Namespace) -> dict[str, int]:
     if missing_orders:
         raise ValueError("few-shot example review order is outside the campaign")
 
+    explicit_label_pairs = list(getattr(args, "example_label", None) or [])
+    explicit_labels: dict[int, str] = {}
+    for review_order, label in explicit_label_pairs:
+        if review_order in explicit_labels:
+            raise ValueError("few-shot example-label review orders must be unique")
+        explicit_labels[review_order] = label
+    if operational_target is None and explicit_labels:
+        raise ValueError("--example-label requires --operational-target")
+    if operational_target is not None and set(explicit_labels) != set(review_orders):
+        raise ValueError(
+            "component few-shot experiments require one --example-label per --example"
+        )
+
     selected_rows = []
     labels = state["labels"]
     for exemplar_order, (review_order, role) in enumerate(examples, start=1):
         row = by_order.loc[review_order].to_dict()
-        label = labels[row["view_id"]]["label"]
+        label = (
+            explicit_labels[review_order]
+            if operational_target is not None
+            else labels[row["view_id"]]["label"]
+        )
         if label not in {VIEW_LABEL_PRESENT, VIEW_LABEL_ABSENT}:
             raise ValueError("few-shot examples must have adjudicated binary labels")
         selected_rows.append(
@@ -224,6 +288,12 @@ def run_from_args(args: argparse.Namespace) -> dict[str, int]:
         "created_at": datetime.now(timezone.utc).isoformat(),
         "command": command,
         "target": target,
+        "operational_target": source_target,
+        "example_label_source": (
+            "explicit_component_adjudication"
+            if operational_target is not None
+            else "campaign_state"
+        ),
         "source_rows": len(manifest),
         "exemplar_rows": len(exemplar_manifest),
         "evaluation_rows": len(evaluation_manifest),
@@ -246,6 +316,13 @@ def run_from_args(args: argparse.Namespace) -> dict[str, int]:
                 "# View-level few-shot mechanism experiment",
                 "",
                 f"- target: `{target}`",
+                f"- operational target: `{source_target}`",
+                "- exemplar labels: "
+                + (
+                    "explicit component adjudication"
+                    if operational_target is not None
+                    else "completed campaign state"
+                ),
                 f"- exemplars: `{len(exemplar_manifest)}`",
                 f"- matched evaluation views: `{len(evaluation_manifest)}`",
                 "- exemplar and evaluation view IDs are disjoint",

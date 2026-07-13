@@ -66,9 +66,12 @@ def main() -> int:
     view_args.manifest = view_args.manifest.resolve()
     view_args.run_file = view_args.run_file.resolve()
     view_args.target_prompt_file = view_args.target_prompt_file.resolve()
+    view_records = run_view_auto_qc.load_view_records(
+        view_args.manifest,
+        model_image_column=view_args.model_image_column,
+    )
     if view_args.few_shot_manifest:
         view_args.few_shot_manifest = view_args.few_shot_manifest.resolve()
-        view_records = run_view_auto_qc.load_view_records(view_args.manifest)
         run_view_auto_qc.load_view_few_shot_manifest(
             view_args.few_shot_manifest,
             target=view_args.target,

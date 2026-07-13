@@ -27,7 +27,7 @@ from prima.view_auto_qc import (
     require_compatible_view_auto_run,
     save_view_auto_run,
 )
-from prima.view_few_shot import load_view_few_shot_manifest
+from prima.view_few_shot import load_view_few_shot_manifest, sha256_file
 from prima.view_qc import (
     normalize_view_id,
     normalize_view_qc_target,
@@ -46,6 +46,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Score a source-linked individual-view QC manifest with local vLLM."
     )
     parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument(
+        "--model-image-column",
+        default="image_path",
+        help=(
+            "manifest column containing the image sent to the model; image_path "
+            "always remains the canonical target-view path saved in the run"
+        ),
+    )
     parser.add_argument("--run-file", type=Path, required=True)
     parser.add_argument("--target", required=True)
     parser.add_argument("--target-prompt-file", type=Path, required=True)
@@ -94,33 +102,61 @@ def load_target_prompt(path: Path, *, target: str) -> str:
     return prompt
 
 
-def load_view_records(manifest_path: Path) -> list[dict[str, str]]:
+def _resolve_manifest_image(
+    *, root: Path, raw_path: object, description: str
+) -> tuple[Path, str]:
+    relative = Path(str(raw_path))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError(f"view auto-QC {description} must be a safe relative path")
+    resolved = (root / relative).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as error:
+        raise ValueError(
+            f"view auto-QC {description} escapes its manifest root"
+        ) from error
+    if not resolved.is_file():
+        raise FileNotFoundError(f"view auto-QC {description} is missing")
+    return resolved, relative.as_posix()
+
+
+def load_view_records(
+    manifest_path: Path, *, model_image_column: str = "image_path"
+) -> list[dict[str, str]]:
     manifest = pd.read_parquet(manifest_path)
     validate_view_manifest_columns(manifest.columns, str(manifest_path))
     if manifest.empty:
         raise ValueError("view auto-QC manifest is empty")
+    model_image_column = str(model_image_column).strip()
+    if not model_image_column:
+        raise ValueError("--model-image-column must be nonempty")
+    if model_image_column not in manifest.columns:
+        raise ValueError(
+            f"view auto-QC manifest lacks model image column: {model_image_column}"
+        )
     manifest = manifest.sort_values("review_order", kind="stable")
     root = manifest_path.parent.resolve()
     records: list[dict[str, str]] = []
     for row in manifest.to_dict("records"):
         view_id = normalize_view_id(row["view_id"])
-        relative = Path(str(row["image_path"]))
-        if relative.is_absolute() or ".." in relative.parts:
-            raise ValueError("view auto-QC image path must be a safe relative path")
-        image_path = (root / relative).resolve()
-        try:
-            image_path.relative_to(root)
-        except ValueError as error:
-            raise ValueError("view auto-QC image escapes its manifest root") from error
-        if not image_path.is_file():
-            raise FileNotFoundError("view auto-QC image is missing")
-        records.append(
-            {
-                "view_id": view_id,
-                "image_path": str(image_path),
-                "saved_image_path": relative.as_posix(),
-            }
+        _canonical_path, saved_image_path = _resolve_manifest_image(
+            root=root,
+            raw_path=row["image_path"],
+            description="canonical image_path",
         )
+        model_path, saved_model_path = _resolve_manifest_image(
+            root=root,
+            raw_path=row[model_image_column],
+            description=f"model image column {model_image_column}",
+        )
+        record = {
+            "view_id": view_id,
+            "image_path": str(model_path),
+            "saved_image_path": saved_image_path,
+        }
+        if model_image_column != "image_path":
+            record["saved_model_image_path"] = saved_model_path
+        records.append(record)
     if len(records) != len({record["view_id"] for record in records}):
         raise ValueError("view auto-QC manifest contains duplicate view IDs")
     return records
@@ -150,6 +186,14 @@ def build_inference_settings(
     }
     if few_shot_metadata:
         settings.update(few_shot_metadata)
+    model_image_column = str(getattr(args, "model_image_column", "image_path")).strip()
+    if model_image_column != "image_path":
+        settings.update(
+            {
+                "model_image_column": model_image_column,
+                "model_input_manifest_sha256": sha256_file(args.manifest),
+            }
+        )
     return settings
 
 
@@ -177,7 +221,9 @@ def run_from_args(args: argparse.Namespace) -> int:
             f"model requires {model_spec.tensor_parallel_size} GPUs, "
             f"but --expected-gpus={args.expected_gpus}"
         )
-    records = load_view_records(manifest_path)
+    records = load_view_records(
+        manifest_path, model_image_column=args.model_image_column
+    )
     if args.few_shot_manifest is None:
         few_shot_exemplars: list[dict[str, Any]] = []
         few_shot_metadata: dict[str, Any] = {}

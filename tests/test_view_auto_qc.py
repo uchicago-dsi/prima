@@ -17,6 +17,7 @@ from prima.view_auto_qc import (
 )
 from qc.run_view_auto_qc import load_target_prompt, load_view_records
 from qc import evaluate_view_auto_qc
+from qc.combine_view_auto_qc_runs import combine_view_runs
 from prima.view_qc import (
     VIEW_LABEL_ABSENT,
     VIEW_LABEL_UNCERTAIN,
@@ -73,6 +74,16 @@ def test_target_prompt_file_owns_artifact_specific_definition() -> None:
     assert "repeated bright curved bands" in prompt
     assert "surgical scar/incision marker" in prompt
     assert "image-frame/crop borders" in prompt
+
+
+def test_context_prompt_keeps_reference_and_target_roles_distinct() -> None:
+    prompt = load_target_prompt(
+        Path("qc/targets/magnification_mammography_view_context_v1.txt"),
+        target="magnification mammography view",
+    )
+    assert "TARGET VIEW" in prompt
+    assert "SAME-EXAM REFERENCE" in prompt
+    assert "never answer YES merely because a reference" in prompt
 
 
 def test_target_prompt_must_name_the_run_target(tmp_path: Path) -> None:
@@ -139,6 +150,119 @@ def test_view_run_round_trip_and_resume_guard(tmp_path: Path) -> None:
         require_compatible_view_auto_run(saved, changed)
 
 
+def test_logical_or_combiner_preserves_component_provenance(tmp_path: Path) -> None:
+    manifest = pd.DataFrame(
+        [
+            {
+                "view_id": view_id(index),
+                "image_path": f"images/{view_id(index)}.png",
+                "laterality": "L",
+                "view": "CC",
+                "review_order": index,
+            }
+            for index in (1, 2)
+        ]
+    )
+    manifest_path = tmp_path / "manifest.parquet"
+    manifest.to_parquet(manifest_path, index=False)
+
+    run_paths = []
+    for target, positive_index, confidence in (
+        ("component a", 1, "high"),
+        ("component b", 2, "medium"),
+    ):
+        run = new_view_auto_run(
+            target=target,
+            model="model@revision",
+            prompt_variant="confidence_specificity",
+            inference_settings={"target_prompt_sha256": target},
+        )
+        run["view_suggestions"] = {
+            view_id(index): {
+                "image_path": f"images/{view_id(index)}.png",
+                "suggestions": (
+                    [{"tag": target, "confidence": confidence}]
+                    if index == positive_index
+                    else []
+                ),
+            }
+            for index in (1, 2)
+        }
+        path = tmp_path / f"{target[-1]}.json"
+        save_view_auto_run(path, run)
+        run_paths.append(path)
+
+    output = tmp_path / "combined.json"
+    combined = combine_view_runs(
+        manifest_path=manifest_path,
+        run_paths=run_paths,
+        output_path=output,
+        target=TARGET,
+        minimum_confidence="high",
+    )
+
+    assert combined["backend"] == "derived_logical_or"
+    assert combined["prompt_mode"] == "derived_logical_or"
+    assert combined["target"] == TARGET
+    assert (
+        combined["view_suggestions"][view_id(1)]["suggestions"][0]["confidence"]
+        == "high"
+    )
+    assert not combined["view_suggestions"][view_id(2)]["suggestions"]
+    components = combined["inference_settings"]["components"]
+    assert [component["target"] for component in components] == [
+        "component a",
+        "component b",
+    ]
+    assert all(len(component["run_sha256"]) == 64 for component in components)
+    assert all(
+        component["model_image_column"] == "image_path" for component in components
+    )
+    assert output.stat().st_mode & 0o777 == 0o600
+
+
+def test_logical_or_combiner_rejects_partial_component(tmp_path: Path) -> None:
+    manifest = pd.DataFrame(
+        [
+            {
+                "view_id": view_id(index),
+                "image_path": f"images/{view_id(index)}.png",
+                "laterality": "L",
+                "view": "CC",
+                "review_order": index,
+            }
+            for index in (1, 2)
+        ]
+    )
+    manifest_path = tmp_path / "manifest.parquet"
+    manifest.to_parquet(manifest_path, index=False)
+    paths = []
+    for target in ("component a", "component b"):
+        run = new_view_auto_run(
+            target=target,
+            model="model@revision",
+            prompt_variant="confidence_specificity",
+            inference_settings={},
+        )
+        run["view_suggestions"] = {
+            view_id(1): {
+                "image_path": f"images/{view_id(1)}.png",
+                "suggestions": [],
+            }
+        }
+        path = tmp_path / f"{target[-1]}.json"
+        save_view_auto_run(path, run)
+        paths.append(path)
+    with pytest.raises(ValueError, match="coverage"):
+        combine_view_runs(
+            manifest_path=manifest_path,
+            run_paths=paths,
+            output_path=tmp_path / "combined.json",
+            target=TARGET,
+            minimum_confidence="high",
+        )
+
+
 def test_view_manifest_loader_uses_relative_images(tmp_path: Path) -> None:
     image_dir = tmp_path / "images"
     image_dir.mkdir()
@@ -165,6 +289,63 @@ def test_view_manifest_loader_uses_relative_images(tmp_path: Path) -> None:
             "saved_image_path": f"images/{image_name}",
         }
     ]
+
+
+def test_view_manifest_loader_separates_target_and_model_images(
+    tmp_path: Path,
+) -> None:
+    image_dir = tmp_path / "images"
+    context_dir = tmp_path / "context_images"
+    image_dir.mkdir()
+    context_dir.mkdir()
+    image_name = f"{view_id(1)}.png"
+    Image.new("L", (8, 8)).save(image_dir / image_name)
+    Image.new("L", (16, 8)).save(context_dir / image_name)
+    manifest = pd.DataFrame(
+        [
+            {
+                "view_id": view_id(1),
+                "image_path": f"images/{image_name}",
+                "model_image_path": f"context_images/{image_name}",
+                "laterality": "R",
+                "view": "CC",
+                "review_order": 1,
+            }
+        ]
+    )
+    manifest_path = tmp_path / "manifest.parquet"
+    manifest.to_parquet(manifest_path, index=False)
+
+    records = load_view_records(manifest_path, model_image_column="model_image_path")
+
+    assert records == [
+        {
+            "view_id": view_id(1),
+            "image_path": str((context_dir / image_name).resolve()),
+            "saved_image_path": f"images/{image_name}",
+            "saved_model_image_path": f"context_images/{image_name}",
+        }
+    ]
+
+
+def test_view_manifest_loader_requires_declared_model_image_column(
+    tmp_path: Path,
+) -> None:
+    manifest = pd.DataFrame(
+        [
+            {
+                "view_id": view_id(1),
+                "image_path": f"images/{view_id(1)}.png",
+                "laterality": "L",
+                "view": "CC",
+                "review_order": 1,
+            }
+        ]
+    )
+    manifest_path = tmp_path / "manifest.parquet"
+    manifest.to_parquet(manifest_path, index=False)
+    with pytest.raises(ValueError, match="lacks model image column"):
+        load_view_records(manifest_path, model_image_column="model_image_path")
 
 
 def test_vllm_view_examples_use_fixed_order_and_view_wording(tmp_path: Path) -> None:

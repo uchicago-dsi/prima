@@ -296,6 +296,21 @@ def test_gallery_keeps_stable_port_and_smaller_image() -> None:
     assert "Target: " in HTML
 
 
+def test_gallery_tracks_session_annotation_rate_after_first_save() -> None:
+    assert 'id="session-rate"' in HTML
+    assert 'id="reset-session"' in HTML
+    assert "Rate starts with your first saved annotation." in HTML
+    assert "function recordSessionAnnotation(" in HTML
+    assert "recordSessionAnnotation(item.view_id, label, actionStartedAtMs);" in HTML
+    assert "sessionAnnotatedViewIds = new Set()" in HTML
+    assert "sessionAnnotatedViewIds.add(viewId)" in HTML
+    assert "sessionStorage.setItem(" in HTML
+    assert "sessionStorage.getItem(" in HTML
+    assert "unique view" in HTML
+    assert "views/min" in HTML
+    assert "Reset timer" in HTML
+
+
 def test_view_sampling_is_disjoint_and_one_per_exam() -> None:
     rows = []
     for exam_index in range(10):

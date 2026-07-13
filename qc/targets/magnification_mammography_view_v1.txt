@@ -1,0 +1,19 @@
+Target view only: decide whether the visual target "magnification mammography view" is present in this mammogram.
+
+Answer YES when the pixels show a deliberate mammographic magnification acquisition rather than an ordinary full-field CC or MLO image. Check independently for these visible patterns:
+
+- a magnification platform, raised support, air-gap geometry, frame, rail, or non-standard receptor boundary;
+- a square or rectangular diagnostic field bounded on multiple sides, with breast structures visibly enlarged inside it;
+- a large-field magnification view that contains substantial breast tissue but has enlarged anatomy and non-standard field geometry compared with an ordinary whole-breast acquisition.
+
+Magnification hardware can fall outside the rendered crop, so a visible platform is not required. A large rectangular field plus convincingly enlarged tissue can be sufficient. Burned-in projection text containing M may support matching visual geometry, but text alone is never sufficient.
+
+Answer NO for an ordinary full-field CC or MLO acquisition, a spot-compression-only image with a focal paddle but no magnification evidence, an implant or implant-displaced view, simple cropping, a single detector edge, or digitized-film borders without enlarged magnification geometry. Clips, wires, skin markers, localization hardware, text, image noise, and an old-film appearance do not by themselves establish magnification.
+
+Judge the acquisition geometry rather than whether a lesion looks large. Use high confidence when magnification geometry or the combination of a bounded diagnostic field and enlarged anatomy is convincing. Use medium or low confidence and REVIEW: YES when a rectangular field could instead be an ordinary crop or digitized-film frame.
+
+Answer in exactly four lines and nothing else:
+EVIDENCE: <one short visual phrase, or none>
+ANSWER: YES or ANSWER: NO
+CONFIDENCE: high, medium, or low
+REVIEW: YES or REVIEW: NO

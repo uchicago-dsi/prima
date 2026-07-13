@@ -111,12 +111,15 @@ HTML = r"""<!doctype html>
     header { padding: 12px 18px; border-bottom: 1px solid #34383d; background: #171a1e; }
     #stats { font-variant-numeric: tabular-nums; font-weight: 650; }
     #context { color: #aeb6bf; margin-top: 5px; }
+    #session-row { display: flex; flex-wrap: wrap; gap: 9px; align-items: center; margin-top: 7px; }
+    #session-rate { color: #b9e9ca; font-variant-numeric: tabular-nums; font-weight: 650; }
     #controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: center; padding: 10px 12px; border-bottom: 1px solid #34383d; background: #171a1e; }
     main { display: flex; align-items: flex-start; justify-content: center; padding: 16px; }
     img { display: block; width: auto; height: auto; max-width: 70vw; max-height: 65vh; object-fit: contain; background: black; }
     button { border: 1px solid #59616a; border-radius: 7px; padding: 10px 14px; color: white; background: #282d33; font-size: 16px; cursor: pointer; }
     button:hover { background: #343b43; }
     button.active { box-shadow: 0 0 0 3px #f4c542 inset; }
+    #reset-session { padding: 4px 8px; font-size: 13px; }
     #end-marker { border-left: 4px solid #66c58c; padding: 8px 12px; color: #b9e9ca; background: #193226; font-size: 16px; font-weight: 750; }
     #save-status { min-width: 145px; color: #9fd8b8; font-weight: 650; }
     #save-status.error { color: #ff9b9b; }
@@ -129,6 +132,10 @@ HTML = r"""<!doctype html>
   <header>
     <div id="stats">Loading…</div>
     <div id="context">Loading target…</div>
+    <div id="session-row">
+      <span id="session-rate" role="timer" aria-live="off">Rate starts with your first saved annotation.</span>
+      <button id="reset-session" type="button" hidden>Reset timer</button>
+    </div>
   </header>
   <div id="controls">
     <button id="previous">← Previous</button>
@@ -151,6 +158,106 @@ let target = '';
 let saving = false;
 let unsureReviewQueue = [];
 let unsureReviewPosition = -1;
+let sessionStorageKey = '';
+let sessionStartedAtMs = null;
+let sessionAnnotatedViewIds = new Set();
+let sessionTimerHandle = null;
+
+function formatElapsed(milliseconds) {
+  const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  const minuteText = String(minutes).padStart(2, '0');
+  const secondText = String(seconds).padStart(2, '0');
+  return hours > 0
+    ? String(hours) + ':' + minuteText + ':' + secondText
+    : minuteText + ':' + secondText;
+}
+
+function renderSessionRate() {
+  const display = document.getElementById('session-rate');
+  const reset = document.getElementById('reset-session');
+  if (sessionStartedAtMs === null) {
+    display.textContent = 'Rate starts with your first saved annotation.';
+    reset.hidden = true;
+    return;
+  }
+  const elapsedMs = Math.max(Date.now() - sessionStartedAtMs, 1000);
+  const annotationCount = sessionAnnotatedViewIds.size;
+  const rateText = annotationCount < 2
+    ? 'measuring…'
+    : (annotationCount / (elapsedMs / 60000)).toFixed(1) + ' views/min';
+  display.textContent =
+    'session ' + formatElapsed(elapsedMs) +
+    ' | ' + annotationCount + ' unique view' + (annotationCount === 1 ? '' : 's') +
+    ' | ' + rateText;
+  reset.hidden = false;
+}
+
+function startSessionTimer() {
+  if (sessionTimerHandle === null) {
+    sessionTimerHandle = window.setInterval(renderSessionRate, 1000);
+  }
+}
+
+function saveSessionRate() {
+  if (!sessionStorageKey || sessionStartedAtMs === null) return;
+  sessionStorage.setItem(sessionStorageKey, JSON.stringify({
+    version: 1,
+    startedAtMs: sessionStartedAtMs,
+    annotatedViewIds: [...sessionAnnotatedViewIds]
+  }));
+}
+
+function initializeSessionRate() {
+  const firstViewId = items[0]?.view_id || 'none';
+  const lastViewId = items[items.length - 1]?.view_id || 'none';
+  sessionStorageKey =
+    'view_qc_session_v1::' + target + '::' + items.length + '::' +
+    firstViewId + '::' + lastViewId;
+  const raw = sessionStorage.getItem(sessionStorageKey);
+  if (raw) {
+    try {
+      const saved = JSON.parse(raw);
+      const validIds = new Set(items.map(item => item.view_id));
+      if (
+        saved?.version === 1 &&
+        Number.isFinite(saved.startedAtMs) &&
+        Array.isArray(saved.annotatedViewIds)
+      ) {
+        sessionStartedAtMs = saved.startedAtMs;
+        sessionAnnotatedViewIds = new Set(
+          saved.annotatedViewIds.filter(viewId => validIds.has(viewId))
+        );
+        startSessionTimer();
+      }
+    } catch (error) {
+      sessionStorage.removeItem(sessionStorageKey);
+    }
+  }
+  renderSessionRate();
+}
+
+function recordSessionAnnotation(viewId, label, actionStartedAtMs) {
+  if (label === null) return;
+  if (sessionStartedAtMs === null) {
+    sessionStartedAtMs = actionStartedAtMs;
+    startSessionTimer();
+  }
+  sessionAnnotatedViewIds.add(viewId);
+  saveSessionRate();
+  renderSessionRate();
+}
+
+function resetSessionRate() {
+  if (sessionStorageKey) sessionStorage.removeItem(sessionStorageKey);
+  if (sessionTimerHandle !== null) window.clearInterval(sessionTimerHandle);
+  sessionTimerHandle = null;
+  sessionStartedAtMs = null;
+  sessionAnnotatedViewIds = new Set();
+  renderSessionRate();
+}
 
 function unsureReviewActive() {
   return unsureReviewPosition >= 0 && unsureReviewQueue.length > 0;
@@ -228,6 +335,7 @@ async function setLabel(label) {
   saving = true;
   showStatus('Saving…');
   const item = items[index];
+  const actionStartedAtMs = Date.now();
   try {
     const response = await fetch('/api/label', {
       method: 'POST',
@@ -237,6 +345,7 @@ async function setLabel(label) {
     if (!response.ok) throw new Error(await response.text());
     const payload = await response.json();
     labels = payload.labels;
+    recordSessionAnnotation(item.view_id, label, actionStartedAtMs);
     const labelText = label === null ? 'Label cleared' :
       label === 'absent' ? 'Saved: not present' :
       label === 'present' ? 'Saved: present' : 'Saved: unsure';
@@ -327,6 +436,7 @@ function nextUnreviewed(start = 0) {
 
 document.getElementById('previous').onclick = () => move(-1);
 document.getElementById('next').onclick = () => move(1);
+document.getElementById('reset-session').onclick = resetSessionRate;
 document.getElementById('absent').onclick = () => setLabel('absent');
 document.getElementById('present').onclick = () => setLabel('present');
 document.getElementById('uncertain').onclick = () => setLabel('uncertain');
@@ -363,6 +473,7 @@ Promise.all([
   items = loadedItems;
   labels = state.labels;
   target = state.target;
+  initializeSessionRate();
   nextUnreviewed(0);
 }).catch(error => {
   document.getElementById('stats').textContent = 'Failed to load review: ' + error;

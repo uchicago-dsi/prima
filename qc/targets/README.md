@@ -109,3 +109,78 @@ records the exemplar manifest SHA-256 plus each example's image SHA-256, order,
 label, and role so a result cannot silently resume with a different reference
 bank. Keep example selection inside development data, then freeze it before
 scoring an exam-disjoint blinded confirmation panel.
+
+When the learned target is one component of a broader operational exclusion,
+keep the component exemplar labels separate from the completed union campaign:
+
+```bash
+python qc/build_view_few_shot_experiment.py \
+  --campaign-dir /restricted/path/to/completed_union_panel \
+  --baseline-run /restricted/path/to/union_baseline.json \
+  --out-dir /restricted/path/to/component_experiment \
+  --target 'one visual component' \
+  --operational-target 'the broader operational union' \
+  --example '3=positive defining component appearance' \
+  --example-label '3=present' \
+  --example '8=negative hard look-alike from another component' \
+  --example-label '8=absent'
+```
+
+This mode preserves the union labels and baseline for matched evaluation while
+building an explicitly adjudicated component-target exemplar bank. Every
+example needs exactly one explicit component label, and exemplars are excluded
+from the scored manifest.
+
+## Split targets
+
+When one operational exclusion is the union of visually different findings,
+score each component with its own single-target prompt and combine only the
+frozen high-confidence decisions. The combiner requires identical manifest
+coverage and image paths and records each source run and SHA-256:
+
+```bash
+python qc/combine_view_auto_qc_runs.py \
+  --manifest /restricted/path/to/manifest.parquet \
+  --run-file /restricted/path/to/component_a.json \
+  --run-file /restricted/path/to/component_b.json \
+  --output /restricted/path/to/combined.json \
+  --target 'the operational union target' \
+  --minimum-present-confidence high
+```
+
+The combined run is derived and contains no new model inference. Freeze the
+component prompts, thresholds, and logical rule before scoring a blinded
+panel.
+
+## Same-exam context
+
+When a completed development experiment shows that a target view is ambiguous
+in isolation, build a target-preserving context manifest rather than replacing
+the target path with a montage:
+
+```bash
+python qc/build_same_exam_context_views.py \
+  --manifest /restricted/path/to/target_manifest.parquet \
+  --source-manifest /restricted/path/to/target_sources.parquet \
+  --exclusions /restricted/path/to/view_exclusions.parquet \
+  --candidates /restricted/path/to/view_candidates.parquet \
+  --raw-root /restricted/path/to/dicoms \
+  --output-manifest /restricted/path/to/context_manifest.parquet \
+  --temp-root /scratch/user/context-render
+```
+
+The output retains `image_path` as the canonical target view and adds
+`model_image_path` for a labeled composite containing that target plus up to
+three deterministic same-exam references. Run it with:
+
+```bash
+python submit_view_auto_qc.py \
+  --manifest /restricted/path/to/context_manifest.parquet \
+  --model-image-column model_image_path \
+  ...
+```
+
+The run stores the context-manifest digest and model-image column while each
+prediction remains keyed to the original target image. This allows evaluation
+and logical-OR combination to enforce the same target-view lineage even when a
+component model consumes additional visual evidence.
