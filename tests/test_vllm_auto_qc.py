@@ -144,6 +144,27 @@ def test_cuda_home_requires_compiler_and_headers(tmp_path: Path) -> None:
     assert vllm_server._resolve_cuda_home(str(executable)) == prefix
 
 
+def test_cuda_jit_paths_require_flashinfer_build_inputs(tmp_path: Path) -> None:
+    prefix = tmp_path / "env"
+    include_directory = prefix / "targets" / "x86_64-linux" / "include"
+    library_directory = prefix / "lib"
+    include_directory.mkdir(parents=True)
+    library_directory.mkdir()
+
+    with pytest.raises(RuntimeError, match="CUDA JIT prerequisites"):
+        vllm_server._resolve_cuda_jit_paths(prefix)
+
+    for name in vllm_server._CUDA_JIT_HEADERS:
+        (include_directory / name).touch()
+    for name in vllm_server._CUDA_JIT_LIBRARIES:
+        (library_directory / name).touch()
+
+    assert vllm_server._resolve_cuda_jit_paths(prefix) == (
+        include_directory,
+        library_directory,
+    )
+
+
 def test_prima_server_delegates_portable_lifecycle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -175,11 +196,20 @@ def test_prima_server_delegates_portable_lifecycle(
     )
     monkeypatch.setattr(
         vllm_server,
+        "_resolve_cuda_jit_paths",
+        lambda _cuda_home: (
+            Path("/runtime/targets/x86_64-linux/include"),
+            Path("/runtime/lib"),
+        ),
+    )
+    monkeypatch.setattr(
+        vllm_server,
         "validate_executable_tmpdir",
         lambda: tmp_path,
     )
     monkeypatch.setenv("LIBRARY_PATH", "/existing/link-libraries")
     monkeypatch.setenv("LD_LIBRARY_PATH", "/existing/runtime-libraries")
+    monkeypatch.setenv("CPATH", "/existing/include")
     payload = model_payload()
     payload["environment"] = {"MODEL_POLICY": "enabled"}
     spec = VLLMModelSpec.from_payload("example", payload)
@@ -201,6 +231,9 @@ def test_prima_server_delegates_portable_lifecycle(
     assert "--disable-uvicorn-access-log" in config.extra_args
     environment = dict(config.environment)
     assert environment["CUDA_HOME"] == "/runtime"
+    assert environment["CPATH"] == (
+        "/runtime/targets/x86_64-linux/include:/existing/include"
+    )
     assert environment["LIBRARY_PATH"] == ("/runtime/lib:/existing/link-libraries")
     assert environment["LD_LIBRARY_PATH"] == (
         "/runtime/lib:/existing/runtime-libraries"

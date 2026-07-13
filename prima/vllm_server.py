@@ -19,6 +19,18 @@ PINNED_RUNTIME_PACKAGES = {
     "vllm": "0.24.0",
 }
 
+_CUDA_JIT_HEADERS = (
+    "cuda_runtime.h",
+    "cuda_fp16.h",
+    "nvrtc.h",
+    "cublasLt.h",
+)
+_CUDA_JIT_LIBRARIES = (
+    "libcudart.so",
+    "libnvrtc.so",
+    "libcublasLt.so",
+)
+
 _RESERVED_VLLM_ARGS = {
     "--host",
     "--port",
@@ -60,7 +72,8 @@ def validate_vllm_runtime() -> str:
             "nvcc executable not found; the pinned Prima vLLM environment must "
             "provide CUDA 13.0 for DeepGEMM JIT compilation"
         )
-    _resolve_cuda_home(executable)
+    cuda_home = _resolve_cuda_home(executable)
+    _resolve_cuda_jit_paths(cuda_home)
     for package, expected_version in PINNED_RUNTIME_PACKAGES.items():
         try:
             installed_version = metadata.version(package)
@@ -94,6 +107,30 @@ def _resolve_cuda_home(vllm_executable: str) -> Path:
     raise RuntimeError(
         f"active vLLM environment has no complete CUDA toolkit under {prefix}"
     )
+
+
+def _resolve_cuda_jit_paths(cuda_home: Path) -> tuple[Path, Path]:
+    """Require the headers and linker inputs used by FlashInfer JIT builds."""
+    target_include = cuda_home / "targets" / "x86_64-linux" / "include"
+    include_directory = (
+        target_include if target_include.is_dir() else cuda_home / "include"
+    )
+    library_directory = cuda_home / "lib"
+    missing = [
+        path
+        for path in (
+            *(include_directory / name for name in _CUDA_JIT_HEADERS),
+            *(library_directory / name for name in _CUDA_JIT_LIBRARIES),
+        )
+        if not path.is_file()
+    ]
+    if missing:
+        missing_names = ", ".join(path.name for path in missing)
+        raise RuntimeError(
+            "active vLLM environment is missing CUDA JIT prerequisites: "
+            f"{missing_names}"
+        )
+    return include_directory, library_directory
 
 
 @dataclass(frozen=True)
@@ -337,14 +374,19 @@ class ManagedVLLMServer:
         if "VLLM_LOGGING_LEVEL" not in os.environ:
             environment["VLLM_LOGGING_LEVEL"] = "INFO"
         runtime_prefix = Path(executable).resolve().parent.parent
-        environment["CUDA_HOME"] = str(_resolve_cuda_home(executable))
+        cuda_home = _resolve_cuda_home(executable)
+        cuda_include, runtime_library = _resolve_cuda_jit_paths(cuda_home)
+        environment["CUDA_HOME"] = str(cuda_home)
         environment["PATH"] = (
             f"{runtime_prefix / 'nvvm' / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}"
         )
-        runtime_library = runtime_prefix / "lib"
-        for variable in ("LIBRARY_PATH", "LD_LIBRARY_PATH"):
+        for variable, path in (
+            ("CPATH", cuda_include),
+            ("LIBRARY_PATH", runtime_library),
+            ("LD_LIBRARY_PATH", runtime_library),
+        ):
             existing = os.environ.get(variable)
-            environment[variable] = str(runtime_library) + (
+            environment[variable] = str(path) + (
                 f"{os.pathsep}{existing}" if existing else ""
             )
         environment["FLASHINFER_WORKSPACE_BASE"] = str(validate_executable_tmpdir())

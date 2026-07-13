@@ -14,6 +14,8 @@ dependencies:
   - submitit
   - huggingface_hub
   - cuda-nvcc=13.0.88
+  - cuda-nvrtc-dev=13.0.88
+  - libcublas-dev=13.1.0.3
 # vLLM/OpenAI/Torch and dsi-local-llms are installed with the pinned uv/pip
 # commands in docs/auto_qc_vllm.md. The current dsi-local-llms source is a
 # checksummed local wheel until its feature branch is pushed and reviewed.
