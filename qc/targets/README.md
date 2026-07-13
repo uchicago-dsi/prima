@@ -54,6 +54,12 @@ The browser reads the deidentified `manifest.parquet`. Exact DICOM lineage is
 kept separately in mode-600 `source_manifest.parquet`; enrichment strata are
 sampling aids and never reference labels.
 
+For a confirmatory panel, pass each prior browser manifest with
+`--exclude-manifest` to prevent exact-view reuse and pass the restricted prior
+`source_manifest.parquet` with `--exclude-source-manifest` to exclude every
+image from those exams. Whole-exam exclusion prevents correlated views from the
+same acquisition leaking between development and holdout panels.
+
 Example:
 
 ```bash

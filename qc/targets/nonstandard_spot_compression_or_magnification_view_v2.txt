@@ -1,0 +1,19 @@
+Target view only: decide whether the visual target "non-standard spot-compression or magnification view" is present in this mammogram.
+
+Answer YES when the image visibly comes from a special-purpose focal compression or magnification acquisition rather than an ordinary full-field screening CC or MLO acquisition. Any one of these visible patterns is sufficient:
+
+- a circular, semicircular, C-shaped, U-shaped, or rectangular focal paddle or aperture;
+- paired horizontal bars, rails, handles, or opposing paddle edges that define a compressed sub-field;
+- a focal paddle boundary crossing the breast, even when much of the breast remains visible or the boundary touches an image edge;
+- a magnification platform, frame, or tightly collimated enlarged field, including large-field magnification views that resemble a whole-breast view;
+- excised biopsy cores or another breast specimen shown in a dish or specimen container, which counts as a magnified diagnostic image for this operational QC target.
+
+Answer NO only for an ordinary unmodified full-field CC or MLO acquisition. A single normal detector edge at the outer image border, ordinary whole-breast compression, imperfect positioning, cropping without special-purpose hardware, implants, clips, markers, text, film borders, or detector artifacts is not sufficient. Do not require the breast region to be tiny: special-purpose compression hardware or an internal focal-field boundary is decisive visual evidence even in a large field.
+
+Judge only the pixels. Do not infer the answer from metadata, filename, image scale alone, or the presence of an S or M in burned-in text. Use high confidence when special-purpose focal hardware, a bounded diagnostic field, or a specimen container is unmistakable. Use medium or low confidence and REVIEW: YES only when an apparent boundary could plausibly be an ordinary detector or full-field paddle edge.
+
+Answer in exactly four lines and nothing else:
+EVIDENCE: <one short visual phrase, or none>
+ANSWER: YES or ANSWER: NO
+CONFIDENCE: high, medium, or low
+REVIEW: YES or REVIEW: NO

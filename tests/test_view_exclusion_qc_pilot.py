@@ -6,6 +6,7 @@ import pandas as pd
 
 from qc.build_view_exclusion_qc_pilot import (
     classify_exclusion_pool,
+    load_excluded_source_ids,
     load_source_table,
     sample_candidate_sources,
     select_rendered_panel,
@@ -90,6 +91,29 @@ def test_source_pool_preserves_reused_exam_and_sop_identifiers(tmp_path: Path) -
 
     assert len(loaded) == 2
     assert loaded["view_id"].tolist() == ["1" * 64, "2" * 64]
+
+
+def test_restricted_source_manifest_excludes_views_and_whole_exams(
+    tmp_path: Path,
+) -> None:
+    manifest = pd.DataFrame(
+        {
+            "view_id": ["a" * 64, "b" * 64],
+            "image_path": [f"images/{'a' * 64}.png", f"images/{'b' * 64}.png"],
+            "laterality": ["L", "R"],
+            "view": ["CC", "MLO"],
+            "review_order": [1, 2],
+            "stratum": ["enriched", "control"],
+            "exam_id": ["EXAM_A", "EXAM_B"],
+        }
+    )
+    path = tmp_path / "source_manifest.parquet"
+    manifest.to_parquet(path, index=False)
+
+    view_ids, exam_ids = load_excluded_source_ids([path])
+
+    assert view_ids == {"a" * 64, "b" * 64}
+    assert exam_ids == {"EXAM_A", "EXAM_B"}
 
 
 def test_sampling_and_render_reserves_preserve_strata_and_exam_disjointness() -> None:

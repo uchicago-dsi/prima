@@ -53,7 +53,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--other-exclusion-count", type=int, default=20)
     parser.add_argument("--standard-count", type=int, default=50)
     parser.add_argument("--reserve-per-stratum", type=int, default=10)
-    parser.add_argument("--exclude-manifest", type=Path, action="append", default=[])
+    parser.add_argument(
+        "--exclude-manifest",
+        type=Path,
+        action="append",
+        default=[],
+        help="deidentified manifest whose exact view IDs must be excluded",
+    )
+    parser.add_argument(
+        "--exclude-source-manifest",
+        type=Path,
+        action="append",
+        default=[],
+        help="restricted source manifest whose entire exams must be excluded",
+    )
     parser.add_argument("--seed", type=int, default=20260712)
     parser.add_argument("--max-render-pixels", type=int, default=2_000_000)
     parser.add_argument("--temp-root", type=Path, default=None)
@@ -89,6 +102,27 @@ def load_excluded_view_ids(paths: list[Path]) -> set[str]:
         ids = {normalize_view_id(value) for value in manifest["view_id"]}
         excluded.update(ids)
     return excluded
+
+
+def load_excluded_source_ids(paths: list[Path]) -> tuple[set[str], set[str]]:
+    """Load exact view IDs and whole-exam IDs from restricted source manifests."""
+    excluded_views: set[str] = set()
+    excluded_exams: set[str] = set()
+    for raw_path in paths:
+        path = raw_path.resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"excluded source manifest not found: {path}")
+        manifest = pd.read_parquet(path)
+        validate_view_manifest_columns(manifest.columns, str(path))
+        if "exam_id" not in manifest.columns:
+            raise ValueError(f"excluded source manifest lacks exam_id: {path}")
+        if manifest["exam_id"].isna().any():
+            raise ValueError(
+                f"excluded source manifest contains missing exam_id: {path}"
+            )
+        excluded_views.update(normalize_view_id(value) for value in manifest["view_id"])
+        excluded_exams.update(str(value) for value in manifest["exam_id"])
+    return excluded_views, excluded_exams
 
 
 def classify_exclusion_pool(
@@ -265,6 +299,7 @@ def write_outputs(
                 f"- strata: `{metadata['selected_counts']}`",
                 f"- seed: `{metadata['seed']}`",
                 "- one view per exam across all strata",
+                f"- prior holdout exclusions: `{metadata['prior_view_ids_excluded']}` exact views and `{metadata['prior_exam_ids_excluded']}` entire exams",
                 "- only L/R CC/MLO images are included",
                 "- browser manifest contains no patient, exam, SOP, or source identifiers",
                 "- DICOM metadata is used only for enrichment, never as reference truth",
@@ -327,8 +362,18 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
     exclusions = load_source_table(exclusions_path, required=exclusion_required)
     standard = load_source_table(standard_path, required=standard_required)
     prior_ids = load_excluded_view_ids(args.exclude_manifest)
-    exclusions = exclusions[~exclusions["view_id"].isin(prior_ids)].copy()
-    standard = standard[~standard["view_id"].isin(prior_ids)].copy()
+    source_view_ids, prior_exam_ids = load_excluded_source_ids(
+        args.exclude_source_manifest
+    )
+    prior_ids.update(source_view_ids)
+    exclusions = exclusions[
+        ~exclusions["view_id"].isin(prior_ids)
+        & ~exclusions["exam_id"].astype(str).isin(prior_exam_ids)
+    ].copy()
+    standard = standard[
+        ~standard["view_id"].isin(prior_ids)
+        & ~standard["exam_id"].astype(str).isin(prior_exam_ids)
+    ].copy()
     exclusions = classify_exclusion_pool(exclusions, args.enrichment_regex)
     standard = standard[
         standard["laterality"].isin(["L", "R"])
@@ -385,6 +430,7 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
         "reserve_per_stratum": int(args.reserve_per_stratum),
         "render_failures": int(render_result["failed"]),
         "prior_view_ids_excluded": int(len(prior_ids)),
+        "prior_exam_ids_excluded": int(len(prior_exam_ids)),
         "seed": int(args.seed),
         "max_render_pixels": int(args.max_render_pixels),
     }
