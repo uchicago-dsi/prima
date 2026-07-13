@@ -27,6 +27,7 @@ from prima.view_auto_qc import (
     require_compatible_view_auto_run,
     save_view_auto_run,
 )
+from prima.view_few_shot import load_view_few_shot_manifest
 from prima.view_qc import (
     normalize_view_id,
     normalize_view_qc_target,
@@ -48,6 +49,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-file", type=Path, required=True)
     parser.add_argument("--target", required=True)
     parser.add_argument("--target-prompt-file", type=Path, required=True)
+    parser.add_argument("--few-shot-manifest", type=Path, default=None)
     parser.add_argument("--model-key", default="qwen35_27b_fp8")
     parser.add_argument(
         "--model-registry", type=Path, default=DEFAULT_VLLM_MODEL_REGISTRY
@@ -125,9 +127,12 @@ def load_view_records(manifest_path: Path) -> list[dict[str, str]]:
 
 
 def build_inference_settings(
-    args: argparse.Namespace, model_spec: Any, target_prompt: str
+    args: argparse.Namespace,
+    model_spec: Any,
+    target_prompt: str,
+    few_shot_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    settings = {
         "model_key": model_spec.key,
         "model_revision": model_spec.revision,
         "runtime_versions": {
@@ -143,6 +148,9 @@ def build_inference_settings(
         "target_prompt_sha256": hashlib.sha256(target_prompt.encode()).hexdigest(),
         "target_prompt_text": target_prompt,
     }
+    if few_shot_metadata:
+        settings.update(few_shot_metadata)
+    return settings
 
 
 def run_from_args(args: argparse.Namespace) -> int:
@@ -170,12 +178,26 @@ def run_from_args(args: argparse.Namespace) -> int:
             f"but --expected-gpus={args.expected_gpus}"
         )
     records = load_view_records(manifest_path)
+    if args.few_shot_manifest is None:
+        few_shot_exemplars: list[dict[str, Any]] = []
+        few_shot_metadata: dict[str, Any] = {}
+    else:
+        few_shot_exemplars, few_shot_metadata = load_view_few_shot_manifest(
+            args.few_shot_manifest,
+            target=target,
+            excluded_view_ids=(record["view_id"] for record in records),
+        )
     model_label = f"{model_spec.served_model_name}@{model_spec.revision[:12]}"
     current = new_view_auto_run(
         target=target,
         model=model_label,
         prompt_variant=args.prompt_variant,
-        inference_settings=build_inference_settings(args, model_spec, target_prompt),
+        inference_settings=build_inference_settings(
+            args,
+            model_spec,
+            target_prompt,
+            few_shot_metadata=few_shot_metadata,
+        ),
     )
     existing = load_view_auto_run(run_file)
     if existing and not args.force_rescore:
@@ -198,8 +220,8 @@ def run_from_args(args: argparse.Namespace) -> int:
         startup_timeout_seconds=args.startup_timeout_seconds,
         request_timeout_seconds=args.request_timeout_seconds,
         max_new_tokens=args.max_new_tokens,
-        few_shot_examples=0,
-        few_shot_exemplar_pool=[],
+        few_shot_examples=len(few_shot_exemplars),
+        few_shot_exemplar_pool=few_shot_exemplars,
         prompt_mode="marker_classifier",
         prompt_variant=args.prompt_variant,
         probe_tag=target,
@@ -235,13 +257,7 @@ def run_from_args(args: argparse.Namespace) -> int:
     finally:
         annotator.close()
 
-    suggested = sum(
-        bool(record["suggestions"]) for record in payload["view_suggestions"].values()
-    )
-    print(
-        f"view auto-QC complete: scored={len(payload['view_suggestions'])} "
-        f"suggested={suggested}"
-    )
+    print(f"view auto-QC complete: scored={len(payload['view_suggestions'])}")
     return 130 if interrupted else 0
 
 

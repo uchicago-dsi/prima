@@ -3790,7 +3790,29 @@ class VLLMVisionAnnotator:
             self.server.stop()
 
     def _select_few_shot_examples(self, exam_id: str) -> list[dict[str, Any]]:
-        if self.prompt_mode == "marker_classifier" and self.probe_tag:
+        ordered = [
+            example
+            for example in self.few_shot_exemplar_pool
+            if "few_shot_order" in example
+        ]
+        if ordered:
+            if len(ordered) != len(self.few_shot_exemplar_pool):
+                raise ValueError(
+                    "few-shot exemplar pool mixes ordered and unordered records"
+                )
+            orders = [int(example["few_shot_order"]) for example in ordered]
+            if len(orders) != len(set(orders)) or min(orders) <= 0:
+                raise ValueError(
+                    "ordered few-shot exemplars require unique positive order"
+                )
+            examples = [
+                example
+                for example in sorted(
+                    ordered, key=lambda record: int(record["few_shot_order"])
+                )
+                if str(example["exam_id"]) != str(exam_id)
+            ][: self.few_shot_examples]
+        elif self.prompt_mode == "marker_classifier" and self.probe_tag:
             examples = select_probe_few_shot_examples(
                 exemplar_pool=self.few_shot_exemplar_pool,
                 max_examples=self.few_shot_examples,
@@ -3820,6 +3842,7 @@ class VLLMVisionAnnotator:
                 ),
             }
         ]
+        reference_type = "view" if self.input_level == "view" else "montage"
         for idx, exemplar in enumerate(few_shot_examples, start=1):
             messages.append(
                 {
@@ -3835,7 +3858,8 @@ class VLLMVisionAnnotator:
                             "type": "text",
                             "text": (
                                 f"Labeled reference example {idx}. "
-                                "Return the accepted QC labels for this montage."
+                                "Return the accepted QC label for this "
+                                f"{reference_type}."
                             ),
                         },
                     ],

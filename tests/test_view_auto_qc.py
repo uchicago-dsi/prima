@@ -167,6 +167,47 @@ def test_view_manifest_loader_uses_relative_images(tmp_path: Path) -> None:
     ]
 
 
+def test_vllm_view_examples_use_fixed_order_and_view_wording(tmp_path: Path) -> None:
+    first = tmp_path / "first.png"
+    second = tmp_path / "second.png"
+    target = tmp_path / "target.png"
+    for path in (first, second, target):
+        Image.new("L", (8, 8)).save(path)
+    annotator = auto_annotate_qc.VLLMVisionAnnotator.__new__(
+        auto_annotate_qc.VLLMVisionAnnotator
+    )
+    annotator.few_shot_exemplar_pool = [
+        {
+            "exam_id": "second",
+            "image_path": str(second),
+            "annotations": [],
+            "few_shot_order": 2,
+        },
+        {
+            "exam_id": "first",
+            "image_path": str(first),
+            "annotations": [TARGET],
+            "few_shot_order": 1,
+        },
+    ]
+    annotator.few_shot_examples = 2
+    annotator.prompt_mode = "marker_classifier"
+    annotator.probe_tag = TARGET
+    annotator.input_level = "view"
+    annotator.text_only_prompt = None
+
+    selected = annotator._select_few_shot_examples("target")
+    assert [record["exam_id"] for record in selected] == ["first", "second"]
+    messages = annotator._build_messages(
+        image_path=target,
+        target_prompt_text="classify the target view",
+        few_shot_examples=selected,
+    )
+    exemplar_text = messages[1]["content"][1]["text"]
+    assert "for this view" in exemplar_text
+    assert "montage" not in exemplar_text
+
+
 def test_evaluator_refuses_partial_blinded_labels(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

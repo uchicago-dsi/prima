@@ -66,6 +66,14 @@ def main() -> int:
     view_args.manifest = view_args.manifest.resolve()
     view_args.run_file = view_args.run_file.resolve()
     view_args.target_prompt_file = view_args.target_prompt_file.resolve()
+    if view_args.few_shot_manifest:
+        view_args.few_shot_manifest = view_args.few_shot_manifest.resolve()
+        view_records = run_view_auto_qc.load_view_records(view_args.manifest)
+        run_view_auto_qc.load_view_few_shot_manifest(
+            view_args.few_shot_manifest,
+            target=view_args.target,
+            excluded_view_ids=(record["view_id"] for record in view_records),
+        )
     view_args.model_registry = view_args.model_registry.resolve()
     view_args.models_dir = view_args.models_dir.resolve()
     if view_args.vllm_server_log:

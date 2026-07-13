@@ -68,3 +68,44 @@ python submit_view_auto_qc.py \
   --target-prompt-file qc/targets/vertical_detector_seam_v1.txt \
   ...
 ```
+
+## Fixed visual examples
+
+Use a small ordered contrastive bank only after a completed development panel
+shows that examples answer a specific model-error hypothesis. Build the bank
+and a matched evaluation subset from explicit human review positions:
+
+```bash
+python qc/build_view_few_shot_experiment.py \
+  --campaign-dir /restricted/path/to/completed_development_panel \
+  --baseline-run /restricted/path/to/baseline_run.json \
+  --out-dir /restricted/path/to/few_shot_experiment \
+  --target 'the visual finding being reviewed' \
+  --example '3=positive defining appearance' \
+  --example '8=negative hard look-alike'
+```
+
+The resulting exemplar manifest is a fixed, contiguous order of 2--15
+view-level examples and must include both `present` and `absent` labels. Each
+row records `view_id`, a canonical relative PNG path, `target`, `label`,
+`exemplar_order`, and a concise role. The loader rejects malformed images,
+unsafe paths, duplicate examples, target mismatches, and overlap with the
+scored manifest.
+
+Pass the frozen bank to inference with `--few-shot-manifest`:
+
+```bash
+python submit_view_auto_qc.py \
+  --manifest /restricted/path/to/evaluation/manifest.parquet \
+  --run-file /restricted/path/to/model_run.json \
+  --target 'the visual finding being reviewed' \
+  --target-prompt-file qc/targets/example_target_v1.txt \
+  --few-shot-manifest /restricted/path/to/exemplars/manifest.parquet \
+  ...
+```
+
+Every request receives the examples in the manifest order. The saved run
+records the exemplar manifest SHA-256 plus each example's image SHA-256, order,
+label, and role so a result cannot silently resume with a different reference
+bank. Keep example selection inside development data, then freeze it before
+scoring an exam-disjoint blinded confirmation panel.
