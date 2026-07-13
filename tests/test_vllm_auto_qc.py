@@ -178,6 +178,8 @@ def test_prima_server_delegates_portable_lifecycle(
         "validate_executable_tmpdir",
         lambda: tmp_path,
     )
+    monkeypatch.setenv("LIBRARY_PATH", "/existing/link-libraries")
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/existing/runtime-libraries")
     payload = model_payload()
     payload["environment"] = {"MODEL_POLICY": "enabled"}
     spec = VLLMModelSpec.from_payload("example", payload)
@@ -199,6 +201,10 @@ def test_prima_server_delegates_portable_lifecycle(
     assert "--disable-uvicorn-access-log" in config.extra_args
     environment = dict(config.environment)
     assert environment["CUDA_HOME"] == "/runtime"
+    assert environment["LIBRARY_PATH"] == ("/runtime/lib:/existing/link-libraries")
+    assert environment["LD_LIBRARY_PATH"] == (
+        "/runtime/lib:/existing/runtime-libraries"
+    )
     assert environment["FLASHINFER_WORKSPACE_BASE"] == str(tmp_path)
     assert environment["MODEL_POLICY"] == "enabled"
     assert captured["started"] is True

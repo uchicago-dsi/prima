@@ -341,6 +341,12 @@ class ManagedVLLMServer:
         environment["PATH"] = (
             f"{runtime_prefix / 'nvvm' / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}"
         )
+        runtime_library = runtime_prefix / "lib"
+        for variable in ("LIBRARY_PATH", "LD_LIBRARY_PATH"):
+            existing = os.environ.get(variable)
+            environment[variable] = str(runtime_library) + (
+                f"{os.pathsep}{existing}" if existing else ""
+            )
         environment["FLASHINFER_WORKSPACE_BASE"] = str(validate_executable_tmpdir())
         environment.update(self.spec.environment)
         config = VLLMServerConfig(
