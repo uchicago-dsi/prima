@@ -24,12 +24,16 @@ _CUDA_JIT_HEADERS = (
     "cuda_fp16.h",
     "nvrtc.h",
     "cublasLt.h",
+    "curand_kernel.h",
+    "curand_philox4x32_x.h",
 )
 _CUDA_JIT_LIBRARIES = (
     "libcudart.so",
     "libnvrtc.so",
     "libcublasLt.so",
+    "libcurand.so",
 )
+_CUDA_JIT_DRIVER_STUBS = ("libcuda.so",)
 
 _RESERVED_VLLM_ARGS = {
     "--host",
@@ -109,18 +113,25 @@ def _resolve_cuda_home(vllm_executable: str) -> Path:
     )
 
 
-def _resolve_cuda_jit_paths(cuda_home: Path) -> tuple[Path, Path]:
+def _resolve_cuda_jit_paths(cuda_home: Path) -> tuple[Path, Path, Path]:
     """Require the headers and linker inputs used by FlashInfer JIT builds."""
-    target_include = cuda_home / "targets" / "x86_64-linux" / "include"
+    target_directory = cuda_home / "targets" / "x86_64-linux"
+    target_include = target_directory / "include"
     include_directory = (
         target_include if target_include.is_dir() else cuda_home / "include"
     )
     library_directory = cuda_home / "lib"
+    driver_stub_directory = (
+        target_directory / "lib" / "stubs"
+        if target_directory.is_dir()
+        else cuda_home / "lib64" / "stubs"
+    )
     missing = [
         path
         for path in (
             *(include_directory / name for name in _CUDA_JIT_HEADERS),
             *(library_directory / name for name in _CUDA_JIT_LIBRARIES),
+            *(driver_stub_directory / name for name in _CUDA_JIT_DRIVER_STUBS),
         )
         if not path.is_file()
     ]
@@ -130,7 +141,7 @@ def _resolve_cuda_jit_paths(cuda_home: Path) -> tuple[Path, Path]:
             "active vLLM environment is missing CUDA JIT prerequisites: "
             f"{missing_names}"
         )
-    return include_directory, library_directory
+    return include_directory, library_directory, driver_stub_directory
 
 
 @dataclass(frozen=True)
@@ -375,18 +386,20 @@ class ManagedVLLMServer:
             environment["VLLM_LOGGING_LEVEL"] = "INFO"
         runtime_prefix = Path(executable).resolve().parent.parent
         cuda_home = _resolve_cuda_home(executable)
-        cuda_include, runtime_library = _resolve_cuda_jit_paths(cuda_home)
+        cuda_include, runtime_library, driver_stub_library = _resolve_cuda_jit_paths(
+            cuda_home
+        )
         environment["CUDA_HOME"] = str(cuda_home)
         environment["PATH"] = (
             f"{runtime_prefix / 'nvvm' / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}"
         )
-        for variable, path in (
-            ("CPATH", cuda_include),
-            ("LIBRARY_PATH", runtime_library),
-            ("LD_LIBRARY_PATH", runtime_library),
+        for variable, paths in (
+            ("CPATH", (cuda_include,)),
+            ("LIBRARY_PATH", (runtime_library, driver_stub_library)),
+            ("LD_LIBRARY_PATH", (runtime_library,)),
         ):
             existing = os.environ.get(variable)
-            environment[variable] = str(path) + (
+            environment[variable] = os.pathsep.join(str(path) for path in paths) + (
                 f"{os.pathsep}{existing}" if existing else ""
             )
         environment["FLASHINFER_WORKSPACE_BASE"] = str(validate_executable_tmpdir())

@@ -148,8 +148,10 @@ def test_cuda_jit_paths_require_flashinfer_build_inputs(tmp_path: Path) -> None:
     prefix = tmp_path / "env"
     include_directory = prefix / "targets" / "x86_64-linux" / "include"
     library_directory = prefix / "lib"
+    driver_stub_directory = prefix / "targets" / "x86_64-linux" / "lib" / "stubs"
     include_directory.mkdir(parents=True)
     library_directory.mkdir()
+    driver_stub_directory.mkdir(parents=True)
 
     with pytest.raises(RuntimeError, match="CUDA JIT prerequisites"):
         vllm_server._resolve_cuda_jit_paths(prefix)
@@ -158,10 +160,13 @@ def test_cuda_jit_paths_require_flashinfer_build_inputs(tmp_path: Path) -> None:
         (include_directory / name).touch()
     for name in vllm_server._CUDA_JIT_LIBRARIES:
         (library_directory / name).touch()
+    for name in vllm_server._CUDA_JIT_DRIVER_STUBS:
+        (driver_stub_directory / name).touch()
 
     assert vllm_server._resolve_cuda_jit_paths(prefix) == (
         include_directory,
         library_directory,
+        driver_stub_directory,
     )
 
 
@@ -200,6 +205,7 @@ def test_prima_server_delegates_portable_lifecycle(
         lambda _cuda_home: (
             Path("/runtime/targets/x86_64-linux/include"),
             Path("/runtime/lib"),
+            Path("/runtime/targets/x86_64-linux/lib/stubs"),
         ),
     )
     monkeypatch.setattr(
@@ -234,7 +240,9 @@ def test_prima_server_delegates_portable_lifecycle(
     assert environment["CPATH"] == (
         "/runtime/targets/x86_64-linux/include:/existing/include"
     )
-    assert environment["LIBRARY_PATH"] == ("/runtime/lib:/existing/link-libraries")
+    assert environment["LIBRARY_PATH"] == (
+        "/runtime/lib:/runtime/targets/x86_64-linux/lib/stubs:/existing/link-libraries"
+    )
     assert environment["LD_LIBRARY_PATH"] == (
         "/runtime/lib:/existing/runtime-libraries"
     )
