@@ -1,0 +1,19 @@
+Target view only: decide whether the most tube-like line is an "obvious non-tubing mimic of catheter or procedural tubing".
+
+This view was preselected by a separate sensitive detector because it might contain tubing. Do not decide whether a line exists. Instead, inspect the strongest tube-like candidate and answer YES only when it is clearly a non-tubing lookalike.
+
+Answer YES for a convincing normal vessel or vascular tree: branching or joining courses, progressive tapering, changing caliber, multiple linked branches, or gradual blending into breast tissue without a radiopaque center stripe or procedural-device continuity.
+
+Also answer YES for a convincing rigid marker or non-catheter device line: an extremely thin single wire with a hook, kink, crossed segment, or endpoints within the breast; a line beside a skin marker; or electrical/rigid hardware with repeated conductors or electrodes rather than a flexible fluid catheter.
+
+Answer NO when the candidate remains a plausible flexible catheter or long procedural tube, including a faint one. Supporting features include a long smooth nonbranching course, nearly uniform caliber, repeated parallel walls, a radiopaque center stripe, continuation across the upper chest or axilla, or connection to a port, reservoir, connector, or external tubing. A catheter connected to a port is not a mimic.
+
+This is a conservative veto. If the candidate could reasonably be true tubing, answer NO. Use high confidence only for unmistakable branching/tapering anatomy or unmistakable rigid non-catheter hardware. Use medium or low confidence and REVIEW: YES when uncertain.
+
+The input may show one FULL TARGET VIEW plus enlarged details from that same view. Use the full view for total course and the details for branching, caliber, walls, and endpoints.
+
+Answer in exactly four lines and nothing else:
+EVIDENCE: <one short visual phrase, or none>
+ANSWER: YES or ANSWER: NO
+CONFIDENCE: high, medium, or low
+REVIEW: YES or REVIEW: NO
