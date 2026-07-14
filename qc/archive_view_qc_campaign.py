@@ -18,6 +18,7 @@ import pandas as pd
 
 from prima.view_qc import (
     VIEW_QC_EVENT_FILENAME,
+    VIEW_QC_SCHEMA_VERSION,
     load_view_qc_events,
     normalize_view_id,
     normalize_view_qc_target,
@@ -99,7 +100,7 @@ def load_completed_campaign(campaign_dir: Path) -> dict[str, Any]:
         "labels",
     }:
         raise ValueError("campaign state has an unexpected structure")
-    if state["schema_version"] not in {1, 2}:
+    if state["schema_version"] not in {1, 2, VIEW_QC_SCHEMA_VERSION}:
         raise ValueError("campaign state schema is not archivable")
     target = normalize_view_qc_target(state["target"])
     if not isinstance(state["labels"], dict):
@@ -108,16 +109,22 @@ def load_completed_campaign(campaign_dir: Path) -> dict[str, Any]:
     if label_ids != set(view_ids):
         raise ValueError("only completely annotated campaigns may be archived")
     for view_id, record in state["labels"].items():
-        if not isinstance(record, dict) or set(record) != {
-            "label",
-            "source",
-            "updated_at",
-        }:
+        expected_fields = {"label", "source", "updated_at"}
+        if state["schema_version"] == VIEW_QC_SCHEMA_VERSION:
+            expected_fields.add("low_confidence")
+        if not isinstance(record, dict) or set(record) != expected_fields:
             raise ValueError(f"campaign label record is invalid for {view_id[:12]}")
         if str(record["source"]).strip() != "human":
             raise ValueError("campaign archive accepts only human reference labels")
         if not str(record["label"]).strip() or not str(record["updated_at"]).strip():
             raise ValueError("campaign label record is incomplete")
+        if state["schema_version"] == VIEW_QC_SCHEMA_VERSION:
+            if not isinstance(record["low_confidence"], bool):
+                raise ValueError("campaign low-confidence flag must be boolean")
+            if record["low_confidence"]:
+                raise ValueError(
+                    "low-confidence labels must be adjudicated before archiving"
+                )
     root = campaign_dir.resolve()
     image_paths: set[Path] = set()
     for relative_value in manifest["image_path"]:
@@ -136,13 +143,13 @@ def load_completed_campaign(campaign_dir: Path) -> dict[str, Any]:
         raise ValueError("campaign manifest does not map one image per view")
     events_path = campaign_dir / VIEW_QC_EVENT_FILENAME
     if events_path.exists():
-        if state["schema_version"] != 2:
+        if state["schema_version"] != VIEW_QC_SCHEMA_VERSION:
             raise ValueError("legacy campaign state cannot have current event history")
         events = load_view_qc_events(events_path)
         validate_view_qc_campaign_state(state, events, view_ids)
         event_history = "verified"
         event_count = len(events)
-    elif state["schema_version"] == 2:
+    elif state["schema_version"] in {2, VIEW_QC_SCHEMA_VERSION}:
         event_history = "unavailable-pre-audit"
         event_count = 0
     else:

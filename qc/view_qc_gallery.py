@@ -29,7 +29,52 @@ from prima.view_qc import (
 )
 
 MAX_REQUEST_BYTES = 4096
+MAX_REVIEW_RUBRIC_CHARS = 12_000
 DEFAULT_REVIEW_PORT = 8767
+DEFAULT_NEGATIVE_LABEL = "Not present"
+DEFAULT_POSITIVE_LABEL = "Present"
+DEFAULT_NEGATIVE_SHORTCUT = "n"
+DEFAULT_POSITIVE_SHORTCUT = "y"
+DEFAULT_REVIEW_INSTRUCTION = (
+    "Decide only whether this target is present; ignore every other finding."
+)
+
+
+def normalize_ui_text(value: object, *, field: str, max_length: int) -> str:
+    """Normalize one browser-facing label or instruction and fail if malformed."""
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+    text = " ".join(value.split())
+    if not text:
+        raise ValueError(f"{field} cannot be empty")
+    if len(text) > max_length:
+        raise ValueError(f"{field} cannot exceed {max_length} characters")
+    return text
+
+
+def normalize_shortcut(value: object, *, field: str) -> str:
+    """Normalize one single-key browser shortcut."""
+    text = normalize_ui_text(value, field=field, max_length=1).casefold()
+    if not text.isalnum():
+        raise ValueError(f"{field} must be one letter or number")
+    return text
+
+
+def load_review_rubric(path: Path | None) -> str:
+    """Load a browser-facing plain-text rubric without collapsing its layout."""
+    if path is None:
+        return ""
+    rubric_path = path.resolve()
+    if not rubric_path.is_file():
+        raise FileNotFoundError(f"review rubric not found: {rubric_path}")
+    rubric = rubric_path.read_text().strip()
+    if not rubric:
+        raise ValueError("review rubric cannot be empty")
+    if len(rubric) > MAX_REVIEW_RUBRIC_CHARS:
+        raise ValueError(
+            f"review rubric cannot exceed {MAX_REVIEW_RUBRIC_CHARS} characters"
+        )
+    return rubric
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,6 +87,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reviewer", required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=DEFAULT_REVIEW_PORT)
+    parser.add_argument("--negative-label", default=DEFAULT_NEGATIVE_LABEL)
+    parser.add_argument("--positive-label", default=DEFAULT_POSITIVE_LABEL)
+    parser.add_argument("--negative-shortcut", default=DEFAULT_NEGATIVE_SHORTCUT)
+    parser.add_argument("--positive-shortcut", default=DEFAULT_POSITIVE_SHORTCUT)
+    parser.add_argument("--review-instruction", default=DEFAULT_REVIEW_INSTRUCTION)
+    parser.add_argument("--review-rubric-file", type=Path)
     return parser.parse_args()
 
 
@@ -114,6 +165,9 @@ HTML = r"""<!doctype html>
     #session-row { display: flex; flex-wrap: wrap; gap: 9px; align-items: center; margin-top: 7px; }
     #session-rate { color: #b9e9ca; font-variant-numeric: tabular-nums; font-weight: 650; }
     #controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: center; padding: 10px 12px; border-bottom: 1px solid #34383d; background: #171a1e; }
+    #rubric-panel { max-width: 1100px; margin: 10px auto 0; border: 1px solid #48505a; border-radius: 7px; background: #171a1e; }
+    #rubric-panel summary { cursor: pointer; padding: 8px 12px; color: #dce5ee; font-weight: 700; }
+    #rubric-text { max-height: 28vh; margin: 0; padding: 0 14px 12px; overflow-y: auto; white-space: pre-wrap; color: #d0d7df; font: 14px/1.4 system-ui, sans-serif; user-select: text; }
     main { display: flex; align-items: flex-start; justify-content: center; padding: 16px; }
     img { display: block; width: auto; height: auto; max-width: 70vw; max-height: 65vh; object-fit: contain; background: black; }
     button { border: 1px solid #59616a; border-radius: 7px; padding: 10px 14px; color: white; background: #282d33; font-size: 16px; cursor: pointer; }
@@ -125,6 +179,7 @@ HTML = r"""<!doctype html>
     #save-status.error { color: #ff9b9b; }
     .absent { background: #315d7d; }
     .present { background: #8a5b24; }
+    .low-confidence { background: #6f6228; }
     .muted { color: #aeb6bf; }
   </style>
 </head>
@@ -133,7 +188,7 @@ HTML = r"""<!doctype html>
     <div id="stats">Loading…</div>
     <div id="context">Loading target…</div>
     <div id="session-row">
-      <span id="session-rate" role="timer" aria-live="off">Rate starts with your first saved annotation.</span>
+      <span id="session-rate" role="timer" aria-live="off">Rate and ETA start with your first saved annotation.</span>
       <button id="reset-session" type="button" hidden>Reset timer</button>
     </div>
   </header>
@@ -141,20 +196,31 @@ HTML = r"""<!doctype html>
     <button id="previous">← Previous</button>
     <button id="absent" class="absent">Not present [n]</button>
     <button id="present" class="present">Present [y]</button>
-    <button id="uncertain">Unsure [u]</button>
+    <button id="low-confidence" class="low-confidence" aria-pressed="false">Low confidence: off [u]</button>
     <button id="clear">Clear [x]</button>
     <button id="next">Next →</button>
     <span id="end-marker" role="status" hidden>✓ End of batch</span>
     <button id="pending">Next unreviewed</button>
-    <button id="review-unsure">Review unsure (0)</button>
+    <button id="review-unsure">Review low confidence (0)</button>
     <span id="save-status" role="status" aria-live="polite"></span>
   </div>
+  <details id="rubric-panel" open hidden>
+    <summary>Full decision rubric (click to collapse)</summary>
+    <pre id="rubric-text"></pre>
+  </details>
   <main><img id="image" alt="Mammography view"></main>
 <script>
 let items = [];
 let labels = {};
 let index = 0;
 let target = '';
+let negativeLabel = 'Not present';
+let positiveLabel = 'Present';
+let negativeShortcut = 'n';
+let positiveShortcut = 'y';
+let reviewInstruction = 'Decide only whether this target is present; ignore every other finding.';
+let reviewRubric = '';
+let pendingLowConfidence = false;
 let saving = false;
 let unsureReviewQueue = [];
 let unsureReviewPosition = -1;
@@ -179,19 +245,27 @@ function renderSessionRate() {
   const display = document.getElementById('session-rate');
   const reset = document.getElementById('reset-session');
   if (sessionStartedAtMs === null) {
-    display.textContent = 'Rate starts with your first saved annotation.';
+    display.textContent = 'Rate and ETA start with your first saved annotation.';
     reset.hidden = true;
     return;
   }
   const elapsedMs = Math.max(Date.now() - sessionStartedAtMs, 1000);
   const annotationCount = sessionAnnotatedViewIds.size;
+  const summary = counts();
+  const ratePerMinute = annotationCount / (elapsedMs / 60000);
   const rateText = annotationCount < 2
     ? 'measuring…'
-    : (annotationCount / (elapsedMs / 60000)).toFixed(1) + ' views/min';
+    : ratePerMinute.toFixed(1) + ' views/min';
+  const etaText = summary.remaining === 0
+    ? 'ETA done'
+    : annotationCount < 2
+      ? 'ETA measuring…'
+      : 'ETA ' + formatElapsed((summary.remaining / ratePerMinute) * 60000);
   display.textContent =
     'session ' + formatElapsed(elapsedMs) +
     ' | ' + annotationCount + ' unique view' + (annotationCount === 1 ? '' : 's') +
-    ' | ' + rateText;
+    ' | ' + rateText +
+    ' | ' + etaText;
   reset.hidden = false;
 }
 
@@ -266,15 +340,16 @@ function unsureReviewActive() {
 function counts() {
   let absent = 0;
   let present = 0;
-  let uncertain = 0;
+  let lowConfidence = 0;
   for (const item of items) {
-    const label = labels[item.view_id]?.label;
+    const record = labels[item.view_id];
+    const label = record?.label;
     if (label === 'absent') absent += 1;
     if (label === 'present') present += 1;
-    if (label === 'uncertain') uncertain += 1;
+    if (record?.low_confidence === true) lowConfidence += 1;
   }
-  const reviewed = absent + present + uncertain;
-  return {absent, present, uncertain, reviewed, remaining: items.length - reviewed};
+  const reviewed = absent + present;
+  return {absent, present, lowConfidence, reviewed, remaining: items.length - reviewed};
 }
 
 function render() {
@@ -285,14 +360,14 @@ function render() {
     return;
   }
   document.getElementById('image').src = item.image_url;
-  const instruction = 'Target: ' + target + '. Decide only whether this target is present; ignore every other finding.';
+  const instruction = 'Target: ' + target + '. ' + reviewInstruction;
   let context = item.laterality + ' ' + item.view + ' | ' + instruction;
   if (unsureReviewActive()) {
-    context += ' Unsure review pass ' + (unsureReviewPosition + 1) + '/' + unsureReviewQueue.length + '.';
+    context += ' Low-confidence review pass ' + (unsureReviewPosition + 1) + '/' + unsureReviewQueue.length + '.';
   } else if (summary.remaining === 0) {
     context = instruction + ' Review complete — all labels are saved.';
-    context += summary.uncertain > 0
-      ? ' Use Review unsure to revisit the unsure labels.'
+    context += summary.lowConfidence > 0
+      ? ' Use Review low confidence to revisit the low-confidence labels.'
       : ' Use Previous or the arrow keys to inspect them.';
   }
   document.getElementById('context').textContent = context;
@@ -300,15 +375,23 @@ function render() {
     'position ' + (index + 1) + '/' + items.length +
     ' | reviewed ' + summary.reviewed + '/' + items.length +
     ' | remaining ' + summary.remaining +
-    ' | absent ' + summary.absent +
-    ' | present ' + summary.present +
-    ' | unsure ' + summary.uncertain +
-    (unsureReviewActive() ? ' | unsure pass ' + (unsureReviewPosition + 1) + '/' + unsureReviewQueue.length : '') +
+    ' | ' + negativeLabel.toLowerCase() + ' ' + summary.absent +
+    ' | ' + positiveLabel.toLowerCase() + ' ' + summary.present +
+    ' | low confidence ' + summary.lowConfidence +
+    (unsureReviewActive() ? ' | low-confidence pass ' + (unsureReviewPosition + 1) + '/' + unsureReviewQueue.length : '') +
     (summary.remaining === 0 ? ' | COMPLETE' : '');
-  const active = labels[item.view_id]?.label;
+  const record = labels[item.view_id];
+  const active = record?.label;
   document.getElementById('absent').classList.toggle('active', active === 'absent');
   document.getElementById('present').classList.toggle('active', active === 'present');
-  document.getElementById('uncertain').classList.toggle('active', active === 'uncertain');
+  const lowConfidence = record
+    ? record.low_confidence === true
+    : pendingLowConfidence;
+  const lowConfidenceButton = document.getElementById('low-confidence');
+  lowConfidenceButton.classList.toggle('active', lowConfidence);
+  lowConfidenceButton.setAttribute('aria-pressed', String(lowConfidence));
+  lowConfidenceButton.textContent =
+    'Low confidence: ' + (lowConfidence ? 'on' : 'off') + ' [u]';
   const reviewingUnsure = unsureReviewActive();
   document.getElementById('previous').disabled = reviewingUnsure
     ? unsureReviewPosition === 0
@@ -319,18 +402,18 @@ function render() {
   const next = document.getElementById('next');
   const endMarker = document.getElementById('end-marker');
   next.hidden = atEnd;
-  next.textContent = reviewingUnsure ? 'Next unsure →' : 'Next →';
+  next.textContent = reviewingUnsure ? 'Next low confidence →' : 'Next →';
   endMarker.hidden = !atEnd;
-  endMarker.textContent = reviewingUnsure ? '✓ End of unsure review' : '✓ End of batch';
+  endMarker.textContent = reviewingUnsure ? '✓ End of low-confidence review' : '✓ End of batch';
   const reviewUnsure = document.getElementById('review-unsure');
-  reviewUnsure.disabled = !reviewingUnsure && summary.uncertain === 0;
+  reviewUnsure.disabled = !reviewingUnsure && summary.lowConfidence === 0;
   reviewUnsure.classList.toggle('active', reviewingUnsure);
   reviewUnsure.textContent = reviewingUnsure
-    ? 'Exit unsure review (' + (unsureReviewPosition + 1) + '/' + unsureReviewQueue.length + ')'
-    : 'Review unsure (' + summary.uncertain + ')';
+    ? 'Exit low-confidence review (' + (unsureReviewPosition + 1) + '/' + unsureReviewQueue.length + ')'
+    : 'Review low confidence (' + summary.lowConfidence + ')';
 }
 
-async function setLabel(label) {
+async function saveDecision(label, lowConfidence, {advance = true} = {}) {
   if (saving) return;
   saving = true;
   showStatus('Saving…');
@@ -340,20 +423,28 @@ async function setLabel(label) {
     const response = await fetch('/api/label', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({view_id: item.view_id, label})
+      body: JSON.stringify({
+        view_id: item.view_id,
+        label,
+        low_confidence: lowConfidence
+      })
     });
     if (!response.ok) throw new Error(await response.text());
     const payload = await response.json();
     labels = payload.labels;
     recordSessionAnnotation(item.view_id, label, actionStartedAtMs);
+    pendingLowConfidence = false;
     const labelText = label === null ? 'Label cleared' :
-      label === 'absent' ? 'Saved: not present' :
-      label === 'present' ? 'Saved: present' : 'Saved: unsure';
-    showStatus(labelText);
-    if (label === null) {
+      label === 'absent' ? 'Saved: ' + negativeLabel.toLowerCase() :
+      'Saved: ' + positiveLabel.toLowerCase();
+    const confidenceText = label !== null && lowConfidence
+      ? labelText + ' (low confidence)'
+      : labelText;
+    showStatus(confidenceText);
+    if (label === null || !advance) {
       render();
     } else if (unsureReviewActive()) {
-      advanceUnsureReview(labelText);
+      advanceUnsureReview(confidenceText);
     } else if (counts().remaining > 0) {
       nextUnreviewed(index + 1);
     } else if (index < items.length - 1) {
@@ -369,6 +460,35 @@ async function setLabel(label) {
   }
 }
 
+function chooseLabel(label) {
+  const record = labels[items[index].view_id];
+  const lowConfidence = record
+    ? record.low_confidence === true
+    : pendingLowConfidence;
+  saveDecision(label, lowConfidence);
+}
+
+function clearLabel() {
+  saveDecision(null, null);
+}
+
+function toggleLowConfidence() {
+  if (saving) return;
+  const item = items[index];
+  const record = labels[item.view_id];
+  if (!record) {
+    pendingLowConfidence = !pendingLowConfidence;
+    showStatus(
+      pendingLowConfidence
+        ? 'Next decision will be low confidence'
+        : 'Low-confidence flag cleared'
+    );
+    render();
+    return;
+  }
+  saveDecision(record.label, !record.low_confidence, {advance: false});
+}
+
 function showStatus(message, isError = false) {
   const status = document.getElementById('save-status');
   status.textContent = message;
@@ -376,6 +496,7 @@ function showStatus(message, isError = false) {
 }
 
 function move(delta) {
+  pendingLowConfidence = false;
   if (unsureReviewActive()) {
     unsureReviewPosition = Math.max(
       0,
@@ -396,17 +517,17 @@ function exitUnsureReview() {
 
 function startUnsureReview() {
   unsureReviewQueue = items
-    .filter(item => labels[item.view_id]?.label === 'uncertain')
+    .filter(item => labels[item.view_id]?.low_confidence === true)
     .map(item => item.view_id);
   if (unsureReviewQueue.length === 0) {
     unsureReviewPosition = -1;
-    showStatus('No unsure labels to review');
+    showStatus('No low-confidence labels to review');
     render();
     return;
   }
   unsureReviewPosition = 0;
   index = items.findIndex(item => item.view_id === unsureReviewQueue[0]);
-  showStatus('Reviewing ' + unsureReviewQueue.length + ' unsure labels');
+  showStatus('Reviewing ' + unsureReviewQueue.length + ' low-confidence labels');
   render();
 }
 
@@ -418,11 +539,12 @@ function advanceUnsureReview(labelText) {
     return;
   }
   exitUnsureReview();
-  showStatus(labelText + ' — unsure review pass complete');
+  showStatus(labelText + ' — low-confidence review pass complete');
   render();
 }
 
 function nextUnreviewed(start = 0) {
+  pendingLowConfidence = false;
   for (let offset = 0; offset < items.length; offset += 1) {
     const candidate = (start + offset) % items.length;
     if (!labels[items[candidate].view_id]) {
@@ -437,10 +559,10 @@ function nextUnreviewed(start = 0) {
 document.getElementById('previous').onclick = () => move(-1);
 document.getElementById('next').onclick = () => move(1);
 document.getElementById('reset-session').onclick = resetSessionRate;
-document.getElementById('absent').onclick = () => setLabel('absent');
-document.getElementById('present').onclick = () => setLabel('present');
-document.getElementById('uncertain').onclick = () => setLabel('uncertain');
-document.getElementById('clear').onclick = () => setLabel(null);
+document.getElementById('absent').onclick = () => chooseLabel('absent');
+document.getElementById('present').onclick = () => chooseLabel('present');
+document.getElementById('low-confidence').onclick = toggleLowConfidence;
+document.getElementById('clear').onclick = clearLabel;
 document.getElementById('pending').onclick = () => {
   exitUnsureReview();
   nextUnreviewed(index + 1);
@@ -456,23 +578,36 @@ document.getElementById('review-unsure').onclick = () => {
 document.addEventListener('keydown', event => {
   if (event.metaKey || event.ctrlKey || event.altKey) return;
   const key = event.key.toLowerCase();
-  if (!['arrowleft', 'arrowright', 'n', 'y', 'u', 'x'].includes(key)) return;
+  if (!['arrowleft', 'arrowright', negativeShortcut, positiveShortcut, 'u', 'x'].includes(key)) return;
   event.preventDefault();
   if (key === 'arrowleft') move(-1);
   else if (key === 'arrowright') move(1);
-  else if (key === 'n') setLabel('absent');
-  else if (key === 'y') setLabel('present');
-  else if (key === 'u') setLabel('uncertain');
-  else if (key === 'x') setLabel(null);
+  else if (key === negativeShortcut) chooseLabel('absent');
+  else if (key === positiveShortcut) chooseLabel('present');
+  else if (key === 'u') toggleLowConfidence();
+  else if (key === 'x') clearLabel();
 });
 
 Promise.all([
   fetch('/api/items').then(response => response.json()),
-  fetch('/api/state').then(response => response.json())
-]).then(([loadedItems, state]) => {
+  fetch('/api/state').then(response => response.json()),
+  fetch('/api/config').then(response => response.json())
+]).then(([loadedItems, state, config]) => {
   items = loadedItems;
   labels = state.labels;
   target = state.target;
+  negativeLabel = config.negative_label;
+  positiveLabel = config.positive_label;
+  negativeShortcut = config.negative_shortcut;
+  positiveShortcut = config.positive_shortcut;
+  reviewInstruction = config.review_instruction;
+  reviewRubric = config.review_rubric;
+  document.getElementById('absent').textContent = negativeLabel + ' [' + negativeShortcut + ']';
+  document.getElementById('present').textContent = positiveLabel + ' [' + positiveShortcut + ']';
+  if (reviewRubric) {
+    document.getElementById('rubric-text').textContent = reviewRubric;
+    document.getElementById('rubric-panel').hidden = false;
+  }
   initializeSessionRate();
   nextUnreviewed(0);
 }).catch(error => {
@@ -489,6 +624,7 @@ class ReviewServer(ThreadingHTTPServer):
     images: dict[str, Path]
     state_path: Path
     state_lock: threading.Lock
+    ui_config: dict[str, str]
 
 
 class ReviewHandler(BaseHTTPRequestHandler):
@@ -539,6 +675,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 )
             self._send_json(state)
             return
+        if path == "/api/config":
+            self._send_json(self.server.ui_config)
+            return
         if path.startswith("/image/"):
             raw_view_id = path[len("/image/") :]
             try:
@@ -569,12 +708,27 @@ class ReviewHandler(BaseHTTPRequestHandler):
             if length <= 0 or length > MAX_REQUEST_BYTES:
                 raise ValueError("invalid request size")
             payload = json.loads(self.rfile.read(length))
+            if not isinstance(payload, dict):
+                raise ValueError("request body must be a JSON object")
+            required_fields = {"view_id", "label", "low_confidence"}
+            if set(payload) != required_fields:
+                raise ValueError(
+                    "request must contain view_id, label, and low_confidence"
+                )
             view_id = normalize_view_id(payload.get("view_id"))
             if view_id not in self.server.images:
                 raise ValueError("view is outside the review manifest")
             label = payload.get("label")
             if label is not None and label not in VALID_VIEW_LABELS:
                 raise ValueError("invalid view label")
+            low_confidence = payload.get("low_confidence")
+            if label is None:
+                if low_confidence is not None:
+                    raise ValueError(
+                        "a cleared view label cannot have a confidence flag"
+                    )
+            elif not isinstance(low_confidence, bool):
+                raise ValueError("low_confidence must be boolean")
             with self.server.state_lock:
                 state = record_view_qc_label(
                     state_path=self.server.state_path,
@@ -582,6 +736,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
                     manifest_view_ids=[item["view_id"] for item in self.server.items],
                     view_id=view_id,
                     label=label,
+                    low_confidence=low_confidence,
                     reviewer=self.server.reviewer,
                 )
             self._send_json(state)
@@ -604,6 +759,29 @@ def main() -> int:
         else default_view_qc_events_path(state_path)
     )
     reviewer = normalize_view_qc_reviewer(args.reviewer)
+    negative_label = normalize_ui_text(
+        args.negative_label, field="--negative-label", max_length=80
+    )
+    positive_label = normalize_ui_text(
+        args.positive_label, field="--positive-label", max_length=80
+    )
+    negative_shortcut = normalize_shortcut(
+        args.negative_shortcut, field="--negative-shortcut"
+    )
+    positive_shortcut = normalize_shortcut(
+        args.positive_shortcut, field="--positive-shortcut"
+    )
+    review_instruction = normalize_ui_text(
+        args.review_instruction, field="--review-instruction", max_length=500
+    )
+    review_rubric = load_review_rubric(args.review_rubric_file)
+    if negative_label.casefold() == positive_label.casefold():
+        raise ValueError("positive and negative labels must differ")
+    reserved_shortcuts = {"u", "x"}
+    if negative_shortcut == positive_shortcut:
+        raise ValueError("positive and negative shortcuts must differ")
+    if {negative_shortcut, positive_shortcut} & reserved_shortcuts:
+        raise ValueError("positive and negative shortcuts cannot use u or x")
     if not manifest_path.is_file():
         raise FileNotFoundError(f"view QC manifest not found: {manifest_path}")
     items, images = load_review_items(manifest_path)
@@ -627,6 +805,14 @@ def main() -> int:
     server.events_path = events_path
     server.reviewer = reviewer
     server.state_lock = threading.Lock()
+    server.ui_config = {
+        "negative_label": negative_label,
+        "positive_label": positive_label,
+        "negative_shortcut": negative_shortcut,
+        "positive_shortcut": positive_shortcut,
+        "review_instruction": review_instruction,
+        "review_rubric": review_rubric,
+    }
     print(
         "view QC ready: "
         f"total={progress['total']} reviewed={progress['reviewed']} "

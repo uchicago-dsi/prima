@@ -108,10 +108,10 @@ def main() -> int:
         raise RuntimeError(
             f"fallback audit evaluation requires complete labels; {progress['remaining']} remain"
         )
-    if progress["uncertain"]:
+    if progress["low_confidence"]:
         raise RuntimeError(
             "fallback audit evaluation requires adjudicated labels; "
-            f"{progress['uncertain']} remain uncertain"
+            f"{progress['low_confidence']} remain low confidence"
         )
     run = load_view_auto_run(run_path)
     if run["target"] != state["target"]:

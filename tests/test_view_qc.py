@@ -15,7 +15,6 @@ from prima.view_fallback import (
 from prima.view_qc import (
     VIEW_LABEL_ABSENT,
     VIEW_LABEL_PRESENT,
-    VIEW_LABEL_UNCERTAIN,
     default_view_qc_events_path,
     empty_view_qc_state,
     initialize_view_qc_event_log,
@@ -33,7 +32,19 @@ from prima.view_qc import (
 from qc.build_view_qc_pilot import sample_views
 from qc.build_ranked_view_qc_pilot import run_from_args as build_ranked_pilot
 from qc.init_view_qc_review import initialize_review
-from qc.view_qc_gallery import DEFAULT_REVIEW_PORT, HTML, load_review_items
+from qc.view_qc_gallery import (
+    DEFAULT_NEGATIVE_LABEL,
+    DEFAULT_NEGATIVE_SHORTCUT,
+    DEFAULT_POSITIVE_LABEL,
+    DEFAULT_POSITIVE_SHORTCUT,
+    DEFAULT_REVIEW_INSTRUCTION,
+    DEFAULT_REVIEW_PORT,
+    HTML,
+    load_review_rubric,
+    load_review_items,
+    normalize_shortcut,
+    normalize_ui_text,
+)
 
 
 def view_id(index: int) -> str:
@@ -45,7 +56,12 @@ def test_view_qc_state_uses_one_manifest_denominator(tmp_path: Path) -> None:
     state = empty_view_qc_state("test artifact")
     state = set_view_label(state, view_id(1), VIEW_LABEL_ABSENT)
     state = set_view_label(state, view_id(2), VIEW_LABEL_PRESENT)
-    state = set_view_label(state, view_id(3), VIEW_LABEL_UNCERTAIN)
+    state = set_view_label(
+        state,
+        view_id(3),
+        VIEW_LABEL_ABSENT,
+        low_confidence=True,
+    )
     save_view_qc_state(path, state)
 
     loaded = load_view_qc_state(path)
@@ -56,8 +72,8 @@ def test_view_qc_state_uses_one_manifest_denominator(tmp_path: Path) -> None:
         "reviewed": 3,
         "remaining": 1,
         "present": 1,
-        "absent": 1,
-        "uncertain": 1,
+        "absent": 2,
+        "low_confidence": 1,
     }
     assert path.stat().st_mode & 0o777 == 0o600
 
@@ -146,6 +162,7 @@ def test_view_qc_event_log_is_append_only_hash_chained_and_replayable(
         manifest_view_ids=manifest_ids,
         view_id=view_id(1),
         label=VIEW_LABEL_PRESENT,
+        low_confidence=False,
         reviewer="reviewer-1",
     )
     state = record_view_qc_label(
@@ -154,6 +171,7 @@ def test_view_qc_event_log_is_append_only_hash_chained_and_replayable(
         manifest_view_ids=manifest_ids,
         view_id=view_id(1),
         label=VIEW_LABEL_ABSENT,
+        low_confidence=True,
         reviewer="reviewer-1",
     )
     state = record_view_qc_label(
@@ -162,6 +180,7 @@ def test_view_qc_event_log_is_append_only_hash_chained_and_replayable(
         manifest_view_ids=manifest_ids,
         view_id=view_id(1),
         label=None,
+        low_confidence=None,
         reviewer="reviewer-1",
     )
 
@@ -175,6 +194,16 @@ def test_view_qc_event_log_is_append_only_hash_chained_and_replayable(
     assert [event["label"] for event in events] == [
         VIEW_LABEL_PRESENT,
         VIEW_LABEL_ABSENT,
+        None,
+    ]
+    assert [event["previous_low_confidence"] for event in events] == [
+        None,
+        False,
+        True,
+    ]
+    assert [event["low_confidence"] for event in events] == [
+        False,
+        True,
         None,
     ]
     assert all(event["reviewer"] == "reviewer-1" for event in events)
@@ -194,6 +223,7 @@ def test_view_qc_event_log_detects_tampering(tmp_path: Path) -> None:
         manifest_view_ids=[view_id(1)],
         view_id=view_id(1),
         label=VIEW_LABEL_PRESENT,
+        low_confidence=False,
         reviewer="reviewer-1",
     )
     text = events_path.read_text().replace('"label":"present"', '"label":"absent"')
@@ -205,7 +235,10 @@ def test_view_qc_event_log_detects_tampering(tmp_path: Path) -> None:
 
 def test_imported_state_is_explicit_in_event_history(tmp_path: Path) -> None:
     state = set_view_label(
-        empty_view_qc_state("test artifact"), view_id(1), VIEW_LABEL_UNCERTAIN
+        empty_view_qc_state("test artifact"),
+        view_id(1),
+        VIEW_LABEL_PRESENT,
+        low_confidence=True,
     )
     events_path = tmp_path / "events.jsonl"
     events = initialize_view_qc_event_log(
@@ -232,6 +265,7 @@ def test_event_replay_recovers_state_after_interrupted_projection_write(
         manifest_view_ids=manifest_ids,
         view_id=view_id(1),
         label=VIEW_LABEL_PRESENT,
+        low_confidence=False,
         reviewer="reviewer-1",
     )
 
@@ -256,6 +290,7 @@ def test_event_replay_refuses_divergent_state(tmp_path: Path) -> None:
         manifest_view_ids=manifest_ids,
         view_id=view_id(1),
         label=VIEW_LABEL_PRESENT,
+        low_confidence=False,
         reviewer="reviewer-1",
     )
     divergent = set_view_label(empty, view_id(1), VIEW_LABEL_ABSENT)
@@ -274,9 +309,9 @@ def test_gallery_has_explicit_completion_state() -> None:
     assert "✓ End of batch" in HTML
     assert "End reached" not in HTML
     assert 'id="review-unsure"' in HTML
-    assert "Review unsure (" in HTML
+    assert "Review low confidence (" in HTML
     assert "function startUnsureReview()" in HTML
-    assert "unsure review pass complete" in HTML
+    assert "low-confidence review pass complete" in HTML
 
 
 def test_gallery_keeps_stable_port_and_smaller_image() -> None:
@@ -289,17 +324,52 @@ def test_gallery_keeps_stable_port_and_smaller_image() -> None:
     assert "caret-color: transparent" in HTML
     assert 'id="save-status"' in HTML
     assert "event.preventDefault()" in HTML
-    assert "Saved: not present" in HTML
+    assert "'Saved: ' + negativeLabel.toLowerCase()" in HTML
+    assert "'Saved: ' + positiveLabel.toLowerCase()" in HTML
     assert "Not present [n]" in HTML
     assert "Present [y]" in HTML
-    assert "Unsure [u]" in HTML
+    assert "Low confidence: off [u]" in HTML
+    assert 'id="rubric-panel"' in HTML
+    assert "reviewRubric = config.review_rubric" in HTML
+    assert "record?.low_confidence === true" in HTML
+    assert "pendingLowConfidence" in HTML
     assert "Target: " in HTML
+    assert "fetch('/api/config')" in HTML
+    assert "negativeLabel = config.negative_label" in HTML
+    assert "positiveLabel = config.positive_label" in HTML
+    assert "negativeShortcut = config.negative_shortcut" in HTML
+    assert "positiveShortcut = config.positive_shortcut" in HTML
+    assert "reviewInstruction = config.review_instruction" in HTML
+
+
+def test_gallery_supports_generic_binary_decision_labels() -> None:
+    assert DEFAULT_NEGATIVE_LABEL == "Not present"
+    assert DEFAULT_POSITIVE_LABEL == "Present"
+    assert DEFAULT_NEGATIVE_SHORTCUT == "n"
+    assert DEFAULT_POSITIVE_SHORTCUT == "y"
+    assert DEFAULT_REVIEW_INSTRUCTION.startswith("Decide only whether")
+    assert (
+        normalize_ui_text("  Use   for Mirai ", field="label", max_length=80)
+        == "Use for Mirai"
+    )
+    with pytest.raises(ValueError, match="cannot be empty"):
+        normalize_ui_text("  ", field="label", max_length=80)
+    assert normalize_shortcut(" P ", field="shortcut") == "p"
+    with pytest.raises(ValueError, match="one letter or number"):
+        normalize_shortcut("!", field="shortcut")
+
+
+def test_gallery_loads_multiline_review_rubric(tmp_path: Path) -> None:
+    path = tmp_path / "rubric.txt"
+    path.write_text("Use:\n- ordinary image\n\nDo not use:\n- film\n")
+    assert load_review_rubric(path) == ("Use:\n- ordinary image\n\nDo not use:\n- film")
+    assert load_review_rubric(None) == ""
 
 
 def test_gallery_tracks_session_annotation_rate_after_first_save() -> None:
     assert 'id="session-rate"' in HTML
     assert 'id="reset-session"' in HTML
-    assert "Rate starts with your first saved annotation." in HTML
+    assert "Rate and ETA start with your first saved annotation." in HTML
     assert "function recordSessionAnnotation(" in HTML
     assert "recordSessionAnnotation(item.view_id, label, actionStartedAtMs);" in HTML
     assert "sessionAnnotatedViewIds = new Set()" in HTML
@@ -308,6 +378,9 @@ def test_gallery_tracks_session_annotation_rate_after_first_save() -> None:
     assert "sessionStorage.getItem(" in HTML
     assert "unique view" in HTML
     assert "views/min" in HTML
+    assert "ETA measuring" in HTML
+    assert "ETA done" in HTML
+    assert "summary.remaining / ratePerMinute" in HTML
     assert "Reset timer" in HTML
 
 
@@ -483,7 +556,7 @@ def test_fallback_never_crosses_exact_view_slots() -> None:
     assert right["selected_view_id"] == view_id(3)
 
 
-def test_uncertain_target_label_keeps_slot_unresolved() -> None:
+def test_unreviewed_target_keeps_slot_unresolved() -> None:
     candidates = pd.DataFrame(
         [
             {
@@ -497,9 +570,7 @@ def test_uncertain_target_label_keeps_slot_unresolved() -> None:
             }
         ]
     )
-    decision = choose_exact_slot_views(
-        candidates, {view_id(1): VIEW_LABEL_UNCERTAIN}
-    ).iloc[0]
+    decision = choose_exact_slot_views(candidates, {}).iloc[0]
     assert decision["fallback_status"] == "unresolved_candidates"
     assert pd.isna(decision["selected_view_id"])
     assert decision["reviewed_candidate_count"] == 0

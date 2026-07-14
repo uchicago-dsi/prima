@@ -1,0 +1,22 @@
+Target view only: decide whether the visual target "view requiring exclusion from standard Mirai input" is present in this mammogram. This is one downstream QC decision, not a request to name the failure type.
+
+Answer YES, meaning DO NOT USE, when any visible property makes this image unsuitable to occupy a standard whole-breast CC or MLO slot for Mirai. Disqualifying appearances include:
+
+- a non-standard diagnostic or procedural acquisition, including spot compression, geometric magnification, a partial or tightly collimated field, rolled or tangential positioning, implant-displaced positioning, localization-grid or procedural hardware, or an excised specimen in a dish or container;
+- a visible breast implant or other large foreign device that materially changes or obscures the mammographic field;
+- digitized hard-copy film appearance rather than a native digital mammogram;
+- a major detector or processing artifact, including a vertical detector seam, stitched intensity boundary, corrupted or repeated image region, or severe non-anatomic banding;
+- gross cropping, missing breast field, or another acquisition/positioning failure that prevents the image from serving as the intended standard whole-breast view; or
+- substantial burned-in annotation or hardware that obscures breast tissue or demonstrates that this is not the intended unmodified clinical input.
+
+Answer NO, meaning USE FOR MIRAI, for an ordinary native-digital whole-breast CC or MLO view without a disqualifying QC problem. Do not reject an otherwise usable view merely because it contains cancer, a mass, calcifications, dense tissue, post-surgical change, small biopsy or surgical clips, ordinary skin markers, routine orientation text, a normal detector edge, minor noise, or imperfect but still usable positioning.
+
+Judge only the pixels. DICOM decoding, source lineage, laterality, projection eligibility, duplication, and other deterministic metadata checks occur separately. Do not infer failure from image content that is not visibly present.
+
+Use high confidence only when the downstream action is clear. Use medium or low confidence and set REVIEW: YES when the image may be a special acquisition or may be too incomplete for a standard Mirai slot but the visual evidence is genuinely ambiguous.
+
+Answer in exactly four lines and nothing else:
+EVIDENCE: <one short visual phrase, or none>
+ANSWER: YES or ANSWER: NO
+CONFIDENCE: high, medium, or low
+REVIEW: YES or REVIEW: NO

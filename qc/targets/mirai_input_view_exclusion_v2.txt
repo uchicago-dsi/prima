@@ -1,0 +1,25 @@
+Target view only: decide whether the visual target "view requiring exclusion from standard Mirai input under visual rubric v2" is present in this mammogram. This is one downstream input decision, not a request to name the failure type or diagnose the patient.
+
+Answer YES, meaning DO NOT USE, when any visible property makes this image unsuitable to occupy a standard whole-breast CC or MLO slot for Mirai. Disqualifying appearances include:
+
+- a nonstandard diagnostic or procedural acquisition, including spot compression, geometric magnification, a partial or tightly collimated field, rolled, tangential, or cleavage positioning, implant-displaced positioning, localization hardware, or an excised specimen in a dish or container;
+- any visible breast implant, implant shell, or tissue expander;
+- a visible gross foreign or procedural device, including a venous-access port/Port-a-Cath reservoir or catheter, pacemaker/ICD generator or leads, localization wire or grid, drain, large hardware, paddle, or specimen container. There is no fixed size cutoff: gross device type is decisive even when partly visible, whereas small biopsy/surgical clips and skin markers are allowed;
+- digitized or scanned hard-copy film appearance rather than a native-digital mammogram;
+- a major detector, motion, or processing artifact, including a vertical detector seam, stitched intensity boundary, corrupted or repeated image region, severe non-anatomic banding, or severe exposure/processing loss that makes a substantial breast region nearly featureless;
+- gross cropping, a clearly focal or partial field, or another acquisition/positioning failure that prevents the image from serving as an intended whole-breast view; or
+- substantial burned-in CAD/human markup, text, or hardware that obscures breast tissue or demonstrates that this is not the intended unmodified clinical input.
+
+Answer NO, meaning USE FOR MIRAI, for an ordinary native-digital whole-breast CC or MLO view without a disqualifying problem. Pathology is not a QC failure: do not reject an otherwise usable view merely because it contains cancer, a mass, asymmetry, architectural distortion, calcifications, dense tissue, scars, or other post-surgical breast changes. Also do not reject for small biopsy/surgical clips, ordinary skin/scar/nipple markers, routine orientation text at the margin, a normal detector edge, minor noise, low contrast with tissue texture still visible through most of the breast, or imperfect but still recognizable whole-breast positioning. Do not impose strict ACR positioning criteria.
+
+Film is a separate failure rule. A definite physical film frame plus film labels, uneven illumination/fog, scratches/dust, or scanned-film texture supports YES. Old age, low contrast, a black border, or one text label alone does not prove film.
+
+Judge only the pixels. DICOM decoding, source lineage, laterality, projection eligibility, duplication, and other deterministic metadata checks occur separately. Do not infer an implant or device that is not visibly present.
+
+Use high confidence only when the downstream action is clear. Use medium or low confidence and set REVIEW: YES when the image may be film, a special acquisition, a gross device, or too incomplete for a standard slot but the visual evidence is genuinely ambiguous.
+
+Answer in exactly four lines and nothing else:
+EVIDENCE: <one short visual phrase, or none>
+ANSWER: YES or ANSWER: NO
+CONFIDENCE: high, medium, or low
+REVIEW: YES or REVIEW: NO

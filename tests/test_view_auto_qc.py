@@ -20,7 +20,7 @@ from qc import evaluate_view_auto_qc
 from qc.combine_view_auto_qc_runs import combine_view_runs
 from prima.view_qc import (
     VIEW_LABEL_ABSENT,
-    VIEW_LABEL_UNCERTAIN,
+    VIEW_LABEL_PRESENT,
     empty_view_qc_state,
     save_view_qc_state,
     set_view_label,
@@ -456,7 +456,12 @@ def test_evaluator_refuses_partial_blinded_labels(
     with pytest.raises(RuntimeError, match="1 remain"):
         evaluate_view_auto_qc.main()
 
-    state = set_view_label(state, view_id(2), VIEW_LABEL_UNCERTAIN)
+    state = set_view_label(
+        state,
+        view_id(2),
+        VIEW_LABEL_PRESENT,
+        low_confidence=True,
+    )
     save_view_qc_state(state_path, state)
-    with pytest.raises(RuntimeError, match="1 remain uncertain"):
+    with pytest.raises(RuntimeError, match="1 remain low confidence"):
         evaluate_view_auto_qc.main()

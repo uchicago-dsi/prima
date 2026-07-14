@@ -1,0 +1,30 @@
+QUESTION
+Judge this image alone: can it serve as one standard whole-breast CC or MLO input view for Mirai? This is a technical/input-eligibility decision, not a clinical interpretation and not a claim that the mammogram is perfect. DICOM lineage, laterality, projection tags, duplication, and decoding are checked separately.
+
+USE FOR MIRAI [p]
+Choose Use for Mirai for an ordinary native-digital whole-breast CC or MLO image unless one of the explicit failure rules below applies.
+
+- Pathology is allowed. A cancer, mass, asymmetry, architectural distortion, calcifications, dense tissue, scars, and other post-surgical breast changes are findings Mirai is supposed to see. Do not fail an image merely because it is abnormal or difficult to interpret.
+- Low contrast is usually allowed. Use the image if the breast outline and internal tissue texture remain visible through most of the breast. Dense tissue, mild underexposure or overexposure, vendor processing, and minor noise are not failures by themselves.
+- Imperfect clinical positioning is allowed when the image is still recognizably a whole-breast CC or MLO view. Do not apply strict ACR positioning criteria here: a non-profile nipple, incomplete pectoral muscle, or imperfect inframammary fold is not automatically a failure.
+- Small biopsy clips, surgical clips, localization clips left in the breast, skin/scar/nipple markers, and routine laterality/orientation text at the margin are allowed.
+
+DO NOT USE [f]
+Choose Do not use if any one of these visible rules applies:
+
+1. NONSTANDARD ACQUISITION: spot compression, geometric magnification, implant-displaced positioning, rolled/tangential/cleavage positioning, a partial or tightly collimated diagnostic field, localization procedure, specimen image, or other special-purpose view rather than an ordinary whole-breast CC/MLO acquisition.
+
+2. DIGITIZED FILM: a scanned or digitized hard-copy film rather than a native-digital mammogram. Typical evidence is a definite physical film frame combined with film labels, uneven illumination/fog, scratches/dust, or photographed/scanned-film texture. Fail definite film even when the anatomy is readable. Age, low contrast, a black border, or one text label alone does not prove film; if those are the only clues, make the best binary decision and mark Low confidence.
+
+3. IMPLANTS AND GROSS FOREIGN DEVICES: any visible breast implant, implant shell, or tissue expander; or any visible gross implanted/procedural device such as a venous-access port/Port-a-Cath reservoir or catheter, pacemaker/ICD generator or leads, localization wire/grid, drain, paddle/hardware, or specimen container. Fail an implant-displaced view even if most of the implant is pushed out of the field.
+
+   There is no defensible millimeter or image-area cutoff. Device type is the rule: a biopsy/surgical clip or small skin marker is allowed, while an implant, port, pacemaker, long lead/wire, or other gross device fails even when only partly visible. For an unrecognized object, fail if it is clearly gross hardware, spans the field, obscures breast tissue, or demonstrates a procedural/nonstandard acquisition; otherwise choose Use and add Low confidence.
+
+4. MAJOR IMAGE ARTIFACT: vertical detector seam, stitched intensity step, repeated or corrupted region, severe non-anatomic banding, motion/processing failure, or another artifact that materially removes or distorts breast information. A normal detector edge, skin fold, vessel, scar line, or minor noise is allowed.
+
+5. GROSSLY INCOMPLETE OR UNUSABLE BREAST FIELD: a clearly focal/partial view, major accidental crop, or severe exposure/processing loss that makes a substantial part of the breast nearly featureless black/white or removes the expected whole-breast field. Minor posterior tissue loss or ordinary positioning imperfection alone is allowed.
+
+6. SUBSTANTIAL BURNED-IN MARKUP: CAD arrows/circles, human drawings, large text, or hardware over breast tissue that obscures anatomy or shows that this is not the intended unmodified input. Routine small text at the margin is allowed.
+
+LOW CONFIDENCE [u] IS A SEPARATE FLAG
+Always make a Use or Do not use decision. Toggle Low confidence in addition when the boundary is genuinely ambiguous. On an unreviewed image, press u before p/f; on a saved image, u toggles the flag without changing the decision. Low confidence is not a third label, and all flagged images can be reviewed together at the end.

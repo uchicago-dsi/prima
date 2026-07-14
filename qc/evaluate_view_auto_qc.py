@@ -111,10 +111,10 @@ def main() -> int:
             "view QC evaluation requires complete blinded labels; "
             f"{progress['remaining']} remain"
         )
-    if progress["uncertain"]:
+    if progress["low_confidence"]:
         raise RuntimeError(
             "view QC evaluation requires adjudicated labels; "
-            f"{progress['uncertain']} remain uncertain"
+            f"{progress['low_confidence']} remain low confidence"
         )
     run = load_view_auto_run(run_path)
     if run["target"] != state["target"]:

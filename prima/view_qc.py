@@ -17,18 +17,16 @@ from typing import Any, Iterable, Mapping
 import numpy as np
 from PIL import Image
 
-VIEW_QC_SCHEMA_VERSION = 2
-VIEW_QC_EVENT_SCHEMA_VERSION = 1
+VIEW_QC_SCHEMA_VERSION = 3
+VIEW_QC_EVENT_SCHEMA_VERSION = 2
 VIEW_QC_EVENT_FILENAME = "view_qc_events.jsonl"
 VIEW_QC_EVENT_GENESIS_SHA256 = "0" * 64
 VIEW_QC_EVENT_TYPES = {"label_change", "state_import"}
 VIEW_LABEL_PRESENT = "present"
 VIEW_LABEL_ABSENT = "absent"
-VIEW_LABEL_UNCERTAIN = "uncertain"
 VALID_VIEW_LABELS = {
     VIEW_LABEL_PRESENT,
     VIEW_LABEL_ABSENT,
-    VIEW_LABEL_UNCERTAIN,
 }
 
 VIEW_MANIFEST_REQUIRED_COLUMNS = {
@@ -109,14 +107,27 @@ def normalize_view_qc_state(payload: Any) -> dict[str, Any]:
     if not isinstance(raw_labels, dict):
         raise ValueError("view QC state labels must be a JSON object")
 
-    labels: dict[str, dict[str, str]] = {}
+    labels: dict[str, dict[str, Any]] = {}
     for raw_view_id, raw_record in raw_labels.items():
         view_id = normalize_view_id(raw_view_id)
         if not isinstance(raw_record, dict):
             raise ValueError("each view QC label must be a JSON object")
+        required_record_fields = {
+            "label",
+            "low_confidence",
+            "source",
+            "updated_at",
+        }
+        if set(raw_record) != required_record_fields:
+            raise ValueError(f"invalid view QC record fields for {view_id[:12]}")
         label = str(raw_record.get("label", "")).strip()
         if label not in VALID_VIEW_LABELS:
             raise ValueError(f"invalid view QC label for {view_id[:12]}")
+        low_confidence = raw_record.get("low_confidence")
+        if not isinstance(low_confidence, bool):
+            raise ValueError(
+                f"view QC low_confidence must be boolean for {view_id[:12]}"
+            )
         source = str(raw_record.get("source", "")).strip()
         if source != "human":
             raise ValueError("view QC reference labels must have source='human'")
@@ -125,6 +136,7 @@ def normalize_view_qc_state(payload: Any) -> dict[str, Any]:
             raise ValueError("view QC label is missing updated_at")
         labels[view_id] = {
             "label": label,
+            "low_confidence": low_confidence,
             "source": "human",
             "updated_at": updated_at,
         }
@@ -173,20 +185,31 @@ def save_view_qc_state(path: Path, state: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def set_view_label(
-    state: Mapping[str, Any], view_id: object, label: str | None
+    state: Mapping[str, Any],
+    view_id: object,
+    label: str | None,
+    *,
+    low_confidence: bool | None = None,
 ) -> dict[str, Any]:
-    """Set or clear one human view label and return normalized state."""
+    """Set or clear one binary decision and its orthogonal confidence flag."""
     normalized = normalize_view_qc_state(dict(state))
     key = normalize_view_id(view_id)
     labels = dict(normalized["labels"])
     if label is None:
+        if low_confidence is not None:
+            raise ValueError("a cleared view label cannot have a confidence flag")
         labels.pop(key, None)
     else:
         label = str(label).strip()
         if label not in VALID_VIEW_LABELS:
             raise ValueError(f"unsupported view QC label: {label!r}")
+        if low_confidence is None:
+            low_confidence = False
+        if not isinstance(low_confidence, bool):
+            raise ValueError("low_confidence must be boolean")
         labels[key] = {
             "label": label,
+            "low_confidence": low_confidence,
             "source": "human",
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -228,7 +251,9 @@ def normalize_view_qc_event(
         "target",
         "view_id",
         "previous_label",
+        "previous_low_confidence",
         "label",
+        "low_confidence",
         "source",
         "reviewer",
         "recorded_at",
@@ -259,11 +284,23 @@ def normalize_view_qc_event(
         not isinstance(previous_label, str) or previous_label not in VALID_VIEW_LABELS
     ):
         raise ValueError("view QC event has an invalid previous_label")
+    previous_low_confidence = payload["previous_low_confidence"]
+    if previous_label is None:
+        if previous_low_confidence is not None:
+            raise ValueError("view QC event has confidence without a previous label")
+    elif not isinstance(previous_low_confidence, bool):
+        raise ValueError("view QC event previous_low_confidence must be boolean")
     label = payload["label"]
     if label is not None and (
         not isinstance(label, str) or label not in VALID_VIEW_LABELS
     ):
         raise ValueError("view QC event has an invalid label")
+    low_confidence = payload["low_confidence"]
+    if label is None:
+        if low_confidence is not None:
+            raise ValueError("view QC event has confidence without a label")
+    elif not isinstance(low_confidence, bool):
+        raise ValueError("view QC event low_confidence must be boolean")
     if event_type == "state_import" and (previous_label is not None or label is None):
         raise ValueError("state_import must install one nonempty label")
     if str(payload["source"]).strip() != "human":
@@ -281,7 +318,9 @@ def normalize_view_qc_event(
         "target": target,
         "view_id": view_id,
         "previous_label": previous_label,
+        "previous_low_confidence": previous_low_confidence,
         "label": label,
+        "low_confidence": low_confidence,
         "source": "human",
         "reviewer": reviewer,
         "recorded_at": recorded_at,
@@ -299,7 +338,9 @@ def new_view_qc_event(
     target: object,
     view_id: object,
     previous_label: str | None,
+    previous_low_confidence: bool | None,
     label: str | None,
+    low_confidence: bool | None,
     reviewer: object,
     recorded_at: object,
     previous_event_sha256: str,
@@ -312,7 +353,9 @@ def new_view_qc_event(
         "target": normalize_view_qc_target(target),
         "view_id": normalize_view_id(view_id),
         "previous_label": previous_label,
+        "previous_low_confidence": previous_low_confidence,
         "label": label,
+        "low_confidence": low_confidence,
         "source": "human",
         "reviewer": normalize_view_qc_reviewer(reviewer),
         "recorded_at": _require_utc_timestamp(recorded_at, "recorded_at"),
@@ -361,19 +404,30 @@ def replay_view_qc_events(
 ) -> dict[str, Any]:
     """Replay verified events into the canonical current-state projection."""
     state = empty_view_qc_state(target)
-    labels: dict[str, dict[str, str]] = {}
+    labels: dict[str, dict[str, Any]] = {}
     for event in events:
         if normalize_view_qc_target(event["target"]) != state["target"]:
             raise ValueError("view QC event target does not match campaign target")
         view_id = normalize_view_id(event["view_id"])
-        previous = labels.get(view_id, {}).get("label")
-        if previous != event["previous_label"]:
+        previous_record = labels.get(view_id)
+        previous_label = (
+            previous_record["label"] if previous_record is not None else None
+        )
+        previous_low_confidence = (
+            previous_record["low_confidence"] if previous_record is not None else None
+        )
+        if previous_label != event["previous_label"]:
             raise ValueError("view QC event previous_label does not match replay state")
+        if previous_low_confidence != event["previous_low_confidence"]:
+            raise ValueError(
+                "view QC event previous_low_confidence does not match replay state"
+            )
         if event["label"] is None:
             labels.pop(view_id, None)
         else:
             labels[view_id] = {
                 "label": event["label"],
+                "low_confidence": event["low_confidence"],
                 "source": "human",
                 "updated_at": event["recorded_at"],
             }
@@ -417,7 +471,9 @@ def initialize_view_qc_event_log(
                 target=normalized["target"],
                 view_id=view_id,
                 previous_label=None,
+                previous_low_confidence=None,
                 label=record["label"],
+                low_confidence=record["low_confidence"],
                 reviewer=import_reviewer,
                 recorded_at=record["updated_at"],
                 previous_event_sha256=previous_hash,
@@ -494,6 +550,7 @@ def record_view_qc_label(
     manifest_view_ids: Iterable[object],
     view_id: object,
     label: str | None,
+    low_confidence: bool | None,
     reviewer: object,
 ) -> dict[str, Any]:
     """Append one audit event, then atomically update the current-state projection."""
@@ -505,12 +562,28 @@ def record_view_qc_label(
         raise ValueError("view is outside the review manifest")
     if label is not None and label not in VALID_VIEW_LABELS:
         raise ValueError("invalid view label")
+    if label is None:
+        if low_confidence is not None:
+            raise ValueError("a cleared view label cannot have a confidence flag")
+    elif not isinstance(low_confidence, bool):
+        raise ValueError("low_confidence must be boolean")
     reviewer = normalize_view_qc_reviewer(reviewer)
     with _view_qc_campaign_lock(events_path):
         events = load_view_qc_events(events_path)
         state = reconcile_view_qc_campaign_state(state_path, events, manifest_ids)
-        previous_label = state["labels"].get(key, {}).get("label")
-        new_state = set_view_label(state, key, label)
+        previous_record = state["labels"].get(key)
+        previous_label = (
+            previous_record["label"] if previous_record is not None else None
+        )
+        previous_low_confidence = (
+            previous_record["low_confidence"] if previous_record is not None else None
+        )
+        new_state = set_view_label(
+            state,
+            key,
+            label,
+            low_confidence=low_confidence,
+        )
         if label is None:
             recorded_at = datetime.now(timezone.utc).isoformat()
         else:
@@ -523,7 +596,9 @@ def record_view_qc_label(
             target=state["target"],
             view_id=key,
             previous_label=previous_label,
+            previous_low_confidence=previous_low_confidence,
             label=label,
+            low_confidence=low_confidence,
             reviewer=reviewer,
             recorded_at=recorded_at,
             previous_event_sha256=previous_hash,
@@ -551,10 +626,8 @@ def summarize_view_qc_state(
     labels = normalized["labels"]
     present = sum(record["label"] == VIEW_LABEL_PRESENT for record in labels.values())
     absent = sum(record["label"] == VIEW_LABEL_ABSENT for record in labels.values())
-    uncertain = sum(
-        record["label"] == VIEW_LABEL_UNCERTAIN for record in labels.values()
-    )
-    reviewed = present + absent + uncertain
+    low_confidence = sum(record["low_confidence"] for record in labels.values())
+    reviewed = present + absent
     total = len(manifest_ids)
     return {
         "total": total,
@@ -562,7 +635,7 @@ def summarize_view_qc_state(
         "remaining": total - reviewed,
         "present": present,
         "absent": absent,
-        "uncertain": uncertain,
+        "low_confidence": low_confidence,
     }
 
 

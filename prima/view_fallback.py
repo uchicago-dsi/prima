@@ -158,7 +158,7 @@ def choose_exact_slot_views(
 ) -> pd.DataFrame:
     """Choose the first candidate where the target is explicitly absent.
 
-    An unreviewed or uncertain original or alternate never counts as target-absent.
+    An unreviewed original or alternate never counts as target-absent.
     The function records unresolved and exhausted slots rather than substituting
     another laterality or projection.
     """

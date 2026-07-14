@@ -143,7 +143,7 @@ def run_from_args(args: argparse.Namespace) -> dict[str, int]:
     events = load_view_qc_events(events_path)
     validate_view_qc_campaign_state(state, events, manifest["view_id"])
     summary = summarize_view_qc_state(state, manifest["view_id"])
-    if summary["remaining"] or summary["uncertain"]:
+    if summary["remaining"] or summary["low_confidence"]:
         raise ValueError("few-shot source campaign must be complete with binary labels")
     source_target = operational_target or target
     if state["target"] != source_target:

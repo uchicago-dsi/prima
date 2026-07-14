@@ -9,6 +9,7 @@ from PIL import Image
 import pytest
 
 from prima.view_qc import (
+    VIEW_QC_SCHEMA_VERSION,
     VIEW_LABEL_ABSENT,
     VIEW_LABEL_PRESENT,
     default_view_qc_events_path,
@@ -98,7 +99,7 @@ def test_completed_campaign_archive_is_restricted_and_verifiable(
     metadata = verify_archive(archive)
     assert metadata["manifest_rows"] == 2
     assert metadata["human_labels"] == 2
-    assert metadata["state_schema_version"] == (1 if legacy else 2)
+    assert metadata["state_schema_version"] == (1 if legacy else VIEW_QC_SCHEMA_VERSION)
     assert metadata["source_file_count"] == 5
     assert metadata["event_history"] == (
         "not-applicable-legacy-state" if legacy else "unavailable-pre-audit"
@@ -149,6 +150,24 @@ def test_campaign_archive_requires_complete_labels(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="completely annotated"):
         create_archive(archive_args(source, tmp_path / "archives", "incomplete"))
+
+
+def test_campaign_archive_requires_low_confidence_adjudication(
+    tmp_path: Path,
+) -> None:
+    source = make_campaign(tmp_path / "source")
+    state_path = source / "view_qc_state.json"
+    state = load_view_qc_state(state_path)
+    state = set_view_label(
+        state,
+        view_id(1),
+        VIEW_LABEL_PRESENT,
+        low_confidence=True,
+    )
+    save_view_qc_state(state_path, state)
+
+    with pytest.raises(ValueError, match="must be adjudicated"):
+        create_archive(archive_args(source, tmp_path / "archives", "low_confidence"))
 
 
 def test_campaign_archive_materializes_only_internal_file_symlinks(

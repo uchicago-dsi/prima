@@ -1,8 +1,9 @@
 # Single-target view QC prompts
 
 Each file defines one visual target for one model run. Shared QC code treats the
-target only as present or absent; `uncertain` is reserved for human review and
-never counts as a target-absent fallback candidate.
+target only as present or absent. Human low confidence is an orthogonal boolean
+flag on that binary decision; it is never a third target label and must be
+adjudicated before evaluation or fallback selection.
 
 A target prompt must:
 
@@ -11,6 +12,13 @@ A target prompt must:
 - say how borderline appearances should be handled;
 - end with the exact `EVIDENCE`, `ANSWER`, `CONFIDENCE`, and `REVIEW` fields
   required by `qc/run_view_auto_qc.py`.
+
+An operational binary target may combine multiple visible disqualifiers only
+when they all produce the same downstream action, such as excluding a view from
+a standard Mirai input slot. Keep the output binary, freeze the full usability
+rubric before review, and report performance within each sampled failure family
+so pooled accuracy cannot hide a missed artifact class. DICOM lineage, decoding,
+projection, and other deterministic checks remain outside the visual prompt.
 
 Pass the same concise target name to `--target` whenever the prompt is used.
 Start a new human state and model run when either the target definition or
@@ -32,6 +40,7 @@ Initialization creates both `view_qc_state.json` and the append-only
 python qc/view_qc_gallery.py \
   --manifest /path/to/manifest.parquet \
   --state /path/to/view_qc_state.json \
+  --review-rubric-file /path/to/human_rubric.txt \
   --reviewer annawoodard \
   --port 8767
 ```
