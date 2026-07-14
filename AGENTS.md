@@ -6,6 +6,9 @@
 - Fail fast on bad paths, caches, or dependencies. Do not add backward-compatibility shims.
 - If a maintained library already provides missing functionality, install it into the `prima` env instead of re-implementing that functionality locally.
 - Never commit or print PHI.
+- Do not write or run automated tests. This is research code; validate changes
+  with targeted dry runs on the real workflow and inspect the resulting
+  artifacts instead.
 - When a runtime or launcher failure on the current path has a clear fix, apply the fix and retry or resubmit automatically before reporting back. Report the fix and the new job state after it has been attempted.
 
 ## Project Structure & Module Organization
@@ -71,7 +74,7 @@ micromamba run -p /net/projects2/annawoodard/micromamba/envs/prima <command>
 
 This environment has all required dependencies (torch, pydicom, zarr, pandas, etc.).
 
-## Build, Test, and Development Commands
+## Build And Development Commands
 
 Create the micromamba env once with `micromamba create -y -f env.yaml`, then `micromamba activate prima`, `pip install -e .`, `pip install -r requirements.txt`, and `pip install -r requirements-dev.txt` for linting/notebook extras. Scripts expose CLI help; run `python ops/fingerprinter.py --help` or `python ops/sync.py --dry-run` before touching production mounts.
 
@@ -127,9 +130,13 @@ python analysis/analyze_metadata.py --modality MG
 
 Keep configuration in module-level constants or argparse defaults. Do not scatter hidden fallbacks across call sites. Follow PEP 8 with 4-space indentation, snake_case functions, CamelCase classes, and ALL_CAPS constants. Prefer `pathlib.Path`, structured logging, and concise comments. Favor vectorized NumPy or PyTorch utilities for volume work.
 
-## Testing Guidelines
+## Validation Guidelines
 
-There is no automated unit suite. Validate with targeted dry runs (for example, `python ops/fingerprinter.py --patients 1234 --max-workers 2`). When adjusting fingerprint rules, sync heuristics, or cache schemas, delete affected caches and regenerate them. Mixed-version caches are unsupported.
+Do not create or run unit or integration test suites. Validate with targeted dry
+runs (for example, `python ops/fingerprinter.py --patients 1234 --max-workers
+2`) and inspect the produced artifacts. When adjusting fingerprint rules, sync
+heuristics, or cache schemas, delete affected caches and regenerate them.
+Mixed-version caches are unsupported.
 
 ## Handoffs
 

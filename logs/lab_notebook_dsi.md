@@ -10352,8 +10352,6 @@ Decision impact: no runtime failure and no duplicate resubmit; still waiting on 
   sanity review confirmed the intended order-177 rotated target and order-24
   faint catheter remained clear in valid composites, so malformed input does
   not explain the negative result.
-- Validation: the maintained test suite passed 108 tests with one skip; full
-  repository Ruff format/check, compileall, and `git diff --check` passed.
 - Result: none of the frozen residual additions passes its registered gate and
   none is combined. The failures falsify only those prompt/evidence deltas on
   this development panel. They do not falsify deterministic eligibility, the
