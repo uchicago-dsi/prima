@@ -5,6 +5,8 @@
     "directory_name": "Qwen3.5-397B-A17B-FP8",
     "served_model_name": "qwen35_397b_fp8",
     "tensor_parallel_size": 4,
+    "weight_format": "huggingface",
+    "download_ignore_patterns": [],
     "extra_args": [
       "--max-model-len",
       "32768",
@@ -34,6 +36,8 @@
     "directory_name": "Qwen3.5-27B-FP8",
     "served_model_name": "qwen35_27b_fp8",
     "tensor_parallel_size": 1,
+    "weight_format": "huggingface",
+    "download_ignore_patterns": [],
     "environment": {
       "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER": "0",
       "VLLM_USE_FLASHINFER_SAMPLER": "0"
@@ -69,6 +73,8 @@
     "directory_name": "GLM-4.6V-FP8",
     "served_model_name": "glm46v_fp8",
     "tensor_parallel_size": 1,
+    "weight_format": "huggingface",
+    "download_ignore_patterns": [],
     "extra_args": [
       "--max-model-len",
       "8192",

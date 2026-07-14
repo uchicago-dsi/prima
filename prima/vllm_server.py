@@ -204,12 +204,12 @@ class VLLMModelSpec:
             raise ValueError(
                 f"model entry {key!r} environment must map strings to strings"
             )
-        weight_format = str(payload.get("weight_format", "huggingface")).strip()
+        weight_format = required_string("weight_format")
         if weight_format not in {"huggingface", "mistral"}:
             raise ValueError(
                 f"model entry {key!r} weight_format must be 'huggingface' or 'mistral'"
             )
-        raw_download_ignore_patterns = payload.get("download_ignore_patterns", [])
+        raw_download_ignore_patterns = payload.get("download_ignore_patterns")
         if not isinstance(raw_download_ignore_patterns, list) or not all(
             isinstance(pattern, str) and pattern
             for pattern in raw_download_ignore_patterns
