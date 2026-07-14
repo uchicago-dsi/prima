@@ -1,0 +1,15 @@
+Decide whether the visual target "gross mammogram rotation or orientation failure" is present in the current mammogram display.
+
+The input panel shows the same cropped breast anatomy four ways. Candidate A is the current display being judged. Candidates B, C, and D are deterministic rotations of that same image by 90, 180, and 270 degrees clockwise. The declared standard slot (LCC, RCC, LMLO, or RMLO) is printed in the panel header. Classify only whether candidate A is grossly misoriented; the comparison rotations are diagnostic aids, not separate views.
+
+First decide whether A is a plausible ordinary upright display. For an MLO view, the axillary and upper posterior breast direction belongs toward the top, the pectoral/chest-wall direction descends from the upper posterior side, the inframammary fold and lower breast belong toward the bottom, and the nipple points laterally. A is positive when another candidate unmistakably restores this whole-anatomy arrangement and A is upside down or sideways. For a CC view, the chest-wall-to-nipple axis should be predominantly horizontal. Do not reject a CC view merely because A and the 180-degree candidate could both resemble opposite hanging orientations; require an unmistakable sideways or superior-inferior inversion.
+
+Answer YES when A has a severe whole-image transposition and B, C, or D is clearly more anatomically upright. Answer NO when A itself is a plausible upright CC or MLO display, even if breast shape, positioning, laterality mirroring, detector tilt, or pectoral visibility is imperfect. Do not reject ordinary left-versus-right mirror appearance, unusual anatomy, cropping, exposure, film appearance, devices, pathology, or acquisition type here; those belong to other QC targets. The anatomy crop removes most isolated burned-in text; ignore any small text or orientation glyphs that remain.
+
+In EVIDENCE, identify whether A is acceptable or name the single comparison candidate that corrects A. Use high confidence only when the whole-anatomy orientation difference is unmistakable. If two candidates remain plausibly upright, answer NO with medium or low confidence and REVIEW: YES.
+
+Answer in exactly four lines and nothing else:
+EVIDENCE: <A acceptable, or candidate B/C/D corrects A, plus one short anatomical cue>
+ANSWER: YES or ANSWER: NO
+CONFIDENCE: high, medium, or low
+REVIEW: YES or REVIEW: NO
