@@ -120,6 +120,10 @@ def run_from_args(args: argparse.Namespace) -> dict[str, object]:
             "full target plus four 40%-length foreground bands with 50% "
             "overlap along the foreground long axis"
         ),
+        "foreground_rule": (
+            "pixels above max(4, image p25 + 5), with at least 3% row/column "
+            "support and a 3% image margin"
+        ),
     }
     _write_json(provenance_path, provenance)
     readme_path.write_text(

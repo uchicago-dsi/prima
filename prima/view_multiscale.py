@@ -51,9 +51,10 @@ def _draw_panel(
 def substantial_foreground_box(image: Image.Image) -> tuple[int, int, int, int]:
     """Bound substantial non-background content while ignoring isolated text."""
     pixels = np.asarray(image)
-    foreground = pixels > 4
-    column_minimum = max(8, round(image.height * 0.01))
-    row_minimum = max(8, round(image.width * 0.01))
+    background_threshold = max(4.0, float(np.percentile(pixels, 25)) + 5.0)
+    foreground = pixels > background_threshold
+    column_minimum = max(8, round(image.height * 0.03))
+    row_minimum = max(8, round(image.width * 0.03))
     columns = np.flatnonzero(foreground.sum(axis=0) >= column_minimum)
     rows = np.flatnonzero(foreground.sum(axis=1) >= row_minimum)
     if not len(columns) or not len(rows):
