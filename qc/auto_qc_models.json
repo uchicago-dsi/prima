@@ -62,5 +62,29 @@
       "--default-chat-template-kwargs",
       "{\"enable_thinking\": false}"
     ]
+  },
+  "glm46v_fp8": {
+    "repo_id": "zai-org/GLM-4.6V-FP8",
+    "revision": "33172e26eb88482cf3d0a36fced01d05454734ec",
+    "directory_name": "GLM-4.6V-FP8",
+    "served_model_name": "glm46v_fp8",
+    "tensor_parallel_size": 1,
+    "extra_args": [
+      "--max-model-len",
+      "8192",
+      "--max-num-seqs",
+      "1",
+      "--gpu-memory-utilization",
+      "0.95",
+      "--generation-config",
+      "vllm",
+      "--limit-mm-per-prompt",
+      "{\"image\": 16}",
+      "--mm-processor-cache-gb",
+      "0",
+      "--enforce-eager",
+      "--default-chat-template-kwargs",
+      "{\"enable_thinking\": false}"
+    ]
   }
 }
