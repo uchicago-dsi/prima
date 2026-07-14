@@ -155,6 +155,8 @@ class VLLMModelSpec:
     tensor_parallel_size: int
     extra_args: tuple[str, ...]
     environment: tuple[tuple[str, str], ...]
+    weight_format: str
+    download_ignore_patterns: tuple[str, ...]
     revision: str | None = None
 
     @classmethod
@@ -202,6 +204,20 @@ class VLLMModelSpec:
             raise ValueError(
                 f"model entry {key!r} environment must map strings to strings"
             )
+        weight_format = str(payload.get("weight_format", "huggingface")).strip()
+        if weight_format not in {"huggingface", "mistral"}:
+            raise ValueError(
+                f"model entry {key!r} weight_format must be 'huggingface' or 'mistral'"
+            )
+        raw_download_ignore_patterns = payload.get("download_ignore_patterns", [])
+        if not isinstance(raw_download_ignore_patterns, list) or not all(
+            isinstance(pattern, str) and pattern
+            for pattern in raw_download_ignore_patterns
+        ):
+            raise ValueError(
+                f"model entry {key!r} download_ignore_patterns must be a list "
+                "of strings"
+            )
         raw_revision = payload.get("revision")
         revision = None
         if raw_revision is not None:
@@ -218,6 +234,8 @@ class VLLMModelSpec:
             tensor_parallel_size=tensor_parallel_size,
             extra_args=tuple(raw_extra_args),
             environment=tuple(sorted(raw_environment.items())),
+            weight_format=weight_format,
+            download_ignore_patterns=tuple(raw_download_ignore_patterns),
             revision=revision,
         )
 
@@ -262,7 +280,7 @@ def resolve_model_path(spec: VLLMModelSpec, models_dir: Path) -> Path:
             f"local model directory is incomplete (missing config.json): {model_path}"
         )
     _validate_model_revision(spec, model_path)
-    _validate_model_weights(model_path)
+    _validate_model_weights(model_path, weight_format=spec.weight_format)
     return model_path
 
 
@@ -297,8 +315,17 @@ def _validate_model_revision(spec: VLLMModelSpec, model_path: Path) -> None:
         )
 
 
-def _validate_model_weights(model_path: Path) -> None:
-    index_path = model_path / "model.safetensors.index.json"
+def _validate_model_weights(model_path: Path, *, weight_format: str) -> None:
+    if weight_format == "mistral":
+        index_name = "consolidated.safetensors.index.json"
+        single_name = "consolidated.safetensors"
+    elif weight_format == "huggingface":
+        index_name = "model.safetensors.index.json"
+        single_name = "model.safetensors"
+    else:
+        raise ValueError(f"unsupported model weight format: {weight_format!r}")
+
+    index_path = model_path / index_name
     if index_path.is_file():
         with open(index_path) as handle:
             index_payload = json.load(handle)
@@ -309,7 +336,7 @@ def _validate_model_weights(model_path: Path) -> None:
             raise ValueError(f"invalid safetensors weight index: {index_path}")
         filenames = sorted({str(filename) for filename in weight_map.values()})
     else:
-        filenames = ["model.safetensors"]
+        filenames = [single_name]
 
     missing_or_empty = [
         filename

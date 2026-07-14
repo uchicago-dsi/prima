@@ -86,5 +86,37 @@
       "--default-chat-template-kwargs",
       "{\"enable_thinking\": false}"
     ]
+  },
+  "mistral_small_3_2_24b": {
+    "repo_id": "mistralai/Mistral-Small-3.2-24B-Instruct-2506",
+    "revision": "95a6d26c4bfb886c58daf9d3f7332c857cb27b43",
+    "directory_name": "Mistral-Small-3.2-24B-Instruct-2506",
+    "served_model_name": "mistral_small_3_2_24b",
+    "tensor_parallel_size": 1,
+    "weight_format": "mistral",
+    "download_ignore_patterns": [
+      "model-*.safetensors",
+      "model.safetensors.index.json"
+    ],
+    "extra_args": [
+      "--tokenizer-mode",
+      "mistral",
+      "--config-format",
+      "mistral",
+      "--load-format",
+      "mistral",
+      "--max-model-len",
+      "16384",
+      "--max-num-seqs",
+      "1",
+      "--gpu-memory-utilization",
+      "0.9",
+      "--generation-config",
+      "vllm",
+      "--limit-mm-per-prompt",
+      "{\"image\": 16}",
+      "--mm-processor-cache-gb",
+      "0"
+    ]
   }
 }

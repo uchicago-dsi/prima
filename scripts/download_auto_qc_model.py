@@ -8,6 +8,7 @@ import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import fcntl
+from fnmatch import fnmatch
 import json
 import os
 from pathlib import Path
@@ -82,6 +83,8 @@ def _write_provenance(
     provenance = {
         "repo_id": spec.repo_id,
         "revision": spec.revision,
+        "weight_format": spec.weight_format,
+        "download_ignore_patterns": list(spec.download_ignore_patterns),
         "downloaded_at": datetime.now(timezone.utc).isoformat(),
         "transfer": transfer,
         "command": " ".join(sys.argv),
@@ -230,6 +233,10 @@ def _download_via_datamover(
         sibling.rfilename
         for sibling in info.siblings
         if sibling.rfilename.endswith((".safetensors", ".bin"))
+        and not any(
+            fnmatch(sibling.rfilename, pattern)
+            for pattern in spec.download_ignore_patterns
+        )
     )
     if not weight_files:
         raise RuntimeError(
@@ -288,6 +295,10 @@ def main() -> int:
     destination = (args.models_dir.resolve() / spec.directory_name).resolve()
     route = f"datamover:{datamover_host}" if datamover_host else "direct"
     print(f"{spec.key}: {spec.repo_id}@{spec.revision} -> {destination} via {route}")
+    print(
+        f"  weight_format={spec.weight_format} "
+        f"download_ignore_patterns={list(spec.download_ignore_patterns)}"
+    )
     if args.dry_run:
         return 0
 
@@ -318,6 +329,7 @@ def main() -> int:
                 repo_id=spec.repo_id,
                 revision=spec.revision,
                 local_dir=str(destination),
+                ignore_patterns=list(spec.download_ignore_patterns) or None,
             )
             transfer = {"method": "direct", "xet_enabled": bool(args.use_xet)}
     if not (destination / "config.json").is_file():
