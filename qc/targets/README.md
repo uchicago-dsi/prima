@@ -116,8 +116,10 @@ python submit_view_auto_qc.py \
 Every request receives the examples in the manifest order. The saved run
 records the exemplar manifest SHA-256 plus each example's image SHA-256, order,
 label, and role so a result cannot silently resume with a different reference
-bank. Keep example selection inside development data, then freeze it before
-scoring an exam-disjoint blinded confirmation panel.
+bank. Marker-classifier references receive the same frozen target task as the
+scored view, and the concise role is used as their accepted evidence phrase.
+Keep example selection inside development data, then freeze it before scoring
+an exam-disjoint blinded confirmation panel.
 
 When the learned target is one component of a broader operational exclusion,
 keep the component exemplar labels separate from the completed union campaign:
@@ -138,7 +140,10 @@ python qc/build_view_few_shot_experiment.py \
 This mode preserves the union labels and baseline for matched evaluation while
 building an explicitly adjudicated component-target exemplar bank. Every
 example needs exactly one explicit component label, and exemplars are excluded
-from the scored manifest.
+from the scored manifest. Pass `--excluded-score-manifest` to additionally
+require zero exemplar overlap at both view and audit-exam level. When synthetic
+component labels are derived from otherwise usable source views, pass
+`--require-operational-example-label absent` to enforce that source condition.
 
 ## Split targets
 

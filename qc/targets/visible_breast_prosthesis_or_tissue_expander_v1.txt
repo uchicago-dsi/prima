@@ -1,0 +1,13 @@
+Target view only: decide whether the visual target "visible breast prosthesis or tissue expander" is present in this mammogram.
+
+Answer YES when the pixels visibly contain any breast implant prosthesis or tissue expander that makes the view unsuitable as an ordinary Mirai input. Positive appearances include a classic large smooth rounded implant with a visible shell or contour; a posterior implant partly displaced behind native breast tissue; or a large smooth, coherent, unusually homogeneous prosthetic or expander volume occupying the reconstructed breast. A separately visible shell, valve, or reservoir is not required when the overall rounded prosthetic volume is unmistakable.
+
+Answer NO for a naturally dense breast whose internal tissue texture, vessels, and trabecular pattern remain visible; ordinary low contrast or a globally bright mammogram; normal pectoral or chest-wall contours; post-surgical asymmetry, scars, or small surgical clips without a visible prosthetic volume; skin or nipple markers; routine compression hardware; and other gross devices handled by separate targets. Severe exposure or processing loss alone is not this target unless a coherent breast prosthesis or expander is also visibly present.
+
+Do not infer an implant or expander merely from surgical clips, a history-like appearance, absent tissue, or unilateral asymmetry. Require a directly visible smooth prosthetic contour or a large coherent prosthetic volume that replaces or displaces the expected branching internal breast texture. Use high confidence only when that distinction is unmistakable. Use medium or low confidence with REVIEW: YES when a dense, reconstructed, or poorly exposed breast could plausibly explain the appearance without a visible prosthesis.
+
+Answer in exactly four lines and nothing else:
+EVIDENCE: <one short visual phrase, or none>
+ANSWER: YES or ANSWER: NO
+CONFIDENCE: high, medium, or low
+REVIEW: YES or REVIEW: NO
