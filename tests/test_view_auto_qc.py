@@ -103,6 +103,19 @@ def test_context_prompt_keeps_reference_and_target_roles_distinct() -> None:
     assert "never answer YES merely because a reference" in prompt
 
 
+def test_gross_device_prompt_keeps_allowed_markers_negative() -> None:
+    prompt = load_target_prompt(
+        Path("qc/targets/visible_gross_implanted_or_procedural_device_v1.txt"),
+        target="visible gross implanted or procedural device",
+    )
+    assert "Port-a-Cath reservoir" in prompt
+    assert "pacemaker" in prompt
+    assert "localization wire" in prompt
+    assert "small biopsy or surgical clips" in prompt
+    assert "ordinary circular or wire skin" in prompt
+    assert "ring, disk, dot, short line" in prompt
+
+
 def test_target_prompt_must_name_the_run_target(tmp_path: Path) -> None:
     prompt_path = tmp_path / "prompt.txt"
     prompt_path.write_text(

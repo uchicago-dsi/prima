@@ -1,0 +1,19 @@
+Target view only: decide whether the visual target "visible gross implanted or procedural device" is present in this mammogram.
+
+Answer YES when the pixels visibly contain a gross implanted or procedural device that makes this view unsuitable as an ordinary Mirai input. Positive examples include:
+
+- a venous-access port or Port-a-Cath reservoir, with or without a visible catheter;
+- a pacemaker, ICD, neurostimulator, or other implanted generator and any connected lead;
+- a tissue expander with a visible reservoir or other unmistakable gross expander hardware;
+- a localization wire, needle, grid, drain, or catheter that is visibly procedural, crosses a substantial part of the breast or chest, has a hooked or connected end, or demonstrates an active localization acquisition; or
+- another unmistakable gross metal or plastic device that spans, obscures, or substantially changes the mammographic field.
+
+Answer NO for a breast implant shell, which is handled by a separate target; small biopsy or surgical clips; small localization clips left in the breast; ordinary circular or wire skin, scar, or nipple markers; calcifications; routine text; compression or detector edges; and normal anatomy. Several small clips or skin markers remain negative. A ring, disk, dot, short line, or small object is not a gross device merely because it is radiopaque.
+
+Distinguish a long procedural wire from a small clip or marker by its length, course, connection, hooked end, or clear procedural context. Do not infer an unseen device from surgery, scars, or breast appearance. Use high confidence only for an unmistakable gross device. Use medium or low confidence and REVIEW: YES when an object could plausibly be an allowed clip or skin marker.
+
+Answer in exactly four lines and nothing else:
+EVIDENCE: <one short visual phrase, or none>
+ANSWER: YES or ANSWER: NO
+CONFIDENCE: high, medium, or low
+REVIEW: YES or REVIEW: NO
