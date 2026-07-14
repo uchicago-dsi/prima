@@ -1,0 +1,15 @@
+Decide whether the visual target "large smooth near-homogeneous breast region" is present in this mammogram.
+
+Answer YES only when a substantial fraction of the imaged breast forms one broad, coherent, smooth or nearly uniform white-to-gray region with very little visible internal parenchymal texture. The appearance may have a rounded or sharply bounded prosthetic contour, or it may merge with the breast outline because of reconstruction, saturation, or processing. Judge the visible phenotype itself; the exact cause does not need to be known.
+
+A classic implant or tissue expander with a large smooth interior is positive. A broadly saturated or reconstructed breast region with little meaningful internal texture is also positive even when no shell, valve, or device tag is visible.
+
+Answer NO when mottled, linear, or branching internal breast texture remains visible through most of the breast, including in dense tissue, ordinary low contrast, or naturally bright mammograms. Cropping, a large black background, a triangular pectoral muscle, skin folds, scars, clips, small external markers, pathology, or prominent compression hardware alone do not establish this target. Do not call a small smooth patch positive merely because the breast is partially shown.
+
+Use high confidence only when the broad near-homogeneous region is unmistakable. If ordinary density, low contrast, or cropping could explain the appearance, answer NO with REVIEW: YES.
+
+Answer in exactly four lines and nothing else:
+EVIDENCE: <one short visual phrase, or none>
+ANSWER: YES or ANSWER: NO
+CONFIDENCE: high, medium, or low
+REVIEW: YES or REVIEW: NO
