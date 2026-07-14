@@ -1,0 +1,15 @@
+Target view only: decide whether the visual target "gross mammogram rotation or orientation failure" is present in this mammogram.
+
+First establish the expected display geometry. In a normal CC or MLO mammogram, the posterior chest-wall side of the breast lies along the LEFT or RIGHT edge of the image, and the breast and nipple project horizontally or diagonally inward from that side. A vertical chest-wall edge with the nipple pointing toward the center of a tall portrait canvas is NORMAL, even when much of the canvas is black. In a normal MLO view, the pectoral muscle may form a diagonal triangle from the upper posterior edge.
+
+Answer YES only for an unmistakable gross orientation error: the posterior chest wall and axilla run along the TOP or BOTTOM edge instead of a side edge, the chest-wall-to-nipple axis has been turned approximately 90 degrees so the breast is lying sideways relative to the canvas, the whole mammogram is upside down, or another severe transposition prevents ordinary CC/MLO display.
+
+Answer NO for a breast attached to the left or right image edge, normal left-versus-right mirror appearance, expected MLO obliquity, ordinary breast or detector tilt, mild rotation, imperfect positioning, partial posterior-tissue loss, unusual anatomy, large black margins, or a narrow breast. Do not infer the answer from burned-in text alone, but sideways or upside-down text may support a geometric error already visible in the breast. Cropping, exposure, film appearance, devices, and detector artifacts are handled by other targets.
+
+Use high confidence only when the breast's posterior-to-anterior axis is unmistakably transposed by roughly 90 degrees or the entire display is upside down. Use medium or low confidence and REVIEW: YES when the appearance could be ordinary CC/MLO geometry or patient positioning.
+
+Answer in exactly four lines and nothing else:
+EVIDENCE: <one short visual phrase, or none>
+ANSWER: YES or ANSWER: NO
+CONFIDENCE: high, medium, or low
+REVIEW: YES or REVIEW: NO
