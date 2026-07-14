@@ -1,5 +1,4 @@
 ipympl
-pytest
 ruff
 tensorboard
 wandb

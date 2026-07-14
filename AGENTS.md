@@ -6,9 +6,11 @@
 - Fail fast on bad paths, caches, or dependencies. Do not add backward-compatibility shims.
 - If a maintained library already provides missing functionality, install it into the `prima` env instead of re-implementing that functionality locally.
 - Never commit or print PHI.
-- Do not write or run automated tests. This is research code; validate changes
-  with targeted dry runs on the real workflow and inspect the resulting
-  artifacts instead.
+- Do not write, expand, restore, or run automated tests or test scripts unless
+  Anna explicitly asks. Validate with the cheapest direct check: compile/lint,
+  config or dry-run validation, or one representative real-input smoke with
+  artifact inspection. If safe validation appears to require a durable
+  regression test, explain the specific risk and ask rather than creating one.
 - When a runtime or launcher failure on the current path has a clear fix, apply the fix and retry or resubmit automatically before reporting back. Report the fix and the new job state after it has been attempted.
 
 ## Project Structure & Module Organization
@@ -23,6 +25,7 @@ CLI entrypoints live under `analysis/`, `exports/`, `ops/`, `pipelines/`, `qc/`,
 
 ## Long-Running Automation
 
+- On Randi, access shared persistent priority/nonpreemptible H200 allocations only through `/gpfs/data/huo-lab/Image/annawoodard/hfdp/scripts/shared_h200_pool.sh`: inspect `status`, then use `run --project prima` with the lane, semantic task, broker-enforced maximum runtime, existing run root, and exact command. Never issue raw `srun --jobid` into these allocations; the broker owns atomic GPU auditing, claims, and cross-project fair sharing. When every shared lane is busy, follow the broker's profile-derived opportunistic route for restartable/checkpointed work; non-restartable work waits. Never leave the same task queued in the broker and opportunistic Slurm simultaneously.
 - Prefer timer-driven babysitters over ad hoc tmux watchers for ongoing experiments.
 - The control plane should be a fresh one-shot process on each tick, not a long-lived shell loop.
 - Select jobs by campaign family (for example, regex over run roots or job names), not by hardcoded job IDs.
@@ -129,14 +132,6 @@ python analysis/analyze_metadata.py --modality MG
 ## Coding Style & Naming Conventions
 
 Keep configuration in module-level constants or argparse defaults. Do not scatter hidden fallbacks across call sites. Follow PEP 8 with 4-space indentation, snake_case functions, CamelCase classes, and ALL_CAPS constants. Prefer `pathlib.Path`, structured logging, and concise comments. Favor vectorized NumPy or PyTorch utilities for volume work.
-
-## Validation Guidelines
-
-Do not create or run unit or integration test suites. Validate with targeted dry
-runs (for example, `python ops/fingerprinter.py --patients 1234 --max-workers
-2`) and inspect the produced artifacts. When adjusting fingerprint rules, sync
-heuristics, or cache schemas, delete affected caches and regenerate them.
-Mixed-version caches are unsupported.
 
 ## Handoffs
 
