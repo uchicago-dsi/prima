@@ -1,0 +1,15 @@
+Target view only: decide whether the visual target "visible catheter or long procedural tubing" is present in this mammogram.
+
+Answer YES only for convincing manufactured catheter or flexible procedural tubing that traverses a substantial part of the breast or chest field. Require at least one non-anatomic device cue: sharply defined uniform-caliber walls, a radiopaque center stripe or repeated lumen, a connector or clamp, continuity to external hardware or a port, or a long course that enters from outside the body field without branching or tapering. A port or connector may lie partly outside the image.
+
+Normal breast vessels are an important hard negative. Answer NO for tubular soft-tissue densities that branch, taper, merge, change caliber, or form a network with several similar structures, even when enlargement makes their two edges look parallel. If no connector, stripe, external continuity, or other manufactured cue separates a line from a vessel, do not call it tubing. Also answer NO for ducts, skin folds, a single straight or gently bent scar-marker wire, localization wire, skin marker, biopsy or surgical clips, calcifications, detector seams, film scratches, text, compression hardware, breast implants, pacemaker generators, and ordinary implanted pacemaker leads. Those devices may make a view fail another QC target but are not this target.
+
+The input may show one FULL TARGET VIEW plus enlarged details from that same view. Use the full view to decide whether a line branches, tapers, or connects to anatomy or hardware; use the details only to confirm morphology. A structure repeated across overlapping details is still one structure.
+
+Use high confidence only when at least one manufactured-device cue is unmistakable. If a line could be a vessel, marker, fold, or image artifact, answer NO with medium or low confidence and REVIEW: YES.
+
+Answer in exactly four lines and nothing else:
+EVIDENCE: <one short visual phrase, or none>
+ANSWER: YES or ANSWER: NO
+CONFIDENCE: high, medium, or low
+REVIEW: YES or REVIEW: NO

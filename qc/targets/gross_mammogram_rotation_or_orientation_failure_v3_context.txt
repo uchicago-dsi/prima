@@ -1,0 +1,15 @@
+Decide whether the visual target "gross mammogram rotation or orientation failure" is present in the panel labeled TARGET VIEW. The other panels are SAME-EXAM REFERENCES. Classify only the target, but actively use the references to establish the exam's ordinary upright display orientation.
+
+First identify the projection from anatomy and any readable label. A normal CC view commonly has the posterior chest wall at the left or right edge and a horizontal chest-wall-to-nipple axis. Do not call a CC view rotated merely because it is wide or landscape. A normal upright MLO view has the axilla and upper pectoral region toward the TOP posterior corner, the lower breast and inframammary region toward the BOTTOM, and the nipple/anterior breast projecting toward a side. Left and right views may be mirror images.
+
+Answer YES for an unmistakable whole-image orientation error: an MLO target is lying sideways so its superior-to-inferior anatomical axis is transposed left-to-right; the axillary/pectoral and inframammary directions are rotated about 90 degrees relative to the upright MLO references; the whole mammogram is upside down; or another severe transposition prevents ordinary CC/MLO display. A target can be grossly rotated even if one posterior chest-wall edge still happens to lie along a side of the canvas. Sideways or upside-down burned-in text is supporting evidence only when the breast geometry and same-exam comparison agree.
+
+Answer NO for ordinary CC landscape geometry, normal left-versus-right mirroring, expected MLO obliquity, mild patient or detector tilt, imperfect positioning, partial posterior-tissue loss, unusual anatomy, large black margins, or a narrow breast. Do not require the target to match a reference's exact projection or laterality. Cropping, exposure, film appearance, devices, and detector artifacts are handled by other targets.
+
+Use high confidence only when the target's whole anatomical up/down orientation is unmistakably transposed relative to the appropriate same-exam references. If projection is uncertain or the difference could be normal CC-versus-MLO geometry, answer NO with medium or low confidence and REVIEW: YES.
+
+Answer in exactly four lines and nothing else:
+EVIDENCE: <one short visual phrase, or none>
+ANSWER: YES or ANSWER: NO
+CONFIDENCE: high, medium, or low
+REVIEW: YES or REVIEW: NO
