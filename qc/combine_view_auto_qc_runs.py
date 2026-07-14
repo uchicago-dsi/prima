@@ -35,6 +35,16 @@ def parse_args() -> argparse.Namespace:
         choices=VIEW_CONFIDENCE_LEVELS,
         required=True,
     )
+    parser.add_argument(
+        "--allow-repeated-targets",
+        action="store_true",
+        help="allow provenance-distinct runs for the same target to be OR-combined",
+    )
+    parser.add_argument(
+        "--allow-single-run",
+        action="store_true",
+        help="allow an identity wrapper around one complete run",
+    )
     return parser.parse_args()
 
 
@@ -65,6 +75,8 @@ def combine_view_runs(
     output_path: Path,
     target: str,
     minimum_confidence: str,
+    allow_repeated_targets: bool = False,
+    allow_single_run: bool = False,
 ) -> dict[str, Any]:
     """Create one provenance-rich target run from component target decisions."""
     manifest_path = Path(manifest_path).resolve()
@@ -78,7 +90,7 @@ def combine_view_runs(
     if output_path.exists():
         raise FileExistsError(f"refusing to overwrite combined run: {output_path}")
     resolved_runs = [Path(path).resolve() for path in run_paths]
-    if len(resolved_runs) < 2:
+    if len(resolved_runs) < 2 and not allow_single_run:
         raise ValueError("logical-OR combination requires at least two runs")
     if len(resolved_runs) != len(set(resolved_runs)):
         raise ValueError("component run paths must be unique")
@@ -108,16 +120,21 @@ def combine_view_runs(
                 raise ValueError("component image path does not match the manifest")
         components.append((path, run))
     component_targets = [run["target"] for _path, run in components]
-    if len(component_targets) != len(set(component_targets)):
+    repeated_targets = len(component_targets) != len(set(component_targets))
+    if repeated_targets and not allow_repeated_targets:
         raise ValueError("component runs must have distinct targets")
 
     models = sorted({run["model"] for _path, run in components})
     combined = new_view_auto_run(
         target=target,
         model="logical_or[" + ",".join(models) + "]",
-        prompt_variant="logical_or_v1",
+        prompt_variant=(
+            "logical_or_repeated_targets_v1" if repeated_targets else "logical_or_v1"
+        ),
         inference_settings={
             "combination_rule": "logical_or",
+            "repeated_component_targets_allowed": allow_repeated_targets,
+            "single_run_allowed": allow_single_run,
             "minimum_component_confidence": minimum_confidence,
             "components": [
                 _component_provenance(path, run) for path, run in components
@@ -138,7 +155,10 @@ def combine_view_runs(
                 minimum_confidence=minimum_confidence,
             ):
                 confidence = record["suggestions"][0]["confidence"]
-                positive_components.append((run["target"], confidence))
+                component_name = run["target"]
+                if repeated_targets:
+                    component_name += f" [{run['prompt_variant']}]"
+                positive_components.append((component_name, confidence))
         suggestions = []
         if positive_components:
             confidence = max(
@@ -166,6 +186,8 @@ def main() -> int:
         output_path=args.output,
         target=args.target,
         minimum_confidence=args.minimum_present_confidence,
+        allow_repeated_targets=args.allow_repeated_targets,
+        allow_single_run=args.allow_single_run,
     )
     print(
         "combined view auto-QC complete: "

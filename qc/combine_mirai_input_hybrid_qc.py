@@ -37,6 +37,16 @@ def parse_args() -> argparse.Namespace:
         choices=VIEW_CONFIDENCE_LEVELS,
         required=True,
     )
+    parser.add_argument(
+        "--allow-repeated-run-targets",
+        action="store_true",
+        help="allow multiple provenance-distinct visual runs for the same target",
+    )
+    parser.add_argument(
+        "--allow-single-run",
+        action="store_true",
+        help="allow one visual run to pass through the provenance combiner",
+    )
     return parser.parse_args()
 
 
@@ -209,6 +219,8 @@ def main() -> int:
         output_path=visual_path,
         target=args.target,
         minimum_confidence=args.minimum_present_confidence,
+        allow_repeated_targets=args.allow_repeated_run_targets,
+        allow_single_run=args.allow_single_run,
     )
     system = build_hybrid_run(
         visual_run_path=visual_path,

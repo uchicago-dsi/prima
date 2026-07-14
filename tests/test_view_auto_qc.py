@@ -293,6 +293,75 @@ def test_logical_or_combiner_rejects_partial_component(tmp_path: Path) -> None:
         )
 
 
+def test_logical_or_combiner_can_explicitly_union_repeated_targets(
+    tmp_path: Path,
+) -> None:
+    manifest = pd.DataFrame(
+        [
+            {
+                "view_id": view_id(1),
+                "image_path": f"images/{view_id(1)}.png",
+                "laterality": "L",
+                "view": "CC",
+                "review_order": 1,
+            }
+        ]
+    )
+    manifest_path = tmp_path / "manifest.parquet"
+    manifest.to_parquet(manifest_path, index=False)
+    paths = []
+    for index, variant in enumerate(("modular", "embedding")):
+        run = new_view_auto_run(
+            target=TARGET,
+            model=f"model-{variant}",
+            prompt_variant=variant,
+            inference_settings={},
+        )
+        run["view_suggestions"] = {
+            view_id(1): {
+                "image_path": f"images/{view_id(1)}.png",
+                "suggestions": (
+                    [{"tag": TARGET, "confidence": "high"}] if index else []
+                ),
+            }
+        }
+        path = tmp_path / f"{variant}.json"
+        save_view_auto_run(path, run)
+        paths.append(path)
+
+    with pytest.raises(ValueError, match="distinct targets"):
+        combine_view_runs(
+            manifest_path=manifest_path,
+            run_paths=paths,
+            output_path=tmp_path / "rejected.json",
+            target=TARGET,
+            minimum_confidence="high",
+        )
+    combined = combine_view_runs(
+        manifest_path=manifest_path,
+        run_paths=paths,
+        output_path=tmp_path / "combined.json",
+        target=TARGET,
+        minimum_confidence="high",
+        allow_repeated_targets=True,
+    )
+    assert combined["prompt_variant"] == "logical_or_repeated_targets_v1"
+    assert combined["inference_settings"]["repeated_component_targets_allowed"]
+    rationale = combined["view_suggestions"][view_id(1)]["suggestions"][0]["rationale"]
+    assert "[embedding]" in rationale
+
+    identity = combine_view_runs(
+        manifest_path=manifest_path,
+        run_paths=[paths[1]],
+        output_path=tmp_path / "identity.json",
+        target=TARGET,
+        minimum_confidence="high",
+        allow_single_run=True,
+    )
+    assert identity["inference_settings"]["single_run_allowed"]
+    assert identity["view_suggestions"][view_id(1)]["suggestions"]
+
+
 def test_view_manifest_loader_uses_relative_images(tmp_path: Path) -> None:
     image_dir = tmp_path / "images"
     image_dir.mkdir()
