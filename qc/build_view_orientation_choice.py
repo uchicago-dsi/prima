@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build four-orientation comparison panels for view-level auto-QC."""
+"""Build equal-scale orientation comparison panels for view-level auto-QC."""
 
 from __future__ import annotations
 
@@ -26,13 +26,17 @@ from prima.view_qc import (
 )
 
 FONT_PATH = Path("/usr/share/fonts/dejavu/DejaVuSansMono-Bold.ttf")
-CANVAS_SIZE = (1600, 1200)
-CANVAS_MAX_PIXELS = CANVAS_SIZE[0] * CANVAS_SIZE[1]
-PANEL_BOUNDS = (
-    (12, 78, 796, 632),
-    (804, 78, 1588, 632),
-    (12, 640, 796, 1192),
-    (804, 640, 1588, 1192),
+FOUR_WAY_CANVAS_SIZE = (1440, 1440)
+PAIRWISE_CANVAS_SIZE = (1440, 720)
+FOUR_WAY_PANEL_BOUNDS = (
+    (12, 78, 716, 756),
+    (724, 78, 1428, 756),
+    (12, 764, 716, 1432),
+    (724, 764, 1428, 1432),
+)
+PAIRWISE_PANEL_BOUNDS = (
+    (12, 78, 716, 712),
+    (724, 78, 1428, 712),
 )
 ORIENTATIONS = (
     ("A", "CURRENT DISPLAY", None),
@@ -40,6 +44,11 @@ ORIENTATIONS = (
     ("C", "180 DEGREES", Image.ROTATE_180),
     ("D", "90 DEGREES COUNTERCLOCKWISE", Image.ROTATE_90),
 )
+TRANSPOSE_BY_CLOCKWISE_DEGREES = {
+    90: Image.ROTATE_270,
+    180: Image.ROTATE_180,
+    270: Image.ROTATE_90,
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -50,6 +59,16 @@ def parse_args() -> argparse.Namespace:
         "--input-image-column",
         default="image_path",
         help="manifest image column to rotate; image_path remains canonical",
+    )
+    parser.add_argument(
+        "--comparison-rotation-degrees-clockwise",
+        type=int,
+        choices=sorted(TRANSPOSE_BY_CLOCKWISE_DEGREES),
+        default=None,
+        help=(
+            "render only A=current and B at this rotation using equal-scale "
+            "square image boxes; omit for the four-way panel"
+        ),
     )
     parser.add_argument("--max-source-pixels", type=int, default=2_097_152)
     return parser.parse_args()
@@ -83,14 +102,20 @@ def _draw_panel(
     image: Image.Image,
     bounds: tuple[int, int, int, int],
     label: str,
+    is_current: bool,
 ) -> None:
     left, top, right, bottom = bounds
     label_height = 42
     draw = ImageDraw.Draw(canvas)
-    draw.rectangle(bounds, outline=255 if label.startswith("A") else 150, width=4)
+    draw.rectangle(bounds, outline=255 if is_current else 150, width=4)
     draw.text((left + 10, top + 6), label, fill=255, font=_font(23))
-    image_box = (left + 6, top + label_height, right - 6, bottom - 6)
-    box_size = (image_box[2] - image_box[0], image_box[3] - image_box[1])
+    available_width = right - left - 12
+    available_height = bottom - top - label_height - 6
+    side = min(available_width, available_height)
+    image_left = left + (right - left - side) // 2
+    image_top = top + label_height + (available_height - side) // 2
+    image_box = (image_left, image_top, image_left + side, image_top + side)
+    box_size = (side, side)
     contained = ImageOps.contain(image, box_size, Image.LANCZOS)
     x = image_box[0] + (box_size[0] - contained.width) // 2
     y = image_box[1] + (box_size[1] - contained.height) // 2
@@ -103,8 +128,9 @@ def render_orientation_choice_png(
     *,
     declared_slot: str,
     max_source_pixels: int,
+    comparison_rotation_degrees_clockwise: int | None,
 ) -> None:
-    """Render current, clockwise, inverted, and counterclockwise candidates."""
+    """Render current display beside deterministic orientation candidates."""
     validate_rendered_view_png(source_path, max_pixels=max_source_pixels)
     with Image.open(source_path) as source:
         source.load()
@@ -113,27 +139,48 @@ def render_orientation_choice_png(
     if anatomy.width < 2 or anatomy.height < 2:
         raise ValueError("orientation-choice anatomy crop is empty")
 
-    canvas = Image.new("L", CANVAS_SIZE, color=0)
+    if comparison_rotation_degrees_clockwise is None:
+        canvas_size = FOUR_WAY_CANVAS_SIZE
+        panel_bounds = FOUR_WAY_PANEL_BOUNDS
+        orientations = ORIENTATIONS
+        heading = f"SAME TARGET IN FOUR ORIENTATIONS | DECLARED SLOT: {declared_slot}"
+        subheading = "A IS THE CURRENT DISPLAY; B-D ARE COMPARISON ROTATIONS"
+    else:
+        canvas_size = PAIRWISE_CANVAS_SIZE
+        panel_bounds = PAIRWISE_PANEL_BOUNDS
+        orientations = (
+            ("A", "CURRENT DISPLAY", None),
+            (
+                "B",
+                f"{comparison_rotation_degrees_clockwise} DEGREES CLOCKWISE",
+                TRANSPOSE_BY_CLOCKWISE_DEGREES[comparison_rotation_degrees_clockwise],
+            ),
+        )
+        heading = f"SAME TARGET AT EQUAL SCALE | DECLARED SLOT: {declared_slot}"
+        subheading = "A IS CURRENT; B IS THE ONLY COMPARISON ROTATION"
+
+    canvas = Image.new("L", canvas_size, color=0)
     draw = ImageDraw.Draw(canvas)
     draw.text(
         (18, 10),
-        f"SAME TARGET IN FOUR ORIENTATIONS | DECLARED SLOT: {declared_slot}",
+        heading,
         fill=255,
         font=_font(27),
     )
     draw.text(
         (18, 46),
-        "A IS THE CURRENT DISPLAY; B-D ARE COMPARISON ROTATIONS",
+        subheading,
         fill=190,
         font=_font(20),
     )
-    for (candidate, description, transpose), bounds in zip(ORIENTATIONS, PANEL_BOUNDS):
+    for (candidate, description, transpose), bounds in zip(orientations, panel_bounds):
         image = anatomy if transpose is None else anatomy.transpose(transpose)
         _draw_panel(
             canvas,
             image=image,
             bounds=bounds,
             label=f"{candidate}: {description}",
+            is_current=candidate == "A",
         )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -144,7 +191,9 @@ def render_orientation_choice_png(
     temporary_path = Path(temporary_name)
     try:
         canvas.save(temporary_path, format="PNG", optimize=True)
-        validate_rendered_view_png(temporary_path, max_pixels=CANVAS_MAX_PIXELS)
+        validate_rendered_view_png(
+            temporary_path, max_pixels=canvas_size[0] * canvas_size[1]
+        )
         os.chmod(temporary_path, 0o600)
         os.replace(temporary_path, output_path)
         os.chmod(output_path, 0o600)
@@ -218,6 +267,9 @@ def run_from_args(args: argparse.Namespace) -> dict[str, Any]:
             output_path,
             declared_slot=f"{row['laterality']}{row['view']}",
             max_source_pixels=args.max_source_pixels,
+            comparison_rotation_degrees_clockwise=(
+                args.comparison_rotation_degrees_clockwise
+            ),
         )
         model_paths[row["view_id"]] = output_path.relative_to(root).as_posix()
 
@@ -233,6 +285,17 @@ def run_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "".join(ordered_panel_digests).encode()
     ).hexdigest()
     command = shlex.join([sys.executable, *sys.argv])
+    if args.comparison_rotation_degrees_clockwise is None:
+        candidate_rotations = {"A": 0, "B": 90, "C": 180, "D": 270}
+        canvas_size = FOUR_WAY_CANVAS_SIZE
+        layout = "four_way_equal_scale"
+    else:
+        candidate_rotations = {
+            "A": 0,
+            "B": int(args.comparison_rotation_degrees_clockwise),
+        }
+        canvas_size = PAIRWISE_CANVAS_SIZE
+        layout = "pairwise_equal_scale"
     provenance = {
         "schema_version": 1,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -245,33 +308,31 @@ def run_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "input_image_column": image_column,
         "model_image_column": "model_image_path",
         "current_display_candidate": "A",
-        "candidate_rotations_degrees_clockwise": {
-            "A": 0,
-            "B": 90,
-            "C": 180,
-            "D": 270,
-        },
+        "candidate_rotations_degrees_clockwise": candidate_rotations,
         "anatomy_crop": "substantial_foreground_box",
-        "canvas_size": list(CANVAS_SIZE),
+        "layout": layout,
+        "candidate_image_boxes": "equal square bounds",
+        "canvas_size": list(canvas_size),
     }
     _write_json(provenance_path, provenance)
     readme_path.write_text(
         "\n".join(
             [
-                "# Four-orientation view inputs",
+                "# Orientation-comparison view inputs",
                 "",
                 f"- rows: `{len(output)}`",
                 "- canonical target column: `image_path`",
                 f"- source image column: `{image_column}`",
                 "- model input column: `model_image_path`",
                 "- candidate A: current display",
-                "- candidates B/C/D: 90/180/270 degrees clockwise",
+                f"- layout: `{layout}`",
+                f"- candidate rotations clockwise: `{candidate_rotations}`",
                 f"- ordered panel-bank SHA-256: `{panel_bank_digest}`",
                 "",
                 "Each panel crops to substantial breast foreground before applying",
-                "the four deterministic rotations, suppressing most isolated",
-                "burned-in text as an orientation shortcut. The canonical target",
-                "is unchanged.",
+                "deterministic rotations. Equal square image boxes prevent rotated",
+                "candidates from gaining effective scale merely because their aspect",
+                "ratio matches the outer panel. The canonical target is unchanged.",
                 "",
                 f"Exact producer command: `{command}`",
                 "",

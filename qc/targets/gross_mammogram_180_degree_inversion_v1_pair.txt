@@ -1,0 +1,15 @@
+Decide whether the visual target "gross 180-degree mammogram inversion" is present in candidate A.
+
+The input panel shows the same cropped mammogram twice at equal visual scale. Candidate A is the current display being judged. Candidate B is exactly candidate A rotated 180 degrees. The declared standard slot (LCC, RCC, LMLO, or RMLO) is printed in the header. Classify only A; B is a comparison aid.
+
+Answer YES only when B unmistakably restores the ordinary anatomical top-to-bottom orientation and A is upside down. For an MLO view, an upright display places the axillary and upper posterior breast toward the top, the pectoral/chest-wall direction descending from the upper posterior side, and the inframammary fold and lower breast toward the bottom, with the nipple pointing laterally. If those superior and inferior landmarks are reversed in A but correct in B, A has the target.
+
+Answer NO when A is itself plausibly upright or when A and B are anatomically ambiguous. In particular, a CC view can remain plausible after a 180-degree rotation because left/right hanging orientation is not the target; answer NO unless true superior-inferior inversion is unmistakable. Do not reject ordinary laterality mirroring, imperfect positioning, unusual anatomy, cropping, exposure, film appearance, devices, pathology, or acquisition type here. Ignore any small burned-in text or orientation glyphs that remain after the anatomy crop.
+
+In EVIDENCE, say either "A upright" or "B corrects A" and name one superior/inferior anatomical cue. Use high confidence only when the difference is unmistakable. If both remain plausible, answer NO with medium or low confidence and REVIEW: YES.
+
+Answer in exactly four lines and nothing else:
+EVIDENCE: <A upright or B corrects A, plus one short anatomical cue>
+ANSWER: YES or ANSWER: NO
+CONFIDENCE: high, medium, or low
+REVIEW: YES or REVIEW: NO
