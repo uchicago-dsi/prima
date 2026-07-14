@@ -21,6 +21,7 @@ from prima.view_qc import (
     VIEW_LABEL_PRESENT,
     load_view_qc_events,
     load_view_qc_state,
+    normalize_view_id,
     normalize_view_qc_target,
     save_view_qc_state,
     summarize_view_qc_state,
@@ -84,6 +85,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--target", required=True)
     parser.add_argument(
+        "--model-input-manifest",
+        type=Path,
+        help=(
+            "optional source-linked manifest containing the model representation "
+            "to copy for both exemplars and evaluation inputs"
+        ),
+    )
+    parser.add_argument(
+        "--model-image-column",
+        default="model_image_path",
+        help="image column in --model-input-manifest",
+    )
+    parser.add_argument(
         "--operational-target",
         help=(
             "completed campaign/baseline target when --target is one component "
@@ -116,11 +130,37 @@ def _copy_image(source: Path, destination: Path) -> None:
     os.chmod(destination, 0o600)
 
 
+def _resolve_relative_image(root: Path, raw_path: object, *, description: str) -> Path:
+    relative = Path(str(raw_path))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError(f"{description} must be a safe relative path")
+    resolved = (root / relative).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as error:
+        raise ValueError(f"{description} escapes its manifest root") from error
+    if not resolved.is_file():
+        raise FileNotFoundError(f"{description} is missing")
+    return resolved
+
+
 def run_from_args(args: argparse.Namespace) -> dict[str, int]:
     """Create one immutable-input mechanism experiment without source identifiers."""
     campaign_dir = args.campaign_dir.resolve()
     baseline_path = args.baseline_run.resolve()
     out_dir = args.out_dir.resolve()
+    model_input_path = (
+        args.model_input_manifest.resolve()
+        if args.model_input_manifest is not None
+        else None
+    )
+    model_image_column = str(args.model_image_column).strip()
+    if not model_image_column:
+        raise ValueError("--model-image-column must be nonempty")
+    if model_input_path is not None and model_image_column == "image_path":
+        raise ValueError(
+            "--model-image-column must preserve canonical image_path separately"
+        )
     target = normalize_view_qc_target(args.target)
     raw_operational_target = getattr(args, "operational_target", None)
     operational_target = (
@@ -133,12 +173,61 @@ def run_from_args(args: argparse.Namespace) -> dict[str, int]:
     manifest_path = campaign_dir / "manifest.parquet"
     state_path = campaign_dir / "view_qc_state.json"
     events_path = campaign_dir / "view_qc_events.jsonl"
-    for path in (manifest_path, state_path, events_path, baseline_path):
+    source_paths = [manifest_path, state_path, events_path, baseline_path]
+    if model_input_path is not None:
+        source_paths.append(model_input_path)
+    for path in source_paths:
         if not path.is_file():
             raise FileNotFoundError(f"few-shot source input not found: {path}")
 
     manifest = pd.read_parquet(manifest_path)
     validate_view_manifest_columns(manifest.columns, str(manifest_path))
+    manifest = manifest.copy()
+    manifest["view_id"] = manifest["view_id"].map(normalize_view_id)
+    if manifest["view_id"].duplicated().any():
+        raise ValueError("few-shot source manifest contains duplicate view IDs")
+    campaign_images = {
+        str(row.view_id): _resolve_relative_image(
+            campaign_dir,
+            row.image_path,
+            description="few-shot canonical image",
+        )
+        for row in manifest.itertuples(index=False)
+    }
+    model_images: dict[str, Path] | None = None
+    if model_input_path is not None:
+        model_manifest = pd.read_parquet(model_input_path)
+        validate_view_manifest_columns(model_manifest.columns, str(model_input_path))
+        if model_image_column not in model_manifest.columns:
+            raise ValueError(
+                "few-shot model-input manifest lacks model image column: "
+                + model_image_column
+            )
+        model_manifest = model_manifest.copy()
+        model_manifest["view_id"] = model_manifest["view_id"].map(normalize_view_id)
+        if model_manifest["view_id"].duplicated().any():
+            raise ValueError(
+                "few-shot model-input manifest contains duplicate view IDs"
+            )
+        if set(model_manifest["view_id"]) != set(manifest["view_id"]):
+            raise ValueError(
+                "few-shot model-input and campaign manifests cover different views"
+            )
+        canonical_by_view = manifest.set_index("view_id")["image_path"].astype(str)
+        model_canonical = model_manifest.set_index("view_id")["image_path"].astype(str)
+        if not model_canonical.equals(canonical_by_view.reindex(model_canonical.index)):
+            raise ValueError(
+                "few-shot model-input manifest changes canonical image lineage"
+            )
+        model_root = model_input_path.parent
+        model_images = {
+            str(row["view_id"]): _resolve_relative_image(
+                model_root,
+                row[model_image_column],
+                description="few-shot model image",
+            )
+            for row in model_manifest.to_dict("records")
+        }
     state = load_view_qc_state(state_path)
     events = load_view_qc_events(events_path)
     validate_view_qc_campaign_state(state, events, manifest["view_id"])
@@ -231,12 +320,18 @@ def run_from_args(args: argparse.Namespace) -> dict[str, int]:
     ):
         directory.mkdir(parents=True, mode=0o700)
         os.chmod(directory, 0o700)
+    if model_images is not None:
+        (evaluation_dir / "model_images").mkdir(mode=0o700)
+        os.chmod(evaluation_dir / "model_images", 0o700)
 
     exemplar_records = []
     for row in selected.sort_values("exemplar_order").to_dict("records"):
         image_name = f"{row['view_id']}.png"
         _copy_image(
-            campaign_dir / row["image_path"], exemplar_dir / "images" / image_name
+            campaign_images[row["view_id"]]
+            if model_images is None
+            else model_images[row["view_id"]],
+            exemplar_dir / "images" / image_name,
         )
         exemplar_records.append(
             {
@@ -257,9 +352,16 @@ def run_from_args(args: argparse.Namespace) -> dict[str, int]:
     for row in evaluation.sort_values("review_order", kind="stable").to_dict("records"):
         image_name = f"{row['view_id']}.png"
         _copy_image(
-            campaign_dir / row["image_path"], evaluation_dir / "images" / image_name
+            campaign_images[row["view_id"]], evaluation_dir / "images" / image_name
         )
-        evaluation_records.append({**row, "image_path": f"images/{image_name}"})
+        record = {**row, "image_path": f"images/{image_name}"}
+        if model_images is not None:
+            _copy_image(
+                model_images[row["view_id"]],
+                evaluation_dir / "model_images" / image_name,
+            )
+            record[model_image_column] = f"model_images/{image_name}"
+        evaluation_records.append(record)
     evaluation_manifest = pd.DataFrame(evaluation_records)
     evaluation_manifest_path = evaluation_dir / "manifest.parquet"
     evaluation_manifest.to_parquet(evaluation_manifest_path, index=False)
@@ -303,6 +405,13 @@ def run_from_args(args: argparse.Namespace) -> dict[str, int]:
             "events": sha256_file(events_path),
             "baseline_run": sha256_file(baseline_path),
         },
+        "model_input": None
+        if model_input_path is None
+        else {
+            "manifest": str(model_input_path),
+            "manifest_sha256": sha256_file(model_input_path),
+            "image_column": model_image_column,
+        },
         "examples": exemplar_manifest[
             ["source_review_order", "label", "exemplar_order", "role"]
         ].to_dict("records"),
@@ -326,6 +435,12 @@ def run_from_args(args: argparse.Namespace) -> dict[str, int]:
                 f"- exemplars: `{len(exemplar_manifest)}`",
                 f"- matched evaluation views: `{len(evaluation_manifest)}`",
                 "- exemplar and evaluation view IDs are disjoint",
+                "- model representation: "
+                + (
+                    "canonical image_path"
+                    if model_input_path is None
+                    else f"`{model_image_column}` from the frozen model-input manifest"
+                ),
                 "- all labels and model outputs come from the completed development panel",
                 "- this experiment does not read or modify the blinded holdout",
                 "",
