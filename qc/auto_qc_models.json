@@ -7,6 +7,9 @@
     "tensor_parallel_size": 4,
     "weight_format": "huggingface",
     "download_ignore_patterns": [],
+    "request_chat_template_kwargs": {
+      "enable_thinking": false
+    },
     "extra_args": [
       "--max-model-len",
       "32768",
@@ -38,6 +41,9 @@
     "tensor_parallel_size": 1,
     "weight_format": "huggingface",
     "download_ignore_patterns": [],
+    "request_chat_template_kwargs": {
+      "enable_thinking": false
+    },
     "environment": {
       "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER": "0",
       "VLLM_USE_FLASHINFER_SAMPLER": "0"
@@ -75,6 +81,9 @@
     "tensor_parallel_size": 1,
     "weight_format": "huggingface",
     "download_ignore_patterns": [],
+    "request_chat_template_kwargs": {
+      "enable_thinking": false
+    },
     "extra_args": [
       "--max-model-len",
       "8192",
@@ -104,6 +113,7 @@
       "model-*.safetensors",
       "model.safetensors.index.json"
     ],
+    "request_chat_template_kwargs": {},
     "extra_args": [
       "--tokenizer-mode",
       "mistral",

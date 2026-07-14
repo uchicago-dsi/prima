@@ -55,6 +55,10 @@ def require_protocol_contract(protocol: Any, *, arm_name: str) -> dict[str, Any]
             raise ValueError(f"challenge protocol model requires {field}")
     if not isinstance(model.get("serve_extra_args"), list):
         raise ValueError("challenge protocol model requires serve_extra_args")
+    if not isinstance(model.get("request_chat_template_kwargs"), dict):
+        raise ValueError(
+            "challenge protocol model requires request_chat_template_kwargs"
+        )
     runtime_versions = model.get("runtime_versions")
     if not isinstance(runtime_versions, dict) or not runtime_versions:
         raise ValueError("challenge protocol model requires runtime_versions")
@@ -172,6 +176,13 @@ def main() -> int:
                 )
         if settings.get("serve_extra_args") != contract["model"]["serve_extra_args"]:
             raise ValueError(f"run serve_extra_args do not match protocol: {run_path}")
+        if (
+            settings.get("request_chat_template_kwargs")
+            != contract["model"]["request_chat_template_kwargs"]
+        ):
+            raise ValueError(
+                f"run request_chat_template_kwargs do not match protocol: {run_path}"
+            )
         if settings.get("runtime_versions") != contract["model"]["runtime_versions"]:
             raise ValueError(f"run runtime versions do not match protocol: {run_path}")
         if settings.get("temperature") != 0.0:

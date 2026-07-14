@@ -157,6 +157,9 @@ class VLLMModelSpec:
     environment: tuple[tuple[str, str], ...]
     weight_format: str
     download_ignore_patterns: tuple[str, ...]
+    request_chat_template_kwargs: tuple[
+        tuple[str, bool | int | float | str | None], ...
+    ]
     revision: str | None = None
 
     @classmethod
@@ -218,6 +221,17 @@ class VLLMModelSpec:
                 f"model entry {key!r} download_ignore_patterns must be a list "
                 "of strings"
             )
+        raw_request_chat_template_kwargs = payload.get("request_chat_template_kwargs")
+        if not isinstance(raw_request_chat_template_kwargs, dict) or not all(
+            isinstance(name, str)
+            and name
+            and (value is None or isinstance(value, (bool, int, float, str)))
+            for name, value in raw_request_chat_template_kwargs.items()
+        ):
+            raise ValueError(
+                f"model entry {key!r} request_chat_template_kwargs must map "
+                "strings to JSON scalar values"
+            )
         raw_revision = payload.get("revision")
         revision = None
         if raw_revision is not None:
@@ -236,6 +250,9 @@ class VLLMModelSpec:
             environment=tuple(sorted(raw_environment.items())),
             weight_format=weight_format,
             download_ignore_patterns=tuple(raw_download_ignore_patterns),
+            request_chat_template_kwargs=tuple(
+                sorted(raw_request_chat_template_kwargs.items())
+            ),
             revision=revision,
         )
 

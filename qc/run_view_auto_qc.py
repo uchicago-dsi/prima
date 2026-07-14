@@ -177,6 +177,7 @@ def build_inference_settings(
         },
         "serve_environment": dict(model_spec.environment),
         "serve_extra_args": list(model_spec.extra_args),
+        "request_chat_template_kwargs": dict(model_spec.request_chat_template_kwargs),
         "request_timeout_seconds": int(args.request_timeout_seconds),
         "max_new_tokens": int(args.max_new_tokens),
         "temperature": 0.0,

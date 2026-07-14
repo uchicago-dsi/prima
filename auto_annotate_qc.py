@@ -3990,8 +3990,11 @@ class VLLMVisionAnnotator:
             "timeout": self.request_timeout_seconds,
         }
         extra_body: dict[str, Any] = {}
-        if self.disable_thinking:
-            extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+        request_chat_template_kwargs = dict(
+            self.model_spec.request_chat_template_kwargs
+        )
+        if self.disable_thinking and request_chat_template_kwargs:
+            extra_body["chat_template_kwargs"] = request_chat_template_kwargs
         if self.prompt_mode == "binary_tag_probe":
             extra_body["structured_outputs"] = {"choice": ["yes", "no"]}
         if extra_body:
