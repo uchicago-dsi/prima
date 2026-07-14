@@ -74,7 +74,7 @@ def build_hybrid_run(
         raise ValueError("visual run and hybrid target disagree")
 
     eligibility = pd.read_parquet(eligibility_path)
-    required = {"view_id", "is_standard_mirai_view", "exclusion_reasons"}
+    required = {"view_id", "is_mirai_source_eligible", "exclusion_reasons"}
     missing = sorted(required - set(eligibility.columns))
     if missing:
         raise ValueError("eligibility audit is missing columns: " + ", ".join(missing))
@@ -97,7 +97,7 @@ def build_hybrid_run(
             "visual_run_sha256": sha256_file(visual_run_path),
             "eligibility_audit_file": str(eligibility_path),
             "eligibility_audit_sha256": sha256_file(eligibility_path),
-            "deterministic_rule": "nonstandard_mirai_view_reasons is nonempty",
+            "deterministic_rule": "mirai_source_eligibility_reasons is nonempty",
         },
     )
     hybrid["backend"] = "derived_dicom_or_visual"
@@ -110,7 +110,7 @@ def build_hybrid_run(
             minimum_confidence=minimum_confidence,
         )
         deterministic_positive = not bool(
-            eligibility.at[view_id, "is_standard_mirai_view"]
+            eligibility.at[view_id, "is_mirai_source_eligible"]
         )
         reasons = []
         if deterministic_positive:

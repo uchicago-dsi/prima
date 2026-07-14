@@ -27,6 +27,19 @@ CLI entrypoints live under `analysis/`, `exports/`, `ops/`, `pipelines/`, `qc/`,
 - Decision records should include: what action was taken, why, evidence used, files or artifacts touched, and the next check condition.
 - Keep durable automation conventions in `AGENTS.md`; keep live campaign state in the notebook or a handoff doc, not here.
 
+## Baseline Retention And Scoped Falsification
+
+- Keep the best valid baseline active until a prospectively defined successor
+  beats it on the same decision readouts.
+- Attribute failure only to the changed delta. Failure of an additive or rescue
+  arm rejects the addition or combination, not unchanged baseline components.
+- Before pivoting, record the baseline, delta, result, exact hypothesis
+  falsified, hypotheses not falsified, and retained active path in the canonical
+  notebook.
+- Stop rules must state their exact scope. Do not retire a parent method family
+  from failure of a broader prompt, extension, or challenger unless the parent
+  itself was directly tested and failed.
+
 ## Lab Notebooks
 
 - Use one canonical lab notebook per working environment, not one notebook per thread, conversation, campaign, or narrow experiment.

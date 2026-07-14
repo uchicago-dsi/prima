@@ -108,7 +108,9 @@ from prima.dicom_source import (
 from prima.view_selection import (
     estimate_magnification_factor,
     estimate_pixel_spacing_mm,
-    nonstandard_mirai_view_reasons,
+    is_for_presentation,
+    mammography_laterality,
+    mirai_source_eligibility_reasons,
     view_modifier_code_meanings,
     view_selection_key,
 )
@@ -413,11 +415,10 @@ def extract_all_tags(ds: FileDataset, sop_instance_uid: str) -> Dict[str, str]:
 
 def infer_view_identity(ds: FileDataset) -> Tuple[str, str]:
     """Read a diagnostic view's laterality and raw ViewPosition."""
-    lat = get_tag(ds, (0x0020, 0x0062)) or get_tag(ds, (0x0020, 0x0060))
+    lat = mammography_laterality(ds)
     vp = get_tag(ds, (0x0018, 0x5101))
-    if lat is None or vp is None:
+    if not lat or vp is None:
         raise ValueError("missing laterality or ViewPosition")
-    lat = lat.strip().upper()
     vp = vp.strip().upper()
     if lat not in {"L", "R"}:
         raise ValueError(f"unexpected laterality: {lat}")
@@ -427,28 +428,10 @@ def infer_view_identity(ds: FileDataset) -> Tuple[str, str]:
 def infer_view_fields(ds: FileDataset) -> Tuple[str, str]:
     """Infer laterality (L/R) and a standard, unmodified CC/MLO view."""
     lat, vp = infer_view_identity(ds)
-    nonstandard_reasons = nonstandard_mirai_view_reasons(ds)
-    if nonstandard_reasons:
-        raise ValueError("non-standard Mirai view: " + "; ".join(nonstandard_reasons))
+    eligibility_reasons = mirai_source_eligibility_reasons(ds)
+    if eligibility_reasons:
+        raise ValueError("Mirai-ineligible source: " + "; ".join(eligibility_reasons))
     return lat, vp
-
-
-def is_for_presentation(ds: FileDataset) -> bool:
-    """True if PresentationIntentType == 'FOR PRESENTATION'.
-
-    Checks both (0x0008, 0x0068) PresentationIntentType and (0x0008, 0x0069) Presentation Intent Type.
-    """
-    # Try PresentationIntentType first (0x0008, 0x0068)
-    pit = get_tag(ds, (0x0008, 0x0068), "")
-    if pit and str(pit).strip().upper() == "FOR PRESENTATION":
-        return True
-
-    # Try Presentation Intent Type (0x0008, 0x0069) as fallback
-    pit_alt = get_tag(ds, (0x0008, 0x0069), "")
-    if pit_alt and str(pit_alt).strip().upper() == "FOR PRESENTATION":
-        return True
-
-    return False
 
 
 def has_implant(ds: FileDataset) -> bool:
@@ -602,7 +585,6 @@ def _save_debug_figure(
                 f"  (0x0020,0x0060) ImageLaterality: {get_tag(ds, (0x0020, 0x0060), 'MISSING')}",
                 f"  (0x0018,0x5101) ViewPosition: {get_tag(ds, (0x0018, 0x5101), 'MISSING')}",
                 f"  (0x0008,0x0068) PresentationIntentType: {get_tag(ds, (0x0008, 0x0068), 'MISSING')}",
-                f"  (0x0008,0x0069) Presentation Intent Type: {get_tag(ds, (0x0008, 0x0069), 'MISSING')}",
             ]
         )
 
@@ -849,8 +831,8 @@ def _process_exam_dir(
                     ),
                 }
 
-                nonstandard_reasons = nonstandard_mirai_view_reasons(ds)
-                if nonstandard_reasons:
+                eligibility_reasons = mirai_source_eligibility_reasons(ds)
+                if eligibility_reasons:
                     exclusion_row = dict(row_data)
                     exclusion_row.pop("_materialized_dicom_path")
                     exclusion_row.update(
@@ -868,12 +850,12 @@ def _process_exam_dir(
                             "paddle_description": str(
                                 ds.get("PaddleDescription", "") or ""
                             ).strip(),
-                            "exclusion_reasons": json.dumps(list(nonstandard_reasons)),
+                            "exclusion_reasons": json.dumps(list(eligibility_reasons)),
                         }
                     )
                     exclusion_rows.append(exclusion_row)
                     if debug_dir:
-                        reason = "; ".join(nonstandard_reasons)
+                        reason = "; ".join(eligibility_reasons)
                         logger.warning(f"  EXCLUDE: {p.name} - {reason}")
                         _save_debug_figure(
                             ds,

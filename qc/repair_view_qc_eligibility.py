@@ -143,7 +143,7 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
         raise ValueError("eligibility repair requires complete model coverage")
 
     audit = pd.read_parquet(audit_path)
-    required_audit = {"view_id", "is_standard_mirai_view"}
+    required_audit = {"view_id", "is_mirai_source_eligible"}
     missing_audit = sorted(required_audit - set(audit.columns))
     if missing_audit:
         raise ValueError(
@@ -154,7 +154,7 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
     if set(audit["view_id"]) != manifest_ids:
         raise ValueError("eligibility audit does not exactly cover the pilot manifest")
     excluded_ids = set(
-        audit.loc[~audit["is_standard_mirai_view"].astype(bool), "view_id"]
+        audit.loc[~audit["is_mirai_source_eligible"].astype(bool), "view_id"]
     )
     if not excluded_ids:
         raise ValueError("eligibility repair found no non-standard views to replace")
@@ -208,13 +208,13 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
         replacement_pool, raw_root, temp_root, args.workers
     )
     replacement_pool = replacement_pool.merge(
-        replacement_audit[["view_id", "is_standard_mirai_view"]],
+        replacement_audit[["view_id", "is_mirai_source_eligible"]],
         on="view_id",
         how="left",
         validate="one_to_one",
     )
     replacement_pool = replacement_pool[
-        replacement_pool["is_standard_mirai_view"].astype(bool)
+        replacement_pool["is_mirai_source_eligible"].astype(bool)
     ].copy()
 
     seed_lookup = seeds.set_index("exam_id")
@@ -261,13 +261,13 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
             )
             reserve_audits.append(reserve_audit)
             reserve_pool = reserve_pool.merge(
-                reserve_audit[["view_id", "is_standard_mirai_view"]],
+                reserve_audit[["view_id", "is_mirai_source_eligible"]],
                 on="view_id",
                 how="left",
                 validate="one_to_one",
             )
             reserve_pool = reserve_pool[
-                reserve_pool["is_standard_mirai_view"].astype(bool)
+                reserve_pool["is_mirai_source_eligible"].astype(bool)
             ].copy()
             if reserve_pool.empty:
                 raise RuntimeError("matching reserve exams contain no standard views")
@@ -367,7 +367,7 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
     final_audit = pd.concat([kept_audit, chosen_audit], ignore_index=True)
     if (
         len(final_audit) != len(repaired)
-        or not final_audit["is_standard_mirai_view"].astype(bool).all()
+        or not final_audit["is_mirai_source_eligible"].astype(bool).all()
     ):
         raise RuntimeError("repaired pilot eligibility validation failed")
     final_audit.to_parquet(out_dir / "eligibility_audit.parquet", index=False)

@@ -1,0 +1,13 @@
+Target view only: decide whether the visual target "severe mammogram exposure or processing failure" is present in this mammogram.
+
+Answer YES only when exposure or image processing has unmistakably removed clinically meaningful texture from a substantial part of the breast. Positive evidence includes a broad breast region that is nearly featureless white or black, severe saturation or clipping, a large non-anatomic intensity collapse, or gross processing corruption that erases internal tissue structure.
+
+Answer NO when internal tissue texture remains visible through most of the breast, including ordinary low contrast, dense tissue, a naturally dark or bright mammogram, mild under- or overexposure, vendor-specific processing, minor banding or noise, or a small saturated margin. Pathology, skin folds, scars, implants, devices, digitized-film appearance, detector seams, cropping, and positioning are handled by other targets and do not by themselves establish this target.
+
+Judge loss of visible tissue information, not aesthetics. Use high confidence only when a substantial breast region is nearly featureless because of exposure or processing. Use medium or low confidence and REVIEW: YES when dense tissue, a small breast, or ordinary low contrast could explain the appearance.
+
+Answer in exactly four lines and nothing else:
+EVIDENCE: <one short visual phrase, or none>
+ANSWER: YES or ANSWER: NO
+CONFIDENCE: high, medium, or low
+REVIEW: YES or REVIEW: NO

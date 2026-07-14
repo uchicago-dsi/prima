@@ -1,0 +1,13 @@
+Target view only: decide whether the visual target "visible catheter or long procedural tubing" is present in this mammogram.
+
+Answer YES when a catheter or other long procedural tube is visibly traversing the breast or chest field, even if its reservoir, port, or external connector is outside the image or only partly visible. Positive evidence includes a long, smooth, relatively uniform radiopaque tube with a continuous course, a tube connected to a port or other device, or unmistakable procedural tubing that crosses a substantial part of the field.
+
+Answer NO for normal vessels, ducts, skin folds, scar or nipple marker wires, a short localization clip, biopsy or surgical clips, calcifications, detector seams, film scratches, text, or compression hardware. A thin line is not enough: it should have a convincing tubular course, device connection, repeated parallel walls, or other procedural context. Breast implant shells and ordinary localization wires are handled by other targets.
+
+Use high confidence only when catheter or tubing morphology is unmistakable. Use medium or low confidence and REVIEW: YES when a line could instead be anatomy, a skin/scar marker, a film artifact, or a detector boundary.
+
+Answer in exactly four lines and nothing else:
+EVIDENCE: <one short visual phrase, or none>
+ANSWER: YES or ANSWER: NO
+CONFIDENCE: high, medium, or low
+REVIEW: YES or REVIEW: NO

@@ -19,7 +19,11 @@ import pandas as pd
 from prima.dicom_source import SOURCE_COLUMNS, read_dicom_source, require_source_columns
 from prima.view_qc import normalize_view_id, validate_view_manifest_columns
 from prima.view_selection import (
-    nonstandard_mirai_view_reasons,
+    burned_in_annotation_value,
+    has_overlay_data,
+    mammography_laterality,
+    mirai_source_eligibility_reasons,
+    presentation_intent_type,
     view_modifier_code_meanings,
 )
 
@@ -47,13 +51,17 @@ def audit_source(
         verify_sha256=False,
         temp_root=temp_root,
     )
-    reasons = nonstandard_mirai_view_reasons(dataset)
+    reasons = mirai_source_eligibility_reasons(dataset)
     return {
         "view_id": normalize_view_id(row["sha256"]),
-        "is_standard_mirai_view": not reasons,
+        "is_mirai_source_eligible": not reasons,
+        "laterality": mammography_laterality(dataset),
         "view_position": str(dataset.get("ViewPosition", "") or "").strip(),
+        "presentation_intent_type": presentation_intent_type(dataset),
         "view_modifiers": " | ".join(view_modifier_code_meanings(dataset)),
         "partial_view": str(dataset.get("PartialView", "") or "").strip(),
+        "burned_in_annotation": burned_in_annotation_value(dataset),
+        "has_overlay_data": has_overlay_data(dataset),
         "exclusion_reasons": " | ".join(reasons),
     }
 
@@ -124,7 +132,7 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
     audit.to_parquet(output_path, index=False)
     os.chmod(output_path, 0o600)
 
-    excluded = audit[~audit["is_standard_mirai_view"].astype(bool)]
+    excluded = audit[~audit["is_mirai_source_eligible"].astype(bool)]
     reason_counts = Counter(excluded["exclusion_reasons"].astype(str))
     restricted_json(
         summary_path,
@@ -137,8 +145,12 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
             "candidates": str(candidates_path),
             "raw_root": str(raw_root),
             "views": int(len(audit)),
-            "standard_views": int(audit["is_standard_mirai_view"].sum()),
+            "eligible_sources": int(audit["is_mirai_source_eligible"].sum()),
             "excluded_views": int(len(excluded)),
+            "burned_in_annotation_yes": int(
+                audit["burned_in_annotation"].astype(str).str.upper().eq("YES").sum()
+            ),
+            "sources_with_overlay_data": int(audit["has_overlay_data"].sum()),
             "exclusion_reason_counts": dict(sorted(reason_counts.items())),
         },
     )
@@ -148,10 +160,10 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
 def main() -> int:
     args = parse_args()
     audit = run_from_args(args)
-    standard = int(audit["is_standard_mirai_view"].sum())
+    eligible = int(audit["is_mirai_source_eligible"].sum())
     print(
         f"view eligibility audited: views={len(audit)} "
-        f"standard={standard} excluded={len(audit) - standard}"
+        f"eligible={eligible} excluded={len(audit) - eligible}"
     )
     print(f"output: {args.output.resolve()}")
     return 0

@@ -102,7 +102,7 @@ def main() -> int:
     if set(eligibility["view_id"]) != set(group["view_id"]):
         raise ValueError("eligibility audit does not cover the group manifest")
     group = group.merge(
-        eligibility[["view_id", "is_standard_mirai_view", "exclusion_reasons"]],
+        eligibility[["view_id", "is_mirai_source_eligible", "exclusion_reasons"]],
         on="view_id",
         how="left",
         validate="one_to_one",
@@ -117,7 +117,7 @@ def main() -> int:
     group["human_visual_target_present"] = group["view_id"].map(
         lambda value: labels[value]["label"] == VIEW_LABEL_PRESENT
     )
-    group["deterministic_target_present"] = ~group["is_standard_mirai_view"].astype(
+    group["deterministic_target_present"] = ~group["is_mirai_source_eligible"].astype(
         bool
     )
     group["human_target_present"] = (

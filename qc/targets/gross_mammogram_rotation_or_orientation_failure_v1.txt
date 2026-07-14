@@ -1,0 +1,13 @@
+Target view only: decide whether the visual target "gross mammogram rotation or orientation failure" is present in this mammogram.
+
+Answer YES only when the displayed mammogram has an unmistakable gross orientation error, such as an approximately 90-degree rotation that makes the breast and chest-wall geometry run sideways across the frame, an upside-down display, or another severe transposition that cannot serve as an ordinary displayed CC or MLO input.
+
+Answer NO for normal left-versus-right mirror appearance, the expected diagonal pectoral muscle in an MLO view, ordinary breast or detector tilt, mild rotation, imperfect positioning, a non-profile nipple, partial posterior-tissue loss, or a breast whose shape is unusual but still recognizably displayed as a mammogram. Do not infer the target from text orientation alone. Cropping, exposure, film appearance, devices, and detector artifacts are handled by other targets.
+
+Use the full breast and chest-wall geometry. Use high confidence only for a gross, unmistakable orientation failure. Use medium or low confidence and REVIEW: YES when the appearance could be ordinary MLO obliquity, patient anatomy, or a slightly tilted image.
+
+Answer in exactly four lines and nothing else:
+EVIDENCE: <one short visual phrase, or none>
+ANSWER: YES or ANSWER: NO
+CONFIDENCE: high, medium, or low
+REVIEW: YES or REVIEW: NO

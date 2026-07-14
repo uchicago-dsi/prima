@@ -4,6 +4,26 @@ Canonical Prima notebook for work run from the DSI cluster. Append new experimen
 
 ## Current Summary
 
+- Active Mirai-input QC baseline: deterministic DICOM eligibility OR the frozen
+  six-component Qwen3.5-27B modular visual system. On the fresh 202-view,
+  32-exam whole-exam audit it scored TP=87, FN=6, FP=3, TN=106 (sensitivity
+  0.9355, specificity 0.9725). Its remaining visible gaps are severe
+  exposure/processing loss, gross rotation, and subtle catheter/tubing.
+- Settled negative additions: the broad whole-image-integrity prompt improved
+  sensitivity to 0.9785 but collapsed specificity to 0.7615; the frozen Mirai
+  embedding addition scored sensitivity 0.9677 and specificity 0.7339. These
+  results reject those additions, not the modular parent baseline.
+- The frozen single-image residual arms and a one-variable same-exam-context
+  falsifier did not pass their registered incremental gates. Exposure recovered
+  one clean severe-exposure miss without new false positives but missed its
+  two-recovery gate; rotation and tubing did not recover their intended misses.
+  These failures reject only those frozen deltas. Do not tune further on this
+  202-view development panel.
+- Next discriminative work: obtain a new patient/exam-disjoint, target-specific
+  reference for severe exposure/processing, gross rotation, and long
+  catheter/tubing before revising those components. Keep deterministic DICOM
+  eligibility and the modular visual system as the active path; require a new
+  whole-exam audit before any deployment claim.
 - Best current explanation: shared runtime caches were not the main culprit. The repaired FP8 path with `PRIMA_QWEN35_FP8_FORCE_BF16_EXPERTS=1` and eager bf16 experts now works end-to-end for the Qwen3.5-397B vertical-line retry3 ablation; baseline, fewshot, and recall_tilted all completed without the prior CUDA/device-side assert/CUBLAS/deep-gemm failure family.
 - Nearest good reference: `/net/projects2/annawoodard/qc_redo/submitit_runs/qwen397b_vertical_line_ablation_launchblocking_retry3_20260429_baseline_20260429_133323/submitit_logs/829144_0_log.err`
 - Nearest bad reference: `/net/projects2/annawoodard/qc_redo/submitit_runs/auto_qc_qwen397b_fp8_vertical_line_oneexam_bf16experts_normal_20260427_165351/submitit_logs/826096_0_log.err`
@@ -10260,3 +10280,90 @@ Decision impact: no runtime failure and no duplicate resubmit; still waiting on 
 - Sensemaking: 29 primary OR false positives occur in only 10 exams, with up to six in one exam; 22/29 are in multi-candidate-control or seam-fallback strata. The surviving primary misses are two severe exposure/processing-loss views and one gross 90-degree rotation. The nearest reference therefore moves from OOF AUC 0.966 to audit AUC 0.808 while errors cluster within exams, consistent with a 512-feature/120-label head learning acquisition/exam appearance rather than a stable per-candidate QC boundary. A falsifier would have been stable audit ranking plus only threshold miscalibration; the observed rank collapse and clustered false positives contradict that explanation.
 - Result: the frozen embedding rescue does not salvage automated QC. Full provenance and exact commands are in `qc_redo/review_batches/mirai_input_whole_exam_fallback_audit/embedding_classifier/README.md`; primary metrics SHA-256 is `79cc7281e34848cf295d14b607551bf5d6dbc08be91c5fdef2b08eec94675bfb`.
 - Decision impact: do not deploy and do not optimize against these 202 labels. If continuing supervised QC, the defensible next change is a substantially larger, exam-diverse weak-supervision set that includes multiple ranked candidates per exam plus hard usable controls, followed by a new untouched whole-exam panel. Another prompt sweep or larger language model does not address the observed correlated embedding errors.
+
+## 2026-07-14 - Modular QC baseline restored and falsification scope corrected
+
+- Question: did failure of the broad integrity prompt or frozen Mirai embedding
+  rescue justify abandoning the successful modular prompt family?
+- Action: reconstructed the experiment lineage against the nearest valid
+  baseline, corrected the live notebook summary, and added baseline-retention
+  and scoped-falsification rules to the repository guidance plus the shared
+  sensemaking and experiment-design skills.
+- Evidence: the original omnibus prompt scored sensitivity 0.9074 and
+  specificity 0.7879 on the 120-view development panel. The modular system then
+  scored sensitivity 0.9815 and specificity 0.9545 on that same panel. On the
+  fresh 202-view whole-exam audit, deterministic eligibility plus the unchanged
+  modular system scored sensitivity 0.9355 and specificity 0.9725. Adding the
+  broad integrity prompt reduced specificity to 0.7615; adding the embedding
+  classifier reduced specificity to 0.7339. The latter additions therefore
+  failed without directly falsifying the retained modular system.
+- Result: the previous instruction to stop generative prompt decomposition as
+  a family was overbroad. The active baseline is again deterministic DICOM
+  eligibility OR the frozen modular system. The broad residual prompt and
+  embedding rescue remain recorded negative challengers, not successors.
+- Decision impact: use the 202-view audit as development for three independent
+  residual targets—severe exposure/processing failure, gross rotation, and
+  visible catheter/tubing. Freeze the modular baseline, add one target at a
+  time, and reject only the failed delta. Combine useful additions only after
+  individual scoring, then require a new patient/exam-disjoint whole-exam panel
+  before any deployment claim.
+
+## 2026-07-14 09:57:30 CDT - Source eligibility consolidated and narrow residual deltas resolved
+
+- Question: which Mirai-input exclusions must come from acquisition metadata
+  rather than pixels, and can narrow prompt additions repair the retained
+  modular baseline's six residual misses without repeating the overbroad
+  baseline-abandonment error?
+- Action: replaced duplicate geometry-only checks with one shared source-level
+  eligibility rule requiring L/R laterality, CC/MLO ViewPosition, exact `FOR
+  PRESENTATION` intent, no `PartialView=YES`, and no explicit view modifier.
+  Audited BurnedInAnnotation and repeating-group overlay data without treating
+  either as automatic exclusion. Recomputed the frozen modular baseline,
+  preregistered three single-image prompt additions, scored each independently,
+  and then changed only the evidence format for a frozen same-exam-context
+  falsifier of the intended rotation and tubing misses. The delta comparator
+  now supports exact required review orders so an unrelated recovery cannot
+  satisfy a target-specific gate.
+- Eligibility evidence: all 202 source headers were readable; 168 are eligible
+  and 34 are excluded (24 implant-displaced modifiers, six magnification
+  modifiers, three partial-plus-spot, and one partial). All 202 are `FOR
+  PRESENTATION`; nine have BurnedInAnnotation=YES and none has standard overlay
+  data. The consolidated rule exactly reproduces the former eligibility result
+  on this panel and exactly reproduces every baseline view, slot, and exam
+  decision. A separate 120-view film reference shows BurnedInAnnotation=YES on
+  59/60 film positives and 0/60 negatives, but the one untagged positive and
+  vendor concentration make it a useful film signal rather than a universal
+  markup rule.
+- Single-image evidence: jobs `12889384`, `12889393`, and `12889394` completed
+  `0:0` with exact 202/202 model/debug coverage. Exposure produced TP=88, FN=5,
+  FP=3, TN=106, recovering one miss with no new false positives but failing its
+  preregistered minimum of two. Rotation produced TP=88, FN=5, FP=5, TN=104;
+  it recovered unrelated order 34, missed the obvious rotated order 177,
+  introduced false positives 75 and 157, and added two false exhausted slots.
+  Tubing made no change. Each failed delta was rejected; the baseline remained
+  TP=87, FN=6, FP=3, TN=106.
+- Context evidence: CPU builder `12889631` completed `0:0` with 202/202
+  target-dominant composites and three same-exam references per target. Frozen
+  context manifest SHA-256 is
+  `3f49092b05631ca5863b6f27bf59719d33fcea2dec08489008e0cc8fb6ec7a0d`.
+  H200 jobs `12889708` and `12889709` completed `0:0` with exact 202/202
+  run/debug coverage. Rotation context recovered no miss, added false positive
+  37, and added one false exhausted slot; tubing context made no change. Visual
+  sanity review confirmed the intended order-177 rotated target and order-24
+  faint catheter remained clear in valid composites, so malformed input does
+  not explain the negative result.
+- Validation: the maintained test suite passed 108 tests with one skip; full
+  repository Ruff format/check, compileall, and `git diff --check` passed.
+- Result: none of the frozen residual additions passes its registered gate and
+  none is combined. The failures falsify only those prompt/evidence deltas on
+  this development panel. They do not falsify deterministic eligibility, the
+  six frozen modular components, or their retained OR baseline. The exposure
+  prompt remains a plausible target-specific candidate, but its one clean
+  recovery is insufficient evidence for promotion.
+- Decision impact: stop tuning on these 202 labels. Keep pixel-invisible source
+  constraints deterministic, keep BurnedInAnnotation/overlay fields as audit
+  signals, and keep visual film/implant/device/artifact components separate.
+  The next model-development data should be a new patient/exam-disjoint,
+  target-enriched reference for exposure, rotation, and tubing; any successor
+  still requires a new whole-exam fallback audit before replacing the active
+  baseline.

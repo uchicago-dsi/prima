@@ -27,6 +27,23 @@ These requirements imply the following QC layers:
 - device-stratified performance reporting rather than visually rejecting an
   otherwise valid image solely because of manufacturer metadata.
 
+The shared deterministic source rule is implemented by
+`prima.view_selection.mirai_source_eligibility_reasons`. It rejects missing or
+unsupported laterality/projection, any intent other than `FOR PRESENTATION`,
+`PartialView == YES`, and any explicit view modifier. Exact four-slot exam
+membership and same-slot fallback remain exam-level checks rather than pixel
+classifier targets.
+
+`BurnedInAnnotation` and repeating-group overlay data are recorded by the
+source audit but are not interpreted as automatic markup truth. In the current
+SoT, all 2,524 selected views with `BurnedInAnnotation == YES` come from R2
+DigitalNow and cover all four slots of 631 exams; none has an untagged same-slot
+alternate. On the 120-view film reference, the tag identifies 59/60 visible
+film positives and 0/60 negatives, while one iCAD film positive is untagged.
+This makes it a vendor-specific film signal, not a complete definition of CAD
+or human markup. Keep the validated visual film target and audit markup pixels
+separately before introducing a hard metadata exclusion.
+
 ## CHiMEC validation-cohort comparability
 
 The Omoleye et al. cohort note records additional exclusions for implants,

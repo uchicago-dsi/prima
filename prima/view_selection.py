@@ -8,6 +8,38 @@ from typing import Optional, Tuple, Union
 from pydicom.dataset import FileDataset
 
 
+def mammography_laterality(ds: FileDataset) -> str:
+    """Return normalized image laterality, preferring ImageLaterality."""
+    return (
+        str(ds.get("ImageLaterality", ds.get("Laterality", "")) or "").strip().upper()
+    )
+
+
+def presentation_intent_type(ds: FileDataset) -> str:
+    """Return normalized DICOM PresentationIntentType."""
+    return str(ds.get("PresentationIntentType", "") or "").strip().upper()
+
+
+def is_for_presentation(ds: FileDataset) -> bool:
+    """Return whether the standard DICOM intent is FOR PRESENTATION."""
+    return presentation_intent_type(ds) == "FOR PRESENTATION"
+
+
+def burned_in_annotation_value(ds: FileDataset) -> str:
+    """Return normalized BurnedInAnnotation metadata without interpreting it."""
+    return str(ds.get("BurnedInAnnotation", "") or "").strip().upper()
+
+
+def has_overlay_data(ds: FileDataset) -> bool:
+    """Return whether any standard repeating overlay group contains pixel data."""
+    return any(
+        0x6000 <= int(tag.group) <= 0x601E
+        and int(tag.group) % 2 == 0
+        and int(tag.element) == 0x3000
+        for tag in ds.keys()
+    )
+
+
 def view_modifier_code_meanings(ds: FileDataset) -> tuple[str, ...]:
     """Return explicit mammography view modifiers from either DICOM location."""
     modifier_items = list(ds.get("ViewModifierCodeSequence", []) or [])
@@ -24,12 +56,20 @@ def view_modifier_code_meanings(ds: FileDataset) -> tuple[str, ...]:
     return tuple(meanings)
 
 
-def nonstandard_mirai_view_reasons(ds: FileDataset) -> tuple[str, ...]:
-    """Explain why a DICOM is not an unmodified full-field CC/MLO view."""
+def mirai_source_eligibility_reasons(ds: FileDataset) -> tuple[str, ...]:
+    """Explain why a source DICOM cannot fill a standard Mirai input slot."""
     reasons: list[str] = []
+    laterality = mammography_laterality(ds)
+    if laterality not in {"L", "R"}:
+        reasons.append(f"unsupported laterality {laterality or '<missing>'}")
     view_position = str(ds.get("ViewPosition", "") or "").strip().upper()
     if view_position not in {"CC", "MLO"}:
         reasons.append(f"unsupported ViewPosition {view_position or '<missing>'}")
+    presentation_intent = presentation_intent_type(ds)
+    if presentation_intent != "FOR PRESENTATION":
+        reasons.append(
+            "PresentationIntentType is " + (presentation_intent or "<missing>")
+        )
     if str(ds.get("PartialView", "") or "").strip().upper() == "YES":
         reasons.append("PartialView is YES")
     modifiers = view_modifier_code_meanings(ds)
@@ -38,9 +78,9 @@ def nonstandard_mirai_view_reasons(ds: FileDataset) -> tuple[str, ...]:
     return tuple(reasons)
 
 
-def is_standard_mirai_view(ds: FileDataset) -> bool:
-    """Return whether a DICOM is an unmodified full-field CC or MLO view."""
-    return not nonstandard_mirai_view_reasons(ds)
+def is_mirai_source_eligible(ds: FileDataset) -> bool:
+    """Return whether a source DICOM can fill a standard Mirai input slot."""
+    return not mirai_source_eligibility_reasons(ds)
 
 
 def to_float(value: object) -> Optional[float]:
@@ -88,14 +128,11 @@ def view_selection_key_from_dataset(
     ds: FileDataset, source_key: Union[str, Path]
 ) -> Tuple[float, int, float, str]:
     """Build a canonical view-selection key directly from a parsed DICOM dataset."""
-    reasons = nonstandard_mirai_view_reasons(ds)
+    reasons = mirai_source_eligibility_reasons(ds)
     if reasons:
-        raise ValueError("cannot select non-standard Mirai view: " + "; ".join(reasons))
-    presentation_intent = (
-        str(ds.get("PresentationIntentType", "") or "").strip().upper()
-    )
+        raise ValueError("cannot select Mirai-ineligible source: " + "; ".join(reasons))
     return view_selection_key(
-        for_presentation=(presentation_intent == "FOR PRESENTATION"),
+        for_presentation=True,
         estimated_magnification_factor=ds.get(
             "EstimatedRadiographicMagnificationFactor"
         ),

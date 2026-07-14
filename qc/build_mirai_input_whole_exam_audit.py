@@ -38,7 +38,11 @@ from prima.view_qc import (
     validate_rendered_view_png,
 )
 from prima.view_selection import (
-    nonstandard_mirai_view_reasons,
+    burned_in_annotation_value,
+    has_overlay_data,
+    mammography_laterality,
+    mirai_source_eligibility_reasons,
+    presentation_intent_type,
     view_modifier_code_meanings,
 )
 
@@ -273,20 +277,24 @@ def audit_selected_sources(
                     str(path), force=True, stop_before_pixels=True
                 )
                 validate_materialized_source(source, path, dataset)
-                reasons = nonstandard_mirai_view_reasons(dataset)
+                reasons = mirai_source_eligibility_reasons(dataset)
                 rows.append(
                     {
                         "view_id": normalize_view_id(record["sha256"]),
-                        "is_standard_mirai_view": not reasons,
+                        "is_mirai_source_eligible": not reasons,
+                        "laterality": mammography_laterality(dataset),
                         "view_position": str(
                             dataset.get("ViewPosition", "") or ""
                         ).strip(),
+                        "presentation_intent_type": presentation_intent_type(dataset),
                         "view_modifiers": " | ".join(
                             view_modifier_code_meanings(dataset)
                         ),
                         "partial_view": str(
                             dataset.get("PartialView", "") or ""
                         ).strip(),
+                        "burned_in_annotation": burned_in_annotation_value(dataset),
+                        "has_overlay_data": has_overlay_data(dataset),
                         "exclusion_reasons": " | ".join(reasons),
                     }
                 )
@@ -522,7 +530,7 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
         "exact_slots": int(group_manifest["audit_group_id"].nunique()),
         "candidate_views": int(len(manifest)),
         "nonstandard_dicom_candidates": int(
-            (~eligibility["is_standard_mirai_view"].astype(bool)).sum()
+            (~eligibility["is_mirai_source_eligible"].astype(bool)).sum()
         ),
         "max_render_pixels": int(args.max_render_pixels),
         "sampling_outputs_are_not_reference_labels": True,
