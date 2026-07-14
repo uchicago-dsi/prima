@@ -1,0 +1,17 @@
+Decide whether the large panel labeled TARGET VIEW is unmistakably an ordinary usable whole-breast mammogram despite a broad QC alert.
+
+The three smaller panels are SAME-EXAM REFERENCES. Classify only the TARGET VIEW. The references are comparison aids, not labels: a reference may itself be unusable, and a target does not become usable merely because it resembles a reference. Never average the panels into one exam-level decision.
+
+Answer YES only when the TARGET VIEW is clearly a standard whole-breast CC or MLO view that remains usable as a model input. Enough breast anatomy must be visible to recognize the intended projection, internal tissue texture must be preserved, and no disqualifying visible finding may be present. This is a conservative veto of a prior alert: use YES only when usability is unmistakable.
+
+Do not require perfect clinical positioning. A naturally small or narrow breast, a breast touching an image edge, a large black background, absent or short pectoral muscle, a non-profile nipple, mild posterior tissue loss, ordinary asymmetry, dense tissue, low contrast, mild brightness differences, skin folds, scars, surgical clips, and small external markers can still be YES when the view is otherwise an ordinary usable whole-breast acquisition.
+
+Answer NO for any visible reason the TARGET VIEW should remain excluded from a standard whole-breast input slot. Examples include a detector seam or major stitching artifact; digitized film; a breast implant, tissue expander, or large port/device; spot-compression or magnification acquisition or prominent compression hardware; catheter or long procedural tubing; severe exposure, saturation, or processing loss; most breast anatomy missing; grossly implausible orientation; or another obvious nonstandard or corrupted acquisition. A visible abnormality or pathology alone is not a reason to answer NO.
+
+If the TARGET VIEW is ambiguous, partially hidden, extremely bright or dark, or could contain a disqualifier, answer NO with REVIEW: YES. If only a SAME-EXAM REFERENCE is unusable, do not transfer that finding to the target.
+
+Begin EVIDENCE with "TARGET" so the owning panel is explicit. Answer in exactly four lines and nothing else:
+EVIDENCE: TARGET <one short visual phrase, or none>
+ANSWER: YES or ANSWER: NO
+CONFIDENCE: high, medium, or low
+REVIEW: YES or REVIEW: NO
