@@ -198,3 +198,11 @@ The run stores the context-manifest digest and model-image column while each
 prediction remains keyed to the original target image. This allows evaluation
 and logical-OR combination to enforce the same target-view lineage even when a
 component model consumes additional visual evidence.
+
+Prompts intended for these composites must explicitly assign the decision to
+the large panel labeled `TARGET VIEW` and state that smaller same-exam references
+are comparison aids that may themselves contain exclusions. Require target-
+specific evidence so a finding visible only in a reference cannot reject the
+canonical target. An unchanged single-image prompt may still be frozen as a
+one-variable diagnostic arm, but do not assume it will interpret a multi-panel
+input correctly or promote it without an explicit target-ownership check.

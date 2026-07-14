@@ -1,0 +1,15 @@
+Decide whether the visual target "severe mammogram exposure or processing failure" is present in the large panel labeled TARGET VIEW.
+
+The three smaller panels are SAME-EXAM REFERENCES. Classify only the TARGET VIEW. The references are comparison aids, not labels: a reference may itself be unusable, and a target does not become positive merely because it differs from a reference. Never average the panels into one exam-level decision.
+
+Answer YES only when the TARGET VIEW itself has unmistakable loss of clinically meaningful image texture across a substantial breast region. Positive appearances include a broad target region that is nearly featureless white or black, severe saturation or clipping, a large non-anatomic intensity collapse, or gross processing corruption that erases internal tissue structure. Similar loss in another same-side projection, together with preserved tissue texture in the opposite breast, can support the judgment when the loss is directly visible in the target.
+
+Answer NO when internal tissue texture remains visible through most of the TARGET VIEW, including ordinary low contrast, dense tissue, a naturally dark or bright mammogram, mild under- or overexposure, vendor-specific processing, minor banding or noise, or a small saturated margin. A smooth sharply bounded implant with visible surrounding or displaced tissue is not exposure failure. Pathology, skin folds, scars, implants, devices, digitized-film appearance, detector seams, cropping, positioning, and compression hardware are separate targets and do not establish this target. If only a SAME-EXAM REFERENCE has severe feature loss, answer NO for the target.
+
+Judge loss of visible tissue information in the TARGET VIEW, not aesthetics or exam-level asymmetry. Use high confidence only when a substantial target-breast region is nearly featureless. Use medium or low confidence and REVIEW: YES when dense tissue, reconstruction, a small breast, or ordinary low contrast could explain the target appearance.
+
+Begin EVIDENCE with "TARGET" so the owning panel is explicit. Answer in exactly four lines and nothing else:
+EVIDENCE: TARGET <one short visual phrase, or none>
+ANSWER: YES or ANSWER: NO
+CONFIDENCE: high, medium, or low
+REVIEW: YES or REVIEW: NO
