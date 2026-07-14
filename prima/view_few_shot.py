@@ -88,6 +88,8 @@ def load_view_few_shot_manifest(
     if frame["role"].isna().any() or not frame["role"].astype(str).str.strip().all():
         raise ValueError("view few-shot examples require nonempty roles")
     frame["role"] = frame["role"].astype(str).str.strip()
+    if frame["role"].str.contains(r"[\r\n]", regex=True).any():
+        raise ValueError("view few-shot roles must be single-line evidence phrases")
 
     excluded = {normalize_view_id(value) for value in excluded_view_ids}
     if set(frame["view_id"]) & excluded:

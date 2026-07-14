@@ -98,10 +98,26 @@ def parse_args() -> argparse.Namespace:
         help="image column in --model-input-manifest",
     )
     parser.add_argument(
+        "--excluded-score-manifest",
+        type=Path,
+        help=(
+            "optional scored manifest whose views and audit exams must be "
+            "disjoint from every exemplar"
+        ),
+    )
+    parser.add_argument(
         "--operational-target",
         help=(
             "completed campaign/baseline target when --target is one component "
             "of a broader operational union"
+        ),
+    )
+    parser.add_argument(
+        "--require-operational-example-label",
+        choices=(VIEW_LABEL_PRESENT, VIEW_LABEL_ABSENT),
+        help=(
+            "require each exemplar source to have this completed operational "
+            "campaign label before applying explicit component labels"
         ),
     )
     parser.add_argument(
@@ -154,6 +170,11 @@ def run_from_args(args: argparse.Namespace) -> dict[str, int]:
         if args.model_input_manifest is not None
         else None
     )
+    excluded_score_path = (
+        args.excluded_score_manifest.resolve()
+        if args.excluded_score_manifest is not None
+        else None
+    )
     model_image_column = str(args.model_image_column).strip()
     if not model_image_column:
         raise ValueError("--model-image-column must be nonempty")
@@ -176,6 +197,10 @@ def run_from_args(args: argparse.Namespace) -> dict[str, int]:
     source_paths = [manifest_path, state_path, events_path, baseline_path]
     if model_input_path is not None:
         source_paths.append(model_input_path)
+    if excluded_score_path is not None:
+        source_paths.extend(
+            [excluded_score_path, campaign_dir / "group_manifest.parquet"]
+        )
     for path in source_paths:
         if not path.is_file():
             raise FileNotFoundError(f"few-shot source input not found: {path}")
@@ -273,11 +298,24 @@ def run_from_args(args: argparse.Namespace) -> dict[str, int]:
         raise ValueError(
             "component few-shot experiments require one --example-label per --example"
         )
+    required_operational_label = args.require_operational_example_label
+    if required_operational_label is not None and operational_target is None:
+        raise ValueError(
+            "--require-operational-example-label requires --operational-target"
+        )
 
     selected_rows = []
     labels = state["labels"]
     for exemplar_order, (review_order, role) in enumerate(examples, start=1):
         row = by_order.loc[review_order].to_dict()
+        operational_label = labels[row["view_id"]]["label"]
+        if (
+            required_operational_label is not None
+            and operational_label != required_operational_label
+        ):
+            raise ValueError(
+                "few-shot exemplar does not have the required operational label"
+            )
         label = (
             explicit_labels[review_order]
             if operational_target is not None
@@ -298,6 +336,45 @@ def run_from_args(args: argparse.Namespace) -> dict[str, int]:
     selected = pd.DataFrame(selected_rows)
     if set(selected["label"]) != {VIEW_LABEL_PRESENT, VIEW_LABEL_ABSENT}:
         raise ValueError("few-shot examples must include positive and negative labels")
+
+    exclusion_provenance = None
+    if excluded_score_path is not None:
+        excluded = pd.read_parquet(excluded_score_path)
+        validate_view_manifest_columns(excluded.columns, str(excluded_score_path))
+        excluded = excluded.copy()
+        excluded["view_id"] = excluded["view_id"].map(normalize_view_id)
+        if excluded["view_id"].duplicated().any():
+            raise ValueError("excluded score manifest contains duplicate view IDs")
+        if not set(excluded["view_id"]).issubset(set(manifest["view_id"])):
+            raise ValueError("excluded score manifest is outside the source campaign")
+        group_path = campaign_dir / "group_manifest.parquet"
+        groups = pd.read_parquet(group_path)
+        required_group_columns = {"view_id", "audit_exam_id"}
+        if not required_group_columns.issubset(groups.columns):
+            raise ValueError("group manifest lacks view_id or audit_exam_id")
+        groups = groups[["view_id", "audit_exam_id"]].copy()
+        groups["view_id"] = groups["view_id"].map(normalize_view_id)
+        if groups["view_id"].duplicated().any():
+            raise ValueError("group manifest contains duplicate view IDs")
+        if set(groups["view_id"]) != set(manifest["view_id"]):
+            raise ValueError("group manifest coverage differs from the source campaign")
+        exam_by_view = groups.set_index("view_id")["audit_exam_id"]
+        selected_exam_ids = set(exam_by_view.loc[selected["view_id"]])
+        excluded_exam_ids = set(exam_by_view.loc[excluded["view_id"]])
+        if len(selected_exam_ids) != len(selected):
+            raise ValueError("few-shot exemplars must come from distinct audit exams")
+        if set(selected["view_id"]) & set(excluded["view_id"]):
+            raise ValueError("few-shot exemplars overlap the scored views")
+        if selected_exam_ids & excluded_exam_ids:
+            raise ValueError("few-shot exemplars overlap scored audit exams")
+        exclusion_provenance = {
+            "manifest": str(excluded_score_path),
+            "manifest_sha256": sha256_file(excluded_score_path),
+            "group_manifest_sha256": sha256_file(group_path),
+            "excluded_views": int(len(excluded)),
+            "selected_exam_count": int(len(selected_exam_ids)),
+            "exam_disjoint": True,
+        }
 
     selected_ids = set(selected["view_id"])
     safe_columns = [
@@ -412,6 +489,8 @@ def run_from_args(args: argparse.Namespace) -> dict[str, int]:
             "manifest_sha256": sha256_file(model_input_path),
             "image_column": model_image_column,
         },
+        "score_exclusion": exclusion_provenance,
+        "required_operational_example_label": required_operational_label,
         "examples": exemplar_manifest[
             ["source_review_order", "label", "exemplar_order", "role"]
         ].to_dict("records"),

@@ -51,6 +51,27 @@ TRANSPOSE_BY_CLOCKWISE_DEGREES = {
 }
 
 
+def parse_current_rotation(value: str) -> tuple[int, int]:
+    """Parse REVIEW_ORDER=DEGREES for a synthetic current display."""
+    raw_order, separator, raw_degrees = str(value).partition("=")
+    if not separator:
+        raise argparse.ArgumentTypeError(
+            "--current-rotation must use REVIEW_ORDER=DEGREES"
+        )
+    try:
+        review_order = int(raw_order)
+        degrees = int(raw_degrees)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "current rotation order and degrees must be integers"
+        ) from error
+    if review_order <= 0 or degrees not in TRANSPOSE_BY_CLOCKWISE_DEGREES:
+        raise argparse.ArgumentTypeError(
+            "current rotation requires a positive order and 90, 180, or 270 degrees"
+        )
+    return review_order, degrees
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
@@ -68,6 +89,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "render only A=current and B at this rotation using equal-scale "
             "square image boxes; omit for the four-way panel"
+        ),
+    )
+    parser.add_argument(
+        "--current-rotation",
+        type=parse_current_rotation,
+        action="append",
+        default=[],
+        help=(
+            "repeat REVIEW_ORDER=DEGREES to rotate candidate A before building "
+            "its comparison candidates"
         ),
     )
     parser.add_argument("--max-source-pixels", type=int, default=2_097_152)
@@ -129,8 +160,11 @@ def render_orientation_choice_png(
     declared_slot: str,
     max_source_pixels: int,
     comparison_rotation_degrees_clockwise: int | None,
+    current_rotation_degrees_clockwise: int = 0,
 ) -> None:
     """Render current display beside deterministic orientation candidates."""
+    if current_rotation_degrees_clockwise not in {0, *TRANSPOSE_BY_CLOCKWISE_DEGREES}:
+        raise ValueError("current-display rotation must be 0, 90, 180, or 270")
     validate_rendered_view_png(source_path, max_pixels=max_source_pixels)
     with Image.open(source_path) as source:
         source.load()
@@ -138,6 +172,10 @@ def render_orientation_choice_png(
     anatomy = grayscale.crop(substantial_foreground_box(grayscale))
     if anatomy.width < 2 or anatomy.height < 2:
         raise ValueError("orientation-choice anatomy crop is empty")
+    if current_rotation_degrees_clockwise:
+        anatomy = anatomy.transpose(
+            TRANSPOSE_BY_CLOCKWISE_DEGREES[current_rotation_degrees_clockwise]
+        )
 
     if comparison_rotation_degrees_clockwise is None:
         canvas_size = FOUR_WAY_CANVAS_SIZE
@@ -220,6 +258,13 @@ def run_from_args(args: argparse.Namespace) -> dict[str, Any]:
         )
     if args.max_source_pixels <= 0:
         raise ValueError("--max-source-pixels must be positive")
+    current_rotation_pairs = list(args.current_rotation)
+    current_rotation_orders = [order for order, _degrees in current_rotation_pairs]
+    if len(current_rotation_orders) != len(set(current_rotation_orders)):
+        raise ValueError("--current-rotation review orders must be unique")
+    if current_rotation_pairs and args.comparison_rotation_degrees_clockwise is None:
+        raise ValueError("--current-rotation requires a pairwise --comparison-rotation")
+    current_rotation_by_order = dict(current_rotation_pairs)
     image_column = str(args.input_image_column).strip()
     if not image_column:
         raise ValueError("--input-image-column must be nonempty")
@@ -245,6 +290,15 @@ def run_from_args(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("orientation-choice manifest is empty")
     if manifest["view_id"].duplicated().any():
         raise ValueError("orientation-choice manifest contains duplicate view IDs")
+    if manifest["review_order"].duplicated().any():
+        raise ValueError("orientation-choice manifest contains duplicate review_order")
+    missing_rotation_orders = sorted(
+        set(current_rotation_orders) - set(manifest["review_order"])
+    )
+    if missing_rotation_orders:
+        raise ValueError(
+            "--current-rotation review order is outside the source manifest"
+        )
     if not manifest["laterality"].isin({"L", "R"}).all():
         raise ValueError("orientation-choice manifest has non-L/R laterality")
     if not manifest["view"].isin({"CC", "MLO"}).all():
@@ -269,6 +323,9 @@ def run_from_args(args: argparse.Namespace) -> dict[str, Any]:
             max_source_pixels=args.max_source_pixels,
             comparison_rotation_degrees_clockwise=(
                 args.comparison_rotation_degrees_clockwise
+            ),
+            current_rotation_degrees_clockwise=current_rotation_by_order.get(
+                int(row["review_order"]), 0
             ),
         )
         model_paths[row["view_id"]] = output_path.relative_to(root).as_posix()
@@ -308,6 +365,10 @@ def run_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "input_image_column": image_column,
         "model_image_column": "model_image_path",
         "current_display_candidate": "A",
+        "synthetic_current_display_rotations_degrees_clockwise": {
+            str(order): current_rotation_by_order[order]
+            for order in sorted(current_rotation_by_order)
+        },
         "candidate_rotations_degrees_clockwise": candidate_rotations,
         "anatomy_crop": "substantial_foreground_box",
         "layout": layout,
@@ -325,6 +386,8 @@ def run_from_args(args: argparse.Namespace) -> dict[str, Any]:
                 f"- source image column: `{image_column}`",
                 "- model input column: `model_image_path`",
                 "- candidate A: current display",
+                "- synthetic candidate-A rotations by review order: "
+                f"`{dict(sorted(current_rotation_by_order.items()))}`",
                 f"- layout: `{layout}`",
                 f"- candidate rotations clockwise: `{candidate_rotations}`",
                 f"- ordered panel-bank SHA-256: `{panel_bank_digest}`",

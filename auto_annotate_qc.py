@@ -1315,15 +1315,17 @@ def build_few_shot_assistant_payload(
     *,
     prompt_mode: str,
     probe_tag: str | None,
+    evidence: str | None = None,
 ) -> str:
     """Render a human-labeled exemplar in the active target output format."""
+    evidence = evidence.strip() if evidence else "accepted human QC label"
     if prompt_mode == "tagger_json":
         payload = {
             "suggestions": [
                 {
                     "tag": tag,
                     "score": 1.0,
-                    "rationale": "accepted human QC label",
+                    "rationale": evidence,
                 }
                 for tag in annotations
             ]
@@ -1336,7 +1338,7 @@ def build_few_shot_assistant_payload(
         if prompt_mode == "binary_tag_probe":
             return "yes" if present else "no"
         return (
-            "EVIDENCE: human-reviewed reference label\n"
+            f"EVIDENCE: {evidence}\n"
             f"ANSWER: {'YES' if present else 'NO'}\n"
             "CONFIDENCE: high\n"
             "REVIEW: NO"
@@ -1345,6 +1347,21 @@ def build_few_shot_assistant_payload(
         label_text = ", ".join(annotations) if annotations else "none"
         return f"Human-reviewed QC labels: {label_text}."
     raise ValueError(f"unsupported prompt mode: {prompt_mode}")
+
+
+def build_few_shot_user_prompt(
+    *,
+    exemplar_index: int,
+    reference_type: str,
+    target_prompt_text: str,
+) -> str:
+    """Apply the target task itself to a labeled visual reference."""
+    return (
+        f"Labeled reference example {exemplar_index}. Apply the same QC target "
+        f"definition and decision rules below to this {reference_type}. The "
+        "accepted answer follows.\n\n"
+        f"{target_prompt_text}"
+    )
 
 
 def build_target_prompt_text(
@@ -3467,9 +3484,10 @@ class LocalVisionAnnotator:
                         },
                         {
                             "type": "text",
-                            "text": (
-                                f"Labeled reference example {idx}. "
-                                "Return the accepted QC labels for this montage."
+                            "text": build_few_shot_user_prompt(
+                                exemplar_index=idx,
+                                reference_type="montage",
+                                target_prompt_text=target_prompt_text,
                             ),
                         },
                     ],
@@ -3485,6 +3503,7 @@ class LocalVisionAnnotator:
                                 list(exemplar["annotations"]),
                                 prompt_mode=self.prompt_mode,
                                 probe_tag=self.probe_tag,
+                                evidence=exemplar.get("role"),
                             ),
                         }
                     ],
@@ -3856,10 +3875,10 @@ class VLLMVisionAnnotator:
                         },
                         {
                             "type": "text",
-                            "text": (
-                                f"Labeled reference example {idx}. "
-                                "Return the accepted QC label for this "
-                                f"{reference_type}."
+                            "text": build_few_shot_user_prompt(
+                                exemplar_index=idx,
+                                reference_type=reference_type,
+                                target_prompt_text=target_prompt_text,
                             ),
                         },
                     ],
@@ -3872,6 +3891,7 @@ class VLLMVisionAnnotator:
                         list(exemplar["annotations"]),
                         prompt_mode=self.prompt_mode,
                         probe_tag=self.probe_tag,
+                        evidence=exemplar.get("role"),
                     ),
                 }
             )
