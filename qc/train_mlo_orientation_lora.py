@@ -58,6 +58,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--lora-alpha", type=int, default=16)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
+    parser.add_argument("--precision", choices=("bf16", "fp16"), default="bf16")
     parser.add_argument("--seed", type=int, default=20260714)
     parser.add_argument("--max-new-tokens", type=int, default=1)
     return parser
@@ -480,10 +481,11 @@ def run_from_args(args: argparse.Namespace) -> dict[str, object]:
         "Qwen2VLForConditionalGeneration": Qwen2VLForConditionalGeneration,
     }
     model_class = model_classes[args.expected_model_architecture]
+    torch_dtype = torch.bfloat16 if args.precision == "bf16" else torch.float16
     model = model_class.from_pretrained(
         model_path,
         local_files_only=True,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch_dtype,
         attn_implementation="eager",
         low_cpu_mem_usage=True,
     ).to("cuda")
@@ -569,8 +571,8 @@ def run_from_args(args: argparse.Namespace) -> dict[str, object]:
         logging_steps=5,
         eval_strategy="epoch",
         save_strategy="no",
-        bf16=True,
-        fp16=False,
+        bf16=args.precision == "bf16",
+        fp16=args.precision == "fp16",
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         remove_unused_columns=False,
@@ -631,6 +633,7 @@ def run_from_args(args: argparse.Namespace) -> dict[str, object]:
             "lora_rank": args.lora_rank,
             "lora_alpha": args.lora_alpha,
             "lora_dropout": args.lora_dropout,
+            "precision": args.precision,
             "target_modules": (
                 "every torch.nn.Linear module in the vision and language model, "
                 "excluding lm_head"
