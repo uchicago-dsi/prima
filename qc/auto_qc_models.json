@@ -121,6 +121,30 @@
       "0"
     ]
   },
+  "smolvlm_2b": {
+    "repo_id": "HuggingFaceTB/SmolVLM-Instruct",
+    "revision": "81cd9a775a4d644f2faf4e7becff4559b46b14c7",
+    "directory_name": "SmolVLM-Instruct",
+    "served_model_name": "smolvlm_2b",
+    "tensor_parallel_size": 1,
+    "weight_format": "huggingface",
+    "download_ignore_patterns": [],
+    "request_chat_template_kwargs": {},
+    "extra_args": [
+      "--max-model-len",
+      "8192",
+      "--max-num-seqs",
+      "1",
+      "--gpu-memory-utilization",
+      "0.9",
+      "--generation-config",
+      "vllm",
+      "--limit-mm-per-prompt",
+      "{\"image\": 1}",
+      "--mm-processor-cache-gb",
+      "0"
+    ]
+  },
   "glm46v_fp8": {
     "repo_id": "zai-org/GLM-4.6V-FP8",
     "revision": "33172e26eb88482cf3d0a36fced01d05454734ec",

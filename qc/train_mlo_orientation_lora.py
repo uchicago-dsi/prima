@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train and score a Qwen2-VL LoRA on synthetic MLO orientation pairs."""
+"""Train and score an open VLM LoRA on synthetic MLO orientation pairs."""
 
 from __future__ import annotations
 
@@ -31,6 +31,10 @@ REQUIRED_RUNTIME = {
     "accelerate": "1.0.1",
     "peft": "0.13.2",
 }
+SUPPORTED_MODEL_ARCHITECTURES = (
+    "Idefics3ForConditionalGeneration",
+    "Qwen2VLForConditionalGeneration",
+)
 SPLITS = ("train", "validation", "challenge")
 
 
@@ -42,6 +46,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-manifest-sha256", required=True)
     parser.add_argument("--expected-model-repo-id", required=True)
     parser.add_argument("--expected-model-revision", required=True)
+    parser.add_argument(
+        "--expected-model-architecture",
+        choices=SUPPORTED_MODEL_ARCHITECTURES,
+        required=True,
+    )
     parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=2)
@@ -148,10 +157,13 @@ def _load_manifest(path: Path, expected_sha256: str) -> pd.DataFrame:
 
 
 def _validate_model_snapshot(
-    model_path: Path, expected_repo_id: str, expected_revision: str
+    model_path: Path,
+    expected_repo_id: str,
+    expected_revision: str,
+    expected_architecture: str,
 ) -> dict[str, Any]:
     if not model_path.is_dir():
-        raise FileNotFoundError(f"Qwen2-VL model snapshot not found: {model_path}")
+        raise FileNotFoundError(f"VLM model snapshot not found: {model_path}")
     provenance_path = model_path / "prima_snapshot.json"
     if not provenance_path.is_file():
         raise FileNotFoundError(
@@ -172,10 +184,10 @@ def _validate_model_snapshot(
     if not config_path.is_file():
         raise FileNotFoundError(f"model config not found: {config_path}")
     config = json.loads(config_path.read_text())
-    if config.get("architectures") != ["Qwen2VLForConditionalGeneration"]:
+    if config.get("architectures") != [expected_architecture]:
         raise RuntimeError(
-            "MLO orientation trainer requires Qwen2VLForConditionalGeneration; "
-            f"found={config.get('architectures')}"
+            "model architecture mismatch: "
+            f"expected={[expected_architecture]} found={config.get('architectures')}"
         )
     return provenance
 
@@ -394,13 +406,17 @@ def run_from_args(args: argparse.Namespace) -> dict[str, object]:
         raise FileExistsError(f"refusing to overwrite LoRA output: {output_dir}")
     manifest = _load_manifest(manifest_path, args.expected_manifest_sha256)
     model_provenance = _validate_model_snapshot(
-        model_path, args.expected_model_repo_id, args.expected_model_revision
+        model_path,
+        args.expected_model_repo_id,
+        args.expected_model_revision,
+        args.expected_model_architecture,
     )
 
     import torch
     from peft import LoraConfig, get_peft_model
     from transformers import (
         AutoProcessor,
+        Idefics3ForConditionalGeneration,
         Qwen2VLForConditionalGeneration,
         Trainer,
         TrainingArguments,
@@ -420,13 +436,16 @@ def run_from_args(args: argparse.Namespace) -> dict[str, object]:
     torch.cuda.manual_seed_all(args.seed)
 
     output_dir.mkdir(mode=0o700, parents=True)
-    processor = AutoProcessor.from_pretrained(
-        model_path,
-        local_files_only=True,
-        min_pixels=896 * 896,
-        max_pixels=896 * 896,
-    )
-    model = Qwen2VLForConditionalGeneration.from_pretrained(
+    processor_kwargs: dict[str, object] = {"local_files_only": True}
+    if args.expected_model_architecture == "Qwen2VLForConditionalGeneration":
+        processor_kwargs.update(min_pixels=896 * 896, max_pixels=896 * 896)
+    processor = AutoProcessor.from_pretrained(model_path, **processor_kwargs)
+    model_classes = {
+        "Idefics3ForConditionalGeneration": Idefics3ForConditionalGeneration,
+        "Qwen2VLForConditionalGeneration": Qwen2VLForConditionalGeneration,
+    }
+    model_class = model_classes[args.expected_model_architecture]
+    model = model_class.from_pretrained(
         model_path,
         local_files_only=True,
         torch_dtype=torch.bfloat16,
@@ -468,11 +487,19 @@ def run_from_args(args: argparse.Namespace) -> dict[str, object]:
         if isinstance(module, torch.nn.Linear) and name != "lm_head"
     )
     if not linear_target_modules:
-        raise RuntimeError("Qwen2-VL exposes no trainable linear adapter targets")
-    if not any(name.startswith("visual.") for name in linear_target_modules):
-        raise RuntimeError("Qwen2-VL adapter targets omit the vision tower")
-    if not any(name.startswith("model.") for name in linear_target_modules):
-        raise RuntimeError("Qwen2-VL adapter targets omit the language model")
+        raise RuntimeError("VLM exposes no trainable linear adapter targets")
+    tower_prefixes = {
+        "Idefics3ForConditionalGeneration": (
+            "model.vision_model.",
+            "model.text_model.",
+        ),
+        "Qwen2VLForConditionalGeneration": ("visual.", "model."),
+    }
+    vision_prefix, language_prefix = tower_prefixes[args.expected_model_architecture]
+    if not any(name.startswith(vision_prefix) for name in linear_target_modules):
+        raise RuntimeError("VLM adapter targets omit the vision tower")
+    if not any(name.startswith(language_prefix) for name in linear_target_modules):
+        raise RuntimeError("VLM adapter targets omit the language model")
     linear_target_modules_sha256 = hashlib.sha256(
         "\n".join(linear_target_modules).encode()
     ).hexdigest()
@@ -555,6 +582,7 @@ def run_from_args(args: argparse.Namespace) -> dict[str, object]:
         "model_path": str(model_path),
         "model_repo_id": model_provenance["repo_id"],
         "model_revision": model_provenance["revision"],
+        "model_architecture": args.expected_model_architecture,
         "runtime_versions": {
             **runtime_versions,
             "torch": torch.__version__,
