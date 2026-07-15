@@ -21,6 +21,53 @@ from qc.train_mlo_orientation_lora import (
 )
 
 
+def _paired_logit_contrast(
+    predictions: list[dict[str, object]],
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    import pandas as pd
+
+    frame = pd.DataFrame.from_records(predictions)
+    required = {
+        "source_view_id",
+        "split",
+        "rotation_degrees_clockwise",
+        "upright_minus_inverted_logit",
+    }
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise ValueError(f"pairwise logit predictions missing columns: {missing}")
+    paired_records: list[dict[str, object]] = []
+    for (_, _), pair in frame.groupby(["split", "source_view_id"]):
+        if len(pair) != 2 or set(pair["rotation_degrees_clockwise"]) != {0, 180}:
+            raise ValueError("pairwise logit contrast requires exact rotation pairs")
+        margins = {
+            int(row.rotation_degrees_clockwise): float(row.upright_minus_inverted_logit)
+            for row in pair.itertuples(index=False)
+        }
+        for row in pair.to_dict("records"):
+            rotation = int(row["rotation_degrees_clockwise"])
+            other_rotation = 180 if rotation == 0 else 0
+            paired_score = margins[rotation] - margins[other_rotation]
+            if paired_score > 0:
+                paired_label = "UPRIGHT"
+            elif paired_score < 0:
+                paired_label = "INVERTED"
+            else:
+                paired_label = None
+            paired_records.append(
+                {
+                    **row,
+                    "paired_logit_contrast": paired_score,
+                    "paired_predicted_label": paired_label,
+                }
+            )
+    score_records = [
+        {**record, "predicted_label": record["paired_predicted_label"]}
+        for record in paired_records
+    ]
+    return _score_by_split(score_records), paired_records
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
@@ -145,7 +192,9 @@ def run_from_args(args: argparse.Namespace) -> dict[str, object]:
         frame=evaluation_frame,
         manifest_root=manifest_path.parent,
         max_new_tokens=args.max_new_tokens,
+        include_class_logits=True,
     )
+    paired_scores, predictions = _paired_logit_contrast(predictions)
     result = {
         "schema_version": 1,
         "completed_at": datetime.now(timezone.utc).isoformat(),
@@ -165,6 +214,15 @@ def run_from_args(args: argparse.Namespace) -> dict[str, object]:
             "python": os.sys.version.split()[0],
         },
         "scores": _score_by_split(predictions),
+        "paired_logit_contrast": {
+            "method": (
+                "for each exact rotation pair, subtract the partner image's "
+                "UPRIGHT-minus-INVERTED class-logit margin from the current "
+                "image's margin; positive predicts UPRIGHT and negative predicts "
+                "INVERTED"
+            ),
+            "scores": paired_scores,
+        },
         "predictions": predictions,
     }
     output_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)

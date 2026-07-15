@@ -318,6 +318,7 @@ def _generate_predictions(
     frame: pd.DataFrame,
     manifest_root: Path,
     max_new_tokens: int,
+    include_class_logits: bool = False,
 ) -> list[dict[str, object]]:
     import torch
 
@@ -326,6 +327,13 @@ def _generate_predictions(
     prompt_text = processor.apply_chat_template(
         _messages(), tokenize=False, add_generation_prompt=True
     )
+    class_token_id_by_label: dict[str, int] = {}
+    if include_class_logits:
+        collator = OrientationCollator(processor, manifest_root)
+        class_token_id_by_label = {
+            label: collator.class_token_id_by_verbalizer[verbalizer]
+            for label, verbalizer in ORIENTATION_VERBALIZER_BY_LABEL.items()
+        }
     for row in frame.to_dict("records"):
         image_path, _ = resolve_relative_image(
             manifest_root, row["model_image_path"], description="model_image_path"
@@ -342,22 +350,52 @@ def _generate_predictions(
                 do_sample=False,
                 max_new_tokens=max_new_tokens,
                 use_cache=True,
+                return_dict_in_generate=include_class_logits,
+                output_scores=include_class_logits,
             )
+        if include_class_logits:
+            sequences = generated.sequences
+        else:
+            sequences = generated
         generated_text = processor.batch_decode(
-            generated[:, input_length:], skip_special_tokens=True
+            sequences[:, input_length:], skip_special_tokens=True
         )[0].strip()
-        records.append(
-            {
-                "sample_id": row["sample_id"],
-                "source_view_id": row["source_view_id"],
-                "source_review_order": int(row["source_review_order"]),
-                "split": row["split"],
-                "rotation_degrees_clockwise": int(row["rotation_degrees_clockwise"]),
-                "expected_label": row["expected_label"],
-                "generated_text": generated_text,
-                "predicted_label": parse_orientation_verbalizer(generated_text),
-            }
-        )
+        record = {
+            "sample_id": row["sample_id"],
+            "source_view_id": row["source_view_id"],
+            "source_review_order": int(row["source_review_order"]),
+            "split": row["split"],
+            "rotation_degrees_clockwise": int(row["rotation_degrees_clockwise"]),
+            "expected_label": row["expected_label"],
+            "generated_text": generated_text,
+            "predicted_label": parse_orientation_verbalizer(generated_text),
+        }
+        if include_class_logits:
+            if len(generated.scores) != 1:
+                raise RuntimeError(
+                    "orientation generation did not return one score row"
+                )
+            first_token_logits = generated.scores[0][0]
+            upright_logit = float(
+                first_token_logits[class_token_id_by_label["UPRIGHT"]]
+                .detach()
+                .float()
+                .cpu()
+            )
+            inverted_logit = float(
+                first_token_logits[class_token_id_by_label["INVERTED"]]
+                .detach()
+                .float()
+                .cpu()
+            )
+            record.update(
+                {
+                    "upright_class_logit": upright_logit,
+                    "inverted_class_logit": inverted_logit,
+                    "upright_minus_inverted_logit": upright_logit - inverted_logit,
+                }
+            )
+        records.append(record)
     return records
 
 
