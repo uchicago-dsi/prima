@@ -475,7 +475,7 @@ def run_from_args(args: argparse.Namespace) -> dict[str, object]:
         lr_scheduler_type="cosine",
         logging_strategy="steps",
         logging_steps=5,
-        evaluation_strategy="epoch",
+        eval_strategy="epoch",
         save_strategy="no",
         bf16=True,
         fp16=False,
@@ -487,7 +487,6 @@ def run_from_args(args: argparse.Namespace) -> dict[str, object]:
         optim="adamw_torch",
         max_grad_norm=1.0,
         seed=args.seed,
-        data_seed=args.seed,
     )
     trainer = Trainer(
         model=model,
