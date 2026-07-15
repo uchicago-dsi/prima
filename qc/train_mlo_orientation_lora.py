@@ -40,6 +40,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-path", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--expected-manifest-sha256", required=True)
+    parser.add_argument("--expected-model-repo-id", required=True)
     parser.add_argument("--expected-model-revision", required=True)
     parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
@@ -147,7 +148,7 @@ def _load_manifest(path: Path, expected_sha256: str) -> pd.DataFrame:
 
 
 def _validate_model_snapshot(
-    model_path: Path, expected_revision: str
+    model_path: Path, expected_repo_id: str, expected_revision: str
 ) -> dict[str, Any]:
     if not model_path.is_dir():
         raise FileNotFoundError(f"Qwen2-VL model snapshot not found: {model_path}")
@@ -157,12 +158,24 @@ def _validate_model_snapshot(
             f"model snapshot provenance not found: {provenance_path}"
         )
     provenance = json.loads(provenance_path.read_text())
-    if provenance.get("repo_id") != "Qwen/Qwen2-VL-2B-Instruct":
-        raise RuntimeError("model snapshot is not Qwen/Qwen2-VL-2B-Instruct")
+    if provenance.get("repo_id") != expected_repo_id:
+        raise RuntimeError(
+            "model repository mismatch: "
+            f"expected={expected_repo_id} found={provenance.get('repo_id')}"
+        )
     if provenance.get("revision") != expected_revision:
         raise RuntimeError(
             "model revision mismatch: "
             f"expected={expected_revision} found={provenance.get('revision')}"
+        )
+    config_path = model_path / "config.json"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"model config not found: {config_path}")
+    config = json.loads(config_path.read_text())
+    if config.get("architectures") != ["Qwen2VLForConditionalGeneration"]:
+        raise RuntimeError(
+            "MLO orientation trainer requires Qwen2VLForConditionalGeneration; "
+            f"found={config.get('architectures')}"
         )
     return provenance
 
@@ -381,7 +394,7 @@ def run_from_args(args: argparse.Namespace) -> dict[str, object]:
         raise FileExistsError(f"refusing to overwrite LoRA output: {output_dir}")
     manifest = _load_manifest(manifest_path, args.expected_manifest_sha256)
     model_provenance = _validate_model_snapshot(
-        model_path, args.expected_model_revision
+        model_path, args.expected_model_repo_id, args.expected_model_revision
     )
 
     import torch
@@ -532,7 +545,7 @@ def run_from_args(args: argparse.Namespace) -> dict[str, object]:
         "schema_version": 1,
         "completed_at": datetime.now(timezone.utc).isoformat(),
         "decision": (
-            "whether one-token image-dependent supervision lets a small open-weight "
+            "whether one-token image-dependent supervision lets this open-weight "
             "VLM adapter learn exam-disjoint MLO orientation and fix the frozen "
             "audit inversion challenge"
         ),
