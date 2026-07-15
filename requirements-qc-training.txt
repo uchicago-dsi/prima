@@ -1,0 +1,5 @@
+# Install in the existing prima environment after its CUDA-enabled Torch stack.
+# These pins match the validated Qwen2-VL adapter-training runtime on Randi.
+transformers==4.46.3
+accelerate==1.0.1
+peft==0.13.2
