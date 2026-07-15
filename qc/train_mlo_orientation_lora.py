@@ -400,7 +400,7 @@ def run_from_args(args: argparse.Namespace) -> dict[str, object]:
         model_path,
         local_files_only=True,
         torch_dtype=torch.bfloat16,
-        attn_implementation="sdpa",
+        attn_implementation="eager",
         low_cpu_mem_usage=True,
     ).to("cuda")
     evaluation_frame = manifest[manifest["split"].isin({"validation", "challenge"})]
