@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import hashlib
 import importlib.metadata
 import json
 import os
@@ -412,14 +413,45 @@ def run_from_args(args: argparse.Namespace) -> dict[str, object]:
         max_new_tokens=args.max_new_tokens,
     )
     base_scores = _score_by_split(base_predictions)
+    base_evaluation_path = output_dir / "base_evaluation.json"
+    base_evaluation_path.write_text(
+        json.dumps(
+            _json_safe(
+                {
+                    "schema_version": 1,
+                    "model_revision": model_provenance["revision"],
+                    "manifest_sha256": sha256_file(manifest_path),
+                    "scores": base_scores,
+                    "predictions": base_predictions,
+                }
+            ),
+            indent=2,
+        )
+        + "\n"
+    )
+    os.chmod(base_evaluation_path, 0o600)
 
     model.config.use_cache = False
+    linear_target_modules = sorted(
+        name
+        for name, module in model.named_modules()
+        if isinstance(module, torch.nn.Linear) and name != "lm_head"
+    )
+    if not linear_target_modules:
+        raise RuntimeError("Qwen2-VL exposes no trainable linear adapter targets")
+    if not any(name.startswith("visual.") for name in linear_target_modules):
+        raise RuntimeError("Qwen2-VL adapter targets omit the vision tower")
+    if not any(name.startswith("model.") for name in linear_target_modules):
+        raise RuntimeError("Qwen2-VL adapter targets omit the language model")
+    linear_target_modules_sha256 = hashlib.sha256(
+        "\n".join(linear_target_modules).encode()
+    ).hexdigest()
     lora_config = LoraConfig(
         r=args.lora_rank,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         bias="none",
-        target_modules="all-linear",
+        target_modules=linear_target_modules,
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora_config)
@@ -506,7 +538,12 @@ def run_from_args(args: argparse.Namespace) -> dict[str, object]:
             "lora_rank": args.lora_rank,
             "lora_alpha": args.lora_alpha,
             "lora_dropout": args.lora_dropout,
-            "target_modules": "all-linear including vision and language linear layers",
+            "target_modules": (
+                "every torch.nn.Linear module in the vision and language model, "
+                "excluding lm_head"
+            ),
+            "target_module_count": len(linear_target_modules),
+            "target_modules_sha256": linear_target_modules_sha256,
             "trainable_parameters": trainable_parameters,
             "total_parameters": total_parameters,
             "trainable_fraction": trainable_parameters / total_parameters,
