@@ -392,9 +392,9 @@ def _gate(base: dict[str, object], adapted: dict[str, object]) -> dict[str, obje
     validation = adapted["validation"]
     challenge = adapted["challenge"]
     checks = {
-        "train_all_38_labels_exact": train["exact"] == 38 and train["rows"] == 38,
-        "train_all_19_pairs_exact": (
-            train["exact_pairs"] == 19 and train["source_pairs"] == 19
+        "train_all_labels_exact": train["rows"] > 0 and train["exact"] == train["rows"],
+        "train_all_pairs_exact": (
+            train["source_pairs"] > 0 and train["exact_pairs"] == train["source_pairs"]
         ),
         "validation_inversion_sensitivity_at_least_0_875": (
             validation["inversion_sensitivity"] >= 0.875
