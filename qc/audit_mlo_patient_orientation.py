@@ -15,13 +15,13 @@ import sys
 import pandas as pd
 
 from prima.dicom_source import read_dicom_source, require_source_columns
+from prima.mlo_orientation import (
+    DICOM_PATIENT_ORIENTATION_STANDARD,
+    mlo_orientation_label_from_column_direction,
+    patient_orientation_directions,
+)
 from prima.view_few_shot import sha256_file
 from prima.view_qc import normalize_view_id
-
-DICOM_PATIENT_ORIENTATION_STANDARD = (
-    "https://dicom.nema.org/medical/dicom/current/output/chtml/part03/"
-    "sect_C.7.6.html#sect_C.7.6.1.1.1"
-)
 
 
 def parse_args() -> argparse.Namespace:
@@ -89,15 +89,6 @@ def _load_source_tables(
     tables["audit"] = _read_source(audit_path, description="audit")
     paths["audit_source_manifest"] = audit_path
     return tables, paths
-
-
-def _original_label(column_direction: str) -> str:
-    principal = column_direction[:1].upper()
-    if principal == "F":
-        return "UPRIGHT"
-    if principal == "H":
-        return "INVERTED"
-    return "UNKNOWN"
 
 
 def run_from_args(args: argparse.Namespace) -> dict[str, object]:
@@ -171,12 +162,9 @@ def run_from_args(args: argparse.Namespace) -> dict[str, object]:
             verify_sha256=False,
             temp_root=temp_root,
         )
-        orientation = [
-            str(value).strip().upper()
-            for value in dataset.get("PatientOrientation", [])
-        ]
-        row_direction = orientation[0] if len(orientation) >= 1 else ""
-        column_direction = orientation[1] if len(orientation) >= 2 else ""
+        row_direction, column_direction = patient_orientation_directions(
+            dataset.get("PatientOrientation")
+        )
         return {
             "source_key": record["source_key"],
             "source_pool": record["source_pool"],
@@ -187,7 +175,9 @@ def run_from_args(args: argparse.Namespace) -> dict[str, object]:
             "row_direction": row_direction,
             "column_direction": column_direction,
             "column_principal_direction": column_direction[:1],
-            "dicom_original_label": _original_label(column_direction),
+            "dicom_original_label": mlo_orientation_label_from_column_direction(
+                column_direction
+            ),
             "field_of_view_rotation": str(dataset.get("FieldOfViewRotation", "")),
             "field_of_view_horizontal_flip": str(
                 dataset.get("FieldOfViewHorizontalFlip", "")

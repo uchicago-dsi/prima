@@ -39,6 +39,34 @@ ORIENTATION_LABEL_BY_VERBALIZER = {
     verbalizer: label for label, verbalizer in ORIENTATION_VERBALIZER_BY_LABEL.items()
 }
 REPRESENTATION_VERSION = "mlo-orientation-anatomy-crop-v3"
+DICOM_PATIENT_ORIENTATION_STANDARD = (
+    "https://dicom.nema.org/medical/dicom/current/output/chtml/part03/"
+    "sect_C.7.6.html#sect_C.7.6.1.1.1"
+)
+
+
+def patient_orientation_directions(value: object) -> tuple[str, str]:
+    """Return normalized row and column directions from PatientOrientation."""
+    if value is None:
+        directions: list[object] = []
+    elif isinstance(value, str):
+        directions = value.split("\\")
+    else:
+        directions = list(value)
+    normalized = [str(direction).strip().upper() for direction in directions]
+    row_direction = normalized[0] if len(normalized) >= 1 else ""
+    column_direction = normalized[1] if len(normalized) >= 2 else ""
+    return row_direction, column_direction
+
+
+def mlo_orientation_label_from_column_direction(column_direction: str) -> str:
+    """Map the top-to-bottom anatomical direction to the displayed MLO label."""
+    principal = str(column_direction).strip().upper()[:1]
+    if principal == "F":
+        return "UPRIGHT"
+    if principal == "H":
+        return "INVERTED"
+    return "UNKNOWN"
 
 
 def suppress_isolated_annotations(image: Image.Image) -> Image.Image:
