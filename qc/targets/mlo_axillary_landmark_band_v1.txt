@@ -1,0 +1,13 @@
+Decide whether the visual target "MLO axillary landmark is localizable" is present.
+
+This is a neutral anatomy-localization task, not a quality-control or orientation judgment. The input contains one cropped MLO mammogram under four fixed horizontal coordinate bands. Band 1 is the top of the displayed image, followed by bands 2 and 3, and band 4 is the bottom.
+
+Locate the axillary region using visible mammographic anatomy. Prefer recognizable axillary lymph nodes when present. Otherwise use the center of the clearest axillary tail or broad upper-posterior pectoral attachment. Report the band containing the center of the best anatomical evidence. Do not assume which band should contain this landmark. Do not decide whether the image is upright, rotated, acceptable, or failed. Ignore burned-in text, markers, band labels, and laterality symbols as anatomical evidence.
+
+Use CUE=nodes only for recognizable axillary lymph nodes, CUE=axillary_tail only for a clear axillary tail, CUE=pectoral_attachment only for a clear broad posterior pectoral attachment, and CUE=unclear otherwise. Answer YES when the axillary landmark is genuinely localizable. Answer NO with AXILLARY_BAND=unclear when it is not.
+
+Answer in exactly four lines and nothing else:
+EVIDENCE: AXILLARY_BAND=<1|2|3|4|unclear>; CUE=<nodes|axillary_tail|pectoral_attachment|unclear>
+ANSWER: YES or ANSWER: NO
+CONFIDENCE: high, medium, or low
+REVIEW: YES or REVIEW: NO
