@@ -222,7 +222,11 @@ def _download_via_datamover(
         repo_id=spec.repo_id,
         revision=spec.revision,
         local_dir=str(destination),
-        ignore_patterns=["*.safetensors", "*.bin"],
+        ignore_patterns=[
+            "*.safetensors",
+            "*.bin",
+            *spec.download_ignore_patterns,
+        ],
     )
     info = model_info(spec.repo_id, revision=spec.revision, files_metadata=True)
     if info.sha != spec.revision:
