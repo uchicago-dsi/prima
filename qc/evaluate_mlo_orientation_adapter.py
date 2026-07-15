@@ -86,7 +86,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--split",
-        choices=("train", "validation", "challenge"),
+        choices=("train", "validation", "challenge", "audit"),
         action="append",
         required=True,
     )
@@ -131,7 +131,11 @@ def run_from_args(args: argparse.Namespace) -> dict[str, object]:
                 f"{description} SHA-256 mismatch: expected={expected} found={actual}"
             )
 
-    manifest = _load_manifest(manifest_path, args.expected_manifest_sha256)
+    manifest = _load_manifest(
+        manifest_path,
+        args.expected_manifest_sha256,
+        require_training_splits=False,
+    )
     evaluation_frame = manifest[manifest["split"].isin(splits)].copy()
     if evaluation_frame.empty or set(evaluation_frame["split"]) != set(splits):
         raise ValueError("requested orientation evaluation splits are incomplete")

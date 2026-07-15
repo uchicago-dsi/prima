@@ -97,7 +97,12 @@ def _validate_args(args: argparse.Namespace) -> None:
         )
 
 
-def _load_manifest(path: Path, expected_sha256: str) -> pd.DataFrame:
+def _load_manifest(
+    path: Path,
+    expected_sha256: str,
+    *,
+    require_training_splits: bool = True,
+) -> pd.DataFrame:
     if not path.is_file():
         raise FileNotFoundError(f"MLO orientation manifest not found: {path}")
     actual_sha256 = sha256_file(path)
@@ -123,10 +128,13 @@ def _load_manifest(path: Path, expected_sha256: str) -> pd.DataFrame:
         raise ValueError(f"MLO orientation manifest missing columns: {missing}")
     if manifest.empty or manifest["sample_id"].duplicated().any():
         raise ValueError("MLO orientation manifest is empty or has duplicate samples")
-    if set(manifest["split"]) != set(SPLITS):
+    manifest_splits = tuple(dict.fromkeys(str(value) for value in manifest["split"]))
+    if require_training_splits and set(manifest_splits) != set(SPLITS):
         raise ValueError(
             "MLO orientation manifest must contain all three frozen splits"
         )
+    if not require_training_splits and not manifest_splits:
+        raise ValueError("MLO orientation evaluation manifest has no splits")
     if not manifest["view"].eq("MLO").all():
         raise ValueError("MLO orientation manifest contains a non-MLO view")
     if not manifest["expected_label"].isin(ORIENTATION_LABELS).all():
@@ -137,8 +145,9 @@ def _load_manifest(path: Path, expected_sha256: str) -> pd.DataFrame:
         split: set(group["source_view_id"])
         for split, group in manifest.groupby("split")
     }
-    for left_index, left in enumerate(SPLITS):
-        for right in SPLITS[left_index + 1 :]:
+    split_names = tuple(source_sets)
+    for left_index, left in enumerate(split_names):
+        for right in split_names[left_index + 1 :]:
             if source_sets[left] & source_sets[right]:
                 raise ValueError(
                     f"MLO orientation source leaks between {left} and {right}"
