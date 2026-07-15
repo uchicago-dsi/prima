@@ -25,6 +25,19 @@ ORIENTATION_PROMPT = (
     "pathology, exposure, devices, and positioning quality. Answer with exactly "
     "UPRIGHT or INVERTED and no other text."
 )
+ORIENTATION_VERBALIZER_PROMPT = (
+    "This is one MLO mammogram image. Classify only its superior-to-inferior "
+    "anatomical display orientation. In an upright MLO, the axillary and upper "
+    "pectoral region is toward the top and the lower breast/inframammary region "
+    "is toward the bottom. An inverted image has those directions reversed by "
+    "an approximately 180-degree whole-image rotation. Ignore laterality, "
+    "pathology, exposure, devices, and positioning quality. Answer with exactly "
+    "A for upright or B for inverted and no other text."
+)
+ORIENTATION_VERBALIZER_BY_LABEL = {"UPRIGHT": "A", "INVERTED": "B"}
+ORIENTATION_LABEL_BY_VERBALIZER = {
+    verbalizer: label for label, verbalizer in ORIENTATION_VERBALIZER_BY_LABEL.items()
+}
 REPRESENTATION_VERSION = "mlo-orientation-anatomy-crop-v3"
 
 
@@ -108,6 +121,11 @@ def parse_orientation_label(text: object) -> str | None:
     if len(found) != 1:
         return None
     return found.pop()
+
+
+def parse_orientation_verbalizer(text: object) -> str | None:
+    """Map one exact A/B verbalizer back to its orientation label."""
+    return ORIENTATION_LABEL_BY_VERBALIZER.get(str(text).strip().upper())
 
 
 def score_orientation_predictions(

@@ -18,8 +18,9 @@ from PIL import Image
 
 from prima.mlo_orientation import (
     ORIENTATION_LABELS,
-    ORIENTATION_PROMPT,
-    parse_orientation_label,
+    ORIENTATION_VERBALIZER_BY_LABEL,
+    ORIENTATION_VERBALIZER_PROMPT,
+    parse_orientation_verbalizer,
     score_orientation_predictions,
 )
 from prima.view_few_shot import sha256_file
@@ -47,7 +48,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lora-alpha", type=int, default=16)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=20260714)
-    parser.add_argument("--max-new-tokens", type=int, default=8)
+    parser.add_argument("--max-new-tokens", type=int, default=1)
     return parser
 
 
@@ -78,8 +79,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("LoRA rank and alpha must be positive")
     if not 0 <= args.lora_dropout < 1:
         raise ValueError("--lora-dropout must be in [0, 1)")
-    if args.max_new_tokens <= 0:
-        raise ValueError("--max-new-tokens must be positive")
+    if args.max_new_tokens != 1:
+        raise ValueError(
+            "single-token orientation training requires --max-new-tokens=1"
+        )
 
 
 def _load_manifest(path: Path, expected_sha256: str) -> pd.DataFrame:
@@ -183,7 +186,7 @@ def _messages(answer: str | None = None) -> list[dict[str, object]]:
             "role": "user",
             "content": [
                 {"type": "image"},
-                {"type": "text", "text": ORIENTATION_PROMPT},
+                {"type": "text", "text": ORIENTATION_VERBALIZER_PROMPT},
             ],
         }
     ]
@@ -216,8 +219,14 @@ class OrientationCollator:
         prompt_text = self.processor.apply_chat_template(
             _messages(), tokenize=False, add_generation_prompt=True
         )
+        verbalizer = ORIENTATION_VERBALIZER_BY_LABEL[str(record["expected_label"])]
+        verbalizer_ids = self.processor.tokenizer(
+            verbalizer, add_special_tokens=False
+        ).input_ids
+        if len(verbalizer_ids) != 1:
+            raise RuntimeError("orientation verbalizer must be exactly one token")
         full_text = self.processor.apply_chat_template(
-            _messages(str(record["expected_label"])),
+            _messages(verbalizer),
             tokenize=False,
             add_generation_prompt=False,
         )
@@ -233,8 +242,10 @@ class OrientationCollator:
             raise RuntimeError(
                 "prompt is not an exact prefix of the supervised example"
             )
-        labels = full_ids.clone()
-        labels[:, :prompt_length] = -100
+        if int(full_ids[0, prompt_length]) != verbalizer_ids[0]:
+            raise RuntimeError("assistant suffix does not begin with the class token")
+        labels = full_ids.new_full(full_ids.shape, -100)
+        labels[:, prompt_length] = full_ids[:, prompt_length]
         encoded["labels"] = labels
         return dict(encoded)
 
@@ -283,7 +294,7 @@ def _generate_predictions(
                 "rotation_degrees_clockwise": int(row["rotation_degrees_clockwise"]),
                 "expected_label": row["expected_label"],
                 "generated_text": generated_text,
-                "predicted_label": parse_orientation_label(generated_text),
+                "predicted_label": parse_orientation_verbalizer(generated_text),
             }
         )
     return records
@@ -316,9 +327,14 @@ def _score_by_split(predictions: list[dict[str, object]]) -> dict[str, object]:
 
 
 def _gate(base: dict[str, object], adapted: dict[str, object]) -> dict[str, object]:
+    train = adapted["train"]
     validation = adapted["validation"]
     challenge = adapted["challenge"]
     checks = {
+        "train_all_38_labels_exact": train["exact"] == 38 and train["rows"] == 38,
+        "train_all_19_pairs_exact": (
+            train["exact_pairs"] == 19 and train["source_pairs"] == 19
+        ),
         "validation_inversion_sensitivity_at_least_0_875": (
             validation["inversion_sensitivity"] >= 0.875
         ),
@@ -419,6 +435,7 @@ def run_from_args(args: argparse.Namespace) -> dict[str, object]:
             _json_safe(
                 {
                     "schema_version": 1,
+                    "objective": "one-token verbalizer with A=UPRIGHT and B=INVERTED",
                     "model_revision": model_provenance["revision"],
                     "manifest_sha256": sha256_file(manifest_path),
                     "scores": base_scores,
@@ -515,8 +532,9 @@ def run_from_args(args: argparse.Namespace) -> dict[str, object]:
         "schema_version": 1,
         "completed_at": datetime.now(timezone.utc).isoformat(),
         "decision": (
-            "whether a small open-weight VLM adapter learns exam-disjoint MLO "
-            "orientation and fixes the frozen audit inversion challenge"
+            "whether one-token image-dependent supervision lets a small open-weight "
+            "VLM adapter learn exam-disjoint MLO orientation and fix the frozen "
+            "audit inversion challenge"
         ),
         "status": "passes_mechanism_gate" if gate["passes"] else "fails_mechanism_gate",
         "manifest": str(manifest_path),
@@ -543,6 +561,10 @@ def run_from_args(args: argparse.Namespace) -> dict[str, object]:
             ),
             "target_module_count": len(linear_target_modules),
             "target_modules_sha256": linear_target_modules_sha256,
+            "objective": (
+                "one-token verbalizer; A=UPRIGHT, B=INVERTED; only the class token "
+                "contributes to loss"
+            ),
             "trainable_parameters": trainable_parameters,
             "total_parameters": total_parameters,
             "trainable_fraction": trainable_parameters / total_parameters,
