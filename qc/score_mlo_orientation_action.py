@@ -91,9 +91,10 @@ def run_from_args(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("orientation action protocol must use schema_version 1")
     if protocol.get("status") != "frozen_before_orientation_inference":
         raise ValueError("orientation action protocol was not frozen before inference")
-    if result.get("manifest_sha256") != protocol.get(
-        "orientation_bank_manifest_sha256"
-    ):
+    bank = protocol.get("raw_dicom_verified_bank")
+    if not isinstance(bank, dict):
+        raise ValueError("orientation protocol has no raw-DICOM-verified bank")
+    if result.get("manifest_sha256") != bank.get("orientation_bank_manifest_sha256"):
         raise RuntimeError("orientation result does not match the frozen holdout bank")
     if result.get("adapter_sha256") != protocol.get("orientation_adapter_sha256"):
         raise RuntimeError("orientation result does not use the frozen adapter")
