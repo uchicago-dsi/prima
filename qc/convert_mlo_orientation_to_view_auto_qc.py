@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 import pandas as pd
@@ -27,6 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-manifest-sha256", required=True)
     parser.add_argument("--expected-orientation-result-sha256", required=True)
     parser.add_argument("--expected-adapter-sha256", required=True)
+    parser.add_argument("--minimum-inversion-contrast", type=float, required=True)
     return parser.parse_args()
 
 
@@ -45,6 +47,11 @@ def run_from_args(args: argparse.Namespace) -> dict[str, object]:
     orientation_path = args.orientation_result.resolve()
     output_path = args.output.resolve()
     target = normalize_view_qc_target(args.target)
+    if (
+        not math.isfinite(args.minimum_inversion_contrast)
+        or args.minimum_inversion_contrast <= 0
+    ):
+        raise ValueError("--minimum-inversion-contrast must be finite and positive")
     _require_hash(
         manifest_path, args.expected_manifest_sha256, "whole-exam audit manifest"
     )
@@ -100,9 +107,15 @@ def run_from_args(args: argparse.Namespace) -> dict[str, object]:
     manifest_mlo = set(manifest.loc[manifest["view"].eq("MLO"), "view_id"])
     if set(originals["source_view_id"]) != manifest_mlo:
         raise ValueError("orientation result does not cover every audit MLO exactly")
-    positive_ids = set(
+    sign_negative_ids = set(
         originals.loc[
             originals["paired_predicted_label"].eq("INVERTED"), "source_view_id"
+        ]
+    )
+    positive_ids = set(
+        originals.loc[
+            originals["paired_logit_contrast"].le(-args.minimum_inversion_contrast),
+            "source_view_id",
         ]
     )
     contrast_by_view = {
@@ -118,9 +131,16 @@ def run_from_args(args: argparse.Namespace) -> dict[str, object]:
         ),
         prompt_variant="smolvlm_mlo_orientation_paired_logits_v1",
         inference_settings={
-            "combination_rule": "MLO paired-logit orientation rejection; CC passthrough",
+            "combination_rule": (
+                "high-confidence MLO paired-logit orientation rejection; "
+                "weak-contrast MLO and all CC views pass through"
+            ),
             "paired_rule": orientation["paired_logit_contrast"]["method"],
-            "threshold": 0.0,
+            "minimum_inversion_contrast": args.minimum_inversion_contrast,
+            "rejection_rule": (
+                "reject only when paired_logit_contrast is at most negative "
+                "minimum_inversion_contrast"
+            ),
             "orientation_result_file": str(orientation_path),
             "orientation_result_sha256": sha256_file(orientation_path),
             "orientation_manifest": orientation["manifest"],
@@ -129,6 +149,10 @@ def run_from_args(args: argparse.Namespace) -> dict[str, object]:
             "adapter_config_sha256": orientation["adapter_config_sha256"],
             "whole_exam_manifest_sha256": sha256_file(manifest_path),
             "mlo_views": len(originals),
+            "sign_negative_mlo_views": len(sign_negative_ids),
+            "weak_sign_negative_mlo_views_abstained": len(
+                sign_negative_ids - positive_ids
+            ),
             "orientation_positive_views": len(positive_ids),
         },
     )
@@ -144,8 +168,10 @@ def run_from_args(args: argparse.Namespace) -> dict[str, object]:
                         "confidence": "high",
                         "rationale": (
                             "MLO superior-inferior orientation is inverted by frozen "
-                            "zero-threshold paired-logit contrast "
-                            f"({contrast_by_view[str(row.view_id)]:.6g})"
+                            "paired-logit contrast above the calibrated rejection "
+                            "floor "
+                            f"({contrast_by_view[str(row.view_id)]:.6g} <= "
+                            f"-{args.minimum_inversion_contrast:.6g})"
                         ),
                     }
                 ]
