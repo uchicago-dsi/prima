@@ -128,7 +128,9 @@
     "served_model_name": "smolvlm_2b",
     "tensor_parallel_size": 1,
     "weight_format": "huggingface",
-    "download_ignore_patterns": [],
+    "download_ignore_patterns": [
+      "onnx/*"
+    ],
     "request_chat_template_kwargs": {},
     "extra_args": [
       "--max-model-len",
