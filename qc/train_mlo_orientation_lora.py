@@ -30,6 +30,7 @@ REQUIRED_RUNTIME = {
     "transformers": "4.46.3",
     "accelerate": "1.0.1",
     "peft": "0.13.2",
+    "pillow": "10.4.0",
 }
 SUPPORTED_MODEL_ARCHITECTURES = (
     "Idefics3ForConditionalGeneration",
@@ -228,6 +229,37 @@ class OrientationCollator:
     def __init__(self, processor: Any, manifest_root: Path) -> None:
         self.processor = processor
         self.manifest_root = manifest_root
+        full_ids_by_verbalizer = {
+            verbalizer: processor.tokenizer(
+                processor.apply_chat_template(
+                    _messages(verbalizer),
+                    tokenize=False,
+                    add_generation_prompt=False,
+                ),
+                add_special_tokens=False,
+            ).input_ids
+            for verbalizer in ORIENTATION_VERBALIZER_BY_LABEL.values()
+        }
+        verbalizers = sorted(full_ids_by_verbalizer)
+        left_ids = full_ids_by_verbalizer[verbalizers[0]]
+        right_ids = full_ids_by_verbalizer[verbalizers[1]]
+        if len(left_ids) != len(right_ids):
+            raise RuntimeError("orientation class templates have unequal token counts")
+        different_positions = [
+            index
+            for index, (left, right) in enumerate(zip(left_ids, right_ids))
+            if left != right
+        ]
+        if len(different_positions) != 1:
+            raise RuntimeError(
+                "orientation class templates must differ at exactly one token; "
+                f"found={len(different_positions)}"
+            )
+        class_position = different_positions[0]
+        self.class_token_id_by_verbalizer = {
+            verbalizer: token_ids[class_position]
+            for verbalizer, token_ids in full_ids_by_verbalizer.items()
+        }
 
     def __call__(self, features: list[dict[str, object]]) -> dict[str, Any]:
         if len(features) != 1:
@@ -245,11 +277,7 @@ class OrientationCollator:
             _messages(), tokenize=False, add_generation_prompt=True
         )
         verbalizer = ORIENTATION_VERBALIZER_BY_LABEL[str(record["expected_label"])]
-        verbalizer_ids = self.processor.tokenizer(
-            verbalizer, add_special_tokens=False
-        ).input_ids
-        if len(verbalizer_ids) != 1:
-            raise RuntimeError("orientation verbalizer must be exactly one token")
+        class_token_id = self.class_token_id_by_verbalizer[verbalizer]
         full_text = self.processor.apply_chat_template(
             _messages(verbalizer),
             tokenize=False,
@@ -267,10 +295,17 @@ class OrientationCollator:
             raise RuntimeError(
                 "prompt is not an exact prefix of the supervised example"
             )
-        if int(full_ids[0, prompt_length]) != verbalizer_ids[0]:
-            raise RuntimeError("assistant suffix does not begin with the class token")
+        class_positions = (
+            full_ids[0, prompt_length:].eq(class_token_id).nonzero().flatten()
+        )
+        if class_positions.numel() != 1:
+            raise RuntimeError(
+                "assistant suffix must contain exactly one class token; "
+                f"found={class_positions.numel()}"
+            )
+        class_position = prompt_length + int(class_positions[0])
         labels = full_ids.new_full(full_ids.shape, -100)
-        labels[:, prompt_length] = full_ids[:, prompt_length]
+        labels[:, class_position] = full_ids[:, class_position]
         encoded["labels"] = labels
         return dict(encoded)
 
