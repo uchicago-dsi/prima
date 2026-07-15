@@ -135,8 +135,8 @@ def _load_pool(
     if not isinstance(quota, dict) or set(quota) != {"L", "R"}:
         raise ValueError(f"source pool {name} must define L/R new_quota_by_laterality")
     quotas = {side: int(quota[side]) for side in ("L", "R")}
-    if any(value <= 0 for value in quotas.values()):
-        raise ValueError(f"source pool {name} quotas must be positive")
+    if any(value < 0 for value in quotas.values()):
+        raise ValueError(f"source pool {name} quotas must be nonnegative")
 
     manifest_path = _resolve_input(
         spec.get("manifest"), description=f"{name} review manifest"
@@ -283,9 +283,9 @@ def _select_sources(
     if validation_per_pool_laterality <= 0:
         raise ValueError("new_validation_per_pool_laterality must be positive")
     pools = pools.copy()
-    pools["is_prior_source"] = pools["view_id"].isin(prior_source_ids) & pools[
-        "source_pool"
-    ].eq(prior_source_pool)
+    pools["is_prior_source"] = pools["view_id"].isin(prior_source_ids)
+    if prior_source_pool != "*":
+        pools["is_prior_source"] &= pools["source_pool"].eq(prior_source_pool)
 
     audit_patients = set(audit["patient_id"])
     audit_exams = set(audit["exam_id"])
@@ -331,6 +331,8 @@ def _select_sources(
     for pool_name, pool_quotas in quotas.items():
         for laterality in ("L", "R"):
             quota = pool_quotas[laterality]
+            if quota == 0:
+                continue
             side = available[
                 available["source_pool"].eq(pool_name)
                 & available["laterality"].eq(laterality)
@@ -341,9 +343,10 @@ def _select_sources(
                     f"{laterality} sources for quota {quota}"
                 )
             selected = side.iloc[:quota].copy()
-            if len(selected) <= validation_per_pool_laterality:
+            if len(selected) < validation_per_pool_laterality:
                 raise ValueError(
-                    f"source pool {pool_name} {laterality} quota leaves no training source"
+                    f"source pool {pool_name} {laterality} quota is smaller than "
+                    "the validation allocation"
                 )
             selected["validation_key"] = selected["view_id"].map(
                 lambda value: _hash_key(split_salt, "validation", value)
@@ -472,8 +475,12 @@ def run_from_args(args: argparse.Namespace) -> dict[str, object]:
     paths["prior_dataset_manifest"] = prior_manifest_path
     prior_source_ids, prior_image_paths = _read_prior_dataset(prior_manifest_path)
     prior_source_pool = str(config.get("prior_source_pool", ""))
-    if prior_source_pool not in quotas:
-        raise ValueError("prior_source_pool must name one configured source pool")
+    if prior_source_pool != "*" and prior_source_pool not in quotas:
+        raise ValueError(
+            "prior_source_pool must name one configured source pool or use '*'"
+        )
+    if not any(value > 0 for quota in quotas.values() for value in quota.values()):
+        raise ValueError("at least one new source quota must be positive")
     audit_spec = config.get("audit")
     if not isinstance(audit_spec, dict):
         raise ValueError("orientation source config must define audit")
