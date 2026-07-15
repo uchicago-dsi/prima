@@ -49,6 +49,7 @@ from prima.view_selection import (
 DEFAULT_TARGET = (
     "view requiring exclusion from standard Mirai input under visual rubric v2"
 )
+FROZEN_CANDIDATE_STATUS = "frozen_before_prospective_inference_and_reference_review"
 REQUIRED_SEAM_DECISION_COLUMNS = {
     "exam_id",
     "laterality",
@@ -64,6 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--render-campaign", type=Path, required=True)
     parser.add_argument("--seam-decisions", type=Path, required=True)
     parser.add_argument("--film-run", type=Path, required=True)
+    parser.add_argument("--candidate-spec", type=Path, required=True)
     parser.add_argument("--raw-root", type=Path, required=True)
     parser.add_argument("--temp-root", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
@@ -87,6 +89,34 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def load_frozen_candidate_spec(path: Path, *, target: str) -> dict[str, Any]:
+    try:
+        candidate = json.loads(path.read_text())
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f"candidate specification is not valid JSON: {path}"
+        ) from error
+    if not isinstance(candidate, dict):
+        raise ValueError("candidate specification must be a JSON object")
+    if candidate.get("schema_version") != 1:
+        raise ValueError("candidate specification must use schema_version 1")
+    if candidate.get("status") != FROZEN_CANDIDATE_STATUS:
+        raise ValueError(
+            "candidate specification must be frozen before prospective inference "
+            "and reference review"
+        )
+    candidate_target = candidate.get("target")
+    if not isinstance(candidate_target, str) or not candidate_target.strip():
+        raise ValueError("candidate specification requires nonempty 'target'")
+    if normalize_view_qc_target(candidate_target) != target:
+        raise ValueError("candidate specification target does not match --target")
+    for field in ("candidate_name", "decision"):
+        value = candidate.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"candidate specification requires nonempty {field!r}")
+    return candidate
 
 
 def audit_group_id(exam_id: object, laterality: object, view: object) -> str:
@@ -317,10 +347,12 @@ def _restricted_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
+    builder_path = Path(__file__).resolve()
     candidates_path = args.candidates.resolve()
     render_campaign = args.render_campaign.resolve()
     seam_path = args.seam_decisions.resolve()
     film_path = args.film_run.resolve()
+    candidate_spec_path = args.candidate_spec.resolve()
     raw_root = args.raw_root.resolve()
     temp_root = args.temp_root.resolve()
     out_dir = args.out_dir.resolve()
@@ -329,6 +361,7 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
         candidates_path,
         seam_path,
         film_path,
+        candidate_spec_path,
         render_campaign / "campaign.json",
         render_campaign / "render_complete.json",
         render_campaign / "manifest.parquet",
@@ -342,6 +375,7 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
         raise FileExistsError(f"refusing to overwrite whole-exam audit: {out_dir}")
     if args.max_render_pixels <= 0:
         raise ValueError("--max-render-pixels must be positive")
+    candidate_spec = load_frozen_candidate_spec(candidate_spec_path, target=target)
 
     counts = {
         "seam_fallback_challenge": int(args.seam_fallback_exams),
@@ -500,6 +534,8 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
         "schema_version": 1,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "command": shlex.join([sys.executable, *sys.argv]),
+        "builder": str(builder_path),
+        "builder_sha256": sha256_file(builder_path),
         "target": target,
         "seed": int(args.seed),
         "candidate_table": str(candidates_path),
@@ -510,6 +546,9 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
         "seam_decisions_sha256": sha256_file(seam_path),
         "film_run": str(film_path),
         "film_run_sha256": sha256_file(film_path),
+        "candidate_spec": str(candidate_spec_path),
+        "candidate_spec_sha256": sha256_file(candidate_spec_path),
+        "candidate_name": candidate_spec["candidate_name"],
         "prior_source_manifests": [
             str(path.resolve()) for path in args.exclude_source_manifest
         ],
@@ -538,16 +577,15 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
     _restricted_json(out_dir / "sampling_metadata.json", metadata)
     protocol = {
         "schema_version": 1,
-        "status": "frozen_before_modular_inference_and_reference_review",
+        "status": "frozen_before_candidate_inference_and_reference_review",
         "target": target,
-        "decision": "deterministic DICOM exclusion OR any high-confidence frozen visual component",
+        "builder": str(builder_path),
+        "builder_sha256": sha256_file(builder_path),
+        "candidate_name": candidate_spec["candidate_name"],
+        "decision": candidate_spec["decision"],
         "reference": "deterministic DICOM exclusion OR completed residual visual human/agent label",
-        "component_protocol": "qc_redo/auto_qc_development/mirai_input_modular_five_family/protocol.json",
-        "component_protocol_sha256": sha256_file(
-            Path(
-                "qc_redo/auto_qc_development/mirai_input_modular_five_family/protocol.json"
-            )
-        ),
+        "candidate_spec": str(candidate_spec_path),
+        "candidate_spec_sha256": sha256_file(candidate_spec_path),
         "gate": {
             "minimum_view_sensitivity": 0.95,
             "minimum_view_specificity": 0.90,
@@ -566,6 +604,7 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
                 "# Fresh whole-exam Mirai-input fallback audit",
                 "",
                 f"- target: `{target}`",
+                f"- frozen candidate: `{candidate_spec['candidate_name']}`",
                 f"- patients/exams: `{metadata['patients']}` / `{metadata['exams']}`",
                 f"- exact slots/candidate views: `{metadata['exact_slots']}` / `{metadata['candidate_views']}`",
                 f"- registered exam strata: `{counts}`",
@@ -578,9 +617,10 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
                 "",
                 "The seam and film runs are used only to enrich challenge strata. They",
                 "are not reference labels. The registered system combines deterministic",
-                "DICOM acquisition eligibility with the unchanged six-call modular visual",
-                "arm. The original candidate rank is never allowed to cross laterality or",
-                "projection. Score once after the residual visual labels are complete.",
+                "DICOM acquisition eligibility with the exact candidate frozen in the",
+                "hashed candidate specification. Candidate rank remains immutable and",
+                "cannot cross laterality or projection. Score once after the residual",
+                "visual labels are complete.",
                 "",
             ]
         )
