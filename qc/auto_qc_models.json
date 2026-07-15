@@ -134,5 +134,33 @@
       "--mm-processor-cache-gb",
       "0"
     ]
+  },
+  "medgemma_27b": {
+    "repo_id": "google/medgemma-27b-it",
+    "revision": "2d3e00ea38b50018bf5dd3aa1009457cd2d5a48f",
+    "directory_name": "MedGemma-27B-IT",
+    "served_model_name": "medgemma_27b",
+    "tensor_parallel_size": 1,
+    "weight_format": "huggingface",
+    "download_ignore_patterns": [],
+    "request_chat_template_kwargs": {},
+    "extra_args": [
+      "--max-model-len",
+      "16384",
+      "--max-num-seqs",
+      "1",
+      "--gpu-memory-utilization",
+      "0.9",
+      "--safetensors-load-strategy",
+      "prefetch",
+      "--generation-config",
+      "vllm",
+      "--limit-mm-per-prompt",
+      "{\"image\": 16}",
+      "--mm-processor-kwargs",
+      "{\"do_pan_and_scan\": false}",
+      "--mm-processor-cache-gb",
+      "0"
+    ]
   }
 }
