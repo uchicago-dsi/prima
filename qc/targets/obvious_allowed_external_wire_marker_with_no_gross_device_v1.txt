@@ -1,0 +1,20 @@
+Target view only: decide whether the visual target "obvious allowed external wire marker with no gross device" is present in this mammogram.
+
+This view was preselected by a separate sensitive observer because it might contain a gross implanted or procedural device. Do not decide whether a line exists. Instead, decide whether the apparent device is clearly only an allowed external wire skin or scar marker and the view contains no true gross implanted or procedural device.
+
+Answer YES only when both conditions are unmistakable:
+
+1. The suspicious line is an external wire marker laid on the skin to mark a surgical scar, skin finding, or nipple. Supporting features include a very thin smooth wire that follows the skin or a scar, forms a superficial curve or loop, has ends at or outside the breast contour, and is not connected to a reservoir, generator, catheter, needle, or internal localization target. Surgical clips and postoperative distortion beneath a superficial scar wire support this interpretation.
+2. No disqualifying gross device is visible elsewhere in the view.
+
+An external scar wire may be long and may contain a bend, loop, or hook-like turn. Do not call it an active localization wire merely because it is long, radiopaque, curved, or accompanied by surgical clips.
+
+Answer NO for any plausible true gross device, including a venous-access port or reservoir; pacemaker, ICD, or other generator and leads; tissue-expander reservoir or unmistakable expander hardware; active localization wire or needle entering the breast and terminating internally; drain, grid, catheter, or procedural tubing; or another large device spanning or obscuring the field. Also answer NO when both an external marker and a true gross device are present.
+
+This is a conservative veto. If the line could reasonably be an active localization wire, needle, drain, catheter, or connected lead, answer NO. If you cannot confidently determine that the line lies externally on the skin, answer NO. Use high confidence only when an allowed external marker is unmistakable and no gross device is present. Use medium or low confidence and REVIEW: YES when uncertain.
+
+Answer in exactly four lines and nothing else:
+EVIDENCE: <one short visual phrase, or none>
+ANSWER: YES or ANSWER: NO
+CONFIDENCE: high, medium, or low
+REVIEW: YES or REVIEW: NO
