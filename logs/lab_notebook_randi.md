@@ -4446,3 +4446,148 @@ incomplete arm cannot silently produce a review panel:
 The assembly job depends on both successful merges and validates complete
 coverage, frozen prompt hashes, and unchanged inference settings before
 selecting the registered 160-view panel.
+
+## 2026-08-19 — Edge-crop panel unblocked; enriched stratum exhausted at 14 views
+
+### Question
+
+Why did blinded panel assembly fail on 2026-07-24 after both mining arms
+completed, and does the assembled panel still support the registered
+gross-device edge-crop mechanism check?
+
+### Nearest Reference
+
+The retained comparator is unchanged frozen v1
+(`visible_gross_implanted_or_procedural_device_v1`), which on the production
+residual audit scored TP 30, FN 2, FP 9, TN 140 with one unsafe selected slot,
+seven false-exhausted slots, and one unsafe accepted exam. Eight of those nine
+false positives involved the gross-device component and both false negatives
+were the same partially cropped generator, which is what this one-delta
+challenge was registered to isolate. No model, threshold, example bank, or
+selection rule changed here.
+
+### Action
+
+Re-entered a campaign left idle since 2026-07-24 18:09. All eight mining jobs,
+both merges, and both arms' 26,450-view coverage had completed; only the
+dependency-gated assembly job `13190617` failed, in four seconds, with
+`RuntimeError: baseline run prompt differs from frozen specification`.
+
+Diagnosed the failure before changing anything. `candidate_spec.json` froze
+`sha256_file()` over the raw prompt bytes, while `qc/run_view_auto_qc.py` loads
+prompts with `.read_text().strip()` and records the digest of that stripped
+text. The two conventions can never agree, so the guard was unsatisfiable
+regardless of correctness; the candidate arm would have failed identically and
+assembly merely reached the baseline check first.
+
+Confirmed both arms executed their registered prompts. Each recorded digest
+equals sha256 of its registered prompt file stripped of one trailing newline
+(1920 to 1919 bytes), and each recorded prompt text contains its registered file
+body verbatim.
+
+Changed only the guard, in `qc/build_gross_device_edge_challenge.py`: derive the
+expected digest through the producer's own `load_target_prompt` rather than
+re-deriving the convention, while still requiring the registered prompt file to
+match its frozen digest. This pins both the registration and the executed text
+and additionally runs the loader's output-contract validation, so the check is
+stricter than the one it replaces. No prompt, model, threshold, stratum
+definition, quota, seed, or selection rule was touched.
+
+Re-verified every frozen input survived the idle period, then ran assembly once
+at the registered seed 20260724.
+
+### Evidence
+
+- Frozen inputs intact: mining `manifest.parquet` and `source_manifest.parquet`
+  match their spec digests exactly; all 26,450 mining images present; the shared
+  `current_policy_candidates` render bank and its `campaign.json` match
+  `rendered_campaign_sha256`.
+- The builder was byte-identical to the frozen `builder_sha256` before the fix,
+  which therefore supersedes it. `builder_sha256` is written only at freeze time
+  and is not re-checked during assembly.
+- Panel: 160 views, 160 distinct patients, 160 distinct exams, 160 images,
+  `review_order` exactly 1 through 160, zero labels, zero events.
+- Panel manifest, source manifest, sampling metadata, empty state, and empty
+  events SHA-256:
+  `21085bd066710b5d01e56cfe9052540a1bdfa55e4a75375ca898ff0cf83e6727`,
+  `16b35cc7235f749abd126d7b57d138e79e53660117f4fce6fb19a454daadc83c`,
+  `0a569c019cf3533a3a5b1e139d971fdaa109fec503d7df91f78ebe135f85bcb5`,
+  `320513a72765f17dd60e086c6be922f7951344276ecc9b578723cbd135e2fc0f`,
+  and
+  `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+- Model subsets are outside the browser directory at
+  `qc_redo/auto_qc_development/gross_device_edge_crop_challenge_v1/panel_model_subsets`;
+  baseline and candidate subset SHA-256 are
+  `e860407aa10b3e2f78026df4f93d8abe2d1676bc38fb852afc8fef9b012a9952`
+  and
+  `b746719dc691b9d4132489e25fc4203233de8d0bd4b0273c530097172034ca8f`.
+- Blinding verified at the code level, not just the manifest: the browser
+  manifest carries a `stratum` column, but `load_review_items` in
+  `qc/view_qc_gallery.py` builds browser items from a fixed allowlist of
+  `view_id`, `laterality`, `view`, `review_order`, and `image_url`, so arm,
+  prediction, rationale, and stratum are all unreachable from the gallery.
+- Registered quota against actual availability in the full 26,450-view mining
+  population, as hidden model dispositions with no truth meaning:
+
+  | stratum | quota | available | taken |
+  | --- | --- | --- | --- |
+  | candidate_only_edge_high | 40 | 14 | 13 |
+  | candidate_only_other_high | 20 | 70 | 47 |
+  | both_high | 30 | 1018 | 36 |
+  | baseline_only_high | 30 | 409 | 30 |
+  | either_lower_confidence | 20 | 22 | 14 |
+  | both_negative_random | 20 | 24917 | 20 |
+
+- Arm-level high-confidence prevalence: baseline 1,427 views, candidate 1,102.
+  The candidate gains 84 high-confidence views and loses 409.
+
+### Result
+
+The campaign is unblocked and the registered 160-view panel exists, blinded and
+unlabeled. The registered enriched quota was not met and cannot be: only 14
+views in the entire disjoint mining population are candidate-only
+high-confidence with an edge-lexicon rationale, and one was dropped by the
+one-view-per-patient-and-exam rule. The shortfall was filled in the registered
+fixed stratum order with each view's actual stratum retained, exactly as the
+frozen `shortfall_rule` requires, so the panel is contract-compliant.
+
+### Conclusion
+
+The 2026-07-24 failure was an integrity-check defect, not a prompt, data, or
+inference defect, and no GPU work needed repeating. The mechanism check is now
+the binding limitation rather than the gate: three human-positive edge-enriched
+views are required out of only 13 available. The registered
+`insufficient_reference_rule` cannot rescue this, because expansion draws from
+the same mining population and that stratum is exhausted at 14.
+
+Separately, the candidate prompt is globally more conservative than baseline
+rather than more sensitive, dropping 409 high-confidence detections while adding
+84. That is the opposite direction from the intended recovery mechanism and
+suggests the added rejection clauses dominate the added border instruction.
+Inference confidence is high for the integrity diagnosis and the availability
+counts, and low for the direction of the accuracy effect, which no human label
+has yet tested.
+
+### Falsifier
+
+Any recorded arm digest that does not equal sha256 of its registered prompt file
+stripped, any panel view sharing a patient or exam with another panel view or
+with a prior reference, or any gallery response exposing arm, prediction,
+rationale, or stratum would falsify the corresponding claim.
+
+### Decision Impact
+
+Do not tune either prompt on these dispositions; no human label has been opened
+and the stop rule stands. The open decision before spending annotation time is
+whether a 13-view enriched stratum is an adequate mechanism check, or whether
+the edge-crop hypothesis needs a differently mined population that targets
+partially cropped devices directly rather than relying on candidate-only
+disagreement to surface them. Recorded as a design limitation in the same spirit
+as the single implant exam in the production residual audit.
+
+### Next Check
+
+If labeling proceeds, score exactly once against the frozen success rule after
+all 160 binary labels and every low-confidence adjudication are complete. Treat
+the enriched-stratum shortfall as a predeclared limitation of the mechanism
+check, not as grounds for rescoring or reselection.
