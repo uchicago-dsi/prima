@@ -386,6 +386,12 @@ def main():
         ),
         help="Labels CSV for Mirai (emitted after merge; not passed to shards)",
     )
+    parser.add_argument(
+        "--today",
+        type=str,
+        default=None,
+        help="Fixed YYYY-MM-DD date passed to emit-csv for reproducible labels",
+    )
     parser.add_argument("--partition", type=str, default="tier1q")
     parser.add_argument("--mem-gb", type=int, default=64)
     parser.add_argument("--timeout-hours", type=int, default=24)
@@ -440,21 +446,25 @@ def main():
         )
         if not metadata.get("summary") and labels_path and Path(labels_path).exists():
             print("\nGenerating Mirai CSV...")
+            emit_command = [
+                sys.executable,
+                "-u",
+                str(PREPROCESS_SCRIPT),
+                "emit-csv",
+                "--raw",
+                str(raw_dir),
+                "--sot",
+                str(sot_dir),
+                "--out",
+                str(out_dir),
+                "--labels",
+                str(labels_path),
+            ]
+            today = args.today or metadata.get("today")
+            if today:
+                emit_command.extend(["--today", str(today)])
             subprocess.run(
-                [
-                    sys.executable,
-                    "-u",
-                    str(PREPROCESS_SCRIPT),
-                    "emit-csv",
-                    "--raw",
-                    str(raw_dir),
-                    "--sot",
-                    str(sot_dir),
-                    "--out",
-                    str(out_dir),
-                    "--labels",
-                    str(labels_path),
-                ],
+                emit_command,
                 check=True,
                 cwd=PROJECT_ROOT,
             )
@@ -568,6 +578,7 @@ def main():
         "sot_dir": str(sot_dir),
         "out_dir": str(out_dir),
         "labels": str(args.labels) if args.labels else None,
+        "today": args.today,
         "allowlist_mode": cohort_label,
         "summary": args.summary,
     }
@@ -599,21 +610,24 @@ def main():
     # Emit Mirai CSV after merge (shards skip this; manifest.parquet exists now)
     if not args.summary and args.labels and args.labels.exists():
         print("\nGenerating Mirai CSV...")
+        emit_command = [
+            sys.executable,
+            "-u",
+            str(PREPROCESS_SCRIPT),
+            "emit-csv",
+            "--raw",
+            str(raw_dir),
+            "--sot",
+            str(sot_dir),
+            "--out",
+            str(out_dir),
+            "--labels",
+            str(args.labels),
+        ]
+        if args.today:
+            emit_command.extend(["--today", args.today])
         subprocess.run(
-            [
-                sys.executable,
-                "-u",
-                str(PREPROCESS_SCRIPT),
-                "emit-csv",
-                "--raw",
-                str(raw_dir),
-                "--sot",
-                str(sot_dir),
-                "--out",
-                str(out_dir),
-                "--labels",
-                str(args.labels),
-            ],
+            emit_command,
             check=True,
             cwd=PROJECT_ROOT,
         )

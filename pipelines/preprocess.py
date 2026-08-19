@@ -975,31 +975,38 @@ def _process_exam_dir(
         has_four_views = len(view_keys & required_views) == 4
 
         manifest_rows: List[Dict] = []
-        zarr_error = None
+        zarr_errors: List[Dict] = []
         if selected_rows and zarr_root is not None:
-            try:
-                zpath, shapes = write_exam_zarr(pd.DataFrame(selected_rows), zarr_root)
-                for r in selected_rows:
-                    key = VIEWS[(r["laterality"], r["view"])]
-                    manifest_rows.append(
+            selected_frame = pd.DataFrame(selected_rows)
+            for (_, exam_id), exam_rows in selected_frame.groupby(
+                ["patient_id", "exam_id"],
+                sort=False,
+            ):
+                try:
+                    zpath, shapes = write_exam_zarr(exam_rows, zarr_root)
+                    for row in exam_rows.to_dict("records"):
+                        key = VIEWS[(row["laterality"], row["view"])]
+                        manifest_rows.append(
+                            {
+                                "patient_id": row["patient_id"],
+                                "exam_id": row["exam_id"],
+                                "laterality": row["laterality"],
+                                "view": row["view"],
+                                "zarr_uri": str(zpath),
+                                "zarr_key": key,
+                                "height": shapes[key][0],
+                                "width": shapes[key][1],
+                            }
+                        )
+                except Exception as error:
+                    zarr_errors.append(
                         {
-                            "patient_id": r["patient_id"],
-                            "exam_id": r["exam_id"],
-                            "laterality": r["laterality"],
-                            "view": r["view"],
-                            "zarr_uri": str(zpath),
-                            "zarr_key": key,
-                            "height": shapes[key][0],
-                            "width": shapes[key][1],
+                            "patient_id": exam_rows.iloc[0]["patient_id"],
+                            "exam_id": exam_id,
+                            "error_type": type(error).__name__,
+                            "error_message": str(error),
                         }
                     )
-            except Exception as e:
-                zarr_error = {
-                    "patient_id": rows[0]["patient_id"],
-                    "exam_id": rows[0]["exam_id"],
-                    "error_type": type(e).__name__,
-                    "error_message": str(e),
-                }
 
         persisted_rows = []
         for row in selected_rows:
@@ -1032,7 +1039,7 @@ def _process_exam_dir(
             "valid_views": len(view_keys),
             "has_four_views": has_four_views,
             "manifest_rows": manifest_rows,
-            "zarr_error": zarr_error,
+            "zarr_errors": zarr_errors,
         }
     except Exception as e:
         logger.error(
@@ -1843,8 +1850,7 @@ def discover_dicoms(
                     chunk_exclusion_rows.extend(result["exclusion_rows"])
                     chunk_tag_rows.extend(result["tag_rows"])
                     chunk_manifest_rows.extend(result.get("manifest_rows", []))
-                    if result.get("zarr_error") is not None:
-                        chunk_zarr_failures.append(result["zarr_error"])
+                    chunk_zarr_failures.extend(result.get("zarr_errors", []))
                     exam_stats["total_dicoms"] += result["total_dicoms"]
                     exam_stats["valid_dicoms"] += result["valid_dicoms"]
                     exam_stats["for_presentation_dicoms"] += result[

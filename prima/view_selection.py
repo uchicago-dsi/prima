@@ -30,6 +30,11 @@ def burned_in_annotation_value(ds: FileDataset) -> str:
     return str(ds.get("BurnedInAnnotation", "") or "").strip().upper()
 
 
+def detector_type_value(ds: FileDataset) -> str:
+    """Return normalized mammography DetectorType metadata."""
+    return str(ds.get("DetectorType", "") or "").strip().upper()
+
+
 def has_overlay_data(ds: FileDataset) -> bool:
     """Return whether any standard repeating overlay group contains pixel data."""
     return any(
@@ -70,6 +75,8 @@ def mirai_source_eligibility_reasons(ds: FileDataset) -> tuple[str, ...]:
         reasons.append(
             "PresentationIntentType is " + (presentation_intent or "<missing>")
         )
+    if detector_type_value(ds) == "FILM":
+        reasons.append("DetectorType is FILM")
     if str(ds.get("PartialView", "") or "").strip().upper() == "YES":
         reasons.append("PartialView is YES")
     modifiers = view_modifier_code_meanings(ds)

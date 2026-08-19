@@ -20,6 +20,8 @@ These requirements imply the following QC layers:
   view. A DICOM whose primary `ViewPosition` is CC/MLO is still non-standard
   when `ViewModifierCodeSequence` says Implant Displaced, rolled, spot
   compression, magnification, or another modifier;
+- source-header exclusion of digitized hard-copy film when normalized
+  `DetectorType == FILM`;
 - metadata checks for For Presentation mode;
 - a visual check for burned-in CAD or human markup;
 - a view-level check that a selected CC/MLO image is not actually a
@@ -30,19 +32,18 @@ These requirements imply the following QC layers:
 The shared deterministic source rule is implemented by
 `prima.view_selection.mirai_source_eligibility_reasons`. It rejects missing or
 unsupported laterality/projection, any intent other than `FOR PRESENTATION`,
-`PartialView == YES`, and any explicit view modifier. Exact four-slot exam
-membership and same-slot fallback remain exam-level checks rather than pixel
-classifier targets.
+`DetectorType == FILM`, `PartialView == YES`, and any explicit view modifier.
+Exact four-slot exam membership and same-slot fallback remain exam-level checks
+rather than pixel classifier targets.
 
 `BurnedInAnnotation` and repeating-group overlay data are recorded by the
-source audit but are not interpreted as automatic markup truth. In the current
-SoT, all 2,524 selected views with `BurnedInAnnotation == YES` come from R2
-DigitalNow and cover all four slots of 631 exams; none has an untagged same-slot
-alternate. On the 120-view film reference, the tag identifies 59/60 visible
-film positives and 0/60 negatives, while one iCAD film positive is untagged.
-This makes it a vendor-specific film signal, not a complete definition of CAD
-or human markup. Keep the validated visual film target and audit markup pixels
-separately before introducing a hard metadata exclusion.
+source audit but are not interpreted as automatic markup truth. On the
+independent 120-view film reference, `DetectorType == FILM` identifies all
+60/60 visible film positives and 0/60 negatives. `BurnedInAnnotation == YES`
+identifies 59/60 positives and 0/60 negatives, missing one iCAD case. The exact
+`DetectorType` rule is therefore the authoritative film source exclusion;
+`BurnedInAnnotation` remains a vendor-specific audit signal rather than a
+complete definition of film, CAD, or human markup.
 
 ## CHiMEC validation-cohort comparability
 
@@ -67,9 +68,10 @@ be replaced only by another source image from the same exam, laterality, and
 projection that passes every frozen target. If the exact slot is exhausted,
 route the exam to human review rather than silently dropping it.
 
-Digitized hard-copy film appearance is tracked separately because visible film
-conversion may create a distribution shift. Metadata such as `DetectorType ==
-FILM` is a challenger baseline, not reference truth.
+Digitized hard-copy film appearance is excluded deterministically with
+`DetectorType == FILM`. The excluded source remains in
+`view_exclusions.parquet` with its durable DICOM locator and reason so the
+decision is auditable.
 
 ## Findings that are not QC failures by default
 
@@ -82,12 +84,13 @@ provides a reason.
 ## Current annotation order
 
 1. Freeze the validated vertical detector-seam classifier.
-2. Audit digitized hard-copy film appearance against the FILM metadata rule.
-3. Validate `visible breast implant` on a blinded enriched-plus-random panel.
-4. Validate `non-standard spot-compression or magnification view` on a separate
+2. Validate `visible breast implant` on a blinded enriched-plus-random panel.
+3. Validate `non-standard spot-compression or magnification view` on a separate
    blinded panel.
+4. Validate large obscuring foreign devices, especially partially cropped
+   devices at image edges, against disjoint hard negatives.
 5. Next, validate burned-in CAD or human markup.
-6. Only then consider large obscuring foreign devices, incomplete breast
+6. Only then consider incomplete breast
    coverage/positioning, and severe exposure or contrast failures as distinct
    targets.
 

@@ -1,0 +1,20 @@
+Judge only whether this image visibly contains a gross implanted or procedural device. Ignore every other QC problem, pathology, positioning issue, film appearance, seam, exposure, or contrast problem.
+
+Choose Gross device present when any unmistakable part of a large device is visible, even if it lies outside the breast or is cropped by an image edge. This includes:
+
+- a port or Port-a-Cath reservoir;
+- a pacemaker, ICD, neurostimulator, or other generator;
+- a cropped part of a generator, reservoir, or device housing when its outline, internal hardware, or connected lead makes it recognizable;
+- gross tissue-expander hardware;
+- a long procedural localization wire, needle, grid, drain, or catheter; or
+- another large unmistakable metal or plastic device that occupies or changes a substantial part of the field.
+
+Choose No gross device for:
+
+- a breast implant shell without gross expander hardware;
+- small biopsy clips, surgical clips, or localization clips;
+- ordinary skin, scar, or nipple markers, including circular and wire markers;
+- calcifications, routine text, compression-paddle or detector edges, and normal anatomy; or
+- an isolated bright corner, ring, dot, disk, short line, or small object that does not have recognizable gross-device structure.
+
+A device does not have to obscure breast tissue to count. A partly cropped device counts if the visible portion is still recognizable as a housing, reservoir, generator, or connected procedural apparatus. If you cannot distinguish a cropped device from an ordinary marker, image edge, anatomy, or artifact, make your best binary choice and also turn on Low confidence.

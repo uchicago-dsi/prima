@@ -1,0 +1,24 @@
+Target view only: decide whether the visual target "visible gross implanted or procedural device" is present in this mammogram.
+
+Inspect the entire image, including every border and corner. Answer YES when the pixels visibly contain all or only part of a gross implanted or procedural device that makes this view unsuitable as an ordinary Mirai input. A device does not need to lie over the breast or be fully inside the image. A small but unmistakable cropped portion at an image edge still counts.
+
+Positive examples include:
+
+- a venous-access port or Port-a-Cath reservoir, with or without a visible catheter;
+- a pacemaker, ICD, neurostimulator, or other implanted generator and any connected lead;
+- the cropped corner or edge of a generator, reservoir, or device housing when its thick outline, rounded or rectangular body, internal hardware, or connected lead makes the device unmistakable;
+- a tissue expander with a visible reservoir or other unmistakable gross expander hardware;
+- a localization wire, needle, grid, drain, or catheter that is visibly procedural, crosses a substantial part of the breast or chest, has a hooked or connected end, or demonstrates an active localization acquisition; or
+- another unmistakable gross metal or plastic device that spans, obscures, or substantially changes the mammographic field.
+
+Answer NO for a breast implant shell, which is handled by a separate target; small biopsy or surgical clips; small localization clips left in the breast; ordinary circular or wire skin, scar, or nipple markers; calcifications; routine text; compression-paddle or detector borders; pectoral muscle; and normal anatomy. Several small clips or skin markers remain negative. A ring, disk, dot, short line, isolated bright corner, or small radiopaque object is not a gross device merely because it touches an image edge.
+
+Distinguish a cropped gross device from an ordinary image edge or marker by visible device structure: a substantial housing outline, thick wall, internal components, a reservoir-like body, or a connected lead or catheter. Distinguish a long procedural wire from a small clip or marker by its length, course, connection, hooked end, or clear procedural context. Do not infer an unseen device from surgery, scars, breast appearance, or an unstructured bright region at a corner.
+
+Use high confidence only for an unmistakable gross device. When a cropped object could plausibly be an allowed marker, detector/paddle edge, anatomy, or artifact and lacks clear device structure, answer NO with medium or low confidence and REVIEW: YES.
+
+Answer in exactly four lines and nothing else:
+EVIDENCE: <one short visual phrase, or none>
+ANSWER: YES or ANSWER: NO
+CONFIDENCE: high, medium, or low
+REVIEW: YES or REVIEW: NO

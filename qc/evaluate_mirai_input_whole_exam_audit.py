@@ -86,18 +86,17 @@ def main() -> int:
     if group["view_id"].duplicated().any():
         raise ValueError("group manifest contains duplicate view IDs")
 
-    state = load_view_qc_state(state_path)
-    progress = summarize_view_qc_state(state, group["view_id"])
-    if progress["remaining"]:
-        raise RuntimeError(
-            f"whole-exam evaluation requires complete labels; {progress['remaining']} remain"
-        )
-    if progress["low_confidence"]:
-        raise RuntimeError(
-            "whole-exam evaluation requires adjudicated labels; "
-            f"{progress['low_confidence']} remain low confidence"
-        )
     eligibility = pd.read_parquet(eligibility_path).copy()
+    required_eligibility = {
+        "view_id",
+        "is_mirai_source_eligible",
+        "exclusion_reasons",
+    }
+    missing_eligibility = sorted(required_eligibility - set(eligibility.columns))
+    if missing_eligibility:
+        raise ValueError(
+            "eligibility audit is missing columns: " + ", ".join(missing_eligibility)
+        )
     eligibility["view_id"] = eligibility["view_id"].map(normalize_view_id)
     if set(eligibility["view_id"]) != set(group["view_id"]):
         raise ValueError("eligibility audit does not cover the group manifest")
@@ -107,6 +106,21 @@ def main() -> int:
         how="left",
         validate="one_to_one",
     )
+    residual_view_ids = group.loc[
+        group["is_mirai_source_eligible"].astype(bool), "view_id"
+    ]
+    state = load_view_qc_state(state_path)
+    progress = summarize_view_qc_state(state, residual_view_ids)
+    if progress["remaining"]:
+        raise RuntimeError(
+            "whole-exam evaluation requires complete residual labels; "
+            f"{progress['remaining']} remain"
+        )
+    if progress["low_confidence"]:
+        raise RuntimeError(
+            "whole-exam evaluation requires adjudicated residual labels; "
+            f"{progress['low_confidence']} remain low confidence"
+        )
 
     run = load_view_auto_run(run_path)
     if run["target"] != state["target"]:
@@ -114,14 +128,23 @@ def main() -> int:
     if set(run["view_suggestions"]) != set(group["view_id"]):
         raise ValueError("system run does not cover the group manifest")
     labels = state["labels"]
-    group["human_visual_target_present"] = group["view_id"].map(
-        lambda value: labels[value]["label"] == VIEW_LABEL_PRESENT
+    if set(labels) != set(residual_view_ids):
+        raise ValueError(
+            "human state must contain exactly the DICOM-eligible residual views"
+        )
+    group["human_residual_target_present"] = pd.Series(
+        pd.NA, index=group.index, dtype="boolean"
     )
+    residual_mask = group["is_mirai_source_eligible"].astype(bool)
+    group.loc[residual_mask, "human_residual_target_present"] = group.loc[
+        residual_mask, "view_id"
+    ].map(lambda value: labels[value]["label"] == VIEW_LABEL_PRESENT)
     group["deterministic_target_present"] = ~group["is_mirai_source_eligible"].astype(
         bool
     )
     group["human_target_present"] = (
-        group["human_visual_target_present"] | group["deterministic_target_present"]
+        group["human_residual_target_present"].fillna(False).astype(bool)
+        | group["deterministic_target_present"]
     )
     group["model_target_present"] = group["view_id"].map(
         lambda value: view_suggestion_is_target_present(
@@ -191,6 +214,12 @@ def main() -> int:
     metrics = {
         "target": state["target"],
         "reference_rule": protocol["reference"],
+        "reference_sources": {
+            "deterministic_dicom_exclusions": int(
+                group["deterministic_target_present"].sum()
+            ),
+            "human_residual_labels": int(progress["reviewed"]),
+        },
         "views": view_metrics,
         "views_by_sampling_stratum": {
             str(stratum): confusion_metrics(rows)

@@ -494,15 +494,34 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
         frac=1.0, random_state=int(args.seed) + 100
     )
     shuffled = [records[index] for index in order]
-    for review_order, record in enumerate(shuffled, start=1):
-        record["review_order"] = review_order
+    for candidate_order, record in enumerate(shuffled, start=1):
+        record["candidate_order"] = candidate_order
         record["image_path"] = f"images/{record['view_id']}.png"
-    review = pd.DataFrame(shuffled)
+    audit_candidates = pd.DataFrame(shuffled)
+    eligible_by_view = eligibility.set_index("view_id")[
+        "is_mirai_source_eligible"
+    ].astype(bool)
+    audit_candidates["is_mirai_source_eligible"] = audit_candidates["view_id"].map(
+        eligible_by_view
+    )
+    if audit_candidates["is_mirai_source_eligible"].isna().any():
+        raise RuntimeError("DICOM eligibility does not cover every audit candidate")
 
-    manifest = review[
+    candidate_manifest = audit_candidates[
+        ["view_id", "image_path", "laterality", "view", "candidate_order"]
+    ].rename(columns={"candidate_order": "review_order"})
+    residual_review = audit_candidates[
+        audit_candidates["is_mirai_source_eligible"]
+    ].copy()
+    if residual_review.empty:
+        raise RuntimeError("whole-exam audit has no DICOM-eligible residual views")
+    residual_review["review_order"] = range(1, len(residual_review) + 1)
+    manifest = residual_review[
         ["view_id", "image_path", "laterality", "view", "review_order"]
     ].copy()
-    group_manifest = review[
+    review_order_by_view = manifest.set_index("view_id")["review_order"]
+
+    group_manifest = audit_candidates[
         [
             "view_id",
             "audit_exam_id",
@@ -513,12 +532,25 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
             "candidate_count",
             "is_selected",
             "sampling_stratum",
-            "review_order",
+            "candidate_order",
         ]
     ].copy()
-    source_manifest = review.copy()
+    group_manifest["review_order"] = (
+        group_manifest["view_id"].map(review_order_by_view).astype("Int64")
+    )
+    source_manifest = audit_candidates.drop(columns=["is_mirai_source_eligible"]).copy()
+    source_manifest["review_order"] = (
+        source_manifest["view_id"].map(review_order_by_view).astype("Int64")
+    )
+    if set(candidate_manifest["view_id"]) != set(group_manifest["view_id"]):
+        raise RuntimeError("candidate and group manifests disagree")
+    if set(manifest["view_id"]) != set(eligible_by_view[eligible_by_view].index):
+        raise RuntimeError(
+            "human review manifest is not the exact residual eligible set"
+        )
     for path, table in (
         (out_dir / "manifest.parquet", manifest),
+        (out_dir / "candidate_manifest.parquet", candidate_manifest),
         (out_dir / "group_manifest.parquet", group_manifest),
         (out_dir / "source_manifest.parquet", source_manifest),
         (out_dir / "eligibility_audit.parquet", eligibility),
@@ -567,10 +599,18 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
         "exams": int(sampled["exam_id"].nunique()),
         "patients": int(sampled["patient_id"].nunique()),
         "exact_slots": int(group_manifest["audit_group_id"].nunique()),
-        "candidate_views": int(len(manifest)),
-        "nonstandard_dicom_candidates": int(
+        "candidate_views": int(len(candidate_manifest)),
+        "human_review_views": int(len(manifest)),
+        "deterministic_dicom_exclusion_views": int(
             (~eligibility["is_mirai_source_eligible"].astype(bool)).sum()
         ),
+        "human_review_is_residual_eligible_only": True,
+        "candidate_manifest_sha256": sha256_file(
+            out_dir / "candidate_manifest.parquet"
+        ),
+        "review_manifest_sha256": sha256_file(out_dir / "manifest.parquet"),
+        "group_manifest_sha256": sha256_file(out_dir / "group_manifest.parquet"),
+        "eligibility_audit_sha256": sha256_file(out_dir / "eligibility_audit.parquet"),
         "max_render_pixels": int(args.max_render_pixels),
         "sampling_outputs_are_not_reference_labels": True,
     }
@@ -586,6 +626,11 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
         "reference": "deterministic DICOM exclusion OR completed residual visual human/agent label",
         "candidate_spec": str(candidate_spec_path),
         "candidate_spec_sha256": sha256_file(candidate_spec_path),
+        "candidate_manifest_sha256": metadata["candidate_manifest_sha256"],
+        "review_manifest_sha256": metadata["review_manifest_sha256"],
+        "group_manifest_sha256": metadata["group_manifest_sha256"],
+        "eligibility_audit_sha256": metadata["eligibility_audit_sha256"],
+        "human_reference_scope": "DICOM-eligible residual views only",
         "gate": {
             "minimum_view_sensitivity": 0.95,
             "minimum_view_specificity": 0.90,
@@ -606,21 +651,25 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
                 f"- target: `{target}`",
                 f"- frozen candidate: `{candidate_spec['candidate_name']}`",
                 f"- patients/exams: `{metadata['patients']}` / `{metadata['exams']}`",
-                f"- exact slots/candidate views: `{metadata['exact_slots']}` / `{metadata['candidate_views']}`",
+                f"- exact slots/candidate views/residual review views: `{metadata['exact_slots']}` / `{metadata['candidate_views']}` / `{metadata['human_review_views']}`",
                 f"- registered exam strata: `{counts}`",
-                f"- deterministic nonstandard candidates: `{metadata['nonstandard_dicom_candidates']}`",
+                f"- deterministic DICOM exclusions omitted from human review: `{metadata['deterministic_dicom_exclusion_views']}`",
                 f"- seed: `{args.seed}`",
                 "- every selected exam has all four L/R CC/MLO slots",
                 "- every candidate sequence is complete and renderable",
                 "- patients, exams, and views from prior source-linked panels are excluded",
-                "- browser manifest contains no patient, exam, SOP, or source identifiers",
+                "- manifest.parquet is the residual DICOM-eligible human-review set",
+                "- candidate_manifest.parquet is the complete system-inference set",
+                "- neither browser-safe manifest contains patient, exam, SOP, or source identifiers",
                 "",
                 "The seam and film runs are used only to enrich challenge strata. They",
                 "are not reference labels. The registered system combines deterministic",
                 "DICOM acquisition eligibility with the exact candidate frozen in the",
-                "hashed candidate specification. Candidate rank remains immutable and",
-                "cannot cross laterality or projection. Score once after the residual",
-                "visual labels are complete.",
+                "hashed candidate specification. Deterministically rejected views remain",
+                "in the complete candidate and group manifests but are not shown to the",
+                "human reviewer. Candidate rank remains immutable and cannot cross",
+                "laterality or projection. Run model inference on candidate_manifest.parquet",
+                "and score once after every residual visual label is complete.",
                 "",
             ]
         )
@@ -632,7 +681,7 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
 def main() -> int:
     args = parse_args()
     manifest = run_from_args(args)
-    print(f"whole-exam fallback audit ready: views={len(manifest)}")
+    print(f"whole-exam fallback audit ready: residual_review_views={len(manifest)}")
     print(f"output: {args.out_dir.resolve()}")
     return 0
 
