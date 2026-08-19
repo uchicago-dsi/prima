@@ -44,6 +44,13 @@ DICOM lineage plus a reason.
   `qc_redo/auto_qc_validation/mirai_input_production_residual_v1/`
 - Production rebuild provenance:
   `/scratch/annawoodard/prima_film_policy_rebuild/README.md`
+- Exact panel assembly command:
+  `qc_redo/auto_qc_development/gross_device_edge_crop_challenge_v1/README.md`
+  (untracked, because `qc_redo/` is gitignored). The frozen spec registers the
+  inputs, seed, and quotas but not the two output paths; the original
+  `13190617` submission persisted no script and has aged out of `scontrol`, so
+  `--out-dir` and `--model-subset-dir` follow repository convention rather than
+  that submission. Every registered argument matches the spec exactly.
 
 ## Open uncertainty (decide before spending annotation time)
 
