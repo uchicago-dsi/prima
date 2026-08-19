@@ -15,6 +15,8 @@ from typing import Any
 
 import pandas as pd
 
+from qc.run_view_auto_qc import load_target_prompt
+
 from prima.dicom_source import (
     SOURCE_COLUMNS,
     SOURCE_ARCHIVE_COLUMN,
@@ -450,6 +452,23 @@ def subset_run(
     )
 
 
+def executed_prompt_sha256(arm: dict[str, Any], *, name: str) -> str:
+    """Return the digest an inference run must record for one frozen arm.
+
+    The specification freezes the raw prompt file digest, while
+    `qc.run_view_auto_qc` sends and hashes the stripped prompt text. Verify the
+    registered file is byte-identical to its frozen digest, then derive the
+    executed-text digest through the producer's own loader so both the
+    registration and the executed prompt stay pinned to one convention.
+    """
+    prompt_path = Path(arm["prompt"])
+    if sha256_file(prompt_path) != arm["prompt_sha256"]:
+        raise RuntimeError(f"{name} prompt file differs from frozen specification")
+    return hashlib.sha256(
+        load_target_prompt(prompt_path, target=TARGET).encode()
+    ).hexdigest()
+
+
 def assemble(args: argparse.Namespace) -> int:
     mining_dir = args.mining_dir.resolve()
     source_path = mining_dir / "source_manifest.parquet"
@@ -504,16 +523,16 @@ def assemble(args: argparse.Namespace) -> int:
             raise RuntimeError(f"{name} run target disagrees with challenge")
         if set(run["view_suggestions"]) != expected_ids:
             raise RuntimeError(f"{name} run does not exactly cover mining manifest")
-    if (
-        baseline["inference_settings"].get("target_prompt_sha256")
-        != spec["nearest_baseline"]["prompt_sha256"]
+    for name, run, arm_key in (
+        ("baseline", baseline, "nearest_baseline"),
+        ("candidate", candidate, "candidate"),
     ):
-        raise RuntimeError("baseline run prompt differs from frozen specification")
-    if (
-        candidate["inference_settings"].get("target_prompt_sha256")
-        != spec["candidate"]["prompt_sha256"]
-    ):
-        raise RuntimeError("candidate run prompt differs from frozen specification")
+        expected_prompt_sha256 = executed_prompt_sha256(spec[arm_key], name=name)
+        if (
+            run["inference_settings"].get("target_prompt_sha256")
+            != expected_prompt_sha256
+        ):
+            raise RuntimeError(f"{name} run prompt differs from frozen specification")
     unchanged_fields = ("model_key", "model_revision", "temperature", "max_new_tokens")
     if any(
         baseline["inference_settings"].get(field)
