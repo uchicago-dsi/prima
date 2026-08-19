@@ -2,7 +2,9 @@
 
 ## Top Rules
 
-- Use the `prima` micromamba env for all work.
+- Use the `prima` micromamba env for all work except GPU model serving for
+  auto-QC, which uses the isolated, pinned `prima-vllm` env from
+  `env-vllm.yaml`. Do not install vLLM into the general-purpose `prima` env.
 - Fail fast on bad paths, caches, or dependencies. Do not add backward-compatibility shims.
 - If a maintained library already provides missing functionality, install it into the `prima` env instead of re-implementing that functionality locally.
 - Never commit or print PHI.
@@ -77,6 +79,40 @@ micromamba run -p /net/projects2/annawoodard/micromamba/envs/prima <command>
 
 This environment has all required dependencies (torch, pydicom, zarr, pandas, etc.).
 
+For vLLM-backed auto-QC only, create and use the isolated serving environment:
+
+```bash
+mkdir -p /scratch/annawoodard/tmp/prima-vllm-pip
+mkdir -p /scratch/annawoodard/tmp/prima-vllm-runtime
+TMPDIR=/scratch/annawoodard/tmp/prima-vllm-pip \
+  micromamba create -y -f env-vllm.yaml
+PYTHONNOUSERSITE=1 \
+TMPDIR=/scratch/annawoodard/tmp/prima-vllm-pip \
+UV_CACHE_DIR=/scratch/annawoodard/uv-cache/prima-vllm \
+UV_LINK_MODE=copy \
+  /gpfs/data/huo-lab/Image/annawoodard/micromamba/envs/prima-vllm/bin/uv \
+  pip install \
+  --python /gpfs/data/huo-lab/Image/annawoodard/micromamba/envs/prima-vllm/bin/python \
+  --torch-backend=cu130 \
+  vllm==0.24.0 openai==2.45.0 torch==2.11.0 torchvision==0.26.0 \
+  torchaudio==2.11.0 numpy==2.3.5
+TMPDIR=/scratch/annawoodard/tmp/prima-vllm-runtime \
+micromamba run -p /gpfs/data/huo-lab/Image/annawoodard/micromamba/envs/prima-vllm \
+  python submit_auto_qc.py ...
+```
+
+The submitter deliberately fails before queueing if the active environment does
+not contain the pinned vLLM and OpenAI client versions.
+The executable scratch `TMPDIR` is required for both installation and serving
+because `/tmp` is mounted `noexec`; Triton loads compiled runtime kernels from
+that directory. The submitter fails before queueing if `TMPDIR` is unsuitable.
+`env-vllm.yaml` also supplies the pinned CUDA 13.0 `nvcc` required by
+DeepGEMM; do not rely on the compute image's `/usr/local/cuda` compiler. The
+managed server sets `CUDA_HOME` to the active environment and puts FlashInfer's
+JIT workspace under `TMPDIR`.
+The explicit `cu130` backend is required because automatic backend detection on
+a GPU-less login node installs CPU-only Torch.
+
 ## Build And Development Commands
 
 Create the micromamba env once with `micromamba create -y -f env.yaml`, then `micromamba activate prima`, `pip install -e .`, `pip install -r requirements.txt`, and `pip install -r requirements-dev.txt` for linting/notebook extras. Scripts expose CLI help; run `python ops/fingerprinter.py --help` or `python ops/sync.py --dry-run` before touching production mounts.
@@ -138,6 +174,12 @@ Keep configuration in module-level constants or argparse defaults. Do not scatte
 - `AGENTS.md` is for stable repo rules and operating conventions, not current run state.
 - For restarts, write a short handoff under `logs/` with the goal, current state, evidence paths, open uncertainty, and the exact first re-entry check.
 - Update the canonical notebook or experiment log before writing the handoff so a fresh agent can trust it.
+- When writing a handoff, delete every stale handoff under `logs/` in the same
+  change. Exactly one current handoff may exist. A superseded handoff is worse
+  than none: a fresh agent cannot tell which of several files is live, and the
+  durable chronology already lives in the canonical notebook.
+- Name the handoff for its scope, not its date, so the current one is always
+  found at the same path.
 
 ## Commit & Pull Request Guidelines
 
